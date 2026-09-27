@@ -69,6 +69,11 @@ pub struct CodexSettings {
     pub provider: Option<CodexProvider>,
     pub project_doc_max_bytes: Option<u64>,
     pub model_reasoning_effort: Option<String>,
+    /// Extra `-c key=value` overrides (value is a TOML literal), e.g. imported from a
+    /// `[profiles.<name>]` of the user's ~/.codex/config.toml by `thien spike init-config`.
+    /// Passed on every exec AND exec resume, like everything else (R19).
+    #[serde(default)]
+    pub overrides: BTreeMap<String, String>,
 }
 fn default_sandbox_mode() -> String {
     "workspace-write".into()

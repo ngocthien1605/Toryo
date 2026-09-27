@@ -59,6 +59,9 @@ impl CodexLaunch {
         if let Some(e) = &s.model_reasoning_effort {
             c.push(format!("model_reasoning_effort={}", toml_str(e)));
         }
+        for (k, v) in &s.overrides {
+            c.push(format!("{k}={v}"));
+        }
         if let Some(n) = s.project_doc_max_bytes {
             c.push(format!("project_doc_max_bytes={n}"));
         }
@@ -343,6 +346,7 @@ mod tests {
                     wire_api: "responses".into(),
                 }),
                 project_doc_max_bytes: None,
+                overrides: Default::default(),
                 model_reasoning_effort: Some("medium".into()),
             },
             output_schema: Some("implementation.schema.json".into()),

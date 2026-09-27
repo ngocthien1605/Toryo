@@ -149,6 +149,29 @@ enum SpikeCmd {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Write thien.yaml for this machine; translate Codex `[profiles.<name>]` into -c overrides.
+    InitConfig {
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        project_root: String,
+        #[arg(long)]
+        worktrees_root: String,
+        #[arg(long)]
+        claude_exe: String,
+        #[arg(long)]
+        git_bash: Option<String>,
+        #[arg(long)]
+        codex_exe: String,
+        /// Usually %USERPROFILE%\.codex\config.toml
+        #[arg(long)]
+        codex_config: Option<PathBuf>,
+        /// Codex profile names to import, e.g. openai,foundry → thien profiles codex-openai, codex-foundry
+        #[arg(long, value_delimiter = ',')]
+        codex_profiles: Vec<String>,
+        #[arg(long, default_value = "unelevated")]
+        windows_sandbox: String,
+    },
     /// End-to-end smoke test: Claude plans → Codex implements → thien checkpoints/verifies → Claude reviews.
     Smoke {
         #[arg(long, default_value = "claude-max")]
@@ -403,6 +426,30 @@ fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
             model,
         } => {
             sa::killed_resume(&load_config(cli)?, profile, *kill_after_secs, model.clone())?;
+            Ok(0)
+        }
+        SpikeCmd::InitConfig {
+            out,
+            project_root,
+            worktrees_root,
+            claude_exe,
+            git_bash,
+            codex_exe,
+            codex_config,
+            codex_profiles,
+            windows_sandbox,
+        } => {
+            thien::spike::init_config::init_config(&thien::spike::init_config::InitArgs {
+                out: out.clone(),
+                project_root: project_root.clone(),
+                worktrees_root: worktrees_root.clone(),
+                claude_exe: claude_exe.clone(),
+                git_bash: git_bash.clone(),
+                codex_exe: codex_exe.clone(),
+                codex_config: codex_config.clone(),
+                codex_profiles: codex_profiles.clone(),
+                windows_sandbox: windows_sandbox.clone(),
+            })?;
             Ok(0)
         }
         SpikeCmd::Smoke {

@@ -23,6 +23,7 @@ hex = "0.4"
 regex = "1"
 aho-corasick = "1"
 time = { version = "0.3", features = ["formatting", "macros"] }
+toml = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }

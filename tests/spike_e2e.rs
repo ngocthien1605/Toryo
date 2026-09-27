@@ -404,12 +404,28 @@ fn doctor_reports_config_and_profiles() {
 #[test]
 fn smoke_orchestrates_both_fakes_end_to_end() {
     let env = setup(false);
-    let (_code, _o, err) = thien(&env, &["spike", "smoke", "--claude-profile", "claude-max", "--codex-profile", "codex-foundry"]);
+    let (_code, _o, err) = thien(
+        &env,
+        &[
+            "spike",
+            "smoke",
+            "--claude-profile",
+            "claude-max",
+            "--codex-profile",
+            "codex-foundry",
+        ],
+    );
     let r = records(&env);
     let last = r.last().unwrap();
     assert_eq!(last["spike"], "smoke", "{err}");
     let steps = last["details"]["steps"].as_array().unwrap();
-    let ok = |name: &str| steps.iter().find(|s| s["step"] == name).map(|s| s["ok"] == true).unwrap_or(false);
+    let ok = |name: &str| {
+        steps
+            .iter()
+            .find(|s| s["step"] == name)
+            .map(|s| s["ok"] == true)
+            .unwrap_or(false)
+    };
     assert!(ok("plan (Claude)"), "{err}");
     assert!(ok("implement (Codex)"), "{err}");
     assert!(ok("agent did not commit (HEAD guard)"));

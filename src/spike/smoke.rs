@@ -50,7 +50,11 @@ fn step(steps: &mut Vec<Step>, name: &'static str, ok: bool, detail: impl Into<S
 }
 
 /// (mode that worked, every attempt with its note, the successful turn)
-type ClaudeStep = (Option<LaunchMode>, Vec<(LaunchMode, String)>, Option<TurnRun>);
+type ClaudeStep = (
+    Option<LaunchMode>,
+    Vec<(LaunchMode, String)>,
+    Option<TurnRun>,
+);
 
 /// Run a Claude step with the first launch mode that produces a structured answer.
 #[allow(clippy::too_many_arguments)]
@@ -138,7 +142,11 @@ fn run_verify(script: &Path, cwd: &Path) -> Result<(Option<i32>, String)> {
             script.display().to_string(),
         ],
         cwd: cwd.to_path_buf(),
-        env: build_env(std::env::vars(), &Default::default(), &Default::default()),
+        env: {
+            let mut e = build_env(std::env::vars(), &Default::default(), &Default::default());
+            e.insert("NO_COLOR".into(), "1".into());
+            e
+        },
         stdin: None,
         boundary: Boundary::None, // smoke: trusted fixture code; the boundary is lowil-canary's job
     };

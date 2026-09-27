@@ -4,6 +4,7 @@
 
 pub mod agents;
 pub mod fixture;
+pub mod init_config;
 pub mod job;
 pub mod lowil;
 pub mod render;

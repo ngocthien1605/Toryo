@@ -110,6 +110,9 @@ fn build_fixture(git: &Path, root: &Path, process_cmd: Option<&str>) -> Result<F
         Ok(())
     };
     plain(&["init", "-q", "-b", "main", "."])?;
+    // repo-local identity: the control's commits must not fail on a machine without a global one
+    plain(&["config", "user.name", "Canary"])?;
+    plain(&["config", "user.email", "canary@local.invalid"])?;
     // hooks in .git/hooks and in a repo-level core.hooksPath
     for dir in [repo.join(".git").join("hooks"), repo.join(".husky")] {
         for h in CLIENT_HOOKS {
