@@ -22,7 +22,8 @@ param(
     [string]$ClaudeModel = "",
     [string]$CodexModel = "",
     # Codex profiles in ~/.codex/config.toml to import (codex --profile <name>)
-    [string[]]$CodexProfiles = @('openai', 'foundry'),
+    # Default: Codex's own login (ChatGPT subscription). Add 'foundry' only if ~/.codex/config.toml has [profiles.foundry].
+    [string[]]$CodexProfiles = @('openai'),
     # Which one the end-to-end smoke test uses as the Implementer
     [string]$SmokeCodexProfile = 'openai',
     [string]$WorkDir = 'C:\.thien\m0',
@@ -51,6 +52,11 @@ foreach ($d in ($regPath -split ';')) { if ($d -and ($env:PATH -split ';') -notc
 "PowerShell $($PSVersionTable.PSVersion) on $([Environment]::OSVersion.VersionString)"
 if (-not (Test-Path $thien)) { Write-Error "thien.exe not found at $thien"; Stop-Transcript | Out-Null; exit 2 }
 & $thien --version
+$initHelp = & $thien spike init-config --help 2>&1 | Out-String
+if ($initHelp -notmatch '--lenient') {
+    Write-Error "bin\thien.exe is older than this script (no --lenient). Re-copy thien.exe from the latest delivery."
+    Stop-Transcript | Out-Null; exit 2
+}
 
 # ---------------------------------------------------------------- Claude Code
 Section "Claude Code"
@@ -133,6 +139,12 @@ $gitBash = @('C:\Program Files\Git\bin\bash.exe', "$env:LOCALAPPDATA\Programs\Gi
 Section "thien.yaml"
 $calc = Join-Path $m0 'calc'
 $contracts = Join-Path $m0 'contracts'
+if ((Test-Path $calc) -and -not (Test-Path (Join-Path $calc '.git'))) {
+    # left over from a run that failed before Git existed: move it aside, never delete
+    $aside = "$calc-incomplete-$(Get-Date -Format yyyyMMddHHmmss)"
+    Move-Item -Path $calc -Destination $aside
+    "moved incomplete fixture to $aside"
+}
 if (-not (Test-Path (Join-Path $calc '.git'))) { & $thien spike init-fixture --into $calc --contracts $contracts }
 elseif (-not (Test-Path $contracts)) { & $thien spike init-fixture --into (Join-Path $m0 ("calc-{0}" -f (Get-Date -Format yyyyMMddHHmmss))) --contracts $contracts }
 $cfgPath = Join-Path $m0 'thien.yaml'
