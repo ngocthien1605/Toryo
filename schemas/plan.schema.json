@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "required": ["understanding", "files_likely_involved", "steps", "validation", "plan_markdown"],
+  "properties": {
+    "understanding":          { "type": "string" },
+    "files_likely_involved":  { "type": "array", "items": { "type": "string" } },
+    "steps":                  { "type": "array", "items": { "type": "string" } },
+    "risks":                  { "type": "array", "items": { "type": "string" } },
+    "validation":             { "type": "array", "items": { "type": "string" } },
+    "assumptions":            { "type": "array", "items": { "type": "string" } },
+    "open_questions":         { "type": "array", "items": { "type": "string" } },
+    "plan_markdown":          { "type": "string" }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_store_token", "outside_file_content", "special_instructions"],
+  "properties": {
+    "run_store_token":      { "type": "string" },
+    "outside_file_content": { "type": "string" },
+    "special_instructions": { "type": "string" }
+  }
+}

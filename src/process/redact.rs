@@ -1,0 +1,530 @@
+//! Streaming secret redaction (plan v0.6, R42 / review finding C9).
+//!
+//! Redacting each chunk on its own misses a secret that is split across two
+//! chunks (`abc` + `def` never matches `abcdef`). [`StreamRedactor`] sits
+//! directly on a child's pipe, keeps a carry-over suffix between chunks and only
+//! emits bytes that can no longer be the start of a secret.
+//!
+//! Invariants (tested exhaustively in the unit tests below):
+//! * every occurrence of a known secret, in literal or JSON-escaped form, is
+//!   replaced by `[REDACTED:<name>]`, wherever the stream is split;
+//! * emitted output never ends in the middle of a UTF-8 character;
+//! * overlapping occurrences of different secrets are replaced as one union span, so
+//!   no part of either secret survives (e.g. `tok-AAAA` + `AAAA-SECRET` in `tok-AAAA-SECRET`);
+//! * `finish()` flushes the retained tail through the same matcher.
+//!
+//! Scope, as stated in the plan: known literal values and their JSON escape.
+//! Other encodings (base64, URL-encoding, a model re-typing the value) are not
+//! covered.
+
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+
+/// One secret to redact: a display name (never the value) and its value.
+#[derive(Clone)]
+pub struct Secret {
+    pub name: String,
+    pub value: String,
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Secret")
+            .field("name", &self.name)
+            .field("value", &"<hidden>")
+            .finish()
+    }
+}
+
+/// Immutable matcher shared by every stream of one process (cheap to clone via `Arc`).
+#[derive(Clone)]
+pub struct Redactions {
+    ac: Option<std::sync::Arc<AhoCorasick>>,
+    replacements: Vec<Vec<u8>>,
+    max_len: usize,
+}
+
+impl std::fmt::Debug for Redactions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Redactions")
+            .field("patterns", &self.replacements.len())
+            .finish()
+    }
+}
+
+impl Redactions {
+    /// Build the matcher. Empty values are ignored. Each secret contributes its
+    /// literal bytes and, when different, its JSON-string-escaped bytes.
+    pub fn new(secrets: &[Secret]) -> Self {
+        let mut patterns: Vec<Vec<u8>> = Vec::new();
+        let mut replacements: Vec<Vec<u8>> = Vec::new();
+        for s in secrets {
+            if s.value.is_empty() {
+                continue;
+            }
+            let repl = format!("[REDACTED:{}]", sanitize_name(&s.name)).into_bytes();
+            let literal = s.value.as_bytes().to_vec();
+            let escaped_full = serde_json::to_string(&s.value).expect("string serialises");
+            let escaped = escaped_full.as_bytes()[1..escaped_full.len() - 1].to_vec();
+            if !patterns.contains(&literal) {
+                patterns.push(literal.clone());
+                replacements.push(repl.clone());
+            }
+            if escaped != literal && !patterns.contains(&escaped) {
+                patterns.push(escaped);
+                replacements.push(repl);
+            }
+        }
+        if patterns.is_empty() {
+            return Self {
+                ac: None,
+                replacements,
+                max_len: 0,
+            };
+        }
+        let max_len = patterns.iter().map(|p| p.len()).max().unwrap_or(0);
+        let ac = AhoCorasickBuilder::new()
+            .match_kind(MatchKind::Standard) // overlapping search; spans are unioned below
+            .build(&patterns)
+            .expect("aho-corasick build");
+        Self {
+            ac: Some(std::sync::Arc::new(ac)),
+            replacements,
+            max_len,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self::new(&[])
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ac.is_none()
+    }
+
+    /// Redact a complete, already-buffered value (e.g. a stored event payload).
+    /// Defence in depth only: streams must go through [`StreamRedactor`].
+    pub fn redact_all(&self, input: &[u8]) -> Vec<u8> {
+        let mut r = StreamRedactor::new(self.clone());
+        let mut out = r.push(input);
+        out.extend(r.finish());
+        out
+    }
+
+    pub fn redact_str(&self, input: &str) -> String {
+        String::from_utf8_lossy(&self.redact_all(input.as_bytes())).into_owned()
+    }
+}
+
+fn sanitize_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Stateful redactor for one byte stream.
+pub struct StreamRedactor {
+    r: Redactions,
+    buf: Vec<u8>,
+    finished: bool,
+}
+
+impl StreamRedactor {
+    pub fn new(r: Redactions) -> Self {
+        Self {
+            r,
+            buf: Vec::new(),
+            finished: false,
+        }
+    }
+
+    /// Feed a chunk; returns the bytes that are now safe to emit.
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        assert!(!self.finished, "push after finish");
+        self.buf.extend_from_slice(chunk);
+        self.process(false)
+    }
+
+    /// End of stream (EOF, pipe closed by Job termination, …): flush the tail.
+    pub fn finish(&mut self) -> Vec<u8> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        self.process(true)
+    }
+
+    /// Bytes currently held back (never emitted if the process dies now).
+    pub fn retained(&self) -> usize {
+        self.buf.len()
+    }
+
+    fn process(&mut self, eof: bool) -> Vec<u8> {
+        let Some(ac) = self.r.ac.clone() else {
+            // No secrets: still respect UTF-8 boundaries so downstream decoding is stable.
+            let cut = if eof {
+                self.buf.len()
+            } else {
+                utf8_safe_cut(&self.buf, self.buf.len(), 0)
+            };
+            return self.buf.drain(..cut).collect();
+        };
+        let len = self.buf.len();
+        // A secret occurrence that is still incomplete must start at or after
+        // `len - (max_len - 1)`; everything before that point is final.
+        let final_before = if eof {
+            len
+        } else {
+            len.saturating_sub(self.r.max_len.saturating_sub(1))
+        };
+        // Union of all (overlapping) occurrences, sorted by start.
+        // Overlapping search reports matches by end position: sort by start (longest first).
+        let mut raw: Vec<(usize, usize, usize)> = ac
+            .find_overlapping_iter(&self.buf)
+            .map(|m| (m.start(), m.end(), m.pattern().as_usize()))
+            .collect();
+        raw.sort_by_key(|&(s, e, _)| (s, std::cmp::Reverse(e)));
+        let mut spans: Vec<(usize, usize, usize)> = Vec::new(); // (start, end, pattern of the longest member)
+        for (s, e, p) in raw {
+            match spans.last_mut() {
+                Some(last) if s < last.1 => {
+                    if e - s > last.1 - last.0 {
+                        last.2 = p;
+                    }
+                    last.1 = last.1.max(e);
+                }
+                _ => spans.push((s, e, p)),
+            }
+        }
+        let mut cut = final_before;
+        let mut out = Vec::with_capacity(len);
+        let mut last = 0usize;
+        for (s, e, p) in spans {
+            if s >= cut {
+                break;
+            }
+            if e > cut && !eof {
+                // A future (not yet complete) occurrence could still overlap this span:
+                // hold the whole span back.
+                cut = s;
+                break;
+            }
+            out.extend_from_slice(&self.buf[last..s]);
+            out.extend_from_slice(&self.r.replacements[p]);
+            last = e;
+        }
+        if last > cut {
+            cut = last;
+        }
+        if !eof {
+            cut = utf8_safe_cut(&self.buf, cut, last);
+        }
+        out.extend_from_slice(&self.buf[last..cut]);
+        self.buf.drain(..cut);
+        out
+    }
+}
+
+/// Move `cut` back (not below `floor`) so that `buf[..cut]` does not end inside a
+/// multi-byte UTF-8 sequence. Invalid UTF-8 is passed through unchanged.
+fn utf8_safe_cut(buf: &[u8], cut: usize, floor: usize) -> usize {
+    let lower = cut.saturating_sub(4).max(floor);
+    let mut p = cut;
+    while p > lower {
+        p -= 1;
+        let b = buf[p];
+        if b & 0b1100_0000 == 0b1000_0000 {
+            continue; // continuation byte: keep looking for the lead
+        }
+        if b & 0b1000_0000 == 0 {
+            return cut; // ASCII lead: cut is on a boundary
+        }
+        let need = if b >= 0xF0 {
+            4
+        } else if b >= 0xE0 {
+            3
+        } else {
+            2
+        };
+        return if cut - p >= need { cut } else { p };
+    }
+    cut
+}
+
+/// Truncate after redaction, at a UTF-8 boundary (plan: diagnostics capped at 64 KB).
+pub fn truncate_utf8(bytes: &[u8], cap: usize) -> &[u8] {
+    if bytes.len() <= cap {
+        return bytes;
+    }
+    let mut c = cap;
+    while c > 0 && bytes[c] & 0b1100_0000 == 0b1000_0000 {
+        c -= 1;
+    }
+    &bytes[..c]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sec(name: &str, v: &str) -> Secret {
+        Secret {
+            name: name.into(),
+            value: v.into(),
+        }
+    }
+
+    fn run_chunks(r: &Redactions, chunks: &[&[u8]]) -> Vec<u8> {
+        let mut s = StreamRedactor::new(r.clone());
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend(s.push(c));
+        }
+        out.extend(s.finish());
+        out
+    }
+
+    fn contains(h: &[u8], n: &[u8]) -> bool {
+        h.windows(n.len()).any(|w| w == n)
+    }
+
+    const SECRETS: &[(&str, &str)] = &[
+        ("KEY_A", "abcdef0123456789"),
+        ("KEY_B", "abcdef"),         // overlaps with KEY_A (prefix)
+        ("KEY_C", "5678XYZ"),        // overlaps with KEY_A (suffix region)
+        ("JP", "秘密のトークン🔑x"), // multibyte, incl. 4-byte char
+        ("QUOTE", "pa\"ss\\word"),   // JSON escaping differs
+    ];
+
+    fn all() -> Redactions {
+        Redactions::new(&SECRETS.iter().map(|(n, v)| sec(n, v)).collect::<Vec<_>>())
+    }
+
+    fn sample() -> Vec<u8> {
+        let s = "start abcdef0123456789 mid abcdef end 5678XYZ; 日本語テキスト 秘密のトークン🔑x \
+                 {\"k\":\"pa\\\"ss\\\\word\"} raw pa\"ss\\word tail abcdef0123456789";
+        s.as_bytes().to_vec()
+    }
+
+    fn assert_clean(out: &[u8]) {
+        for (_, v) in SECRETS {
+            assert!(
+                !contains(out, v.as_bytes()),
+                "leaked {v:?} in {:?}",
+                String::from_utf8_lossy(out)
+            );
+            let esc = serde_json::to_string(v).unwrap();
+            let esc = &esc.as_bytes()[1..esc.len() - 1];
+            assert!(!contains(out, esc), "leaked escaped {v:?}");
+        }
+        assert!(
+            std::str::from_utf8(out).is_ok(),
+            "output must be valid UTF-8"
+        );
+    }
+
+    #[test]
+    fn whole_buffer_is_redacted() {
+        let out = all().redact_all(&sample());
+        assert_clean(&out);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("[REDACTED:KEY_A]"));
+        assert!(s.contains("[REDACTED:KEY_B]"));
+        assert!(s.contains("[REDACTED:JP]"));
+        assert!(s.contains("[REDACTED:QUOTE]"));
+        assert!(s.contains("日本語テキスト"));
+    }
+
+    #[test]
+    fn one_byte_chunks() {
+        let data = sample();
+        let chunks: Vec<&[u8]> = data.chunks(1).collect();
+        let out = run_chunks(&all(), &chunks);
+        assert_clean(&out);
+        assert_eq!(
+            out,
+            all().redact_all(&data),
+            "chunking must not change the result"
+        );
+    }
+
+    #[test]
+    fn every_two_way_split() {
+        let data = sample();
+        let reference = all().redact_all(&data);
+        for i in 0..=data.len() {
+            let out = run_chunks(&all(), &[&data[..i], &data[i..]]);
+            assert_clean(&out);
+            assert_eq!(out, reference, "split at {i}");
+        }
+    }
+
+    #[test]
+    fn every_three_way_split_small() {
+        let r = Redactions::new(&[sec("S", "abcdef"), sec("T", "cdefgh")]);
+        let data = b"xxabcdefghyyabcdefgh";
+        let reference = r.redact_all(data);
+        for i in 0..=data.len() {
+            for j in i..=data.len() {
+                let out = run_chunks(&r, &[&data[..i], &data[i..j], &data[j..]]);
+                assert!(!contains(&out, b"abcdef") && !contains(&out, b"cdefgh"));
+                assert_eq!(out, reference, "split {i},{j}");
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_secret_does_not_leak_suffix_of_longer_one() {
+        // "abcdef" is a prefix of "abcdef0123456789": the longer one must win when it is
+        // complete, even if the stream is cut right after the shorter one.
+        let r = all();
+        let out = run_chunks(&r, &[b"..abcdef", b"0123456789.."]);
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(s, "..[REDACTED:KEY_A]..");
+    }
+
+    #[test]
+    fn eof_mid_secret_is_redacted_or_withheld() {
+        // Stream ends (e.g. Job terminated) in the middle of a secret: nothing of the
+        // partial secret is a full secret, so it is flushed; a full one at the tail is redacted.
+        let r = all();
+        let out = run_chunks(&r, &[b"head ", b"abcdef"]);
+        assert_eq!(String::from_utf8(out).unwrap(), "head [REDACTED:KEY_B]");
+    }
+
+    #[test]
+    fn retained_tail_is_bounded() {
+        let r = all();
+        let mut s = StreamRedactor::new(r.clone());
+        let _ = s.push(&vec![b'z'; 10_000]);
+        assert!(s.retained() < r.max_len, "retains at most max_len-1 bytes");
+    }
+
+    #[test]
+    fn multibyte_never_split_in_output() {
+        let r = Redactions::new(&[sec("K", "zzzzzzzzzzzz")]);
+        let data = "あいうえお🔑かきくけこ".as_bytes().to_vec();
+        for i in 0..=data.len() {
+            let mut s = StreamRedactor::new(r.clone());
+            let a = s.push(&data[..i]);
+            assert!(
+                std::str::from_utf8(&a).is_ok(),
+                "first emission at split {i} not UTF-8"
+            );
+            let mut out = a;
+            out.extend(s.push(&data[i..]));
+            out.extend(s.finish());
+            assert_eq!(out, data);
+        }
+    }
+
+    #[test]
+    fn truncation_after_redaction_cannot_expose_secret_prefix() {
+        let r = all();
+        let data = sample();
+        for cap in 0..data.len() {
+            let red = r.redact_all(&data);
+            let t = truncate_utf8(&red, cap);
+            assert!(std::str::from_utf8(t).is_ok());
+            // The redacted text contains no secret, so no prefix of it can either.
+            assert!(!contains(t, b"abcdef0"));
+        }
+    }
+
+    #[test]
+    fn overlapping_secrets_leave_no_part_of_either() {
+        let r = Redactions::new(&[sec("A", "tok-AAAA"), sec("B", "AAAA-SECRETPART")]);
+        let data = b"x tok-AAAA-SECRETPART y AAAA-SECRETPART z tok-AAAA w";
+        let reference = r.redact_all(data);
+        let s = String::from_utf8(reference.clone()).unwrap();
+        assert!(
+            !s.contains("SECRETPART") && !s.contains("tok-AAAA") && !s.contains("AAAA"),
+            "{s}"
+        );
+        for i in 0..=data.len() {
+            for j in i..=data.len() {
+                let out = run_chunks(&r, &[&data[..i], &data[i..j], &data[j..]]);
+                assert_eq!(out, reference, "split {i},{j}");
+            }
+        }
+    }
+
+    #[test]
+    fn chained_overlaps_are_held_back_not_split() {
+        // A second secret starting inside the first must not be emitted half-raw
+        // when it arrives in a later chunk.
+        let r = Redactions::new(&[sec("A", "abcdef"), sec("B", "defghijk")]);
+        let out = run_chunks(&r, &[b"..abcdef", b"ghijk.."]);
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("ghijk") && !s.contains("abc"), "{s}");
+    }
+
+    /// Randomised: small alphabet so secrets overlap and repeat a lot; random chunking must
+    /// equal whole-buffer redaction and never contain any secret.
+    #[test]
+    fn fuzz_random_secrets_and_splits() {
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let alphabet = b"abcd";
+        for _round in 0..400 {
+            let nsec = 1 + rnd(3) as usize;
+            let secrets: Vec<Secret> = (0..nsec)
+                .map(|i| {
+                    let len = 3 + rnd(5) as usize;
+                    let v: String = (0..len)
+                        .map(|_| alphabet[rnd(4) as usize] as char)
+                        .collect();
+                    sec(&format!("S{i}"), &v)
+                })
+                .collect();
+            let r = Redactions::new(&secrets);
+            let dlen = 10 + rnd(60) as usize;
+            let data: Vec<u8> = (0..dlen).map(|_| alphabet[rnd(4) as usize]).collect();
+            let reference = r.redact_all(&data);
+            for s in &secrets {
+                assert!(
+                    !contains(&reference, s.value.as_bytes()),
+                    "reference leaks {:?} in {:?}",
+                    s.value,
+                    String::from_utf8_lossy(&reference)
+                );
+            }
+            for _ in 0..20 {
+                let mut chunks = Vec::new();
+                let mut i = 0;
+                while i < data.len() {
+                    let n = 1 + rnd(8) as usize;
+                    let j = (i + n).min(data.len());
+                    chunks.push(&data[i..j]);
+                    i = j;
+                }
+                assert_eq!(run_chunks(&r, &chunks), reference);
+            }
+        }
+    }
+
+    #[test]
+    fn no_secrets_is_passthrough() {
+        let r = Redactions::empty();
+        assert_eq!(
+            run_chunks(&r, &[b"hello ", "世界".as_bytes()]),
+            "hello 世界".as_bytes()
+        );
+    }
+
+    #[test]
+    fn debug_never_prints_value() {
+        let s = sec("X", "supersecretvalue");
+        assert!(!format!("{s:?}").contains("supersecret"));
+    }
+}

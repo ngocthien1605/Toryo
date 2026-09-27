@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "deviations", "validation_performed", "open_issues", "resolved"],
+  "properties": {
+    "summary":              { "type": "string" },
+    "deviations":           { "type": "array", "items": { "type": "string" } },
+    "validation_performed": { "type": "array", "items": { "type": "string" } },
+    "open_issues":          { "type": "array", "items": { "type": "string" } },
+    "resolved":             { "type": "array", "items": { "type": "string" } }
+  }
+}

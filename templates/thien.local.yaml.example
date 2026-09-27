@@ -1,0 +1,12 @@
+# Machine config — lives OUTSIDE every repository: %USERPROFILE%\.thien\thien.local.yaml (R35/R37).
+# Selects profiles per machine and holds the ONLY trusted Git filter commands.
+roles:
+  planner:  { profile: claude-max, model: opus }
+  reviewer: { profile: claude-max, model: opus }
+git:
+  trusted_filters:
+    # M0 finding F1: a trusted driver MUST define `process` — Git prefers a non-empty `process`
+    # over clean/smudge, and `-c` cannot unset the repo's own `process`. git-lfs is a process driver.
+    lfs:
+      process: '"C:/Program Files/Git LFS/git-lfs.exe" filter-process'
+      required: true
