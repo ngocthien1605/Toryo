@@ -35,6 +35,46 @@ pub const FILES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Sample app for the pipeline walkthrough (docs/HUONG-DAN.md): a small PowerShell module.
+pub const BATCH_RENAME: &[(&str, &str)] = &[
+    (
+        ".gitignore",
+        include_str!("../../examples/batch-rename/.gitignore"),
+    ),
+    (
+        "AGENTS.md",
+        include_str!("../../examples/batch-rename/AGENTS.md"),
+    ),
+    (
+        "README.md",
+        include_str!("../../examples/batch-rename/README.md"),
+    ),
+    (
+        "scripts/build.ps1",
+        include_str!("../../examples/batch-rename/scripts/build.ps1"),
+    ),
+    (
+        "scripts/test.ps1",
+        include_str!("../../examples/batch-rename/scripts/test.ps1"),
+    ),
+    (
+        "src/BatchRename.psm1",
+        include_str!("../../examples/batch-rename/src/BatchRename.psm1"),
+    ),
+    (
+        "tasks/BR-001.md",
+        include_str!("../../examples/batch-rename/tasks/BR-001.md"),
+    ),
+    (
+        "tasks/BR-002.md",
+        include_str!("../../examples/batch-rename/tasks/BR-002.md"),
+    ),
+    (
+        "tests/SafeFileName.Tests.ps1",
+        include_str!("../../examples/batch-rename/tests/SafeFileName.Tests.ps1"),
+    ),
+];
+
 pub const SCHEMAS: &[(&str, &str)] = &[
     (
         "plan.schema.json",
@@ -79,12 +119,23 @@ pub fn gitcmd() -> Result<GitCmd> {
     GitCmd::new(git_exe(), data_dir().join("empty-hooks"))
 }
 
-/// Write the fixture into `dir` (must not exist or be empty) and commit it on `main`.
+/// Write the calculator fixture into `dir` (must not exist or be empty) and commit it on `main`.
 pub fn init_repo(dir: &Path) -> Result<String> {
+    init_repo_with(dir, FILES, "Calculator Fixture", "calculator fixture")
+}
+
+/// Write `files` into `dir` (must not exist or be empty), `git init -b main`, set a
+/// repo-local identity and make the first commit.
+pub fn init_repo_with(
+    dir: &Path,
+    files: &[(&str, &str)],
+    who: &str,
+    message: &str,
+) -> Result<String> {
     if dir.exists() && std::fs::read_dir(dir)?.next().is_some() {
         bail!("{} is not empty", dir.display());
     }
-    for (rel, content) in FILES {
+    for (rel, content) in files {
         let p = dir.join(rel);
         std::fs::create_dir_all(p.parent().expect("parent"))?;
         std::fs::write(&p, content.replace("\r\n", "\n"))?;
@@ -94,18 +145,14 @@ pub fn init_repo(dir: &Path) -> Result<String> {
     g.run(&loc, false, &["init", "-q", "-b", "main"])?;
     // Repo-local identity, so an agent's `git commit` attempt can only fail because of the
     // sandbox (canary), never because the machine has no global user.email.
-    g.run(&loc, false, &["config", "user.name", "Calculator Fixture"])?;
+    g.run(&loc, false, &["config", "user.name", who])?;
     g.run(
         &loc,
         false,
         &["config", "user.email", "fixture@local.invalid"],
     )?;
     g.run(&loc, false, &["add", "-A"])?;
-    g.run(
-        &loc,
-        false,
-        &["commit", "-q", "--no-verify", "-m", "calculator fixture"],
-    )?;
+    g.run(&loc, false, &["commit", "-q", "--no-verify", "-m", message])?;
     g.run_str(&loc, true, &["rev-parse", "HEAD"])
 }
 

@@ -197,6 +197,40 @@ enum SpikeCmd {
         )]
         modes: Vec<LaunchMode>,
     },
+    /// Run one task through the whole workflow on a real repo: Claude plans → you approve
+    /// → Codex implements → thien checkpoints + verifies → Claude reviews → fix cycles.
+    Pipeline {
+        /// The Git repository (its current branch is the base unless --base is given)
+        #[arg(long)]
+        repo: PathBuf,
+        /// The task file (Markdown with `## Acceptance criteria` / `- AC-1: …`)
+        #[arg(long)]
+        task: PathBuf,
+        /// Task id (default: the `# XYZ-123` heading of the task, else the file name)
+        #[arg(long)]
+        id: Option<String>,
+        /// Base branch/commit (default: the repo's current branch)
+        #[arg(long)]
+        base: Option<String>,
+        /// Claude profile (default: roles.planner from thien.yaml)
+        #[arg(long)]
+        claude_profile: Option<String>,
+        /// Codex profile (default: roles.implementer from thien.yaml)
+        #[arg(long)]
+        codex_profile: Option<String>,
+        #[arg(long)]
+        claude_model: Option<String>,
+        #[arg(long)]
+        codex_model: Option<String>,
+        /// Claude launch mode (the one `spike smoke` reported as working)
+        #[arg(long, value_enum, default_value = "restricted")]
+        mode: LaunchMode,
+        #[arg(long, default_value_t = 2)]
+        max_fix_cycles: u32,
+        /// Skip the human plan gate (demos / CI only)
+        #[arg(long)]
+        yes: bool,
+    },
     /// Job Object tests: stop one stage, thien.exe crash, assign-failure injection (R23).
     JobTest,
     /// Low-integrity verify boundary canary + fixture build at Low IL (M0-VERIFY 9, R36).
@@ -207,10 +241,13 @@ enum SpikeCmd {
         #[arg(long)]
         work: Option<PathBuf>,
     },
-    /// Materialise the calculator fixture as a Git repo (+ schemas and role templates).
+    /// Materialise a sample app as a Git repo (+ schemas and role templates).
     InitFixture {
         #[arg(long)]
         into: PathBuf,
+        /// calculator (M0 smoke fixture) or batch-rename (pipeline walkthrough)
+        #[arg(long, default_value = "calculator")]
+        app: String,
         /// Also write schemas/ and roles/ here (for the manual dry-run)
         #[arg(long)]
         contracts: Option<PathBuf>,
@@ -484,6 +521,52 @@ fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
                 },
             )?)
         }
+        SpikeCmd::Pipeline {
+            repo,
+            task,
+            id,
+            base,
+            claude_profile,
+            codex_profile,
+            claude_model,
+            codex_model,
+            mode,
+            max_fix_cycles,
+            yes,
+        } => {
+            let cfg = load_config(cli)?;
+            let role = |r: &str, dflt: &str| {
+                cfg.repo
+                    .roles
+                    .get(r)
+                    .map(|x| x.profile.clone())
+                    .unwrap_or_else(|| dflt.to_string())
+            };
+            let cp = claude_profile
+                .clone()
+                .unwrap_or_else(|| role("planner", "claude-max"));
+            let xp = codex_profile
+                .clone()
+                .unwrap_or_else(|| role("implementer", "codex"));
+            let model = |r: &str| cfg.repo.roles.get(r).and_then(|x| x.model.clone());
+            thien::spike::smoke::preflight(&cfg, &[&cp, &xp])?;
+            ok(thien::spike::pipeline::pipeline(
+                &cfg,
+                thien::spike::pipeline::PipelineArgs {
+                    repo: repo.clone(),
+                    task: task.clone(),
+                    id: id.clone(),
+                    base: base.clone(),
+                    claude_model: claude_model.clone().or_else(|| model("planner")),
+                    codex_model: codex_model.clone().or_else(|| model("implementer")),
+                    claude_profile: cp,
+                    codex_profile: xp,
+                    mode: *mode,
+                    max_fix_cycles: *max_fix_cycles,
+                    yes: *yes,
+                },
+            )?)
+        }
         SpikeCmd::JobTest => ok(job::job_test()?),
         SpikeCmd::LowilCanary => ok(lowil::lowil_canary()?),
         SpikeCmd::GitCanary { work } => {
@@ -531,9 +614,22 @@ fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
             results::append(&rec)?;
             ok(pass)
         }
-        SpikeCmd::InitFixture { into, contracts } => {
-            let head = fixture::init_repo(into)?;
-            println!("calculator fixture at {} (main = {head})", into.display());
+        SpikeCmd::InitFixture {
+            into,
+            app,
+            contracts,
+        } => {
+            let head = match app.as_str() {
+                "calculator" => fixture::init_repo(into)?,
+                "batch-rename" => fixture::init_repo_with(
+                    into,
+                    fixture::BATCH_RENAME,
+                    "BatchRename Sample",
+                    "BatchRename: initial module",
+                )?,
+                other => anyhow::bail!("unknown --app `{other}` (calculator | batch-rename)"),
+            };
+            println!("{app} sample at {} (main = {head})", into.display());
             if let Some(c) = contracts {
                 fixture::write_contracts(c)?;
                 println!("schemas/ and roles/ written to {}", c.display());

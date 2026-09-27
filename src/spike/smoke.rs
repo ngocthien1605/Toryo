@@ -131,7 +131,7 @@ fn claude_step(
     Ok((None, tried, None))
 }
 
-fn run_verify(script: &Path, cwd: &Path) -> Result<(Option<i32>, String)> {
+pub(crate) fn run_verify(script: &Path, cwd: &Path) -> Result<(Option<i32>, String)> {
     let pwsh = which("pwsh").context("pwsh not found in PATH")?;
     let spec = SpawnSpec {
         program: pwsh,
@@ -165,7 +165,7 @@ fn run_verify(script: &Path, cwd: &Path) -> Result<(Option<i32>, String)> {
     Ok((info.code, String::from_utf8_lossy(&out).into_owned()))
 }
 
-fn which(name: &str) -> Option<PathBuf> {
+pub(crate) fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         for ext in ["", ".exe", ".cmd"] {

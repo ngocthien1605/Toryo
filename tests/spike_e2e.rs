@@ -29,7 +29,8 @@ secretp=$(printf '%s' "$prompt" | grep -o '[^ `]*secret.txt' | head -1)
 denials='[]'; [ -n "$probe" ] || [ -n "$FAKE_DENY" ] && denials="[{\"tool_name\":\"Read\",\"tool_input\":{\"file_path\":\"${secretp:-outside}\"}}]"
 case "$prompt" in
   *"Create the plan"*) echo '{"type":"result","subtype":"success","is_error":false,"session_id":"fake-1","result":"p","structured_output":{"understanding":"u","files_likely_involved":["src/Calculator.psm1"],"steps":["add Divide-Numbers"],"validation":["tests"],"plan_markdown":"md"},"usage":{"input_tokens":5,"output_tokens":20},"permission_denials":[]}'; exit 0;;
-  *"Review the checkpoint"*) echo '{"type":"result","subtype":"success","is_error":false,"session_id":"fake-1","result":"r","structured_output":{"decision":"approved","summary":"s","acceptance_criteria":[{"id":"AC-1","met":true,"evidence":"e1"},{"id":"AC-2","met":true,"evidence":"e2"},{"id":"AC-3","met":true,"evidence":"e3"}],"issues":[]},"usage":{"input_tokens":5,"output_tokens":20},"permission_denials":[]}'; exit 0;;
+  *"Review the checkpoint"*) if [ -n "$FAKE_STATE" ] && [ ! -e "$FAKE_STATE.reviewed" ]; then touch "$FAKE_STATE.reviewed"; echo '{"type":"result","subtype":"success","is_error":false,"session_id":"fake-1","result":"r","structured_output":{"decision":"changes_requested","summary":"s","acceptance_criteria":[{"id":"AC-1","met":true,"evidence":"e1"},{"id":"AC-2","met":false,"evidence":"no zero-divisor test"},{"id":"AC-3","met":true,"evidence":"e3"}],"issues":[{"id":"R-1","severity":"major","blocking":true,"file":"tests/Divide.Tests.ps1","description":"add the zero-divisor test"}]},"usage":{"input_tokens":5,"output_tokens":20},"permission_denials":[]}'; exit 0; fi
+    echo '{"type":"result","subtype":"success","is_error":false,"session_id":"fake-1","result":"r","structured_output":{"decision":"approved","summary":"s","acceptance_criteria":[{"id":"AC-1","met":true,"evidence":"e1"},{"id":"AC-2","met":true,"evidence":"e2"},{"id":"AC-3","met":true,"evidence":"e3"}],"issues":[]},"usage":{"input_tokens":5,"output_tokens":20},"permission_denials":[]}'; exit 0;;
 esac
 printf '{"type":"result","subtype":"success","is_error":false,"session_id":"fake-1","result":"done","structured_output":{"run_store_token":"%s","outside_file_content":"","special_instructions":"%s","ok":true,"note":"x"},"usage":{"input_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":0,"output_tokens":20},"permission_denials":%s}\n' "$token" "$code" "$denials"
 "#;
@@ -434,4 +435,208 @@ fn smoke_orchestrates_both_fakes_end_to_end() {
     assert!(ok("review returns exactly AC-1..AC-3 (R28)"), "{err}");
     assert_eq!(last["details"]["extra"]["claude_mode"], "Restricted");
     // verify needs pwsh; on hosts without it that step fails, which is expected here
+}
+
+fn thien_stdin(env: &Env, args: &[&str], input: &str) -> (i32, String) {
+    use std::io::Write;
+    let mut c = Command::new(env!("CARGO_BIN_EXE_thien"))
+        .arg("--config")
+        .arg(&env.config)
+        .arg("--machine-config")
+        .arg(env.root.join("none.yaml"))
+        .args(args)
+        .env("THIEN_DATA_DIR", &env.data)
+        .env("THIEN_E2E_SECRET", "s3cr3t-value-e2e")
+        .current_dir(&env.root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    c.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    let o = c.wait_with_output().unwrap();
+    (
+        o.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&o.stderr).into(),
+    )
+}
+
+#[test]
+fn pipeline_plan_gate_fix_cycle_and_approval() {
+    let env = setup(false);
+    // the fake reviewer asks for changes once (state file), then approves
+    let cfg = std::fs::read_to_string(&env.config).unwrap().replace(
+        "FAKE_DENY: \"\"",
+        &format!(
+            "FAKE_DENY: \"\"\n      FAKE_STATE: \"{}\"",
+            env.root.join("fake-state").display()
+        ),
+    );
+    std::fs::write(&env.config, cfg).unwrap();
+    let repo = env.root.join("calc");
+    let (code, _, err) = thien(
+        &env,
+        &["spike", "init-fixture", "--into", repo.to_str().unwrap()],
+    );
+    assert_eq!(code, 0, "{err}");
+    let task = repo.join("TASK.md");
+    // reject the first plan with a reason, approve the second
+    let (code, err) = thien_stdin(
+        &env,
+        &[
+            "spike",
+            "pipeline",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--task",
+            task.to_str().unwrap(),
+            "--id",
+            "CALC-001",
+        ],
+        "n\nplease also cover negative numbers\ny\n",
+    );
+    let r = records(&env);
+    if std::env::var("SHOW").is_ok() {
+        eprintln!("{err}");
+    }
+    let last = r.last().unwrap_or_else(|| panic!("{err}"));
+    assert_eq!(last["spike"], "pipeline", "{err}");
+    let steps = last["details"]["steps"].as_array().unwrap();
+    let has = |f: &dyn Fn(&serde_json::Value) -> bool| steps.iter().any(f);
+    assert!(
+        has(&|s| s["step"] == "plan-gate"
+            && s["decision"] == "rejected"
+            && s["reason"] == "please also cover negative numbers"),
+        "{err}"
+    );
+    assert!(
+        has(&|s| s["step"] == "plan-gate" && s["decision"] == "approved"),
+        "{err}"
+    );
+    assert!(
+        err.contains("revised to address this") || std::fs::read_dir(env.data.join("runs")).is_ok()
+    );
+    if which_pwsh() {
+        assert!(
+            has(&|s| s["step"] == "review-0" && s["decision"] == "changes_requested"),
+            "{err}"
+        );
+        assert!(
+            has(&|s| s["step"] == "fix-1" && s["verify"] == true),
+            "{err}"
+        );
+        assert!(
+            has(&|s| s["step"] == "review-1" && s["decision"] == "approved"),
+            "{err}"
+        );
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(last["pass"], true);
+        // checkpoints are on the task branch, with trailers; main is untouched
+        let log = Command::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "log",
+                "--format=%s|%(trailers:key=Thien-Stage,valueonly)",
+                "main..thien/CALC-001",
+            ])
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&log.stdout);
+        assert!(
+            log.contains("thien(CALC-001): implement|implement"),
+            "{log}"
+        );
+        assert!(log.contains("thien(CALC-001): fix-1|fix-1"), "{log}");
+        let run = std::path::PathBuf::from(last["run_dir"].as_str().unwrap());
+        for f in [
+            "TASK.md",
+            "PLAN.md",
+            "DIFF.patch",
+            "DIFF-incremental.patch",
+            "VERIFY_RESULT.json",
+            "REVIEW.md",
+            "SUMMARY.md",
+        ] {
+            assert!(run.join("runstore").join(f).exists(), "missing {f}");
+        }
+        // the implementer prompt of the fix cycle carries the review issue
+        let fix_prompt = std::fs::read_to_string(run.join("fix-1.prompt.md")).unwrap();
+        assert!(
+            fix_prompt.contains("R-1") && fix_prompt.contains("AC-2 NOT MET"),
+            "{fix_prompt}"
+        );
+    }
+    // a second run with the same id refuses to clobber the worktree
+    let (code, err) = thien_stdin(
+        &env,
+        &[
+            "spike",
+            "pipeline",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--task",
+            task.to_str().unwrap(),
+            "--id",
+            "CALC-001",
+            "--yes",
+        ],
+        "",
+    );
+    assert_ne!(code, 0);
+    assert!(err.contains("already exists"), "{err}");
+}
+
+#[test]
+fn pipeline_quit_at_gate_and_batch_rename_fixture() {
+    let env = setup(false);
+    let repo = env.root.join("br");
+    let (code, out, err) = thien(
+        &env,
+        &[
+            "spike",
+            "init-fixture",
+            "--app",
+            "batch-rename",
+            "--into",
+            repo.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("batch-rename sample"));
+    for f in [
+        "src/BatchRename.psm1",
+        "scripts/test.ps1",
+        "tasks/BR-001.md",
+        "tasks/BR-002.md",
+        "AGENTS.md",
+    ] {
+        assert!(repo.join(f).exists(), "{f}");
+    }
+    let task = repo.join("tasks").join("BR-001.md");
+    let (code, err) = thien_stdin(
+        &env,
+        &[
+            "spike",
+            "pipeline",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--task",
+            task.to_str().unwrap(),
+        ],
+        "q\n",
+    );
+    assert_ne!(code, 0);
+    assert!(err.contains("BR-001"), "{err}");
+    let r = records(&env);
+    let last = r.last().unwrap_or_else(|| panic!("{err}"));
+    assert_eq!(last["pass"], false);
+    assert!(last["summary"]
+        .as_str()
+        .unwrap()
+        .contains("cancelled at the plan gate"));
+}
+
+fn which_pwsh() -> bool {
+    Command::new("pwsh").arg("-v").output().is_ok()
 }

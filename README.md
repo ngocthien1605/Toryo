@@ -17,6 +17,7 @@ to answer the twelve `M0-VERIFY` questions on the real Windows machine, before a
 | `config` | §14, R35 | `thien.yaml` + machine config, canonical hash, Credential Manager secrets |
 | `doctor` | §15 | environment / profile / repo checks + recorded M0 evidence |
 | `spike::*` | §17 | the M0 commands (see `docs/M0-RUNBOOK.md`) |
+| `spike::pipeline` | §5.2, R28, R40 | prototype workflow on a real repo: plan gate, guards, checkpoints, verify, exact-AC review, fix cycles |
 
 ```
 thien doctor
@@ -26,6 +27,7 @@ thien spike codex-canary --profile codex-foundry
 thien spike codex-project-config --profile codex-foundry
 thien spike killed-resume --profile <claude-max|codex-foundry>
 thien spike smoke                 # end-to-end: plan → implement → checkpoint → verify → review
+thien spike pipeline --repo R --task T.md   # one real task: plan → HUMAN GATE → implement → verify → review → fix cycles
 thien spike claude|codex …        # single turns for the manual dry-run
 thien spike init-fixture | render | diff | report
 ```
@@ -40,6 +42,9 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File C:\.thien\AgentOrchestrator\thien\
 ```
 
 Results land in `C:\.thien\AgentOrchestrator\thien-m0-data\`.
+
+**Hướng dẫn tiếng Việt (flow, cài đặt, cấu hình, thực hành với app mẫu BatchRename): `docs/HUONG-DAN.md`.**
+`spike pipeline` is a single-process prototype of M2–M8 (no SQLite state/resume, no Low-IL verify boundary yet).
 
 Start with **`docs/M0-RUNBOOK.md`**. Results go to `docs/M0-RESULTS.md`; findings from building the kit
 are in `docs/M0-FINDINGS.md`.
