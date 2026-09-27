@@ -8,4 +8,5 @@ pub mod job;
 pub mod lowil;
 pub mod render;
 pub mod results;
+pub mod smoke;
 pub mod turn;

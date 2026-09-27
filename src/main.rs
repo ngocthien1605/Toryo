@@ -149,6 +149,25 @@ enum SpikeCmd {
         #[arg(long)]
         model: Option<String>,
     },
+    /// End-to-end smoke test: Claude plans → Codex implements → thien checkpoints/verifies → Claude reviews.
+    Smoke {
+        #[arg(long, default_value = "claude-max")]
+        claude_profile: String,
+        #[arg(long, default_value = "codex")]
+        codex_profile: String,
+        #[arg(long)]
+        claude_model: Option<String>,
+        #[arg(long)]
+        codex_model: Option<String>,
+        /// Launch modes to try for Claude, in order.
+        #[arg(
+            long,
+            value_enum,
+            value_delimiter = ',',
+            default_value = "restricted,setting-sources,cwd-run-store"
+        )]
+        modes: Vec<LaunchMode>,
+    },
     /// Job Object tests: stop one stage, thien.exe crash, assign-failure injection (R23).
     JobTest,
     /// Low-integrity verify boundary canary + fixture build at Low IL (M0-VERIFY 9, R36).
@@ -385,6 +404,26 @@ fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
         } => {
             sa::killed_resume(&load_config(cli)?, profile, *kill_after_secs, model.clone())?;
             Ok(0)
+        }
+        SpikeCmd::Smoke {
+            claude_profile,
+            codex_profile,
+            claude_model,
+            codex_model,
+            modes,
+        } => {
+            let cfg = load_config(cli)?;
+            thien::spike::smoke::preflight(&cfg, &[claude_profile, codex_profile])?;
+            ok(thien::spike::smoke::smoke(
+                &cfg,
+                thien::spike::smoke::SmokeArgs {
+                    claude_profile: claude_profile.clone(),
+                    codex_profile: codex_profile.clone(),
+                    claude_model: claude_model.clone(),
+                    codex_model: codex_model.clone(),
+                    modes: modes.clone(),
+                },
+            )?)
         }
         SpikeCmd::JobTest => ok(job::job_test()?),
         SpikeCmd::LowilCanary => ok(lowil::lowil_canary()?),

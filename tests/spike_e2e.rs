@@ -27,6 +27,10 @@ echo '{"type":"stream_event","session_id":"fake-1","event":{"type":"content_bloc
 if [ $resume = 0 ]; then case "$prompt" in *3000-word*) sleep 30;; esac; fi
 secretp=$(printf '%s' "$prompt" | grep -o '[^ `]*secret.txt' | head -1)
 denials='[]'; [ -n "$probe" ] || [ -n "$FAKE_DENY" ] && denials="[{\"tool_name\":\"Read\",\"tool_input\":{\"file_path\":\"${secretp:-outside}\"}}]"
+case "$prompt" in
+  *"Create the plan"*) echo '{"type":"result","subtype":"success","is_error":false,"session_id":"fake-1","result":"p","structured_output":{"understanding":"u","files_likely_involved":["src/Calculator.psm1"],"steps":["add Divide-Numbers"],"validation":["tests"],"plan_markdown":"md"},"usage":{"input_tokens":5,"output_tokens":20},"permission_denials":[]}'; exit 0;;
+  *"Review the checkpoint"*) echo '{"type":"result","subtype":"success","is_error":false,"session_id":"fake-1","result":"r","structured_output":{"decision":"approved","summary":"s","acceptance_criteria":[{"id":"AC-1","met":true,"evidence":"e1"},{"id":"AC-2","met":true,"evidence":"e2"},{"id":"AC-3","met":true,"evidence":"e3"}],"issues":[]},"usage":{"input_tokens":5,"output_tokens":20},"permission_denials":[]}'; exit 0;;
+esac
 printf '{"type":"result","subtype":"success","is_error":false,"session_id":"fake-1","result":"done","structured_output":{"run_store_token":"%s","outside_file_content":"","special_instructions":"%s","ok":true,"note":"x"},"usage":{"input_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":0,"output_tokens":20},"permission_denials":%s}\n' "$token" "$code" "$denials"
 "#;
 
@@ -34,6 +38,10 @@ const FAKE_CODEX: &str = r#"#!/bin/sh
 prompt=$(cat)
 echo '{"type":"thread.started","thread_id":"th-fake"}'
 echo '{"type":"turn.started"}'
+if printf '%s' "$prompt" | grep -q "Role: Implementer"; then
+  printf 'function Divide-Numbers { param($A,$B) $A / $B }\n' >> src/Calculator.psm1
+  mkdir -p tests; echo '# test' > tests/Divide.Tests.ps1
+fi
 if printf '%s' "$prompt" | grep -q "inside.txt"; then
   echo ok > inside.txt
   if [ "$FAKE_ESCAPE" = 1 ]; then
@@ -391,4 +399,23 @@ fn doctor_reports_config_and_profiles() {
     assert!(out.contains("profile claude-max"), "{out}");
     assert!(out.contains("windows.sandbox = unelevated"), "{out}");
     assert!(out.contains("is not a Git repository"), "{out}");
+}
+
+#[test]
+fn smoke_orchestrates_both_fakes_end_to_end() {
+    let env = setup(false);
+    let (_code, _o, err) = thien(&env, &["spike", "smoke", "--claude-profile", "claude-max", "--codex-profile", "codex-foundry"]);
+    let r = records(&env);
+    let last = r.last().unwrap();
+    assert_eq!(last["spike"], "smoke", "{err}");
+    let steps = last["details"]["steps"].as_array().unwrap();
+    let ok = |name: &str| steps.iter().find(|s| s["step"] == name).map(|s| s["ok"] == true).unwrap_or(false);
+    assert!(ok("plan (Claude)"), "{err}");
+    assert!(ok("implement (Codex)"), "{err}");
+    assert!(ok("agent did not commit (HEAD guard)"));
+    assert!(ok("no protected path touched"));
+    assert!(ok("checkpoint + canonical DIFF.patch"));
+    assert!(ok("review returns exactly AC-1..AC-3 (R28)"), "{err}");
+    assert_eq!(last["details"]["extra"]["claude_mode"], "Restricted");
+    // verify needs pwsh; on hosts without it that step fails, which is expected here
 }

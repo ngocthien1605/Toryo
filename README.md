@@ -25,9 +25,21 @@ thien spike claude-isolation --profile claude-max [--mode restricted|setting-sou
 thien spike codex-canary --profile codex-foundry
 thien spike codex-project-config --profile codex-foundry
 thien spike killed-resume --profile <claude-max|codex-foundry>
+thien spike smoke                 # end-to-end: plan → implement → checkpoint → verify → review
 thien spike claude|codex …        # single turns for the manual dry-run
 thien spike init-fixture | render | diff | report
 ```
+
+**Quick start on Windows (no Rust needed):** `bin\thien.exe` is a prebuilt binary (cross-compiled,
+x86_64-pc-windows-gnu, stripped). One command installs Claude Code if missing, checks the Claude/Codex
+logins, writes `C:\.thien\m0\thien.yaml`, and runs `doctor`, `job-test`, `git-canary` and the
+end-to-end `smoke` (Claude plans → Codex implements → thien checkpoints + verifies → Claude reviews):
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File C:\.thien\AgentOrchestrator\thien\scripts\m0-smoke.ps1
+```
+
+Results land in `C:\.thien\AgentOrchestrator\thien-m0-data\`.
 
 Start with **`docs/M0-RUNBOOK.md`**. Results go to `docs/M0-RESULTS.md`; findings from building the kit
 are in `docs/M0-FINDINGS.md`.
