@@ -210,6 +210,10 @@ pub struct InitArgs {
     pub codex_config: Option<PathBuf>,
     pub codex_profiles: Vec<String>,
     pub windows_sandbox: String,
+    /// CODEX_HOME to pass to Codex (when the user has one set).
+    pub codex_home: Option<String>,
+    /// Missing `[profiles.<name>]`: fall back (openai → default login) or skip, instead of failing.
+    pub lenient: bool,
 }
 
 /// Build the YAML text (also used by the tests).
@@ -257,31 +261,49 @@ pub fn render_config(a: &InitArgs) -> Result<(String, Vec<String>)> {
         } else {
             format!("codex-{n}")
         };
-        let prof = match (&text, n.is_empty()) {
-            (Some(t), false) => {
-                let imp = import_codex_profile(t, &n, &a.codex_exe, &a.windows_sandbox)?;
-                warnings.extend(
-                    imp.warnings
-                        .into_iter()
-                        .map(|w| format!("[{thien_name}] {w}")),
-                );
-                imp.profile
-            }
-            _ => Profile {
-                kind: ProfileKind::Codex,
-                billing: Billing::Subscription,
-                exe: a.codex_exe.clone(),
-                version: None,
-                env: BTreeMap::new(),
-                secret_env: BTreeMap::new(),
-                codex: Some(CodexSettings {
-                    sandbox_mode: "workspace-write".into(),
-                    windows_sandbox: Some(a.windows_sandbox.clone()),
-                    ..Default::default()
-                }),
-                model: None,
-            },
+        let plain = || Profile {
+            kind: ProfileKind::Codex,
+            billing: Billing::Subscription,
+            exe: a.codex_exe.clone(),
+            version: None,
+            env: BTreeMap::new(),
+            secret_env: BTreeMap::new(),
+            codex: Some(CodexSettings {
+                sandbox_mode: "workspace-write".into(),
+                windows_sandbox: Some(a.windows_sandbox.clone()),
+                ..Default::default()
+            }),
+            model: None,
         };
+        let mut prof = match (&text, n.is_empty()) {
+            (Some(t), false) => {
+                match import_codex_profile(t, &n, &a.codex_exe, &a.windows_sandbox) {
+                    Ok(imp) => {
+                        warnings.extend(
+                            imp.warnings
+                                .into_iter()
+                                .map(|w| format!("[{thien_name}] {w}")),
+                        );
+                        imp.profile
+                    }
+                    Err(e) if a.lenient => {
+                        if n == "openai" || n == "chatgpt" {
+                            warnings.push(format!("[{thien_name}] {e:#} — using Codex's default login (ChatGPT) instead"));
+                            plain()
+                        } else {
+                            warnings.push(format!("[{thien_name}] {e:#} — profile SKIPPED"));
+                            continue;
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            _ => plain(),
+        };
+        if let Some(h) = &a.codex_home {
+            // Codex keeps auth + sessions in CODEX_HOME; not in the env allowlist, so pass it explicitly.
+            prof.env.insert("CODEX_HOME".into(), h.clone());
+        }
         profiles.insert(thien_name, prof);
     }
     let first_codex = profiles
@@ -391,6 +413,31 @@ experimental_bearer_token = "sk-should-not-travel"
     }
 
     #[test]
+    fn lenient_mode_falls_back_for_openai_and_skips_others() {
+        let d = tempfile::tempdir().unwrap();
+        let cfgp = d.path().join("config.toml");
+        std::fs::write(&cfgp, "model = \"gpt-5\"\n").unwrap();
+        let a = InitArgs {
+            out: d.path().join("t.yaml"),
+            project_root: "r".into(),
+            worktrees_root: "w".into(),
+            claude_exe: "c".into(),
+            git_bash: None,
+            codex_exe: "x".into(),
+            codex_config: Some(cfgp),
+            codex_profiles: vec!["openai".into(), "foundry".into()],
+            windows_sandbox: "unelevated".into(),
+            codex_home: Some("D:\\codex-home".into()),
+            lenient: true,
+        };
+        let (yaml, warnings) = render_config(&a).unwrap();
+        assert!(yaml.contains("codex-openai:"));
+        assert!(!yaml.contains("codex-foundry:"));
+        assert!(yaml.contains("CODEX_HOME"));
+        assert!(warnings.iter().any(|w| w.contains("SKIPPED")));
+    }
+
+    #[test]
     fn unknown_profile_lists_known_ones() {
         let e = import_codex_profile(CFG, "nope", "c", "unelevated")
             .unwrap_err()
@@ -414,6 +461,8 @@ experimental_bearer_token = "sk-should-not-travel"
             codex_config: Some(cfgp),
             codex_profiles: vec!["openai".into(), "foundry".into()],
             windows_sandbox: "unelevated".into(),
+            codex_home: None,
+            lenient: false,
         };
         let (yaml, _) = render_config(&a).unwrap();
         std::fs::write(&out, yaml).unwrap();

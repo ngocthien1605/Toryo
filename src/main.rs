@@ -171,6 +171,12 @@ enum SpikeCmd {
         codex_profiles: Vec<String>,
         #[arg(long, default_value = "unelevated")]
         windows_sandbox: String,
+        /// CODEX_HOME to pass to Codex (default: the current CODEX_HOME, if set)
+        #[arg(long)]
+        codex_home: Option<String>,
+        /// Fall back / skip when a Codex profile is missing instead of failing
+        #[arg(long)]
+        lenient: bool,
     },
     /// End-to-end smoke test: Claude plans → Codex implements → thien checkpoints/verifies → Claude reviews.
     Smoke {
@@ -438,6 +444,8 @@ fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
             codex_config,
             codex_profiles,
             windows_sandbox,
+            codex_home,
+            lenient,
         } => {
             thien::spike::init_config::init_config(&thien::spike::init_config::InitArgs {
                 out: out.clone(),
@@ -449,6 +457,10 @@ fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
                 codex_config: codex_config.clone(),
                 codex_profiles: codex_profiles.clone(),
                 windows_sandbox: windows_sandbox.clone(),
+                codex_home: codex_home
+                    .clone()
+                    .or_else(|| std::env::var("CODEX_HOME").ok()),
+                lenient: *lenient,
             })?;
             Ok(0)
         }

@@ -298,7 +298,10 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
                         "codex.windows_sandbox not set (required on Windows, R18)",
                     ),
                 }
-                if c.provider.is_none() && !c.overrides.contains_key("model_provider") && p.billing == Billing::Foundry {
+                if c.provider.is_none()
+                    && !c.overrides.contains_key("model_provider")
+                    && p.billing == Billing::Foundry
+                {
                     r.add(
                         Level::Fail,
                         &area,

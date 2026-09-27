@@ -25,7 +25,9 @@ param(
     [string[]]$CodexProfiles = @('openai', 'foundry'),
     # Which one the end-to-end smoke test uses as the Implementer
     [string]$SmokeCodexProfile = 'openai',
-    [string]$WorkDir = 'C:\.thien\m0'
+    [string]$WorkDir = 'C:\.thien\m0',
+    # Codex config holding [profiles.<name>] (default: $env:CODEX_HOME\config.toml, else ~/.codex/config.toml)
+    [string]$CodexConfig = ""
 )
 
 $ErrorActionPreference = 'Continue'
@@ -43,6 +45,9 @@ function Section($t) { Write-Host "`n==== $t ====" -ForegroundColor Cyan }
 function Save($name, $text) { Set-Content -Path (Join-Path $dataDir $name) -Value $text -Encoding utf8 }
 
 Section "Environment"
+# Pick up tools installed since this terminal was opened (e.g. Git via winget).
+$regPath = @([Environment]::GetEnvironmentVariable('Path', 'Machine'), [Environment]::GetEnvironmentVariable('Path', 'User')) -join ';'
+foreach ($d in ($regPath -split ';')) { if ($d -and ($env:PATH -split ';') -notcontains $d) { $env:PATH = "$env:PATH;$d" } }
 "PowerShell $($PSVersionTable.PSVersion) on $([Environment]::OSVersion.VersionString)"
 if (-not (Test-Path $thien)) { Write-Error "thien.exe not found at $thien"; Stop-Transcript | Out-Null; exit 2 }
 & $thien --version
@@ -92,15 +97,35 @@ $codexExe = $codex.Source
 & $codexExe --version
 $loginStatus = & $codexExe login status 2>&1 | Out-String
 "codex login status: $($loginStatus.Trim())"
-$codexCfg = Join-Path $env:USERPROFILE '.codex\config.toml'
+$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+$codexCfg = if ($CodexConfig) { $CodexConfig } else { Join-Path $codexHome 'config.toml' }
+"CODEX_HOME: $codexHome $(if ($env:CODEX_HOME) { '(from env)' } else { '(default)' })"
 if (Test-Path $codexCfg) {
-    "profiles in ${codexCfg}:"
-    Select-String -Path $codexCfg -Pattern '^\s*\[profiles\.' | ForEach-Object { "  " + $_.Line.Trim() }
-} else { Write-Warning "$codexCfg not found - Codex profiles cannot be imported" }
+    "table headers in ${codexCfg} (values not shown):"
+    Select-String -Path $codexCfg -Pattern '^\s*\[' | ForEach-Object { "  " + $_.Line.Trim() }
+} else { Write-Warning "$codexCfg not found" }
+$codexHelp = & $codexExe --help 2>&1 | Out-String
+"codex --profile supported: $($codexHelp -match '--profile')"
 
 # ---------------------------------------------------------------- Git / Git Bash
 Section "Git"
-git --version
+$git = Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+$gitPath = if ($git) { $git.Source } else {
+    @('C:\Program Files\Git\cmd\git.exe', "$env:LOCALAPPDATA\Programs\Git\cmd\git.exe", "$env:USERPROFILE\scoop\shims\git.exe") +
+      @(Get-ChildItem "$env:LOCALAPPDATA\GitHubDesktop\app-*\resources\app\git\cmd\git.exe" -ErrorAction SilentlyContinue | ForEach-Object FullName) |
+      Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+if (-not $gitPath) {
+    Write-Host "Git for Windows is not installed. thien needs it (worktrees, checkpoints, canaries); Claude Code also uses its Git Bash." -ForegroundColor Yellow
+    Write-Host "Install it, then re-run this script (no new terminal needed):" -ForegroundColor Yellow
+    Write-Host "    winget install --id Git.Git -e --source winget" -ForegroundColor Yellow
+    Stop-Transcript | Out-Null
+    exit 7
+}
+$env:THIEN_GIT = $gitPath
+if (($env:PATH -split ';') -notcontains (Split-Path $gitPath)) { $env:PATH = "$(Split-Path $gitPath);$env:PATH" }
+"git: $gitPath"
+& $gitPath --version
 $gitBash = @('C:\Program Files\Git\bin\bash.exe', "$env:LOCALAPPDATA\Programs\Git\bin\bash.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
 "Git Bash: $gitBash"
 
@@ -113,7 +138,7 @@ elseif (-not (Test-Path $contracts)) { & $thien spike init-fixture --into (Join-
 $cfgPath = Join-Path $m0 'thien.yaml'
 $initArgs = @('spike', 'init-config', '--out', $cfgPath, '--project-root', $calc, '--worktrees-root', "$m0\worktrees",
               '--claude-exe', $claudeExe, '--codex-exe', $codexExe, '--codex-config', $codexCfg,
-              '--codex-profiles', ($CodexProfiles -join ','))
+              '--codex-profiles', ($CodexProfiles -join ','), '--lenient')
 if ($gitBash) { $initArgs += @('--git-bash', $gitBash) }
 & $thien @initArgs
 if ($LASTEXITCODE -ne 0) { Write-Error "init-config failed"; Stop-Transcript | Out-Null; exit 6 }
@@ -131,9 +156,15 @@ Section "Codex quick check per profile (one turn each, no edits)"
 $probePrompt = Join-Path $m0 'codex-probe.md'
 Set-Content -Path $probePrompt -Encoding utf8 -Value 'Do not run any command and do not edit any file. Return the JSON object with summary = "ok", and every other field = [].'
 $implSchema = Join-Path $m0 'contracts\schemas\implementation.schema.json'
+$generated = Get-Content $cfgPath -Raw
 foreach ($p in $CodexProfiles) {
+    if ($generated -notmatch "(?m)^\s+codex-${p}:") { "--- codex-${p}: not configured (see warnings above), skipped ---"; continue }
     "--- codex-$p ---"
     & $thien --config $cfgPath spike codex --profile "codex-$p" --label "probe-$p" --worktree $calc --prompt-file $probePrompt --schema $implSchema
+}
+if (-not $SkipSmoke -and $generated -notmatch "(?m)^\s+codex-${SmokeCodexProfile}:") {
+    Write-Warning "codex-$SmokeCodexProfile is not configured; smoke test skipped"
+    $SkipSmoke = $true
 }
 if (-not $SkipSmoke) {
     Section "thien spike smoke (Claude plans -> Codex [$SmokeCodexProfile] implements -> verify -> Claude reviews)"
