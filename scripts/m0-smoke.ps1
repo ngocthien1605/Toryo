@@ -19,6 +19,9 @@
 param(
     [switch]$SkipInstall,
     [switch]$SkipSmoke,
+    # Also run the remaining M0 spikes: claude-isolation, codex-canary, codex-project-config,
+    # killed-resume (Claude + Codex) and lowil-canary. Uses a few more agent turns.
+    [switch]$Full,
     [string]$ClaudeModel = "",
     [string]$CodexModel = "",
     # Codex profiles in ~/.codex/config.toml to import (codex --profile <name>)
@@ -42,6 +45,8 @@ $env:THIEN_DATA_DIR = $dataDir
 $log = Join-Path $dataDir ("smoke-console-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))
 Start-Transcript -Path $log | Out-Null
 
+# Native-command output is not always captured by Start-Transcript: pipe it through the host.
+function T { & $thien @args 2>&1 | ForEach-Object { "$_" } | Out-Host; $global:LASTEXITCODE = $LASTEXITCODE }
 function Section($t) { Write-Host "`n==== $t ====" -ForegroundColor Cyan }
 function Save($name, $text) { Set-Content -Path (Join-Path $dataDir $name) -Value $text -Encoding utf8 }
 
@@ -152,18 +157,18 @@ $initArgs = @('spike', 'init-config', '--out', $cfgPath, '--project-root', $calc
               '--claude-exe', $claudeExe, '--codex-exe', $codexExe, '--codex-config', $codexCfg,
               '--codex-profiles', ($CodexProfiles -join ','), '--lenient')
 if ($gitBash) { $initArgs += @('--git-bash', $gitBash) }
-& $thien @initArgs
+T @initArgs
 if ($LASTEXITCODE -ne 0) { Write-Error "init-config failed"; Stop-Transcript | Out-Null; exit 6 }
 Copy-Item $cfgPath (Join-Path $dataDir 'thien.yaml') -Force
 
 # ---------------------------------------------------------------- thien
 Set-Location $m0
 Section "thien doctor"
-& $thien --config $cfgPath doctor
+T --config $cfgPath doctor
 Section "thien spike job-test (R23)"
-& $thien --config $cfgPath spike job-test
+T --config $cfgPath spike job-test
 Section "thien spike git-canary (R33/R37, M0-VERIFY 10)"
-& $thien --config $cfgPath spike git-canary
+T --config $cfgPath spike git-canary
 Section "Codex quick check per profile (one turn each, no edits)"
 $probePrompt = Join-Path $m0 'codex-probe.md'
 Set-Content -Path $probePrompt -Encoding utf8 -Value 'Do not run any command and do not edit any file. Return the JSON object with summary = "ok", and every other field = [].'
@@ -172,7 +177,7 @@ $generated = Get-Content $cfgPath -Raw
 foreach ($p in $CodexProfiles) {
     if ($generated -notmatch "(?m)^\s+codex-${p}:") { "--- codex-${p}: not configured (see warnings above), skipped ---"; continue }
     "--- codex-$p ---"
-    & $thien --config $cfgPath spike codex --profile "codex-$p" --label "probe-$p" --worktree $calc --prompt-file $probePrompt --schema $implSchema
+    T --config $cfgPath spike codex --profile "codex-$p" --label "probe-$p" --worktree $calc --prompt-file $probePrompt --schema $implSchema
 }
 if (-not $SkipSmoke -and $generated -notmatch "(?m)^\s+codex-${SmokeCodexProfile}:") {
     Write-Warning "codex-$SmokeCodexProfile is not configured; smoke test skipped"
@@ -183,9 +188,24 @@ if (-not $SkipSmoke) {
     $smokeArgs = @('--config', $cfgPath, 'spike', 'smoke', '--claude-profile', 'claude-max', '--codex-profile', "codex-$SmokeCodexProfile")
     if ($ClaudeModel) { $smokeArgs += @('--claude-model', $ClaudeModel) }
     if ($CodexModel)  { $smokeArgs += @('--codex-model', $CodexModel) }
-    & $thien @smokeArgs
+    T @smokeArgs
+}
+if ($Full) {
+    $cx = "codex-$SmokeCodexProfile"
+    Section "claude-isolation (M0-VERIFY 1, 2, 7 + R44b)"
+    T --config $cfgPath spike claude-isolation --profile claude-max
+    Section "codex-canary (M0-VERIFY 3: sandbox must block outside write, git commit, run-store write)"
+    T --config $cfgPath spike codex-canary --profile $cx
+    Section "codex-project-config (M0-VERIFY 8)"
+    T --config $cfgPath spike codex-project-config --profile $cx
+    Section "killed-resume Claude (M0-VERIFY 4, 5)"
+    T --config $cfgPath spike killed-resume --profile claude-max
+    Section "killed-resume Codex (M0-VERIFY 11, 12)"
+    T --config $cfgPath spike killed-resume --profile $cx
+    Section "lowil-canary (M0-VERIFY 9: verify commands at Low integrity)"
+    T --config $cfgPath spike lowil-canary
 }
 Section "Report"
-& $thien --config $cfgPath spike report --out (Join-Path $dataDir 'M0-RESULTS.generated.md')
+T --config $cfgPath spike report --out (Join-Path $dataDir 'M0-RESULTS.generated.md')
 Write-Host "`nAll output is in $dataDir" -ForegroundColor Green
 Stop-Transcript | Out-Null
