@@ -215,9 +215,16 @@ enum SpikeCmd {
         /// Claude profile (default: roles.planner from thien.yaml)
         #[arg(long)]
         claude_profile: Option<String>,
-        /// Codex profile (default: roles.implementer from thien.yaml)
+        /// Implementer profile (default: roles.implementer from thien.yaml)
+        #[arg(long, alias = "codex-profile")]
+        implementer: Option<String>,
+        /// Fallback implementers when the current one is out of quota, in order
+        /// (default: roles.implementer.fallback, else the Claude profile)
+        #[arg(long, value_delimiter = ',')]
+        implementer_fallback: Vec<String>,
+        /// Do not switch implementers; stop when the implementer is out of quota
         #[arg(long)]
-        codex_profile: Option<String>,
+        no_fallback: bool,
         #[arg(long)]
         claude_model: Option<String>,
         #[arg(long)]
@@ -230,6 +237,9 @@ enum SpikeCmd {
         /// Skip the human plan gate (demos / CI only)
         #[arg(long)]
         yes: bool,
+        /// Try the fallback path: pretend the primary implementer is out of quota
+        #[arg(long)]
+        simulate_quota: bool,
     },
     /// Job Object tests: stop one stage, thien.exe crash, assign-failure injection (R23).
     JobTest,
@@ -527,12 +537,15 @@ fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
             id,
             base,
             claude_profile,
-            codex_profile,
+            implementer,
+            implementer_fallback,
+            no_fallback,
             claude_model,
             codex_model,
             mode,
             max_fix_cycles,
             yes,
+            simulate_quota,
         } => {
             let cfg = load_config(cli)?;
             let role = |r: &str, dflt: &str| {
@@ -545,11 +558,36 @@ fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
             let cp = claude_profile
                 .clone()
                 .unwrap_or_else(|| role("planner", "claude-max"));
-            let xp = codex_profile
+            let xp = implementer
                 .clone()
                 .unwrap_or_else(|| role("implementer", "codex"));
             let model = |r: &str| cfg.repo.roles.get(r).and_then(|x| x.model.clone());
             thien::spike::smoke::preflight(&cfg, &[&cp, &xp])?;
+            let mut chain = vec![xp.clone()];
+            if !*no_fallback {
+                let configured = cfg
+                    .repo
+                    .roles
+                    .get("implementer")
+                    .map(|r| r.fallback.clone())
+                    .unwrap_or_default();
+                let fb = if !implementer_fallback.is_empty() {
+                    implementer_fallback.clone()
+                } else if !configured.is_empty() {
+                    configured
+                } else {
+                    vec![cp.clone()]
+                };
+                for f in fb {
+                    if chain.contains(&f) {
+                        continue;
+                    }
+                    match thien::spike::smoke::preflight(&cfg, &[&f]) {
+                        Ok(()) => chain.push(f),
+                        Err(e) => eprintln!("WARNING: fallback implementer `{f}` skipped: {e:#}"),
+                    }
+                }
+            }
             ok(thien::spike::pipeline::pipeline(
                 &cfg,
                 thien::spike::pipeline::PipelineArgs {
@@ -560,7 +598,8 @@ fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
                     claude_model: claude_model.clone().or_else(|| model("planner")),
                     codex_model: codex_model.clone().or_else(|| model("implementer")),
                     claude_profile: cp,
-                    codex_profile: xp,
+                    implementers: chain,
+                    simulate_quota: *simulate_quota,
                     mode: *mode,
                     max_fix_cycles: *max_fix_cycles,
                     yes: *yes,

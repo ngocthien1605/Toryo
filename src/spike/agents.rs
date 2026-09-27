@@ -75,6 +75,36 @@ pub fn claude_turn(cfg: &Effective, a: ClaudeArgs, run_dir: &Path) -> Result<Tur
     )
 }
 
+/// Claude as the fallback Implementer (see `ClaudeLaunch::implementer`).
+#[allow(clippy::too_many_arguments)]
+pub fn claude_implement_turn(
+    cfg: &Effective,
+    profile: &str,
+    worktree: &Path,
+    prompt: &str,
+    schema: Option<&str>,
+    model: Option<String>,
+    mode: LaunchMode,
+    label: &str,
+    opts: TurnOpts,
+    run_dir: &Path,
+) -> Result<TurnRun> {
+    let p = cfg.profile(profile)?.clone();
+    if p.kind != ProfileKind::Claude {
+        bail!("profile `{profile}` is not a Claude profile");
+    }
+    if mode == LaunchMode::CwdRunStore {
+        bail!("the Claude implementer needs --mode restricted or setting-sources (cwd must be the worktree)");
+    }
+    let mut l =
+        ClaudeLaunch::implementer(PathBuf::from(expand_vars(&p.exe)?), worktree.to_path_buf());
+    l.mode = mode;
+    l.json_schema = schema.map(str::to_string);
+    l.model = model.or_else(|| p.model.clone());
+    let (cwd, args) = l.argv();
+    run_turn(profile, &p, args, &cwd, prompt, run_dir, label, opts)
+}
+
 pub struct CodexArgs {
     pub profile: String,
     pub worktree: PathBuf,

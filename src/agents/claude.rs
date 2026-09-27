@@ -33,6 +33,13 @@ pub struct ClaudeLaunch {
     pub resume: Option<String>,
     /// Role tools (R16). Planner/Reviewer: Read, Grep, Glob.
     pub tools: Vec<String>,
+    /// Pre-approved tools (`--allowedTools`); `None` = same as `tools`.
+    pub allowed_tools: Option<Vec<String>>,
+    /// `dontAsk` for the read-only roles; `acceptEdits` for the fallback Implementer.
+    pub permission_mode: String,
+    /// Pass the run store as `--add-dir`. Off for the Implementer: every working directory is
+    /// writable under `acceptEdits`, and the run store (TASK.md, PLAN.md) must stay read-only.
+    pub add_run_store: bool,
     /// M0 diagnostics only: flags to drop / extra args to append, recorded in the capture.
     pub drop_flags: Vec<String>,
     pub extra_args: Vec<String>,
@@ -50,9 +57,28 @@ impl ClaudeLaunch {
             model: None,
             resume: None,
             tools: vec!["Read".into(), "Grep".into(), "Glob".into()],
+            allowed_tools: None,
+            permission_mode: "dontAsk".into(),
+            add_run_store: true,
             drop_flags: Vec::new(),
             extra_args: Vec::new(),
         }
+    }
+
+    /// Claude as the fallback Implementer: file tools only, no shell (Bash/PowerShell are not
+    /// in `--tools`, and `--restricted` removes code-running tools anyway). `acceptEdits`
+    /// auto-approves edits inside the working directory (the worktree) only; with
+    /// `--restricted` the file tools are confined to it, and `--permission-prompts none`
+    /// denies anything that would ask (writes elsewhere, settings / git / tool config).
+    pub fn implementer(exe: PathBuf, worktree: PathBuf) -> Self {
+        let mut l = Self::read_only(exe, worktree.clone(), worktree);
+        l.tools = ["Read", "Grep", "Glob", "Edit", "Write"]
+            .map(String::from)
+            .to_vec();
+        l.allowed_tools = Some(["Read", "Grep", "Glob"].map(String::from).to_vec());
+        l.permission_mode = "acceptEdits".into();
+        l.add_run_store = false;
+        l
     }
 
     /// (cwd, argv without the program). Prompt goes on stdin.
@@ -77,7 +103,9 @@ impl ClaudeLaunch {
             }
         };
         a.extend(["--settings".into(), r#"{"disableAllHooks":true}"#.into()]);
-        a.extend(["--add-dir".into(), add_dir.display().to_string()]);
+        if self.add_run_store || self.mode == LaunchMode::CwdRunStore {
+            a.extend(["--add-dir".into(), add_dir.display().to_string()]);
+        }
         a.extend([
             "--output-format".into(),
             "stream-json".into(),
@@ -95,17 +123,17 @@ impl ClaudeLaunch {
         }
         a.extend([
             "--permission-mode".into(),
-            "dontAsk".into(),
+            self.permission_mode.clone(),
             "--permission-prompts".into(),
             "none".into(),
         ]);
         let tools = self.tools.join(",");
-        a.extend([
-            "--tools".into(),
-            tools.clone(),
-            "--allowedTools".into(),
-            tools,
-        ]);
+        let allowed = self
+            .allowed_tools
+            .as_ref()
+            .map(|t| t.join(","))
+            .unwrap_or_else(|| tools.clone());
+        a.extend(["--tools".into(), tools, "--allowedTools".into(), allowed]);
         a.extend([
             "--disallowedTools".into(),
             "mcp__*".into(),
@@ -400,7 +428,21 @@ pub fn classify_api_error(category: &str) -> ErrorClass {
 
 fn classify_text(s: &str) -> ErrorClass {
     let l = s.to_ascii_lowercase();
-    if l.contains("rate limit") || l.contains("429") {
+    // Subscription / API exhaustion (e.g. "Claude AI usage limit reached|<reset>",
+    // "Credit balance is too low") — the implementer fallback keys on this class.
+    if [
+        "usage limit",
+        "limit reached",
+        "quota",
+        "credit balance",
+        "billing",
+        "extra usage",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
+    {
+        ErrorClass::QuotaExceeded
+    } else if l.contains("rate limit") || l.contains("429") {
         ErrorClass::RateLimited
     } else if l.contains("auth") || l.contains("401") || l.contains("403") || l.contains("log in") {
         ErrorClass::Auth
@@ -437,6 +479,36 @@ mod tests {
         assert!(s.contains("--permission-mode dontAsk --permission-prompts none"));
         assert!(s.contains("--tools Read,Grep,Glob --allowedTools Read,Grep,Glob --disallowedTools mcp__* --strict-mcp-config"));
         assert!(!s.contains("--bare"));
+    }
+
+    #[test]
+    fn quota_texts_are_quota_exceeded() {
+        assert_eq!(
+            classify_text("Claude AI usage limit reached|1790000000"),
+            ErrorClass::QuotaExceeded
+        );
+        assert_eq!(
+            classify_text("Credit balance is too low"),
+            ErrorClass::QuotaExceeded
+        );
+        assert_eq!(
+            classify_text("API Error: 429 rate limit"),
+            ErrorClass::RateLimited
+        );
+    }
+
+    #[test]
+    fn argv_implementer_has_file_tools_no_shell_no_run_store() {
+        let l = ClaudeLaunch::implementer("claude.exe".into(), "W".into());
+        let (cwd, a) = l.argv();
+        assert_eq!(cwd, PathBuf::from("W"));
+        let s = a.join(" ");
+        assert!(s.starts_with("-p --restricted --safe-mode --settings"));
+        assert!(!s.contains("--add-dir"), "{s}");
+        assert!(s.contains("--permission-mode acceptEdits --permission-prompts none"));
+        assert!(s.contains("--tools Read,Grep,Glob,Edit,Write --allowedTools Read,Grep,Glob "));
+        assert!(!s.contains("Bash") && !s.contains("PowerShell"));
+        assert!(s.contains("--disallowedTools mcp__* --strict-mcp-config"));
     }
 
     #[test]

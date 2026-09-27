@@ -136,7 +136,7 @@ profiles:                                 # "tài khoản" để chạy agent
       windows_sandbox: unelevated
 roles:                                    # role → profile
   planner:     { profile: claude-max }
-  implementer: { profile: codex-openai }
+  implementer: { profile: codex-openai, fallback: [claude-max] }   # hết quota → Claude làm thay
   reviewer:    { profile: claude-max }
 # --- tuỳ chọn, thêm tay khi cần ---
 commands:
@@ -150,7 +150,7 @@ policy:
 Thêm model riêng cho role: `planner: { profile: claude-max, model: opus }` (hoặc dùng `--claude-model` / `--codex-model` trên dòng lệnh).
 
 Muốn dùng Codex qua **Foundry (API)**: thêm `[profiles.foundry]` trong `~/.codex/config.toml`, chạy lại
-`m0-smoke.ps1 -CodexProfiles openai,foundry -SkipSmoke`, rồi dùng `--codex-profile codex-foundry`.
+`m0-smoke.ps1 -CodexProfiles openai,foundry -SkipSmoke`, rồi dùng `--implementer codex-foundry`.
 
 ### 4.2 Machine config (tuỳ chọn)
 
@@ -193,13 +193,45 @@ Tuỳ chọn của `pipeline`:
 | `--task` | (bắt buộc) | file task; đường dẫn tương đối theo thư mục hiện tại hoặc theo repo |
 | `--id` | heading `# BR-001 …` hoặc tên file | tên task → tên worktree + branch `thien/<id>` |
 | `--base` | branch hiện tại | base branch/commit |
-| `--claude-profile` / `--codex-profile` | theo `roles` | chọn profile |
+| `--claude-profile` | `roles.planner` | profile Claude cho plan + review |
+| `--implementer` | `roles.implementer` | profile code chính (tên cũ `--codex-profile` vẫn dùng được) |
+| `--implementer-fallback` | `roles.implementer.fallback`, nếu không có thì profile Claude | danh sách dự phòng khi hết quota, ví dụ `codex-foundry,claude-max` |
+| `--no-fallback` | tắt | hết quota thì dừng, không chuyển agent |
+| `--simulate-quota` | tắt | giả lập agent chính hết quota để thử đường fallback |
 | `--claude-model` / `--codex-model` | mặc định của CLI | chọn model |
 | `--max-fix-cycles` | 2 | số vòng sửa tối đa |
 | `--mode` | `restricted` | launch mode của Claude (M0 đã xác nhận `restricted` chạy được) |
 | `--yes` | tắt | bỏ qua plan gate (chỉ dùng cho demo) |
 
 Exit code: `0` = approved, khác `0` = dừng (xem `SUMMARY.md`).
+
+### 5.1 Fallback khi Implementer hết quota
+
+Giống **ca trực dự phòng**: Codex nghỉ vì hết quota thì người tiếp theo trong danh sách vào làm tiếp, không bỏ dở task.
+
+```text
+Codex (codex-openai) ──hết quota──► Claude (claude-max) làm tiếp
+        │ 429 / overloaded tạm thời → thử lại 2 lần (chờ 30 s, 60 s) rồi mới chuyển
+        └ lỗi khác (auth, bad request…) → KHÔNG chuyển, dừng như bình thường
+```
+
+- **Nhận biết**: Codex báo `usage limit` / `quota` / `insufficient_quota`; Claude báo `usage limit reached`,
+  `credit balance`, `billing_error` → lớp lỗi `QuotaExceeded`.
+- **Chuyển một lần, giữ luôn**: các vòng fix sau dùng thẳng agent dự phòng, không gọi lại Codex.
+- **Code dở được giữ lại**: Thien liệt kê các file đang thay đổi dở (chưa commit) trong mục *Hand-over* của prompt,
+  agent dự phòng kiểm tra, giữ phần đúng và làm tiếp.
+- **Claude làm Implementer** bị giới hạn chặt: chỉ `Read/Grep/Glob/Edit/Write`, **không có Bash/PowerShell**,
+  `--restricted` + `--permission-mode acceptEdits` → chỉ sửa được file trong worktree; file settings/git/cấu hình tool
+  bị từ chối. TASK.md và PLAN.md được đưa thẳng vào prompt (không mở quyền vào run store). Build/test vẫn do Thien chạy.
+- **Minh bạch**: commit checkpoint có trailer `Thien-Implementer: <profile>`; `SUMMARY.md` có mục *Implementer fallback*.
+- **Lưu ý**: khi Claude vừa code vừa review, review chạy ở session mới nhưng kém độc lập hơn cặp Codex/Claude
+  (Thien in cảnh báo). Claude Max dùng chung quota cho plan, review và code.
+
+Thử đường fallback mà không cần chờ hết quota thật:
+
+```powershell
+thien spike pipeline --repo C:\.thien\demo\batch-rename --task tasks\BR-001.md --id BR-001-fb --simulate-quota
+```
 
 ---
 
@@ -338,6 +370,7 @@ Khi có lệnh build/test X++ chạy không tương tác trên dev VM, chỉ c�
 |---|---|
 | Verify chạy **với quyền user của anh** trong worktree (chưa có Low-IL boundary) | Chỉ dùng cho repo và task anh tin tưởng. Script test do AI viết sẽ được chạy thật! |
 | Chưa có resume sau crash / Ctrl+C | Chạy lại với `--id` khác, hoặc xoá worktree + branch cũ (lệnh in ra cuối mỗi lần chạy) |
+| Fallback mới áp dụng cho Implementer (planner/reviewer Claude hết quota thì dừng) | Chờ reset quota rồi chạy lại |
 | Chưa có budget cap theo token | Xem token ở cuối mỗi lượt và trong `SUMMARY.md`; giữ `--max-fix-cycles` nhỏ |
 | Một task mỗi lần chạy, chạy tuần tự | Chạy nhiều terminal với các `--id` khác nhau nếu cần |
 | Protected paths dùng glob đơn giản | Ghi rõ quy tắc trong `AGENTS.md` để agent tự tránh |
@@ -352,6 +385,6 @@ Khi có lệnh build/test X++ chạy không tương tác trên dev VM, chỉ c�
 | `TASK.md has no AC-<n>: items` | Cần heading `## Acceptance criteria` và dòng `- AC-1: …` |
 | `untrusted_git_filter` | Repo dùng Git LFS/filter → khai báo `git.trusted_filters` trong machine config |
 | Plan lỗi `ProcessCrashed` / không có JSON | `claude` chưa login hoặc hết quota → chạy `claude` một lần để kiểm tra; xem `plan-1.stderr.txt` |
-| Codex báo hết quota / rate limit | Đợi reset quota ChatGPT, hoặc dùng `--codex-profile codex-foundry` (API) |
+| Codex báo hết quota / rate limit | Thien tự chuyển sang agent dự phòng (mục 5.1). Nếu tất cả đều hết: đợi reset, hoặc thêm `--implementer-fallback codex-foundry,claude-max` |
 | Verify fail mãi | Mở `VERIFY_RESULT.json`; tự chạy `pwsh -File scripts\test.ps1` trong worktree |
 | Muốn xem AI "nghĩ" gì | `runs\<ID>-…\*.stdout.jsonl` (stream đầy đủ) và `*.prompt.md` (prompt đã gửi) |

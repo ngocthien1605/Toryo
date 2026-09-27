@@ -317,7 +317,7 @@ pub fn render_config(a: &InitArgs) -> Result<(String, Vec<String>)> {
         "profiles": profiles,
         "roles": {
             "planner": { "profile": "claude-max" },
-            "implementer": { "profile": first_codex },
+            "implementer": { "profile": first_codex, "fallback": ["claude-max"] },
             "reviewer": { "profile": "claude-max" },
         },
     });

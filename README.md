@@ -28,6 +28,7 @@ thien spike codex-project-config --profile codex-foundry
 thien spike killed-resume --profile <claude-max|codex-foundry>
 thien spike smoke                 # end-to-end: plan → implement → checkpoint → verify → review
 thien spike pipeline --repo R --task T.md   # one real task: plan → HUMAN GATE → implement → verify → review → fix cycles
+                                            # (implementer out of quota → fallback, e.g. codex-openai → claude-max)
 thien spike claude|codex …        # single turns for the manual dry-run
 thien spike init-fixture | render | diff | report
 ```

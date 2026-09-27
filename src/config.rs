@@ -105,6 +105,10 @@ pub struct Role {
     pub profile: String,
     #[serde(default)]
     pub model: Option<String>,
+    /// Profiles to switch to, in order, when this role's profile is out of quota
+    /// (implementer only in the prototype).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -293,8 +297,10 @@ impl Effective {
             }
         }
         for (name, role) in &repo.roles {
-            if !repo.profiles.contains_key(&role.profile) {
-                bail!("role `{name}` refers to unknown profile `{}`", role.profile);
+            for p in std::iter::once(&role.profile).chain(&role.fallback) {
+                if !repo.profiles.contains_key(p) {
+                    bail!("role `{name}` refers to unknown profile `{p}`");
+                }
             }
         }
         Ok(Self {

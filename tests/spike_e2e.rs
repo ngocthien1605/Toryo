@@ -28,6 +28,13 @@ if [ $resume = 0 ]; then case "$prompt" in *3000-word*) sleep 30;; esac; fi
 secretp=$(printf '%s' "$prompt" | grep -o '[^ `]*secret.txt' | head -1)
 denials='[]'; [ -n "$probe" ] || [ -n "$FAKE_DENY" ] && denials="[{\"tool_name\":\"Read\",\"tool_input\":{\"file_path\":\"${secretp:-outside}\"}}]"
 case "$prompt" in
+  *"Role: Implementer"*)
+    case " $* " in *" --permission-mode acceptEdits "*) ;; *) echo '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"s","result":"implementer needs acceptEdits"}'; exit 1;; esac
+    case " $* " in *"Bash"*|*" --add-dir "*) echo '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"s","result":"implementer must not get Bash or --add-dir"}'; exit 1;; esac
+    [ -n "$FAKE_STATE" ] && printf '%s\n=====\n' "$prompt" >> "$FAKE_STATE.claude-impl-prompt"
+    printf 'function Divide-Numbers { param($A,$B) $A / $B }\n' >> src/Calculator.psm1
+    mkdir -p tests; echo '# test by claude' > tests/Divide.Tests.ps1
+    echo '{"type":"result","subtype":"success","is_error":false,"session_id":"fake-impl","result":"i","structured_output":{"summary":"s","deviations":[],"validation_performed":[],"open_issues":[],"resolved":[]},"usage":{"input_tokens":5,"output_tokens":20},"permission_denials":[]}'; exit 0;;
   *"Create the plan"*) echo '{"type":"result","subtype":"success","is_error":false,"session_id":"fake-1","result":"p","structured_output":{"understanding":"u","files_likely_involved":["src/Calculator.psm1"],"steps":["add Divide-Numbers"],"validation":["tests"],"plan_markdown":"md"},"usage":{"input_tokens":5,"output_tokens":20},"permission_denials":[]}'; exit 0;;
   *"Review the checkpoint"*) if [ -n "$FAKE_STATE" ] && [ ! -e "$FAKE_STATE.reviewed" ]; then touch "$FAKE_STATE.reviewed"; echo '{"type":"result","subtype":"success","is_error":false,"session_id":"fake-1","result":"r","structured_output":{"decision":"changes_requested","summary":"s","acceptance_criteria":[{"id":"AC-1","met":true,"evidence":"e1"},{"id":"AC-2","met":false,"evidence":"no zero-divisor test"},{"id":"AC-3","met":true,"evidence":"e3"}],"issues":[{"id":"R-1","severity":"major","blocking":true,"file":"tests/Divide.Tests.ps1","description":"add the zero-divisor test"}]},"usage":{"input_tokens":5,"output_tokens":20},"permission_denials":[]}'; exit 0; fi
     echo '{"type":"result","subtype":"success","is_error":false,"session_id":"fake-1","result":"r","structured_output":{"decision":"approved","summary":"s","acceptance_criteria":[{"id":"AC-1","met":true,"evidence":"e1"},{"id":"AC-2","met":true,"evidence":"e2"},{"id":"AC-3","met":true,"evidence":"e3"}],"issues":[]},"usage":{"input_tokens":5,"output_tokens":20},"permission_denials":[]}'; exit 0;;
@@ -39,6 +46,12 @@ const FAKE_CODEX: &str = r#"#!/bin/sh
 prompt=$(cat)
 echo '{"type":"thread.started","thread_id":"th-fake"}'
 echo '{"type":"turn.started"}'
+if [ "$FAKE_CODEX_QUOTA" = 1 ] && printf '%s' "$prompt" | grep -q "Role: Implementer"; then
+  echo '# partial work by codex' > src/Partial.ps1
+  echo '{"type":"error","message":"You'"'"'ve hit your usage limit. Upgrade to Pro or try again later."}'
+  echo '{"type":"turn.failed","error":{"message":"You'"'"'ve hit your usage limit. Upgrade to Pro or try again later."}}'
+  exit 1
+fi
 if printf '%s' "$prompt" | grep -q "Role: Implementer"; then
   printf 'function Divide-Numbers { param($A,$B) $A / $B }\n' >> src/Calculator.psm1
   mkdir -p tests; echo '# test' > tests/Divide.Tests.ps1
@@ -110,6 +123,7 @@ profiles:
     env:
       FAKE_ESCAPE: "{esc}"
       FAKE_LAZY: "{lazy}"
+      FAKE_CODEX_QUOTA: "{quota}"
     codex:
       windows_sandbox: unelevated
       provider: {{ id: foundry, name: Azure Foundry, base_url: "https://x.openai.azure.com/openai/v1", env_key: AZURE_OPENAI_API_KEY }}
@@ -124,6 +138,7 @@ roles:
             esc = if escape { "1" } else { "0" },
             deny = if escape { "1" } else { "" },
             lazy = if lazy { "1" } else { "0" },
+            quota = "0",
         ),
     )
     .unwrap();
@@ -639,4 +654,188 @@ fn pipeline_quit_at_gate_and_batch_rename_fixture() {
 
 fn which_pwsh() -> bool {
     Command::new("pwsh").arg("-v").output().is_ok()
+}
+
+fn pipeline_env(quota: bool, review_once: bool) -> (Env, PathBuf) {
+    let env = setup(false);
+    let mut cfg = std::fs::read_to_string(&env.config).unwrap();
+    if quota {
+        cfg = cfg.replace("FAKE_CODEX_QUOTA: \"0\"", "FAKE_CODEX_QUOTA: \"1\"");
+    }
+    if review_once {
+        cfg = cfg.replace(
+            "FAKE_DENY: \"\"",
+            &format!(
+                "FAKE_DENY: \"\"\n      FAKE_STATE: \"{}\"",
+                env.root.join("fake-state").display()
+            ),
+        );
+    }
+    std::fs::write(&env.config, cfg).unwrap();
+    let repo = env.root.join("calc");
+    let (code, _, err) = thien(
+        &env,
+        &["spike", "init-fixture", "--into", repo.to_str().unwrap()],
+    );
+    assert_eq!(code, 0, "{err}");
+    (env, repo)
+}
+
+fn steps_of(env: &Env) -> (serde_json::Value, Vec<serde_json::Value>) {
+    let r = records(env);
+    let last = r.last().cloned().expect("a pipeline record");
+    let steps = last["details"]["steps"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    (last, steps)
+}
+
+#[test]
+fn pipeline_falls_back_to_claude_when_codex_is_out_of_quota() {
+    let (env, repo) = pipeline_env(true, true);
+    let r = repo.to_str().unwrap();
+    let (code, err) = thien_stdin(
+        &env,
+        &[
+            "spike", "pipeline", "--repo", r, "--task", "TASK.md", "--id", "Q-1", "--yes",
+        ],
+        "",
+    );
+    let (last, steps) = steps_of(&env);
+    assert!(err.contains("switching to claude-max"), "{err}");
+    let sw: Vec<&serde_json::Value> = steps
+        .iter()
+        .filter(|s| s.get("implementer_switch").is_some())
+        .collect();
+    assert_eq!(
+        sw.len(),
+        1,
+        "exactly one switch (sticky for the fix cycle): {steps:?}"
+    );
+    assert_eq!(sw[0]["implementer_switch"]["from"], "codex-foundry");
+    assert_eq!(sw[0]["implementer_switch"]["to"], "claude-max");
+    assert!(sw[0]["implementer_switch"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("usage limit"));
+    assert!(sw[0]["implementer_switch"]["partial_changes"]
+        .to_string()
+        .contains("src/Partial.ps1"));
+    // the hand-over note told Claude about the partial work, and the task pack was inlined
+    let p = std::fs::read_to_string(env.root.join("fake-state.claude-impl-prompt")).unwrap();
+    assert_eq!(
+        p.matches("## Hand-over").count(),
+        1,
+        "hand-over only on the first fallback turn"
+    );
+    assert!(
+        p.contains("Hand-over") && p.contains("src/Partial.ps1"),
+        "{p}"
+    );
+    assert!(p.contains("## TASK.md") && p.contains("NO shell"), "{p}");
+    if which_pwsh() {
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(last["pass"], true);
+        let by: Vec<&str> = steps
+            .iter()
+            .filter_map(|s| s["implemented_by"].as_str())
+            .collect();
+        assert_eq!(
+            by,
+            ["claude-max", "claude-max"],
+            "implement + fix-1 both by the fallback"
+        );
+        let log = Command::new("git")
+            .args([
+                "-C",
+                r,
+                "log",
+                "--format=%(trailers:key=Thien-Implementer,valueonly)",
+                "main..thien/Q-1",
+            ])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&log.stdout).contains("claude-max"));
+        let run = PathBuf::from(last["run_dir"].as_str().unwrap());
+        let summary = std::fs::read_to_string(run.join("runstore").join("SUMMARY.md")).unwrap();
+        assert!(
+            summary.contains("Implementer fallback") && summary.contains("codex-foundry"),
+            "{summary}"
+        );
+    }
+}
+
+#[test]
+fn pipeline_no_fallback_stops_and_simulate_quota_switches() {
+    let (env, repo) = pipeline_env(true, false);
+    let r = repo.to_str().unwrap();
+    let (code, err) = thien_stdin(
+        &env,
+        &[
+            "spike",
+            "pipeline",
+            "--repo",
+            r,
+            "--task",
+            "TASK.md",
+            "--id",
+            "Q-2",
+            "--yes",
+            "--no-fallback",
+        ],
+        "",
+    );
+    assert_ne!(code, 0);
+    let (last, _) = steps_of(&env);
+    assert!(
+        last["summary"]
+            .as_str()
+            .unwrap()
+            .contains("all implementers are out of quota"),
+        "{err}"
+    );
+    // partial work is kept in the worktree for inspection
+    assert!(env
+        .root
+        .join("wts")
+        .join("Q-2")
+        .join("src")
+        .join("Partial.ps1")
+        .exists());
+
+    let (env, repo) = pipeline_env(false, false);
+    let r = repo.to_str().unwrap();
+    let (_code, err) = thien_stdin(
+        &env,
+        &[
+            "spike",
+            "pipeline",
+            "--repo",
+            r,
+            "--task",
+            "TASK.md",
+            "--id",
+            "Q-3",
+            "--yes",
+            "--simulate-quota",
+        ],
+        "",
+    );
+    let (_, steps) = steps_of(&env);
+    let sw = steps
+        .iter()
+        .find(|s| s.get("implementer_switch").is_some())
+        .expect("switch");
+    assert!(
+        sw["implementer_switch"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("simulated"),
+        "{err}"
+    );
+    assert!(
+        steps.iter().any(|s| s["implemented_by"] == "claude-max"),
+        "{err}"
+    );
 }

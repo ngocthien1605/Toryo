@@ -20,13 +20,14 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use super::agents::{claude_turn, codex_turn, ClaudeArgs, CodexArgs};
+use super::agents::{claude_implement_turn, claude_turn, codex_turn, ClaudeArgs, CodexArgs};
 use super::fixture;
 use super::render;
 use super::results::{append, stamp, Record};
 use super::turn::{print_summary, TurnOpts, TurnRun};
 use crate::agents::claude::LaunchMode;
-use crate::config::{data_dir, expand_vars, CommandSpec, Effective};
+use crate::agents::ErrorClass;
+use crate::config::{data_dir, expand_vars, CommandSpec, Effective, ProfileKind};
 use crate::git::{parse_status_z, GitCmd, Loc};
 use crate::process::env::build_env;
 use crate::process::redact::Redactions;
@@ -43,7 +44,11 @@ pub struct PipelineArgs {
     pub id: Option<String>,
     pub base: Option<String>,
     pub claude_profile: String,
-    pub codex_profile: String,
+    /// Implementer profiles in order: the primary, then the fallbacks used when one runs
+    /// out of quota (e.g. `codex-openai`, `claude-max`).
+    pub implementers: Vec<String>,
+    /// Test hook: treat the primary implementer as out of quota without calling it.
+    pub simulate_quota: bool,
     pub claude_model: Option<String>,
     pub codex_model: Option<String>,
     pub mode: LaunchMode,
@@ -414,6 +419,7 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
             .join(" → ")
     );
     eprintln!("  run directory: {}", run.display());
+    eprintln!("  implementer: {}", a.implementers.join(" → (fallback) "));
 
     let fin = Fin {
         run: run.clone(),
@@ -536,13 +542,19 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
         let impl_schema = contracts.join("schemas").join("implementation.schema.json");
         let mut feedback: Option<String> = None;
         let mut last_reviewed: Option<String> = None;
+        let mut claude_impl_noted = false;
+        let mut imps = Implementers {
+            chain: a.implementers.clone(),
+            cur: 0,
+            retries: 0,
+            handoff: None,
+        };
         for cycle in 0..=a.max_fix_cycles {
             let stage = if cycle == 0 {
                 "implement".to_string()
             } else {
                 format!("fix-{cycle}")
             };
-            eprintln!("\n── {} (Codex) ──", stage.to_uppercase());
             let mut prompt = format!(
                 "{}\n\n## Task pack (read-only)\n- TASK.md: {}\n- PLAN.md: {}\n",
                 fixture::ROLES[1].1,
@@ -553,22 +565,39 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
                 prompt.push_str(&format!("\n## Fix cycle {cycle}\nThe previous checkpoint was not accepted. Address the following, then report the issue ids you fixed in `resolved`:\n\n{f}\n"));
             }
             let head_before = g.run_str(&wtl, true, &["rev-parse", "HEAD"])?;
-            let imp = codex_turn(
+            let ctx = ImplCtx {
+                g: &g,
+                wtl: &wtl,
+                wt: &wt,
+                rs: &rs,
+                run: &run,
+                schema_path: &impl_schema,
+            };
+            let Some((imp, implementer)) = implement_turn(
                 cfg,
-                CodexArgs {
-                    profile: a.codex_profile.clone(),
-                    worktree: wt.clone(),
-                    prompt,
-                    schema_path: Some(impl_schema.clone()),
-                    model: a.codex_model.clone(),
-                    resume: None,
-                    extra_args: vec![],
-                    label: stage.clone(),
-                    opts: turn_opts(30),
-                },
-                &run,
-            )?;
-            totals.add(&imp, "implementer");
+                &a,
+                &mut imps,
+                &ctx,
+                &prompt,
+                &stage,
+                &mut totals,
+                &mut log,
+            )?
+            else {
+                return Ok((
+                    false,
+                    format!(
+                        "all implementers are out of quota ({}); the worktree keeps any partial changes — rerun later with another --id, or add a fallback profile",
+                        imps.chain.join(" → ")
+                    ),
+                ));
+            };
+            if cfg.profile(&implementer)?.kind == ProfileKind::Claude && !claude_impl_noted {
+                claude_impl_noted = true;
+                eprintln!("note: {implementer} (Claude) implemented this checkpoint and Claude also reviews it — the review runs in a fresh session, but it is less independent than a Codex/Claude pair.");
+                log.push(json!({"step": stage, "note": "implementer and reviewer are both Claude (fresh sessions)"}));
+            }
+            log.push(json!({"step": stage, "implemented_by": implementer}));
             if let Some(v) = &imp.outcome.structured {
                 std::fs::write(
                     rs.join(format!("implementation-{cycle}.json")),
@@ -636,7 +665,8 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
             let mut c: Vec<&str> = vec!["commit", "-q", "--no-verify", "-m", &msg];
             let t1 = format!("Thien-Task: {id}");
             let t2 = format!("Thien-Stage: {stage}");
-            c.extend(["--trailer", &t1, "--trailer", &t2]);
+            let t3 = format!("Thien-Implementer: {implementer}");
+            c.extend(["--trailer", &t1, "--trailer", &t2, "--trailer", &t3]);
             if no_change {
                 c.extend(["--allow-empty", "--trailer", "Thien-No-Change: true"]);
             }
@@ -851,6 +881,177 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
     }
 }
 
+/// The implementer chain (primary + fallbacks). The position is sticky for the whole run:
+/// once an agent is out of quota, later fix cycles go straight to the next one.
+struct Implementers {
+    chain: Vec<String>,
+    cur: usize,
+    retries: u32,
+    /// Hand-over note for the first turn of the next agent after a switch.
+    handoff: Option<String>,
+}
+
+struct ImplCtx<'a> {
+    g: &'a GitCmd,
+    wtl: &'a Loc,
+    wt: &'a Path,
+    rs: &'a Path,
+    run: &'a Path,
+    schema_path: &'a Path,
+}
+
+/// Extra instructions when Claude is the Implementer: it has file tools but no shell, and
+/// no access to the run store, so the task pack is inlined.
+fn claude_implementer_prompt(base: &str, rs: &Path) -> Result<String> {
+    let task = std::fs::read_to_string(rs.join("TASK.md"))?;
+    let plan = std::fs::read_to_string(rs.join("PLAN.md"))?;
+    Ok(format!(
+        "{base}\n## Session notes (Claude implementer)\n\
+         - Your working directory is the task worktree. You can Read, Grep, Glob, Edit and Write files there only.\n\
+         - You have NO shell in this session: do not try to run commands. The orchestrator runs build/test after you \
+         and sends failures back. Put what you checked by reading code in `validation_performed`.\n\
+         - Read `AGENTS.md` in the worktree first if it exists and follow it.\n\
+         - The paths above are not accessible to you; their content follows.\n\n\
+         ## TASK.md\n\n{task}\n\n## PLAN.md\n\n{plan}\n"
+    ))
+}
+
+/// Run one implementer turn, switching down the chain when an agent is out of quota.
+/// `None` = every implementer is exhausted.
+#[allow(clippy::too_many_arguments)]
+fn implement_turn(
+    cfg: &Effective,
+    a: &PipelineArgs,
+    imps: &mut Implementers,
+    c: &ImplCtx,
+    base_prompt: &str,
+    stage: &str,
+    totals: &mut Totals,
+    log: &mut Vec<Value>,
+) -> Result<Option<(TurnRun, String)>> {
+    let retry_base: u64 = std::env::var("THIEN_RETRY_BASE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let mut attempt = 0;
+    loop {
+        let Some(profile) = imps.chain.get(imps.cur).cloned() else {
+            return Ok(None);
+        };
+        let kind = cfg.profile(&profile)?.kind;
+        attempt += 1;
+        let label = if attempt == 1 {
+            stage.to_string()
+        } else {
+            format!("{stage}-{attempt}")
+        };
+        let who = match kind {
+            ProfileKind::Codex => "Codex",
+            ProfileKind::Claude => "Claude",
+        };
+        eprintln!("\n── {} ({who}: {profile}) ──", stage.to_uppercase());
+        let reason = if a.simulate_quota && imps.cur == 0 {
+            eprintln!("(simulated: {profile} is out of quota)");
+            Some("quota exhausted (simulated)".to_string())
+        } else {
+            let mut prompt = base_prompt.to_string();
+            if let Some(h) = &imps.handoff {
+                prompt.push_str(h);
+            }
+            let r = match kind {
+                ProfileKind::Codex => codex_turn(
+                    cfg,
+                    CodexArgs {
+                        profile: profile.clone(),
+                        worktree: c.wt.to_path_buf(),
+                        prompt,
+                        schema_path: Some(c.schema_path.to_path_buf()),
+                        model: a.codex_model.clone(),
+                        resume: None,
+                        extra_args: vec![],
+                        label: label.clone(),
+                        opts: TurnOpts {
+                            max: Duration::from_secs(30 * 60),
+                            ..Default::default()
+                        },
+                    },
+                    c.run,
+                )?,
+                ProfileKind::Claude => claude_implement_turn(
+                    cfg,
+                    &profile,
+                    c.wt,
+                    &claude_implementer_prompt(&prompt, c.rs)?,
+                    Some(fixture::schema("implementation.schema.json")?),
+                    a.claude_model.clone(),
+                    a.mode,
+                    &label,
+                    TurnOpts {
+                        max: Duration::from_secs(30 * 60),
+                        ..Default::default()
+                    },
+                    c.run,
+                )?,
+            };
+            totals.add(&r, "implementer");
+            match r.outcome.error_class {
+                Some(ErrorClass::QuotaExceeded) => Some(format!(
+                    "quota exhausted: {}",
+                    r.outcome.error_detail.clone().unwrap_or_default()
+                )),
+                Some(ErrorClass::RateLimited | ErrorClass::Overloaded) if imps.retries < 2 => {
+                    imps.retries += 1;
+                    let wait = retry_base * u64::from(imps.retries);
+                    eprintln!(
+                        "!! {profile}: {:?} — retry {}/2 in {wait}s",
+                        r.outcome.error_class, imps.retries
+                    );
+                    log.push(json!({"step": stage, "implementer": profile, "retry": imps.retries, "error": r.outcome.error_class}));
+                    std::thread::sleep(Duration::from_secs(wait));
+                    continue;
+                }
+                Some(ErrorClass::RateLimited | ErrorClass::Overloaded) => Some(format!(
+                    "{:?} after 2 retries",
+                    r.outcome.error_class.unwrap()
+                )),
+                _ => {
+                    imps.retries = 0;
+                    imps.handoff = None;
+                    return Ok(Some((r, profile)));
+                }
+            }
+        };
+        // switch to the next implementer, keeping the partial changes in the worktree
+        let reason = reason.unwrap_or_default();
+        imps.cur += 1;
+        imps.retries = 0;
+        let next = imps.chain.get(imps.cur).cloned();
+        let changed: Vec<String> = parse_status_z(&c.g.run(
+            c.wtl,
+            true,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        )?)
+        .into_iter()
+        .map(|(st, p)| format!("{st} {p}"))
+        .collect();
+        eprintln!(
+            "!! implementer {profile}: {reason} → {}",
+            next.as_deref()
+                .map(|n| format!("switching to {n}"))
+                .unwrap_or_else(|| "no fallback left".into())
+        );
+        log.push(json!({"step": stage, "implementer_switch": {"from": profile, "to": next, "reason": reason, "partial_changes": changed}}));
+        imps.handoff = Some(if changed.is_empty() {
+            format!("\n## Hand-over\nThe previous implementer (`{profile}`) stopped before producing any change ({reason}). Start the task from the plan.\n")
+        } else {
+            format!(
+                "\n## Hand-over\nThe previous implementer (`{profile}`) stopped before finishing ({reason}). The worktree contains its UNCOMMITTED partial changes:\n{}\nInspect them, keep what is correct, fix or complete the rest, and finish the task.\n",
+                changed.iter().map(|x| format!("- `{x}`")).collect::<Vec<_>>().join("\n")
+            )
+        });
+    }
+}
+
 struct Fin {
     run: PathBuf,
     id: String,
@@ -874,6 +1075,29 @@ fn finish(f: &Fin, ok: bool, why: &str, totals: &Totals, log: Vec<Value>) -> Res
         t.output,
         run.join("runstore").display()
     );
+    let mut summary = summary;
+    let switches: Vec<String> = log
+        .iter()
+        .filter_map(|v| {
+            v.get("implementer_switch")
+                .map(|s| (v["step"].clone(), s.clone()))
+        })
+        .map(|(st, s)| {
+            format!(
+                "- {}: `{}` → `{}` ({})",
+                st.as_str().unwrap_or(""),
+                s["from"].as_str().unwrap_or(""),
+                s["to"].as_str().unwrap_or("none"),
+                s["reason"].as_str().unwrap_or("")
+            )
+        })
+        .collect();
+    if !switches.is_empty() {
+        summary.push_str(&format!(
+            "\n## Implementer fallback\n{}\n",
+            switches.join("\n")
+        ));
+    }
     std::fs::write(run.join("runstore").join("SUMMARY.md"), &summary)?;
     let mut rec = Record::new("pipeline", None, &["pipeline prototype"]);
     rec.pass = Some(ok);
