@@ -1,1 +1,4 @@
-target/
+/target/
+# Prebuilt Windows binary: a local build artifact, not source.
+# Build: cargo build --release --target x86_64-pc-windows-gnu  (or natively on Windows: cargo build --release)
+/bin/*.exe
