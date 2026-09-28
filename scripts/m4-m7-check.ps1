@@ -50,8 +50,8 @@ $checks = [System.Collections.Generic.List[object]]::new()
 
 function Show-Step([string]$text) { Write-Host "`n=== $text ===" -ForegroundColor Cyan; "`n=== $text ===" | Add-Content $log }
 function Get-Line($x) {
-    # a stderr line arrives as an ErrorRecord; its text is the TargetObject (empty lines too)
-    if ($x -is [System.Management.Automation.ErrorRecord]) { "$($x.TargetObject)" } else { "$x" }
+    # a stderr line arrives as an ErrorRecord; its text is the exception message (empty lines too)
+    if ($x -is [System.Management.Automation.ErrorRecord]) { "$($x.Exception.Message)" } else { "$x" }
 }
 function T {
     # run toryo, stream its output, keep it in the log; returns the exit code
