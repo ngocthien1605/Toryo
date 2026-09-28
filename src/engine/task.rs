@@ -82,6 +82,8 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     let (planner, implementers, reviewer) = roles(cfg)?;
 
     let g = task_git(cfg, &repo)?;
+    // R36/R45 admission: the verify boundary must be available before anything is created
+    super::verify::probe(cfg)?;
     let repol = Loc::Discover(repo.clone());
     if !g.output(&repol, true, &["rev-parse", "--git-dir"])?.status.success() {
         bail!("{} is not a Git repository", repo.display());
@@ -157,6 +159,9 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         let _ = g.output(&Loc::Discover(wt.clone()), false, &["worktree", "remove", "--force", &fwd(&wt)]);
     }
     let t = res?;
+    // R34: the task snapshot and the frozen configuration are the first immutable versions
+    super::artifacts::put(store, &t, None, "task", "md", "task", text.as_bytes(), Some("TASK.md"))?;
+    super::artifacts::put(store, &t, None, "config", "json", "config", frozen.as_bytes(), Some("config.json"))?;
     // R35: protected baseline v1 — after the info/exclude line (R46), before any agent runs
     let (_, protect, _) = super::runner::task_policy(&t, cfg)?;
     super::protect::take_baseline(store, &t, &g, &protect, "v1 (task created)")?;

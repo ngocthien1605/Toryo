@@ -175,14 +175,7 @@ fn blobs(t: &TaskRow) -> PathBuf {
 /// Take a new baseline version from the current state and make it the one in force.
 pub fn take_baseline(store: &Store, t: &TaskRow, g: &GitCmd, protect: &Protected, reason: &str) -> Result<PManifest> {
     let now = scan(g, &t.worktree, protect)?;
-    let tid = t.id.clone();
-    let version = store.call(move |tx| {
-        Ok(tx.query_row(
-            "SELECT COALESCE(MAX(version), 0) + 1 FROM artifacts WHERE task_id = ?1 AND logical_name = 'protected'",
-            [&tid],
-            |r| r.get::<_, i64>(0),
-        )? as u32)
-    })?;
+    let version = super::artifacts::next_version(store, t, "protected")?;
     let mut total = 0u64;
     let mut entries = BTreeMap::new();
     std::fs::create_dir_all(blobs(t))?;
@@ -198,40 +191,21 @@ pub fn take_baseline(store: &Store, t: &TaskRow, g: &GitCmd, protect: &Protected
         entries.insert(k, e);
     }
     let m = PManifest { version, created_at: crate::evidence::now_rfc3339(), reason: reason.to_string(), entries };
-    let dir = t.artifacts().join("protected");
-    std::fs::create_dir_all(&dir)?;
     let bytes = serde_json::to_vec_pretty(&m)?;
-    let path = dir.join(format!("{version}.json"));
-    std::fs::write(&path, &bytes)?;
-    let rel = path.strip_prefix(&t.run_store).map(|p| p.display().to_string()).unwrap_or_else(|_| path.display().to_string());
-    let (tid, sha, size, r) = (t.id.clone(), sha256_hex(&bytes), bytes.len() as u64, reason.to_string());
+    super::artifacts::put(store, t, None, "protected", "json", "protected_manifest", &bytes, Some(&format!("protected/{version}.json")))?;
+    let (tid, r) = (t.id.clone(), reason.to_string());
     let n = m.entries.len();
-    store.call(move |tx| {
-        store::register_artifact(tx, &tid, None, "protected", "protected_manifest", &rel, &sha, size)?;
-        store::event(tx, Some(&tid), None, "protected_baseline", &serde_json::json!({"version": version, "reason": r, "entries": n}))?;
-        Ok(())
-    })?;
+    store.call(move |tx| store::event(tx, Some(&tid), None, "protected_baseline", &serde_json::json!({"version": version, "reason": r, "entries": n})))?;
     Ok(m)
 }
 
 /// The baseline in force (the head of `protected`), hash-checked; `None` for a task created
 /// before M5 (the caller takes v1 then).
 pub fn baseline(store: &Store, t: &TaskRow) -> Result<Option<(String, PManifest)>> {
-    let tid = t.id.clone();
-    let head = store.call(move |tx| {
-        use rusqlite::OptionalExtension;
-        Ok(tx
-            .query_row("SELECT artifact_id FROM artifact_heads WHERE task_id = ?1 AND logical_name = 'protected'", [&tid], |r| r.get::<_, String>(0))
-            .optional()?)
-    })?;
-    let Some(id) = head else { return Ok(None) };
-    let i = id.clone();
-    let (_, rel, sha) = store.call(move |tx| store::artifact(tx, &i))?;
-    let bytes = std::fs::read(t.run_store.join(&rel)).with_context(|| format!("artifact_missing: protected baseline {rel}"))?;
-    if sha256_hex(&bytes) != sha {
-        anyhow::bail!("artifact_tampered: protected baseline {rel} does not match its registered hash");
+    match super::artifacts::read_head(store, t, "protected")? {
+        Some((v, bytes)) => Ok(Some((v.id, serde_json::from_slice(&bytes)?))),
+        None => Ok(None),
     }
-    Ok(Some((id, serde_json::from_slice(&bytes)?)))
 }
 
 /// The baseline in force, taking v1 if the task has none yet.
@@ -314,8 +288,7 @@ pub fn check(store: &Store, t: &TaskRow, g: &GitCmd, protect: &Protected) -> Res
     if changes.iter().any(Change::is_hard) {
         let hard: Vec<Change> = changes.iter().filter(|c| c.is_hard()).cloned().collect();
         let text = render_changes(g, t, &base, &now, &hard)?;
-        let n = std::fs::read_dir(t.artifacts().join("protected")).map(|d| d.count()).unwrap_or(0);
-        let p = t.artifacts().join(format!("protected-changes-{}.md", n + 1));
+        let p = t.artifacts().join(format!("protected-changes-{}.md", super::artifacts::next_version(store, t, "protected")?));
         std::fs::write(&p, format!("# Protected state changed (R35)\n\nbaseline v{} ({})\n\n{text}", base.version, base.reason))?;
         diff_path = Some(p);
     }

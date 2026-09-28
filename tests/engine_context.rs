@@ -88,8 +88,14 @@ fn every_attempt_gets_a_stored_hashed_context_in_fixed_order() {
     let out = command(&env, &["context", "show", "C-1", "--stage", "review", "--attempt", "1"], &[]).output().unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), r);
-    let stored = t.artifacts().join("context").join("review-1.md");
-    std::fs::write(&stored, format!("{r}\nINJECTED\n")).unwrap();
+    // the view is not evidence (R34): editing it changes nothing; the immutable version is checked
+    std::fs::write(t.artifacts().join("context").join("review-1.md"), "edited view\n").unwrap();
+    let out = command(&env, &["context", "show", "C-1", "--stage", "review", "--attempt", "1"], &[]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let v = toryo::engine::artifacts::head(&st, &t, "context/review-1").unwrap().unwrap();
+    assert!(v.path.starts_with(t.artifacts().join("artifacts").join("context")), "{}", v.path.display());
+    assert!(r.contains("DIFF.patch: ") && r.contains(&t.artifacts().join("artifacts").join("diff").display().to_string()), "agents get version paths: {r}");
+    std::fs::write(&v.path, format!("{r}\nINJECTED\n")).unwrap();
     let out = command(&env, &["context", "show", "C-1", "--stage", "review", "--attempt", "1"], &[]).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("artifact_tampered"));

@@ -3,8 +3,9 @@
 //! processes died with its Job (`KILL_ON_JOB_CLOSE`, R23).
 //!
 //! Step 3 (R35, M5): the protected state is compared first; a change to untracked/ignored
-//! protected files or Git metadata escalates before anything else. Not yet here: artifact
-//! reconciliation (step 4, R34 → M6).
+//! protected files or Git metadata escalates before anything else. Step 4 (R34, M6):
+//! artifact reconciliation — staging leftovers removed, orphans moved to `orphans/`, every
+//! registered version re-hashed (`artifact_missing` / `artifact_tampered` → Escalated).
 
 use std::path::PathBuf;
 
@@ -96,6 +97,24 @@ impl<'a> Recovery<'a> {
                 let (i, r) = (id.to_string(), reason.clone());
                 self.store.call(move |tx| store::transition(tx, &i, Ev::Escalate { reason: r }).map(|_| ()))?;
                 notes.push(format!("escalated before anything else: {reason}"));
+                let (i, n) = (id.to_string(), notes.clone());
+                self.store.call(move |tx| store::event(tx, Some(&i), None, "recovered", &json!({"notes": n})))?;
+                return Ok(notes);
+            }
+        }
+        // §10 step 4 (R34)
+        if !t.state.is_terminal() {
+            let r = super::artifacts::reconcile(self.store, &t)?;
+            notes.extend(r.notes);
+            if let Some(problem) = r.problem {
+                for a in atts.iter().filter(|a| a.status == AttemptStatus::Running) {
+                    self.finish(a, AttemptStatus::Interrupted, AttemptEnd { error_detail: Some("owner process ended".into()), ..Default::default() }, None, None)?;
+                }
+                if t.state != St::Escalated {
+                    let (i, p) = (id.to_string(), problem.clone());
+                    self.store.call(move |tx| store::transition(tx, &i, Ev::Escalate { reason: p }).map(|_| ()))?;
+                }
+                notes.push(format!("escalated: {problem}"));
                 let (i, n) = (id.to_string(), notes.clone());
                 self.store.call(move |tx| store::event(tx, Some(&i), None, "recovered", &json!({"notes": n})))?;
                 return Ok(notes);

@@ -240,6 +240,7 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
             }
             let cfg = frozen_config(&t)?;
             let g = task::task_git(&cfg, &t.repo)?;
+            toryo::engine::verify::cleanup(&g, &t, &cfg)?;
             if t.worktree.exists() {
                 let w = t.worktree.display().to_string().replace('\\', "/");
                 g.run(&toryo::git::Loc::Discover(t.repo.clone()), false, &["worktree", "remove", "--force", &w])?;
@@ -302,12 +303,12 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     let idx = t.current_implementer().and_then(|c| implementers.iter().position(|x| x == c)).unwrap_or(0);
     let verify_changed = serde_json::to_value(&old.repo.commands.verify)? != serde_json::to_value(&new.repo.commands.verify)?
         || serde_json::to_value(&old.repo.verify)? != serde_json::to_value(&new.repo.verify)?;
-    std::fs::write(t.artifacts().join("config.json"), &new_text)?;
+    toryo::engine::artifacts::put(&st, &t, None, "config", "json", "config", new_text.as_bytes(), Some("config.json"))?;
     let mut notes = vec![format!("configuration {} → {} (diff: {})", &t.config_sha256[..12], &new_sha[..12], b.display())];
-    let vr = t.artifacts().join("VERIFY_RESULT.json");
-    let reverify = verify_changed && vr.exists();
+    let reverify = verify_changed && toryo::engine::artifacts::head(&st, &t, "verify-result")?.is_some();
     if reverify {
-        std::fs::rename(&vr, t.artifacts().join(format!("VERIFY_RESULT.invalidated-{n}.json")))?;
+        let inv = serde_json::json!({"invalidated": true, "reason": "task config --reload changed the verify configuration", "config_sha256": new_sha});
+        toryo::engine::artifacts::put(&st, &t, None, "verify-result", "json", "verify_result", &serde_json::to_vec_pretty(&inv)?, Some("VERIFY_RESULT.json"))?;
         notes.push("the verify configuration changed: VERIFY_RESULT.json invalidated".into());
     }
     let (i, sha, im, pl, rv) = (id.to_string(), new_sha.clone(), implementers.clone(), planner.clone(), reviewer.clone());
@@ -324,7 +325,7 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     if to_verify {
         notes.push("the final gate was withdrawn: the checkpoint is verified again".into());
     }
-    toryo::engine::decisions::append(&t, "configuration reloaded (R35)", &notes.iter().map(|x| format!("- {x}")).collect::<Vec<_>>().join("\n"))?;
+    toryo::engine::decisions::append(&st, &t, "configuration reloaded (R35)", &notes.iter().map(|x| format!("- {x}")).collect::<Vec<_>>().join("\n"))?;
     for x in &notes {
         eprintln!("{id}: {x}");
     }
@@ -351,8 +352,8 @@ pub fn approve(id: &str, gate: Gate, expect: Option<&str>, force: bool, cont: bo
         if kind != GateKind::Final || t.state != PipelineState::Escalated {
             bail!("--force only takes an Escalated task to the final gate (state {:?})", t.state);
         }
-        if !t.artifacts().join("VERIFY_RESULT.json").exists() {
-            bail!("{id}: no current VERIFY_RESULT.json (the verify configuration was reloaded) — `toryo resume {id} --note \"…\"` to verify again");
+        if !toryo::engine::runner::verify_current(&st, &t)? {
+            bail!("{id}: no passing VERIFY_RESULT.json for the current checkpoint (e.g. the verify configuration was reloaded) — `toryo resume {id} --note \"…\"` to verify again");
         }
         let i = id.to_string();
         st.call(move |tx| store::transition(tx, &i, PipelineEvent::ForceFinal).map(|_| ()))?;
@@ -434,6 +435,7 @@ fn resume_protected(st: &Store, t: &TaskRow, accept: &[String]) -> Result<bool> 
     let list: Vec<String> = bad.iter().map(|x| format!("{} {}", x.kind, x.path)).collect();
     let m = toryo::engine::protect::take_baseline(st, t, &g, &protect, &format!("accepted by the human: {}", list.join(", ")))?;
     toryo::engine::decisions::append(
+        st,
         t,
         "protected change accepted (R35)",
         &format!(
@@ -610,10 +612,11 @@ pub fn context(cmd: &ContextCmd) -> Result<i32> {
                 .into_iter()
                 .find(|a| a.stage == s2 && a.attempt == *n)
                 .with_context(|| format!("{id}: no attempt {stage}/{n}"))?;
-            let p = cx::artifact_path(&t, &stage, *n);
-            let text = std::fs::read_to_string(&p).with_context(|| format!("{id}/{stage}/{n}: no stored context ({})", p.display()))?;
-            let sha = toryo::engine::task::sha256_hex(text.as_bytes());
-            let ok = a.context_sha256.as_deref() == Some(sha.as_str());
+            let v = toryo::engine::artifacts::head(&st, &t, &cx::logical(&stage, *n))?.with_context(|| format!("{id}/{stage}/{n}: no stored context"))?;
+            let bytes = std::fs::read(&v.path).with_context(|| format!("artifact_missing: {} ({})", v.id, v.path.display()))?;
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            let sha = toryo::engine::task::sha256_hex(&bytes);
+            let ok = a.context_sha256.as_deref() == Some(sha.as_str()) && v.sha256 == sha;
             eprintln!(
                 "{}: context of {} ({}), sha256 {} — {}",
                 id,
@@ -631,7 +634,7 @@ pub fn context(cmd: &ContextCmd) -> Result<i32> {
                 Some(p) => p.clone(),
                 None => cx::stage_profile(&t, &stage)?,
             };
-            let c = cx::assemble(&cx::request(&t, &cfg, &stage, &profile)?)?;
+            let c = cx::assemble(&cx::request(&st, &t, &cfg, &stage, &profile)?)?;
             eprint!("{id}: next `{stage}` attempt with `{profile}` — {}", cx::describe(&c));
             print!("{}", c.text);
             Ok(0)

@@ -360,14 +360,14 @@ fn verify_root_check(r: &mut Report, cfg: &Effective) {
             format!("{} (Low label check is Windows-only)", root.display()),
         );
     }
-    let probe = root.join(format!(".label-probe-{}", std::process::id()));
-    let res = crate::process::label_low(std::slice::from_ref(&probe));
-    let _ = std::fs::remove_dir_all(&probe);
-    match res {
+    if cfg.repo.verify.boundary == "none" {
+        return r.add(Level::Warn, area, "verify.boundary: none — trusted-code mode, verification is NOT isolated (R36)");
+    }
+    match crate::engine::verify::probe(cfg) {
         Ok(()) => r.add(
             Level::Ok,
             area,
-            format!("{}: Low integrity label can be set (R36)", root.display()),
+            format!("{}: Low integrity label can be set (R36/R45)", root.display()),
         ),
         Err(e) => r.add(
             if cfg.repo.verify.boundary == "none" {

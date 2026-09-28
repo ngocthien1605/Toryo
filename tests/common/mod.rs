@@ -47,8 +47,9 @@ roles:
 commands:
   verify:
     - {{ name: divide-present, program: git, args: ["grep", "-q", "Divide-Numbers", "--", "src"] }}
-{extra}"#,
+{verify}{extra}"#,
             repo = fwd(&repo),
+            verify = if extra.contains("verify:") { String::new() } else { format!("verify: {{ boundary: none, verify_root: \"{}\" }}\n", fwd(&root.join("verify"))) },
             wts = fwd(&root.join("wts")),
         ),
     )

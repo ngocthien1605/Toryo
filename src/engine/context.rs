@@ -28,7 +28,7 @@ use anyhow::{bail, Result};
 use serde::Serialize;
 
 use super::contracts;
-use super::store::TaskRow;
+use super::store::{Store, TaskRow};
 use super::task::sha256_hex;
 use crate::config::{home_dir, Effective, ProfileKind};
 use crate::domain::Role;
@@ -302,11 +302,23 @@ fn render(req: &Request, parts: &[Part], pack_start: usize) -> String {
     s
 }
 
-/// The task pack of a stage (source 5), in the run store; files that do not exist yet are
-/// skipped by `assemble`.
-pub fn task_pack(t: &TaskRow, stage: &str) -> Result<Vec<(String, PathBuf)>> {
-    let a = t.artifacts();
-    let f = |n: &str| (n.to_string(), a.join(n));
+/// The task pack of a stage (source 5): the **immutable version** of each artifact, resolved
+/// from `artifact_heads` and hash-checked now (R34: `artifact_tampered` / `artifact_missing`
+/// stop the stage); artifacts that do not exist yet are skipped.
+pub fn task_pack(store: &Store, t: &TaskRow, stage: &str) -> Result<Vec<(String, PathBuf)>> {
+    let mut out = Vec::new();
+    for view in pack_views(stage)? {
+        let logical = super::artifacts::logical_of_view(&view).expect("pack view");
+        if let Some(v) = super::artifacts::head(store, t, logical)? {
+            super::artifacts::read_version(&v)?;
+            out.push((view, v.path));
+        }
+    }
+    Ok(out)
+}
+
+fn pack_views(stage: &str) -> Result<Vec<String>> {
+    let f = |n: &str| n.to_string();
     Ok(match stage_role(stage)? {
         Role::Planner => vec![f("TASK.md"), f("DECISIONS.md")],
         Role::Implementer => {
@@ -329,7 +341,7 @@ pub fn task_pack(t: &TaskRow, stage: &str) -> Result<Vec<(String, PathBuf)>> {
 
 /// The request for the next attempt of `stage` with `profile` — used by the engine and by
 /// `toryo context show`, so the preview is exactly what the agent gets.
-pub fn request(t: &TaskRow, cfg: &Effective, stage: &str, profile: &str) -> Result<Request> {
+pub fn request(store: &Store, t: &TaskRow, cfg: &Effective, stage: &str, profile: &str) -> Result<Request> {
     let role = stage_role(stage)?;
     let kind = cfg.profile(profile)?.kind;
     let kb = cfg.repo.context.budget_kb.get(role.as_str()).copied().unwrap_or(DEFAULT_BUDGET_KB);
@@ -338,7 +350,7 @@ pub fn request(t: &TaskRow, cfg: &Effective, stage: &str, profile: &str) -> Resu
         kind,
         repo: t.repo.clone(),
         global: global_context_path(),
-        pack: task_pack(t, stage)?,
+        pack: task_pack(store, t, stage)?,
         inline_all: role == Role::Implementer && kind == ProfileKind::Claude,
         budget: (kb as usize) * 1024,
     })
@@ -353,9 +365,9 @@ pub fn stage_profile(t: &TaskRow, stage: &str) -> Result<String> {
     })
 }
 
-/// Where the context of an attempt is stored (run store; immutable versions arrive in M6).
-pub fn artifact_path(t: &TaskRow, stage: &str, attempt: u32) -> PathBuf {
-    t.artifacts().join("context").join(format!("{stage}-{attempt}.md"))
+/// The logical artifact name of an attempt's context.
+pub fn logical(stage: &str, attempt: u32) -> String {
+    format!("context/{stage}-{attempt}")
 }
 
 /// A one-line-per-source summary for logs and `context show`.

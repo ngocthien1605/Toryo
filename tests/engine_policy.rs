@@ -178,7 +178,10 @@ fn config_is_frozen_until_reload() {
     assert_eq!(code, 0, "{err}");
     let t = task(&env, "F-1");
     assert_eq!(t.state, St::Verifying);
-    assert!(!t.artifacts().join("VERIFY_RESULT.json").exists());
+    let vr: Value = serde_json::from_slice(&std::fs::read(t.artifacts().join("VERIFY_RESULT.json")).unwrap()).unwrap();
+    assert_eq!(vr["invalidated"], json!(true), "a new version marks the old result invalid");
+    let (code, err) = toryo(&env, &["approve", "F-1", "--gate", "final"], &[]);
+    assert_ne!(code, 0, "no final gate while re-verifying: {err}");
     assert!(std::fs::read_to_string(t.artifacts().join("DECISIONS.md")).unwrap().contains("configuration reloaded"));
     // verify now fails → fix cycle → passes → review → final gate
     let s2 = script(&env, "f1b.json", json!({

@@ -9,8 +9,9 @@
 //! turns, consistency downgrade), final gate. Every agent attempt gets its context from the
 //! ProjectContextLoader (§7, M4). The protected-state snapshot (R35, M5) is compared before
 //! every running stage and after every agent turn and verify run. Quota exhaustion and
-//! `--no-fallback` pause the task (M5). Not yet here: immutable artifacts and the Low-IL
-//! verify boundary (M6), budget admission (M7).
+//! `--no-fallback` pause the task (M5). Artifacts are immutable versions (R34) and Verify runs
+//! in a detached checkout of the checkpoint under `verify_root`, inside the Low-IL boundary
+//! (R29/R36/R45, M6). Not yet here: budget admission (M7).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -24,6 +25,7 @@ use super::checks::{parse_allow_protected, resolve_program, review_violations, v
 use super::context;
 use super::contracts;
 use super::lock::TaskLock;
+use super::verify;
 use super::protect;
 use super::state::{GateKind, PipelineEvent as Ev, PipelineState as St};
 use super::store::{self, AttemptEnd, AttemptRow, AttemptStatus, NewAttempt, Store, TaskRow};
@@ -34,8 +36,6 @@ use crate::agents::hub::AgentHub;
 use crate::config::{expand_vars, Billing, CommandSpec, Effective, ProfileKind};
 use crate::domain::{ErrorClass, OpenSession, Role, StageOutcome, TurnInput, TurnLimits};
 use crate::git::GitCmd;
-use crate::process::env::build_env;
-use crate::process::Boundary;
 use crate::runner::{CommandRunner, LocalRunner, RunSpec};
 
 #[derive(Debug, Clone, Default)]
@@ -81,7 +81,11 @@ pub fn task_policy(t: &TaskRow, cfg: &Effective) -> Result<(GitCmd, Protected, V
         exact.push(r); // the task is the contract: agents may not edit it
     }
     // the allow list comes from the TASK.md snapshot (hashed at create, R28), not the repo
-    let task_md = std::fs::read_to_string(t.artifacts().join("TASK.md")).unwrap_or_default();
+    let task_md = std::fs::read(t.artifacts().join("TASK.md")).unwrap_or_default();
+    if sha256_hex(&task_md) != t.task_sha256 {
+        bail!("artifact_tampered: TASK.md of {} does not match tasks.task_sha256 (R27/R28)", t.id);
+    }
+    let task_md = String::from_utf8_lossy(&task_md).to_string();
     let p = Protected::new(exact, &cfg.repo.policy.protected_paths).with_policy(&parse_allow_protected(&task_md), &cfg.repo.policy.deny_paths);
     Ok((g, p, cmds))
 }
@@ -240,7 +244,7 @@ impl<'a> Engine<'a> {
         let a = self.begin(NewAttempt { stage: "plan", kind: "agent", profile: Some(&t.planner), fallback_from: None, head_before: Some(&head), subject_commit: None })?;
         eprintln!("\n── PLAN (attempt {}, {}) ──", a.attempt, t.planner);
         crash_point("plan:after_begin");
-        let ctx = self.context(t, &a, &t.planner)?;
+        let Some(ctx) = self.context(t, &a, &t.planner)? else { return Ok(Flow::Next) };
         let stop = self.lock.watch_stop();
         let r = self.hub.turn_with(
             OpenSession {
@@ -272,9 +276,9 @@ impl<'a> Engine<'a> {
             return Ok(Flow::Next);
         };
         let bytes = serde_json::to_vec_pretty(&plan)?;
-        std::fs::write(art.join("plan.json"), &bytes)?;
         let md = super::render::render("plan", &plan)?;
-        std::fs::write(art.join("PLAN.md"), &md)?;
+        self.put(t, &a, "plan", "json", &bytes, "plan.json")?;
+        self.put(t, &a, "plan-md", "md", md.as_bytes(), "PLAN.md")?;
         eprintln!("\n{md}");
         let files: Vec<String> = plan["files_likely_involved"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect();
         let bad: Vec<String> = files.iter().filter(|f| self.protect.violates(f)).cloned().collect();
@@ -298,7 +302,6 @@ impl<'a> Engine<'a> {
     fn implement(&mut self, t: &TaskRow) -> Result<Flow> {
         let stage = writing_stage(t.fix_cycle);
         let wt = Worktree::new(&self.g, &t.worktree);
-        let art = t.artifacts();
         let limit = if self.opts.no_fallback { 1 } else { t.implementers.len() };
         let Some(profile) = t.implementers.get(t.implementer_index).filter(|_| t.implementer_index < limit).cloned() else {
             let reason = format!(
@@ -343,7 +346,7 @@ impl<'a> Engine<'a> {
         let a = self.begin(NewAttempt { stage: &stage, kind: "agent", profile: Some(&profile), fallback_from: fallback_from.as_deref(), head_before: Some(&head_before), subject_commit: None })?;
         eprintln!("\n── {} (attempt {}, {profile}) ──", stage.to_uppercase(), a.attempt);
         crash_point("implement:after_begin");
-        let ctx = self.context(t, &a, &profile)?;
+        let Some(ctx) = self.context(t, &a, &profile)? else { return Ok(Flow::Next) };
         let stop = self.lock.watch_stop();
         let r = self.hub.turn_with(
             OpenSession {
@@ -368,7 +371,7 @@ impl<'a> Engine<'a> {
             return self.stopped();
         }
         if let Some(v) = &r.structured {
-            std::fs::write(art.join(format!("implementation-{}.json", t.fix_cycle)), serde_json::to_vec_pretty(v)?)?;
+            self.put(t, &a, "implementation", "json", &serde_json::to_vec_pretty(v)?, &format!("implementation-{}.json", t.fix_cycle))?;
         }
         // quota / rate limits: retry, then the next implementer (sticky, R49)
         let switch = match r.error_class {
@@ -485,13 +488,13 @@ impl<'a> Engine<'a> {
                 (sha, if no_change { "no_change" } else { "normal" })
             }
         };
-        let art = t.artifacts();
-        std::fs::write(art.join("DIFF.patch"), self.g.canonical_diff(&wt.loc, &t.base_commit, Some(&head))?)?;
+        let full = self.g.canonical_diff(&wt.loc, &t.base_commit, Some(&head))?;
+        self.put(t, &a, "diff", "patch", &full, "DIFF.patch")?;
         let inc = match &t.last_reviewed_head {
             Some(h) => self.g.canonical_diff(&wt.loc, h, Some(&head))?,
             None => Vec::new(),
         };
-        std::fs::write(art.join("DIFF-incremental.patch"), inc)?;
+        self.put(t, &a, "diff-incremental", "patch", &inc, "DIFF-incremental.patch")?;
         eprintln!("✔ checkpoint {} ({kind})", &head[..12]);
         // R35: a committed tracked protected change allowed by TASK.md becomes the new baseline
         let c = protect::check(self.store, t, &self.g, &self.protect)?;
@@ -514,24 +517,40 @@ impl<'a> Engine<'a> {
     fn verify(&mut self, t: &TaskRow) -> Result<Flow> {
         let head = t.machine.checkpoint().context("no checkpoint to verify")?.to_string();
         let a = self.begin(NewAttempt { stage: "verify", kind: "command", profile: None, fallback_from: None, head_before: Some(&head), subject_commit: Some(&head) })?;
-        eprintln!("\n── VERIFY (attempt {}) ──", a.attempt);
         crash_point("verify:after_begin");
+        // R36/R45: the boundary is established or the stage stops — never a silent downgrade
+        let prepared = verify::boundary(&self.cfg).and_then(|b| verify::prepare(&self.g, t, &self.cfg, &head, b).map(|c| (b, c)));
+        let (b, co) = match prepared {
+            Ok(x) => x,
+            Err(e) if format!("{e:#}").starts_with(verify::UNAVAILABLE) || format!("{e:#}").starts_with(verify::MUTATED) => {
+                let reason = format!("{e:#}");
+                eprintln!("!! {reason}");
+                let class = reason.split(':').next().unwrap_or(verify::UNAVAILABLE).to_string();
+                let (i, aid) = (self.id.clone(), a.id.clone());
+                self.store.call(move |tx| {
+                    store::finish_attempt(tx, &aid, AttemptStatus::Failed, &AttemptEnd { error_class: Some(class), ..Default::default() })?;
+                    store::transition(tx, &i, Ev::Escalate { reason })?;
+                    Ok(())
+                })?;
+                return Ok(Flow::Next);
+            }
+            Err(e) => return Err(e),
+        };
+        eprintln!("\n── VERIFY (attempt {}, {} in {}) ──", a.attempt, verify::describe(b), co.dir.display());
         let stop = self.lock.watch_stop();
+        let env = verify::env(&co);
         let mut results = Vec::new();
         let mut pass = true;
         for c in &self.cmds {
             let program = resolve_program(&expand_vars(&c.program)?);
-            let mut env = build_env(std::env::vars(), &Default::default(), &Default::default());
-            env.insert("NO_COLOR".into(), "1".into());
             let res = self.hub.block_on(LocalRunner.run(
                 RunSpec {
                     name: c.name.clone(),
                     program,
                     args: c.args.clone(),
-                    cwd: t.worktree.clone(),
-                    env,
-                    // the Low-IL verify boundary (R36) is wired in M6
-                    boundary: Boundary::None,
+                    cwd: co.dir.clone(),
+                    env: env.clone(),
+                    boundary: b,
                     timeout: Duration::from_secs(60 * c.timeout_min.unwrap_or(30)),
                     cancel: Some(stop.flag.clone()),
                 },
@@ -545,10 +564,37 @@ impl<'a> Engine<'a> {
             let ok = res.ok();
             pass &= ok;
             eprintln!("  {} {} (exit {:?}, {:.1}s)", if ok { "✔" } else { "✘" }, c.name, res.exit, res.duration_ms as f64 / 1000.0);
+            // R50: LocalRunner strips ANSI (CSI/OSC) from everything it captures
             results.push(json!({"name": c.name, "argv": std::iter::once(c.program.clone()).chain(c.args.clone()).collect::<Vec<_>>(), "exit": res.exit, "ms": res.duration_ms, "output_tail": res.tail(40)}));
             if !ok {
                 break; // stop at the first failure (§5.2)
             }
+        }
+        // R29/R47: the checkout must be exactly the checkpoint after the run
+        let mutated = verify::mutated(&self.g, &co, &head)?;
+        let tree = self.g.run_str(&Worktree::new(&self.g, &t.worktree).loc, true, &["rev-parse", &format!("{head}^{{tree}}")])?;
+        let vr = json!({
+            "head": head,
+            "tree": tree.trim(),
+            "pass": pass && mutated.is_none(),
+            "boundary": verify::describe(b),
+            "checkout": self.cfg.repo.verify.checkout,
+            "verify_checkout": co.dir,
+            "config_sha256": t.config_sha256,
+            "scripts": verify::script_hashes(&verify_files(&self.cmds, &co.dir), &co),
+            "mutated": mutated,
+            "commands": results,
+        });
+        self.put(t, &a, "verify-result", "json", &serde_json::to_vec_pretty(&vr)?, "VERIFY_RESULT.json")?;
+        if let Some(reason) = mutated {
+            eprintln!("!! {reason}");
+            let (i, aid) = (self.id.clone(), a.id.clone());
+            self.store.call(move |tx| {
+                store::finish_attempt(tx, &aid, AttemptStatus::Failed, &AttemptEnd { error_class: Some(verify::MUTATED.into()), ..Default::default() })?;
+                store::transition(tx, &i, Ev::Escalate { reason })?;
+                Ok(())
+            })?;
+            return Ok(Flow::Next);
         }
         // R35: the verify run must not have touched protected state
         if let Some(reason) = self.protected_violation(t, false)? {
@@ -562,8 +608,6 @@ impl<'a> Engine<'a> {
             })?;
             return Ok(Flow::Next);
         }
-        let vr = json!({"head": head, "pass": pass, "boundary": "none (M6)", "commands": results});
-        std::fs::write(t.artifacts().join("VERIFY_RESULT.json"), serde_json::to_vec_pretty(&vr)?)?;
         let (i, aid, h) = (self.id.clone(), a.id.clone(), head.clone());
         let fb = if pass {
             None
@@ -603,7 +647,7 @@ impl<'a> Engine<'a> {
         let a = self.begin(NewAttempt { stage: "review", kind: "agent", profile: Some(&t.reviewer), fallback_from: None, head_before: Some(&head), subject_commit: Some(&head) })?;
         eprintln!("\n── REVIEW (attempt {}, {}{}) ──", a.attempt, t.reviewer, if resume.is_some() { ", resuming the interrupted session" } else { "" });
         crash_point("review:after_begin");
-        let ctx = self.context(t, &a, &t.reviewer)?;
+        let Some(ctx) = self.context(t, &a, &t.reviewer)? else { return Ok(Flow::Next) };
         let stop = self.lock.watch_stop();
         let mut prompt = format!(
             "Review the checkpoint {} in this worktree against TASK.md. DIFF.patch is base → checkpoint; DIFF-incremental.patch is the change since your last review (empty on the first). Acceptance criteria ids: {:?}.",
@@ -659,9 +703,9 @@ impl<'a> Engine<'a> {
             self.end_and(&a, AttemptStatus::Failed, &last, AttemptEnd { error_class: Some("InvalidOutput".into()), correction_turns: Some(2), ..Default::default() }, Some(Ev::Escalate { reason }), None)?;
             return Ok(Flow::Next);
         }
-        std::fs::write(art.join("review.json"), serde_json::to_vec_pretty(&review)?)?;
         let md = super::render::render("review", &review)?;
-        std::fs::write(art.join("REVIEW.md"), &md)?;
+        self.put(t, &a, "review", "json", &serde_json::to_vec_pretty(&review)?, "review.json")?;
+        self.put(t, &a, "review-md", "md", md.as_bytes(), "REVIEW.md")?;
         eprintln!("\n{md}");
         let mut decision = review["decision"].as_str().unwrap_or("").to_string();
         let unmet: Vec<String> = review["acceptance_criteria"].as_array().into_iter().flatten().filter(|x| x["met"].as_bool() != Some(true)).filter_map(|x| x["id"].as_str().map(str::to_string)).collect();
@@ -717,28 +761,47 @@ impl<'a> Engine<'a> {
 
     // ── attempt helpers ──────────────────────────────────────────────────────────────
 
+    /// Publish an immutable artifact version for this attempt (R34) + its view.
+    fn put(&self, t: &TaskRow, a: &AttemptRow, logical: &str, ext: &str, bytes: &[u8], view: &str) -> Result<super::artifacts::Version> {
+        super::artifacts::put(self.store, t, Some(&a.id), logical, ext, logical, bytes, Some(view))
+    }
+
     /// Assemble the attempt's context (§7), store it as `context/<stage>-<attempt>` and
     /// record its hash on the attempt.
-    fn context(&self, t: &TaskRow, a: &AttemptRow, profile: &str) -> Result<PathBuf> {
-        let req = context::request(t, &self.cfg, &a.stage, profile)?;
+    fn context(&self, t: &TaskRow, a: &AttemptRow, profile: &str) -> Result<Option<PathBuf>> {
+        // R34: the task pack is hash-checked before it is handed over
+        let req = match context::request(self.store, t, &self.cfg, &a.stage, profile) {
+            Ok(r) => r,
+            Err(e) if format!("{e:#}").starts_with("artifact_") => {
+                let reason = format!("{e:#}");
+                eprintln!("!! {reason}");
+                let class = reason.split(':').next().unwrap_or("artifact_tampered").to_string();
+                let (i, aid) = (self.id.clone(), a.id.clone());
+                self.store.call(move |tx| {
+                    store::finish_attempt(tx, &aid, AttemptStatus::Failed, &AttemptEnd { error_class: Some(class), ..Default::default() })?;
+                    store::transition(tx, &i, Ev::Escalate { reason })?;
+                    Ok(())
+                })?;
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
         let c = context::assemble(&req)?;
-        let p = context::artifact_path(t, &a.stage, a.attempt);
-        std::fs::create_dir_all(p.parent().expect("parent"))?;
-        std::fs::write(&p, &c.text)?;
         for w in &c.warnings {
             eprintln!("!! {w}");
         }
         eprintln!("   context: {} bytes, {} sources, sha256 {}", c.text.len(), c.sources.len(), &c.sha256[..12]);
-        let rel = p.strip_prefix(&t.run_store).map(|x| x.display().to_string()).unwrap_or_else(|_| p.display().to_string());
-        let (tid, aid, logical, sha, size) = (t.id.clone(), a.id.clone(), format!("context/{}-{}", a.stage, a.attempt), c.sha256.clone(), c.text.len() as u64);
-        let payload = json!({"sha256": c.sha256, "sources": c.sources, "skipped": c.skipped, "warnings": c.warnings, "budget": c.budget});
+        let logical = format!("context/{}-{}", a.stage, a.attempt);
+        let v = super::artifacts::put(self.store, t, Some(&a.id), &logical, "md", "context", c.text.as_bytes(), Some(&format!("context/{}-{}.md", a.stage, a.attempt)))?;
+        let (tid, aid, sha) = (t.id.clone(), a.id.clone(), c.sha256.clone());
+        let payload = json!({"sha256": c.sha256, "artifact": v.id, "sources": c.sources, "skipped": c.skipped, "warnings": c.warnings, "budget": c.budget});
         self.store.call(move |tx| {
-            store::register_artifact(tx, &tid, Some(&aid), &logical, "context", &rel, &sha, size)?;
             store::set_attempt_context(tx, &aid, &sha)?;
             store::event(tx, Some(&tid), Some(&aid), "context_assembled", &payload)?;
             Ok(())
         })?;
-        Ok(p)
+        // the agent reads the immutable version, never the view (R34)
+        Ok(Some(v.path))
     }
 
     fn begin(&self, a: NewAttempt) -> Result<AttemptRow> {
@@ -855,8 +918,8 @@ pub fn approve_now(store: &Store, t: &TaskRow, kind: GateKind, expect: Option<&s
     }
     let e = match kind {
         GateKind::Plan => {
-            let now = sha256_hex(&std::fs::read(t.artifacts().join("plan.json"))?);
-            if now != gate.subject {
+            let (_, bytes) = super::artifacts::read_head(store, t, "plan")?.context("no registered plan")?;
+            if sha256_hex(&bytes) != gate.subject {
                 bail!("subject_changed: plan.json no longer matches the plan under approval (R32)");
             }
             Ev::PlanApproved { occurrence: gate.occurrence, subject: gate.subject }
@@ -896,6 +959,13 @@ pub fn gate_digest(store: &Store, task: &str, kind: GateKind, occurrence: u32) -
         .find(|r| r.gate == g && r.occurrence == occurrence)
         .map(|r| r.subject_digest)
         .context("no approval row for the open gate")
+}
+
+/// Is there a passing, hash-checked verify result for the current checkpoint (R29)?
+pub fn verify_current(store: &Store, t: &TaskRow) -> Result<bool> {
+    let Some((_, b)) = super::artifacts::read_head(store, t, "verify-result")? else { return Ok(false) };
+    let v: Value = serde_json::from_slice(&b)?;
+    Ok(v["pass"].as_bool() == Some(true) && v["invalidated"].as_bool() != Some(true) && v["head"].as_str().is_some() && v["head"].as_str() == t.machine.checkpoint())
 }
 
 /// What the human does next, for `status` and the end of `run`.
