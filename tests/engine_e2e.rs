@@ -39,8 +39,11 @@ fn gates_persist_and_the_task_completes() {
     let (code, err) = toryo(&env, &["run", "E-1", "--fake-agents", &s], &[]);
     assert_eq!(code, 0, "{err}");
     assert_eq!(task(&env, "E-1").state, St::WaitingPlanApproval);
-    let (_, out) = toryo(&env, &["status", "E-1"], &[]);
-    let _ = out;
+    let out = status_out(&env, "E-1");
+    assert!(
+        out.contains("E-1") && out.contains("WaitingPlanApproval"),
+        "{out}"
+    );
     // --expect with a wrong digest is refused, nothing changes
     let (code, err) = toryo(
         &env,
@@ -708,6 +711,12 @@ fn lock_first_recovery() {
         attempts(&env, "A-1")
             .iter()
             .any(|x| x.id == "A-1/implement/2" && x.status == AttemptStatus::Running)
+    });
+    // the attempt is Running before the fake writes: kill only after the partial work exists,
+    // otherwise the resumed turn has nothing to recover and verify fails (a race under load)
+    wait_until("A's second owner to write its partial work", 60, || {
+        std::fs::read_to_string(wt(&env, "A-1").join("src/Calculator.psm1"))
+            .is_ok_and(|s| s.contains("Divide-Numbers"))
     });
     // a leftover request for this owner: the owner dies before handling it → expired for the next
     let st = db(&env);

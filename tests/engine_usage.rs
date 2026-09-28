@@ -94,10 +94,7 @@ fn usage_accounting_a_admission_cap_pauses_before_the_next_turn() {
         calls(&env, "U-1").iter().all(|c| c["key"] != "reviewer"),
         "the refused turn never started"
     );
-    let (_, out) = toryo(&env, &["status", "U-1"], &[]);
-    let _ = out;
-    let o = command(&env, &["status", "U-1"], &[]).output().unwrap();
-    let status = String::from_utf8_lossy(&o.stdout);
+    let status = status_out(&env, "U-1");
     assert!(
         status.contains("admission cap (may overshoot by one turn)"),
         "{status}"

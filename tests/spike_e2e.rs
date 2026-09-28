@@ -541,9 +541,18 @@ fn pipeline_plan_gate_fix_cycle_and_approval() {
         has(&|s| s["step"] == "plan-gate" && s["decision"] == "approved"),
         "{err}"
     );
-    assert!(
-        err.contains("revised to address this") || std::fs::read_dir(env.data.join("runs")).is_ok()
-    );
+    // the second plan prompt asks for a revision that addresses the rejection
+    let mut files = Vec::new();
+    walk(&env.data.join("runs"), &mut files);
+    let revised = files
+        .iter()
+        .filter(|f| f.file_name().is_some_and(|n| n == "plan-2.prompt.md"))
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .any(|s| {
+            s.contains("revised to address this")
+                && s.contains("please also cover negative numbers")
+        });
+    assert!(revised, "{err}");
     if which_pwsh() {
         assert!(
             has(&|s| s["step"] == "review-0" && s["decision"] == "changes_requested"),

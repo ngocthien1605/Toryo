@@ -586,8 +586,8 @@ fn implementer_fallback_c_no_fallback_pauses_and_keeps_partial_work() {
         wt(&env, "Q-3").join("src/Partial.ps1").exists(),
         "partial work kept"
     );
-    let (_, out) = toryo(&env, &["status", "Q-3"], &[]);
-    let _ = out;
+    let out = status_out(&env, "Q-3");
+    assert!(out.contains("Q-3") && out.contains("Paused"), "{out}");
     // the quota is back: resume starts the chain again from the primary
     let s2 = script(
         &env,

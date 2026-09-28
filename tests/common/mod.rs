@@ -100,6 +100,17 @@ pub fn command(env: &Env, args: &[&str], extra: &[(&str, &str)]) -> Command {
     c
 }
 
+/// `toryo status <id>`: must succeed; returns stdout (where `status` prints).
+pub fn status_out(env: &Env, id: &str) -> String {
+    let o = command(env, &["status", id], &[]).output().unwrap();
+    assert!(
+        o.status.success(),
+        "toryo status {id}: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    String::from_utf8_lossy(&o.stdout).to_string()
+}
+
 pub fn toryo(env: &Env, args: &[&str], extra: &[(&str, &str)]) -> (i32, String) {
     let o = command(env, args, extra).output().unwrap();
     let err = String::from_utf8_lossy(&o.stderr).to_string();
@@ -143,6 +154,8 @@ pub fn wait_until(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
+/// Runs git in `dir` and returns its stdout. A failing git command fails the test, so a
+/// helper such as `clean()` can never pass because git itself failed.
 pub fn git(dir: &Path, args: &[&str]) -> String {
     let o = Command::new("git")
         .arg("-C")
@@ -150,6 +163,12 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .output()
         .unwrap();
+    assert!(
+        o.status.success(),
+        "git {args:?} in {} failed: {}",
+        dir.display(),
+        String::from_utf8_lossy(&o.stderr)
+    );
     String::from_utf8_lossy(&o.stdout).to_string()
 }
 
@@ -191,7 +210,7 @@ pub fn approved() -> Value {
 pub fn changes() -> Value {
     json!({"kind":"complete","structured":{"decision":"changes_requested","summary":"s","acceptance_criteria":[
         {"id":"AC-1","met":true,"evidence":"e1"},{"id":"AC-2","met":false,"evidence":"no zero test"},{"id":"AC-3","met":true,"evidence":"e3"}],
-        "issues":[{"id":"R-1","severity":"major","blocking":true,"description":"add the zero test"}]}})
+        "issues":[{"id":"I-1","severity":"high","blocking":true,"description":"add the zero test"}]}})
 }
 
 pub fn create(env: &Env, id: &str) {
