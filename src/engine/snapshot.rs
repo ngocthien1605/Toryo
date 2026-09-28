@@ -52,12 +52,19 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn paths(&self, kind: &str) -> Vec<&str> {
-        self.entries.iter().filter(|e| e.kind == kind).map(|e| e.path.as_str()).collect()
+        self.entries
+            .iter()
+            .filter(|e| e.kind == kind)
+            .map(|e| e.path.as_str())
+            .collect()
     }
 }
 
 fn split_z(b: &[u8]) -> Vec<String> {
-    b.split(|c| *c == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).to_string()).collect()
+    b.split(|c| *c == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).to_string())
+        .collect()
 }
 
 #[cfg(unix)]
@@ -73,8 +80,20 @@ fn mode_of(_p: &Path) -> Option<u32> {
 fn file_entry(root: &Path, path: &str, kind: &str) -> Result<Entry> {
     let p = root.join(path);
     Ok(match std::fs::read(&p) {
-        Ok(b) => Entry { path: path.into(), kind: kind.into(), size: b.len() as u64, sha256: sha256_hex(&b), mode: mode_of(&p) },
-        Err(_) => Entry { path: path.into(), kind: kind.into(), size: 0, sha256: String::new(), mode: None },
+        Ok(b) => Entry {
+            path: path.into(),
+            kind: kind.into(),
+            size: b.len() as u64,
+            sha256: sha256_hex(&b),
+            mode: mode_of(&p),
+        },
+        Err(_) => Entry {
+            path: path.into(),
+            kind: kind.into(),
+            size: 0,
+            sha256: String::new(),
+            mode: None,
+        },
     })
 }
 
@@ -86,7 +105,13 @@ fn copy_into(src_root: &Path, path: &str, dst_root: &Path) -> Result<()> {
 }
 
 /// Take a new snapshot version under `root` (the attempt's snapshot directory).
-pub fn take(wt: &Worktree, protect: &Protected, root: &Path, task: &str, attempt: &str) -> Result<(PathBuf, Manifest)> {
+pub fn take(
+    wt: &Worktree,
+    protect: &Protected,
+    root: &Path,
+    task: &str,
+    attempt: &str,
+) -> Result<(PathBuf, Manifest)> {
     std::fs::create_dir_all(root)?;
     let head = wt.head()?;
     let staging = root.join(format!(".staging-{}", std::process::id()));
@@ -106,8 +131,21 @@ pub fn take(wt: &Worktree, protect: &Protected, root: &Path, task: &str, attempt
     // Byte copies of the tracked changes too: with `core.autocrlf` (the Git for Windows
     // default) a patch round trip does not restore the exact bytes; the copies do.
     for (kind, args) in [
-        ("staged", vec!["diff", "--cached", "--name-only", "-z", "--no-renames", "HEAD"]),
-        ("unstaged", vec!["diff", "--name-only", "-z", "--no-renames"]),
+        (
+            "staged",
+            vec![
+                "diff",
+                "--cached",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "HEAD",
+            ],
+        ),
+        (
+            "unstaged",
+            vec!["diff", "--name-only", "-z", "--no-renames"],
+        ),
     ] {
         for p in split_z(&g.run(&wt.loc, true, &args)?) {
             let e = file_entry(&wt.path, &p, kind)?;
@@ -117,11 +155,25 @@ pub fn take(wt: &Worktree, protect: &Protected, root: &Path, task: &str, attempt
             entries.push(e);
         }
     }
-    for p in split_z(&g.run(&wt.loc, true, &["ls-files", "-z", "--others", "--exclude-standard"])?) {
+    for p in split_z(&g.run(
+        &wt.loc,
+        true,
+        &["ls-files", "-z", "--others", "--exclude-standard"],
+    )?) {
         copy_into(&wt.path, &p, &staging.join("files"))?;
         entries.push(file_entry(&wt.path, &p, "untracked")?);
     }
-    for p in split_z(&g.run(&wt.loc, true, &["ls-files", "-z", "--others", "--ignored", "--exclude-standard"])?) {
+    for p in split_z(&g.run(
+        &wt.loc,
+        true,
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+        ],
+    )?) {
         if p.starts_with(".toryo-tmp/") || !protect.matches(&p) {
             continue;
         }
@@ -151,7 +203,8 @@ pub fn take(wt: &Worktree, protect: &Protected, root: &Path, task: &str, attempt
 }
 
 pub fn read_manifest(dir: &Path) -> Result<Manifest> {
-    let b = std::fs::read(dir.join("manifest.json")).with_context(|| format!("snapshot_incomplete: no manifest in {}", dir.display()))?;
+    let b = std::fs::read(dir.join("manifest.json"))
+        .with_context(|| format!("snapshot_incomplete: no manifest in {}", dir.display()))?;
     Ok(serde_json::from_slice(&b)?)
 }
 
@@ -160,8 +213,13 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest> {
 /// touching the worktree).
 pub fn completion_check(wt: &Worktree, dir: &Path) -> Result<Manifest> {
     let m = read_manifest(dir)?;
-    let fail = |what: String| -> Result<Manifest> { bail!("snapshot_incomplete: {what} ({})", dir.display()) };
-    for (name, want) in [(TRACKED, &m.tracked_patch_sha256), (UNSTAGED, &m.unstaged_patch_sha256)] {
+    let fail = |what: String| -> Result<Manifest> {
+        bail!("snapshot_incomplete: {what} ({})", dir.display())
+    };
+    for (name, want) in [
+        (TRACKED, &m.tracked_patch_sha256),
+        (UNSTAGED, &m.unstaged_patch_sha256),
+    ] {
         match std::fs::read(dir.join(name)) {
             Ok(b) if sha256_hex(&b) == *want => {}
             _ => return fail(format!("{name} is missing or changed")),
@@ -179,14 +237,21 @@ pub fn completion_check(wt: &Worktree, dir: &Path) -> Result<Manifest> {
             _ => return fail(format!("copy of `{}` is missing or changed", e.path)),
         }
     }
-    let scratch = dir.parent().expect("parent").join(format!(".check-index-{}", std::process::id()));
+    let scratch = dir
+        .parent()
+        .expect("parent")
+        .join(format!(".check-index-{}", std::process::id()));
     let _ = std::fs::remove_file(&scratch);
     let env = [("GIT_INDEX_FILE", scratch.as_path())];
     let g = wt.g;
     let res = (|| -> Result<()> {
         let o = g.output_env(&wt.loc, false, &["read-tree", &m.head], &env)?;
         if !o.status.success() {
-            bail!("read-tree {}: {}", m.head, String::from_utf8_lossy(&o.stderr).trim());
+            bail!(
+                "read-tree {}: {}",
+                m.head,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
         }
         for (name, check) in [(TRACKED, false), (UNSTAGED, true)] {
             let p = dir.join(name);
@@ -201,7 +266,10 @@ pub fn completion_check(wt: &Worktree, dir: &Path) -> Result<Manifest> {
             args.push(&ps);
             let o = g.output_env(&wt.loc, false, &args, &env)?;
             if !o.status.success() {
-                bail!("{name} does not apply: {}", String::from_utf8_lossy(&o.stderr).trim());
+                bail!(
+                    "{name} does not apply: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
             }
         }
         Ok(())
@@ -222,12 +290,21 @@ pub fn export(wt: &Worktree, dir: &Path, into: &Path) -> Result<Manifest> {
         bail!("{} is not empty", into.display());
     }
     let into_s = into.display().to_string().replace('\\', "/");
-    wt.g.run(&wt.loc, false, &["worktree", "add", "--detach", "-q", &into_s, &m.head])?;
-    let dst = Worktree { g: wt.g, path: into.to_path_buf(), loc: Loc::Discover(into.to_path_buf()) };
+    wt.g.run(
+        &wt.loc,
+        false,
+        &["worktree", "add", "--detach", "-q", &into_s, &m.head],
+    )?;
+    let dst = Worktree {
+        g: wt.g,
+        path: into.to_path_buf(),
+        loc: Loc::Discover(into.to_path_buf()),
+    };
     let tracked = dir.join(TRACKED);
     if std::fs::metadata(&tracked)?.len() > 0 {
         let ps = tracked.display().to_string();
-        dst.g.run(&dst.loc, false, &["apply", "--cached", "--binary", &ps])?;
+        dst.g
+            .run(&dst.loc, false, &["apply", "--cached", "--binary", &ps])?;
     }
     for e in &m.entries {
         let sub = match e.kind.as_str() {

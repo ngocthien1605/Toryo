@@ -129,7 +129,10 @@ pub fn parse_allow_protected(task: &str) -> Vec<String> {
     for line in task.lines() {
         let t = line.trim();
         if t.starts_with('#') {
-            in_section = t.trim_start_matches('#').trim().eq_ignore_ascii_case("allow protected");
+            in_section = t
+                .trim_start_matches('#')
+                .trim()
+                .eq_ignore_ascii_case("allow protected");
             continue;
         }
         if in_section {
@@ -183,7 +186,10 @@ impl Protected {
         self.allowed = allowed.iter().map(|g| glob_to_regex(g)).collect();
         self.deny = deny
             .iter()
-            .map(|g| regex::Regex::new(&format!("(?i){}", glob_to_regex(g).as_str())).unwrap_or_else(|_| glob_to_regex(g)))
+            .map(|g| {
+                regex::Regex::new(&format!("(?i){}", glob_to_regex(g).as_str()))
+                    .unwrap_or_else(|_| glob_to_regex(g))
+            })
             .collect();
         self
     }
@@ -348,10 +354,19 @@ mod tests {
         assert!(!p.is_protected("scripts/other.ps1"));
         assert!(!p.is_protected("tasks/BR-002.md"));
         let p = p.with_policy(&["AGENTS.md".into()], &["**/ZZZ/**".into()]);
-        assert!(!p.is_protected("AGENTS.md") && p.matches("AGENTS.md"), "allowed, still snapshotted");
-        assert!(p.is_denied("Metadata/zzz/Foo.xml") && p.is_denied("ZZZ/a") && p.violates("x/ZZZ/y"));
+        assert!(
+            !p.is_protected("AGENTS.md") && p.matches("AGENTS.md"),
+            "allowed, still snapshotted"
+        );
+        assert!(
+            p.is_denied("Metadata/zzz/Foo.xml") && p.is_denied("ZZZ/a") && p.violates("x/ZZZ/y")
+        );
         assert!(!p.is_denied("src/ZZZa/b"));
-        let t = "# T\n## Allow protected\n- `scripts\\test.ps1`\n- AGENTS.md\n\n## Notes\n- not this\n";
-        assert_eq!(parse_allow_protected(t), vec!["scripts/test.ps1".to_string(), "AGENTS.md".to_string()]);
+        let t =
+            "# T\n## Allow protected\n- `scripts\\test.ps1`\n- AGENTS.md\n\n## Notes\n- not this\n";
+        assert_eq!(
+            parse_allow_protected(t),
+            vec!["scripts/test.ps1".to_string(), "AGENTS.md".to_string()]
+        );
     }
 }

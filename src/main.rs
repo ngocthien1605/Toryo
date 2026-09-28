@@ -152,8 +152,6 @@ enum SecretsCmd {
     Set { target: String },
 }
 
-
-
 pub(crate) fn load_config(cli: &Cli) -> Result<Effective> {
     let path = cli
         .config
@@ -166,7 +164,6 @@ pub(crate) fn load_config(cli: &Cli) -> Result<Effective> {
         .or_else(default_machine_config_path);
     Effective::load(&path, machine.as_deref())
 }
-
 
 fn run(cli: Cli) -> Result<i32> {
     match &cli.cmd {
@@ -217,13 +214,30 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Spike { cmd } => spike(&cli, cmd),
         Cmd::Task { cmd } => engine_cli::task(&cli, cmd),
         Cmd::Run { id, drive } => engine_cli::run(id, drive),
-        Cmd::Approve { id, gate, expect, force, cont, drive } => {
-            engine_cli::approve(id, *gate, expect.as_deref(), *force, *cont, drive)
-        }
+        Cmd::Approve {
+            id,
+            gate,
+            expect,
+            force,
+            cont,
+            drive,
+        } => engine_cli::approve(id, *gate, expect.as_deref(), *force, *cont, drive),
         Cmd::Reject { id, gate, reason } => engine_cli::reject(id, *gate, reason),
-        Cmd::Resume { id, note, discard_partial, keep_partial, accept_protected, drive } => engine_cli::resume(
+        Cmd::Resume {
+            id,
+            note,
+            discard_partial,
+            keep_partial,
+            accept_protected,
+            drive,
+        } => engine_cli::resume(
             id.as_deref(),
-            &ResumeArgs { note: note.clone(), discard_partial: *discard_partial, keep_partial: *keep_partial, accept_protected: accept_protected.clone() },
+            &ResumeArgs {
+                note: note.clone(),
+                discard_partial: *discard_partial,
+                keep_partial: *keep_partial,
+                accept_protected: accept_protected.clone(),
+            },
             drive,
         ),
         Cmd::Stop { id, wait_secs } => engine_cli::stop(id, *wait_secs),
@@ -233,7 +247,6 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Budget { cmd } => engine_cli::budget(cmd),
     }
 }
-
 
 fn main() -> ExitCode {
     let cli = Cli::parse();

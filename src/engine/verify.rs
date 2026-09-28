@@ -36,7 +36,9 @@ pub const MUTATED: &str = "verify_mutated_tree";
 /// `verify.verify_root`, expanded (default `%LOCALAPPDATA%\toryo-verify`; `<data>/verify`
 /// where `LOCALAPPDATA` does not exist).
 pub fn verify_root(cfg: &Effective) -> PathBuf {
-    expand_vars(&cfg.repo.verify.verify_root).map(PathBuf::from).unwrap_or_else(|_| data_dir().join("verify"))
+    expand_vars(&cfg.repo.verify.verify_root)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| data_dir().join("verify"))
 }
 
 /// The configured boundary; `separate_user` is not in v0.1.
@@ -79,7 +81,12 @@ pub fn probe(cfg: &Effective) -> Result<()> {
             let scratch = root.join(format!(".label-probe-{}", std::process::id()));
             let r = label(std::slice::from_ref(&scratch));
             let _ = std::fs::remove_dir_all(&scratch);
-            r.map_err(|e| anyhow::anyhow!("{UNAVAILABLE}: verify_root {} — {e:#} (R45)", root.display()))
+            r.map_err(|e| {
+                anyhow::anyhow!(
+                    "{UNAVAILABLE}: verify_root {} — {e:#} (R45)",
+                    root.display()
+                )
+            })
         }
     }
 }
@@ -98,7 +105,10 @@ pub struct Checkout {
 
 impl Checkout {
     pub fn loc(&self) -> Loc {
-        Loc::Explicit { git_dir: self.admin.clone(), work_tree: self.dir.clone() }
+        Loc::Explicit {
+            git_dir: self.admin.clone(),
+            work_tree: self.dir.clone(),
+        }
     }
     pub fn build(&self) -> PathBuf {
         self.base.join("build")
@@ -122,16 +132,28 @@ fn empty_dir(d: &Path) -> Result<()> {
     std::fs::create_dir_all(d)?;
     for e in std::fs::read_dir(d)?.flatten() {
         let p = e.path();
-        let r = if e.file_type().map(|f| f.is_dir()).unwrap_or(false) { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+        let r = if e.file_type().map(|f| f.is_dir()).unwrap_or(false) {
+            std::fs::remove_dir_all(&p)
+        } else {
+            std::fs::remove_file(&p)
+        };
         r.with_context(|| format!("emptying {}", d.display()))?;
     }
     Ok(())
 }
 
 /// Create the checkout once (or again, if it is gone), then reset it to `sha` for this run.
-pub fn prepare(g: &GitCmd, t: &TaskRow, cfg: &Effective, sha: &str, b: Boundary) -> Result<Checkout> {
+pub fn prepare(
+    g: &GitCmd,
+    t: &TaskRow,
+    cfg: &Effective,
+    sha: &str,
+    b: Boundary,
+) -> Result<Checkout> {
     let low = b == Boundary::LowIntegrity;
-    let rec: Option<Checkout> = std::fs::read(record_path(t)).ok().and_then(|x| serde_json::from_slice(&x).ok());
+    let rec: Option<Checkout> = std::fs::read(record_path(t))
+        .ok()
+        .and_then(|x| serde_json::from_slice(&x).ok());
     let co = match rec.filter(|c| c.dir.exists() && c.admin.exists() && c.low == low) {
         Some(c) => c,
         None => {
@@ -145,16 +167,34 @@ pub fn prepare(g: &GitCmd, t: &TaskRow, cfg: &Effective, sha: &str, b: Boundary)
             }
             let _ = g.output(&repo, false, &["worktree", "prune"]);
             std::fs::create_dir_all(&base)?;
-            g.run(&repo, false, &["worktree", "add", "-q", "--detach", &fwd, sha])?;
+            g.run(
+                &repo,
+                false,
+                &["worktree", "add", "-q", "--detach", &fwd, sha],
+            )?;
             // trustworthy: no verify code has run in the checkout yet
-            let admin = PathBuf::from(g.run_str(&Loc::Discover(dir.clone()), true, &["rev-parse", "--absolute-git-dir"])?.trim());
+            let admin = PathBuf::from(
+                g.run_str(
+                    &Loc::Discover(dir.clone()),
+                    true,
+                    &["rev-parse", "--absolute-git-dir"],
+                )?
+                .trim(),
+            );
             let pointer = std::fs::read_to_string(dir.join(".git"))?;
-            let c = Checkout { base, dir, admin, pointer, low };
+            let c = Checkout {
+                base,
+                dir,
+                admin,
+                pointer,
+                low,
+            };
             for d in [c.build(), c.cache(), c.tmp(), c.home()] {
                 std::fs::create_dir_all(&d)?;
             }
             if low {
-                label(&[c.dir.clone(), c.build(), c.cache(), c.tmp(), c.home()]).map_err(|e| anyhow::anyhow!("{UNAVAILABLE}: {e:#} (R45)"))?;
+                label(&[c.dir.clone(), c.build(), c.cache(), c.tmp(), c.home()])
+                    .map_err(|e| anyhow::anyhow!("{UNAVAILABLE}: {e:#} (R45)"))?;
             }
             std::fs::write(record_path(t), serde_json::to_vec_pretty(&c)?)?;
             c
@@ -167,7 +207,11 @@ pub fn prepare(g: &GitCmd, t: &TaskRow, cfg: &Effective, sha: &str, b: Boundary)
     let loc = co.loc();
     g.run(&loc, false, &["checkout", "-q", "--detach", "--force", sha])?;
     let clean = cfg.repo.verify.checkout != "tracked";
-    g.run(&loc, false, &["clean", "-q", if clean { "-ffdx" } else { "-ffd" }])?;
+    g.run(
+        &loc,
+        false,
+        &["clean", "-q", if clean { "-ffdx" } else { "-ffd" }],
+    )?;
     empty_dir(&co.tmp())?;
     empty_dir(&co.home())?;
     if clean {
@@ -175,9 +219,17 @@ pub fn prepare(g: &GitCmd, t: &TaskRow, cfg: &Effective, sha: &str, b: Boundary)
         empty_dir(&co.cache())?;
     }
     let head = g.run_str(&loc, true, &["rev-parse", "HEAD"])?;
-    let status = g.run(&loc, true, &["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
+    let status = g.run(
+        &loc,
+        true,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
     if head.trim() != sha || !status.is_empty() {
-        bail!("{MUTATED}: the verify checkout is not a clean checkout of {} before the run (HEAD {})", &sha[..12], head.trim());
+        bail!(
+            "{MUTATED}: the verify checkout is not a clean checkout of {} before the run (HEAD {})",
+            &sha[..12],
+            head.trim()
+        );
     }
     Ok(co)
 }
@@ -200,9 +252,17 @@ pub fn env(co: &Checkout) -> BTreeMap<String, String> {
         // tools that insist on the profile get Low locations (M0-VERIFY 9)
         set("APPDATA", &co.home().join("AppData").join("Roaming"));
         set("LOCALAPPDATA", &co.home().join("AppData").join("Local"));
-        set("PSModuleAnalysisCachePath", &co.cache().join("psmodule-analysis"));
+        set(
+            "PSModuleAnalysisCachePath",
+            &co.cache().join("psmodule-analysis"),
+        );
     }
-    for (k, v) in [("GIT_OPTIONAL_LOCKS", "0"), ("NO_COLOR", "1"), ("POWERSHELL_TELEMETRY_OPTOUT", "1"), ("POWERSHELL_UPDATECHECK", "Off")] {
+    for (k, v) in [
+        ("GIT_OPTIONAL_LOCKS", "0"),
+        ("NO_COLOR", "1"),
+        ("POWERSHELL_TELEMETRY_OPTOUT", "1"),
+        ("POWERSHELL_UPDATECHECK", "Off"),
+    ] {
         env.insert(k.into(), v.into());
     }
     env
@@ -216,32 +276,72 @@ pub fn mutated(g: &GitCmd, co: &Checkout, sha: &str) -> Result<Option<String>> {
     let loc = co.loc();
     let head = g.run_str(&loc, true, &["rev-parse", "HEAD"])?;
     if head.trim() != sha {
-        return Ok(Some(format!("{MUTATED}: a verify command moved HEAD of the verify checkout to {}", head.trim())));
+        return Ok(Some(format!(
+            "{MUTATED}: a verify command moved HEAD of the verify checkout to {}",
+            head.trim()
+        )));
     }
-    let changed = g.run(&loc, true, &["diff", "--name-only", "-z", "--no-ext-diff", "--no-textconv", "HEAD"])?;
+    let changed = g.run(
+        &loc,
+        true,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+        ],
+    )?;
     if !changed.is_empty() {
-        let files: Vec<String> = changed.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).to_string()).collect();
-        return Ok(Some(format!("{MUTATED}: a verify command modified tracked files {files:?}")));
+        let files: Vec<String> = changed
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).to_string())
+            .collect();
+        return Ok(Some(format!(
+            "{MUTATED}: a verify command modified tracked files {files:?}"
+        )));
     }
     Ok(None)
 }
 
 /// SHA-256 of each verify script as checked out (R29: the result names what ran).
 pub fn script_hashes(files: &[String], co: &Checkout) -> BTreeMap<String, String> {
-    files.iter().filter_map(|f| std::fs::read(co.dir.join(f)).ok().map(|b| (f.clone(), sha256_hex(&b)))).collect()
+    files
+        .iter()
+        .filter_map(|f| {
+            std::fs::read(co.dir.join(f))
+                .ok()
+                .map(|b| (f.clone(), sha256_hex(&b)))
+        })
+        .collect()
 }
 
 /// `task cleanup`: remove the checkout and its directories.
 pub fn cleanup(g: &GitCmd, t: &TaskRow, cfg: &Effective) -> Result<()> {
-    let rec: Option<Checkout> = std::fs::read(record_path(t)).ok().and_then(|x| serde_json::from_slice(&x).ok());
-    let base = rec.as_ref().map(|c| c.base.clone()).unwrap_or_else(|| verify_root(cfg).join(&t.id));
+    let rec: Option<Checkout> = std::fs::read(record_path(t))
+        .ok()
+        .and_then(|x| serde_json::from_slice(&x).ok());
+    let base = rec
+        .as_ref()
+        .map(|c| c.base.clone())
+        .unwrap_or_else(|| verify_root(cfg).join(&t.id));
     if let Some(c) = rec {
         let fwd = c.dir.display().to_string().replace('\\', "/");
-        let _ = g.output(&Loc::Discover(t.repo.clone()), false, &["worktree", "remove", "--force", &fwd]);
+        let _ = g.output(
+            &Loc::Discover(t.repo.clone()),
+            false,
+            &["worktree", "remove", "--force", &fwd],
+        );
     }
     if base.exists() {
         std::fs::remove_dir_all(&base).with_context(|| format!("removing {}", base.display()))?;
     }
-    let _ = g.output(&Loc::Discover(t.repo.clone()), false, &["worktree", "prune"]);
+    let _ = g.output(
+        &Loc::Discover(t.repo.clone()),
+        false,
+        &["worktree", "prune"],
+    );
     Ok(())
 }

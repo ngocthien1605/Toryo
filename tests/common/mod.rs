@@ -49,13 +49,35 @@ commands:
     - {{ name: divide-present, program: git, args: ["grep", "-q", "Divide-Numbers", "--", "src"] }}
 {verify}{extra}"#,
             repo = fwd(&repo),
-            verify = if extra.contains("verify:") { String::new() } else { format!("verify: {{ boundary: none, verify_root: \"{}\" }}\n", fwd(&root.join("verify"))) },
+            verify = if extra.contains("verify:") {
+                String::new()
+            } else {
+                format!(
+                    "verify: {{ boundary: none, verify_root: \"{}\" }}\n",
+                    fwd(&root.join("verify"))
+                )
+            },
             wts = fwd(&root.join("wts")),
         ),
     )
     .unwrap();
-    let env = Env { _tmp: tmp, root, config, data, repo };
-    let (code, err) = toryo(&env, &["spike", "init-fixture", "--into", env.repo.to_str().unwrap()], &[]);
+    let env = Env {
+        _tmp: tmp,
+        root,
+        config,
+        data,
+        repo,
+    };
+    let (code, err) = toryo(
+        &env,
+        &[
+            "spike",
+            "init-fixture",
+            "--into",
+            env.repo.to_str().unwrap(),
+        ],
+        &[],
+    );
     assert_eq!(code, 0, "{err}");
     env
 }
@@ -89,7 +111,11 @@ pub fn toryo(env: &Env, args: &[&str], extra: &[(&str, &str)]) -> (i32, String) 
 
 pub fn spawn(env: &Env, args: &[&str], log: &str) -> Child {
     let f = std::fs::File::create(env.root.join(log)).unwrap();
-    command(env, args, &[]).stdout(Stdio::null()).stderr(f).spawn().unwrap()
+    command(env, args, &[])
+        .stdout(Stdio::null())
+        .stderr(f)
+        .spawn()
+        .unwrap()
 }
 
 pub fn db(env: &Env) -> Store {
@@ -118,17 +144,28 @@ pub fn wait_until(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
 }
 
 pub fn git(dir: &Path, args: &[&str]) -> String {
-    let o = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+    let o = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
     String::from_utf8_lossy(&o.stdout).to_string()
 }
 
 pub fn clean(dir: &Path) -> bool {
-    git(dir, &["status", "--porcelain", "--untracked-files=all"]).trim().is_empty()
+    git(dir, &["status", "--porcelain", "--untracked-files=all"])
+        .trim()
+        .is_empty()
 }
 
 pub fn script(env: &Env, name: &str, turns: Value) -> String {
     let p = env.root.join(name);
-    std::fs::write(&p, serde_json::to_vec_pretty(&json!({ "turns": turns })).unwrap()).unwrap();
+    std::fs::write(
+        &p,
+        serde_json::to_vec_pretty(&json!({ "turns": turns })).unwrap(),
+    )
+    .unwrap();
     p.display().to_string()
 }
 
@@ -158,7 +195,11 @@ pub fn changes() -> Value {
 }
 
 pub fn create(env: &Env, id: &str) {
-    let (code, err) = toryo(env, &["task", "create", "--file", "TASK.md", "--id", id], &[]);
+    let (code, err) = toryo(
+        env,
+        &["task", "create", "--file", "TASK.md", "--id", id],
+        &[],
+    );
     assert_eq!(code, 0, "{err}");
 }
 
@@ -173,11 +214,17 @@ pub fn trailers(env: &Env, id: &str) -> String {
     )
 }
 
-
 /// The fake agent calls recorded by the latest run of a task.
 pub fn calls(env: &Env, id: &str) -> Vec<Value> {
     let t = task(env, id);
-    let v: Value = serde_json::from_slice(&std::fs::read(t.captures().join(format!("fake-calls-{}.json", t.lock_generation))).unwrap()).unwrap();
+    let v: Value = serde_json::from_slice(
+        &std::fs::read(
+            t.captures()
+                .join(format!("fake-calls-{}.json", t.lock_generation)),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     v.as_array().cloned().unwrap_or_default()
 }
 
@@ -192,7 +239,24 @@ pub fn commit_repo(env: &Env, files: &[(&str, &str)], msg: &str) {
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();
         std::fs::write(f, c).unwrap();
     }
-    let run = |a: &[&str]| assert!(Command::new("git").arg("-C").arg(&env.repo).args(a).status().unwrap().success());
+    let run = |a: &[&str]| {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&env.repo)
+            .args(a)
+            .status()
+            .unwrap()
+            .success())
+    };
     run(&["add", "-A"]);
-    run(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", msg]);
+    run(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        msg,
+    ]);
 }

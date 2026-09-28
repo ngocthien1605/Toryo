@@ -94,19 +94,39 @@ impl TokenUsage {
 pub enum AgentEvent {
     SessionIdentified(String),
     TextDelta(String),
-    ToolActivity { name: String, summary: String },
-    PermissionDenied { tool: String, detail: String },
+    ToolActivity {
+        name: String,
+        summary: String,
+    },
+    PermissionDenied {
+        tool: String,
+        detail: String,
+    },
     Usage(TokenUsage),
-    Retrying { attempt: u32, delay_ms: u64, class: ErrorClass },
-    TurnCompleted { final_text: String, structured: Option<Value> },
+    Retrying {
+        attempt: u32,
+        delay_ms: u64,
+        class: ErrorClass,
+    },
+    TurnCompleted {
+        final_text: String,
+        structured: Option<Value>,
+    },
     /// `structured` carries a schema payload that arrived before the failure (e.g. a Claude
     /// result whose turn is failed because of a permission denial), for diagnostics only.
-    TurnFailed { class: ErrorClass, detail: String, structured: Option<Value> },
+    TurnFailed {
+        class: ErrorClass,
+        detail: String,
+        structured: Option<Value>,
+    },
 }
 
 impl AgentEvent {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, AgentEvent::TurnCompleted { .. } | AgentEvent::TurnFailed { .. })
+        matches!(
+            self,
+            AgentEvent::TurnCompleted { .. } | AgentEvent::TurnFailed { .. }
+        )
     }
 }
 
@@ -194,12 +214,19 @@ impl StageOutcome {
             }
             AgentEvent::Usage(u) => self.usage = Some(*u),
             AgentEvent::Retrying { .. } => self.retries += 1,
-            AgentEvent::TurnCompleted { final_text, structured } => {
+            AgentEvent::TurnCompleted {
+                final_text,
+                structured,
+            } => {
                 self.success = true;
                 self.final_text = final_text.clone();
                 self.structured = structured.clone();
             }
-            AgentEvent::TurnFailed { class, detail, structured } => {
+            AgentEvent::TurnFailed {
+                class,
+                detail,
+                structured,
+            } => {
                 self.success = false;
                 self.error_class = Some(*class);
                 self.error_detail = Some(detail.clone());
@@ -213,16 +240,26 @@ impl StageOutcome {
     pub fn print_summary(&self) {
         eprintln!("── turn summary ({}) ──", self.label);
         eprintln!("success          : {}", self.success);
-        eprintln!("session id       : {}", self.session_id.as_deref().unwrap_or("-"));
+        eprintln!(
+            "session id       : {}",
+            self.session_id.as_deref().unwrap_or("-")
+        );
         if let Some(c) = self.error_class {
-            eprintln!("error            : {c:?} — {}", self.error_detail.as_deref().unwrap_or(""));
+            eprintln!(
+                "error            : {c:?} — {}",
+                self.error_detail.as_deref().unwrap_or("")
+            );
         }
         eprintln!("permission denials: {}", self.permission_denials.len());
         match self.usage {
             Some(u) => eprintln!("usage ({:?})     : {:?}", u.accounting, u.buckets),
             None => eprintln!("usage            : none reported"),
         }
-        eprintln!("duration         : {:.1}s{}", self.duration_ms as f64 / 1000.0, if self.timed_out { " (timed out)" } else { "" });
+        eprintln!(
+            "duration         : {:.1}s{}",
+            self.duration_ms as f64 / 1000.0,
+            if self.timed_out { " (timed out)" } else { "" }
+        );
         if let Some(d) = &self.capture_dir {
             eprintln!("captured in      : {}", d.display());
         }

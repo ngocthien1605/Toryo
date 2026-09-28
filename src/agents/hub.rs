@@ -12,7 +12,9 @@ use super::claude::LaunchMode;
 use super::cli::CliAdapter;
 use super::fake::{FakeAgentAdapter, FakeCall, FakeScript};
 use crate::config::Effective;
-use crate::domain::{AgentHealth, OpenSession, StageOutcome, TurnInput, TurnLimits, UsageCapabilities};
+use crate::domain::{
+    AgentHealth, OpenSession, StageOutcome, TurnInput, TurnLimits, UsageCapabilities,
+};
 
 pub struct AgentHub {
     rt: tokio::runtime::Runtime,
@@ -22,13 +24,19 @@ pub struct AgentHub {
 }
 
 impl AgentHub {
-    pub fn new(cfg: &Effective, claude_mode: LaunchMode, fake_script: Option<&Path>) -> Result<Self> {
+    pub fn new(
+        cfg: &Effective,
+        claude_mode: LaunchMode,
+        fake_script: Option<&Path>,
+    ) -> Result<Self> {
         let fake = match fake_script {
             Some(p) => Some(FakeAgentAdapter::new(FakeScript::load(p)?)),
             None => None,
         };
         Ok(Self {
-            rt: tokio::runtime::Builder::new_multi_thread().enable_all().build()?,
+            rt: tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?,
             cfg: Arc::new(cfg.clone()),
             claude_mode,
             fake,
@@ -48,7 +56,11 @@ impl AgentHub {
         let kind = self.cfg.profile(profile)?.kind;
         Ok(match &self.fake {
             Some(f) => Box::new(f.for_profile(profile, kind)),
-            None => Box::new(CliAdapter::new(self.cfg.clone(), profile, self.claude_mode)?),
+            None => Box::new(CliAdapter::new(
+                self.cfg.clone(),
+                profile,
+                self.claude_mode,
+            )?),
         })
     }
 
@@ -62,12 +74,23 @@ impl AgentHub {
     }
 
     /// Open a session, run one turn to completion, close.
-    pub fn turn(&self, open: OpenSession, input: TurnInput, limits: TurnLimits) -> Result<StageOutcome> {
+    pub fn turn(
+        &self,
+        open: OpenSession,
+        input: TurnInput,
+        limits: TurnLimits,
+    ) -> Result<StageOutcome> {
         self.turn_with(open, input, limits, TurnHooks::default())
     }
 
     /// [`AgentHub::turn`] with hooks (stop request, session id as soon as known).
-    pub fn turn_with(&self, open: OpenSession, input: TurnInput, limits: TurnLimits, hooks: TurnHooks) -> Result<StageOutcome> {
+    pub fn turn_with(
+        &self,
+        open: OpenSession,
+        input: TurnInput,
+        limits: TurnLimits,
+        hooks: TurnHooks,
+    ) -> Result<StageOutcome> {
         let adapter = self.adapter(&open.profile)?;
         let capture = open.capture_dir.clone();
         self.rt.block_on(async move {

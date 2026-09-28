@@ -55,7 +55,11 @@ impl CommandResult {
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
     /// Run to completion; `sink` receives output chunks (ANSI-stripped) as they arrive.
-    async fn run(&self, spec: RunSpec, sink: Option<UnboundedSender<String>>) -> Result<CommandResult>;
+    async fn run(
+        &self,
+        spec: RunSpec,
+        sink: Option<UnboundedSender<String>>,
+    ) -> Result<CommandResult>;
 }
 
 /// Runs on this machine inside a per-command Job Object.
@@ -63,7 +67,11 @@ pub struct LocalRunner;
 
 #[async_trait]
 impl CommandRunner for LocalRunner {
-    async fn run(&self, spec: RunSpec, sink: Option<UnboundedSender<String>>) -> Result<CommandResult> {
+    async fn run(
+        &self,
+        spec: RunSpec,
+        sink: Option<UnboundedSender<String>>,
+    ) -> Result<CommandResult> {
         tokio::task::spawn_blocking(move || {
             let s = SpawnSpec {
                 program: spec.program.clone(),
@@ -73,15 +81,18 @@ impl CommandRunner for LocalRunner {
                 stdin: None,
                 boundary: spec.boundary,
             };
-            let running = spawn(&s, &Redactions::empty())
-                .with_context(|| format!("starting `{}` ({})", spec.name, spec.program.display()))?;
+            let running = spawn(&s, &Redactions::empty()).with_context(|| {
+                format!("starting `{}` ({})", spec.name, spec.program.display())
+            })?;
             let cancel_flag = spec.cancel.clone();
             let mut out = Vec::new();
             let info = running.wait(
                 WaitOptions {
                     max: Some(spec.timeout),
                     stall: None,
-                    cancel: cancel_flag.map(|c| Box::new(move || c.load(Ordering::SeqCst)) as Box<dyn Fn() -> bool + Send>),
+                    cancel: cancel_flag.map(|c| {
+                        Box::new(move || c.load(Ordering::SeqCst)) as Box<dyn Fn() -> bool + Send>
+                    }),
                 },
                 |c| {
                     let (Chunk::Stdout(b) | Chunk::Stderr(b)) = c;
@@ -93,7 +104,11 @@ impl CommandRunner for LocalRunner {
             )?;
             Ok(CommandResult {
                 name: spec.name,
-                exit: if info.timed_out || info.cancelled { None } else { info.code },
+                exit: if info.timed_out || info.cancelled {
+                    None
+                } else {
+                    info.code
+                },
                 timed_out: info.timed_out,
                 cancelled: info.cancelled,
                 duration_ms: info.duration_ms,

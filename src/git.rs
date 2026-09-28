@@ -152,7 +152,13 @@ impl GitCmd {
 
     /// Like [`GitCmd::output`] with extra environment (e.g. `GIT_INDEX_FILE` for a scratch
     /// index) and optional stdin.
-    pub fn output_env(&self, loc: &Loc, read_only: bool, args: &[&str], env: &[(&str, &Path)]) -> Result<Output> {
+    pub fn output_env(
+        &self,
+        loc: &Loc,
+        read_only: bool,
+        args: &[&str],
+        env: &[(&str, &Path)],
+    ) -> Result<Output> {
         let mut cmd = self.command(loc, read_only);
         for (k, v) in env {
             cmd.env(k, v);

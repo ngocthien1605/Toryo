@@ -82,8 +82,15 @@ impl TaskLock {
                         std::thread::sleep(Duration::from_millis(200));
                         continue;
                     }
-                    let (owner, since) = o.map(|(l, s, _, _)| (l, s)).unwrap_or_else(|| ("?".into(), "?".into()));
-                    return Err(TaskActive { task: task.to_string(), owner, since }.into());
+                    let (owner, since) = o
+                        .map(|(l, s, _, _)| (l, s))
+                        .unwrap_or_else(|| ("?".into(), "?".into()));
+                    return Err(TaskActive {
+                        task: task.to_string(),
+                        owner,
+                        since,
+                    }
+                    .into());
                 }
                 Err(TryLockError::Error(e)) => return Err(e).context("locking the task"),
             }
@@ -102,13 +109,17 @@ impl TaskLock {
     /// Is a stop addressed to this owner waiting? (Checked at every stage boundary.)
     pub fn stop_requested(&self) -> Result<bool> {
         let (t, g) = (self.task.clone(), self.generation);
-        Ok(self.store.call(move |tx| store::pending_stop(tx, &t, g))?.is_some())
+        Ok(self
+            .store
+            .call(move |tx| store::pending_stop(tx, &t, g))?
+            .is_some())
     }
 
     /// Mark the pending stop(s) handled.
     pub fn handle_stop(&self, outcome: &str) -> Result<()> {
         let (t, g, o) = (self.task.clone(), self.generation, outcome.to_string());
-        self.store.call(move |tx| store::handle_stops(tx, &t, g, &o).map(|_| ()))
+        self.store
+            .call(move |tx| store::handle_stops(tx, &t, g, &o).map(|_| ()))
     }
 
     /// Poll for a stop every second while a stage runs; sets the returned flag (which the
@@ -116,7 +127,13 @@ impl TaskLock {
     pub fn watch_stop(&self) -> StopWatch {
         let flag = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
-        let (f2, d2, st, t, g) = (flag.clone(), done.clone(), self.store.clone(), self.task.clone(), self.generation);
+        let (f2, d2, st, t, g) = (
+            flag.clone(),
+            done.clone(),
+            self.store.clone(),
+            self.task.clone(),
+            self.generation,
+        );
         let handle = std::thread::spawn(move || {
             while !d2.load(Ordering::SeqCst) {
                 let (t2, g2) = (t.clone(), g);

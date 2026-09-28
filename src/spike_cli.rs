@@ -334,9 +334,18 @@ pub fn run_canaries(cli: &Cli, only: &[String], mode: LaunchMode) -> Result<Vec<
         };
         steps.push((format!("{} {name}", args[1]), args));
         // R49: a Claude profile in the implementer chain also runs the implementer mode
-        let in_chain = toryo::engine::task::roles(&cfg).map(|(_, chain, _)| chain.contains(name)).unwrap_or(false);
+        let in_chain = toryo::engine::task::roles(&cfg)
+            .map(|(_, chain, _)| chain.contains(name))
+            .unwrap_or(false);
         if p.kind == toryo::config::ProfileKind::Claude && in_chain {
-            let a2 = s(&["spike", "claude-implementer-isolation", "--profile", name, "--mode", &mode_arg]);
+            let a2 = s(&[
+                "spike",
+                "claude-implementer-isolation",
+                "--profile",
+                name,
+                "--mode",
+                &mode_arg,
+            ]);
             steps.push((format!("claude-implementer-isolation {name}"), a2));
         }
     }
@@ -353,7 +362,10 @@ pub fn run_canaries(cli: &Cli, only: &[String], mode: LaunchMode) -> Result<Vec<
             .args(&args)
             .status()
             .with_context(|| format!("running {label}"))?;
-        eprintln!("════ {label}: {} ════", if st.success() { "PASS" } else { "FAIL" });
+        eprintln!(
+            "════ {label}: {} ════",
+            if st.success() { "PASS" } else { "FAIL" }
+        );
         if !st.success() {
             failed.push(label);
         }
@@ -475,13 +487,21 @@ pub fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
             *mode,
             model.clone(),
         )?),
-        SpikeCmd::ClaudeImplementerIsolation { profile, mode, model } => ok(sa::claude_implementer_isolation(
+        SpikeCmd::ClaudeImplementerIsolation {
+            profile,
+            mode,
+            model,
+        } => ok(sa::claude_implementer_isolation(
             &load_config(cli)?,
             profile,
             *mode,
             model.clone(),
         )?),
-        SpikeCmd::CodexTempProbe { profile, model } => ok(sa::codex_temp_probe(&load_config(cli)?, profile, model.clone())?),
+        SpikeCmd::CodexTempProbe { profile, model } => ok(sa::codex_temp_probe(
+            &load_config(cli)?,
+            profile,
+            model.clone(),
+        )?),
         SpikeCmd::CodexCanary { profile, model } => ok(sa::codex_canary(
             &load_config(cli)?,
             profile,
@@ -598,7 +618,9 @@ pub fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
                 .clone()
                 .unwrap_or_else(|| role("implementer", "codex"));
             // owner decision 15: the reviewer is its own role, never changed by a fallback
-            let rp = claude_profile.clone().unwrap_or_else(|| role("reviewer", &cp));
+            let rp = claude_profile
+                .clone()
+                .unwrap_or_else(|| role("reviewer", &cp));
             let model = |r: &str| cfg.repo.roles.get(r).and_then(|x| x.model.clone());
             preflight(&cfg, &[&cp, &xp, &rp])?;
             // R51: isolation evidence must match the CLI versions installed now
@@ -617,7 +639,9 @@ pub fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
                     .collect::<Vec<_>>()
                     .join("\n");
                 if *accept_unverified {
-                    eprintln!("WARNING: running with unverified profiles (--accept-unverified):\n{list}");
+                    eprintln!(
+                        "WARNING: running with unverified profiles (--accept-unverified):\n{list}"
+                    );
                 } else {
                     bail!("unverified profiles (R51):\n{list}\nrun `toryo doctor --canaries`, or pass --accept-unverified");
                 }
@@ -641,11 +665,9 @@ pub fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
                     if chain.contains(&f) {
                         continue;
                     }
-                    match preflight(&cfg, &[&f]).and_then(|()| {
-                        match unverified(&[&f])?.pop() {
-                            Some((_, why)) if !*accept_unverified => bail!("{why}"),
-                            _ => Ok(()),
-                        }
+                    match preflight(&cfg, &[&f]).and_then(|()| match unverified(&[&f])?.pop() {
+                        Some((_, why)) if !*accept_unverified => bail!("{why}"),
+                        _ => Ok(()),
                     }) {
                         Ok(()) => chain.push(f),
                         Err(e) => eprintln!("WARNING: fallback implementer `{f}` skipped: {e:#}"),

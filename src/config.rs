@@ -337,7 +337,8 @@ impl Effective {
             #[serde(default)]
             trusted_filters: BTreeMap<String, TrustedFilter>,
         }
-        let f: Frozen = serde_json::from_str(canonical_json).context("parsing the frozen config.json")?;
+        let f: Frozen =
+            serde_json::from_str(canonical_json).context("parsing the frozen config.json")?;
         Ok(Self {
             repo: f.repo,
             trusted_filters: f.trusted_filters,

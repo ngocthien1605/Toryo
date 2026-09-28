@@ -891,7 +891,9 @@ fn version_bound_evidence() {
     let (env, repo) = pipeline_env(false, false);
     let r = repo.to_str().unwrap();
     let run = |extra: &[&str]| {
-        let mut a = vec!["spike", "pipeline", "--repo", r, "--task", "TASK.md", "--id"];
+        let mut a = vec![
+            "spike", "pipeline", "--repo", r, "--task", "TASK.md", "--id",
+        ];
         a.extend_from_slice(extra);
         toryo_stdin_strict(&env, &a, "q\n")
     };
@@ -899,7 +901,10 @@ fn version_bound_evidence() {
     let (code, err) = run(&["V-1"]);
     assert_ne!(code, 0);
     assert!(err.contains("unverified profiles (R51)"), "{err}");
-    assert!(err.contains("no claude-isolation record") && err.contains("no codex-canary record"), "{err}");
+    assert!(
+        err.contains("no claude-isolation record") && err.contains("no codex-canary record"),
+        "{err}"
+    );
     assert!(!env.root.join("wts").join("V-1").exists());
 
     // 2. doctor --canaries records versioned evidence for every profile + host
@@ -907,15 +912,33 @@ fn version_bound_evidence() {
     assert!(err.contains("canary: claude-isolation claude-max"), "{err}");
     assert!(err.contains("canary: codex-canary codex-foundry"), "{err}");
     let recs = records(&env);
-    let find = |spike: &str| recs.iter().rev().find(|x| x["spike"] == spike).cloned().unwrap();
-    assert_eq!(find("claude-isolation")["cli_versions"]["claude-max"], "2.1.300");
-    assert_eq!(find("codex-canary")["cli_versions"]["codex-foundry"], "0.200.0");
+    let find = |spike: &str| {
+        recs.iter()
+            .rev()
+            .find(|x| x["spike"] == spike)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(
+        find("claude-isolation")["cli_versions"]["claude-max"],
+        "2.1.300"
+    );
+    assert_eq!(
+        find("codex-canary")["cli_versions"]["codex-foundry"],
+        "0.200.0"
+    );
     assert!(find("git-canary")["cli_versions"]["git"].is_string());
-    assert!(out.contains("codex-canary passed") && out.contains("for 0.200.0 (R51)"), "{out}");
+    assert!(
+        out.contains("codex-canary passed") && out.contains("for 0.200.0 (R51)"),
+        "{out}"
+    );
 
     // 3. verified: the pipeline starts (and stops at the gate)
     let (_, err) = run(&["V-2"]);
-    assert!(err.contains("cancelled at the plan gate") || err.contains("STOPPED"), "{err}");
+    assert!(
+        err.contains("cancelled at the plan gate") || err.contains("STOPPED"),
+        "{err}"
+    );
     assert!(!err.contains("unverified profiles"), "{err}");
     let last = recs_last(&env);
     assert_eq!(last["cli_versions"]["codex-foundry"], "0.200.0", "{last}");
@@ -928,8 +951,15 @@ fn version_bound_evidence() {
     std::fs::write(&env.config, cfg).unwrap();
     let (code, err) = run(&["V-3"]);
     assert_ne!(code, 0);
-    assert!(err.contains("codex-foundry: codex-canary passed") && err.contains("for version 0.200.0 but the CLI is now 0.201.0"), "{err}");
-    assert!(!err.contains("claude-max:"), "Claude is still verified: {err}");
+    assert!(
+        err.contains("codex-foundry: codex-canary passed")
+            && err.contains("for version 0.200.0 but the CLI is now 0.201.0"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("claude-max:"),
+        "Claude is still verified: {err}"
+    );
     let (dcode, dout, _) = toryo(&env, &["doctor"]);
     assert_eq!(dcode, 1);
     assert!(dout.contains("R51: unverified"), "{dout}");
@@ -937,7 +967,10 @@ fn version_bound_evidence() {
     // 5. --accept-unverified runs anyway, with a warning
     let (_, err) = run(&["V-4", "--accept-unverified"]);
     assert!(err.contains("running with unverified profiles"), "{err}");
-    assert!(err.contains("cancelled at the plan gate") || err.contains("STOPPED"), "{err}");
+    assert!(
+        err.contains("cancelled at the plan gate") || err.contains("STOPPED"),
+        "{err}"
+    );
 }
 
 fn recs_last(env: &Env) -> serde_json::Value {

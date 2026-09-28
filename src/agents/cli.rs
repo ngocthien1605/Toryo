@@ -124,7 +124,11 @@ impl CliSession {
     /// argv (without the program) and the prompt actually sent.
     fn build(&self, prompt: &str) -> Result<(Vec<String>, String)> {
         let exe = PathBuf::from(expand_vars(&self.profile.exe)?);
-        let model = self.req.model.clone().or_else(|| self.profile.model.clone());
+        let model = self
+            .req
+            .model
+            .clone()
+            .or_else(|| self.profile.model.clone());
         match self.profile.kind {
             ProfileKind::Claude => {
                 let mut l = match (self.req.role, &self.req.run_store) {
@@ -132,7 +136,11 @@ impl CliSession {
                     (Role::Implementer, _) => ClaudeLaunch::implementer(exe, self.req.cwd.clone()),
                     (_, Some(rs)) => ClaudeLaunch::read_only(exe, self.req.cwd.clone(), rs.clone()),
                     (_, None) => {
-                        let mut l = ClaudeLaunch::read_only(exe, self.req.cwd.clone(), self.req.cwd.clone());
+                        let mut l = ClaudeLaunch::read_only(
+                            exe,
+                            self.req.cwd.clone(),
+                            self.req.cwd.clone(),
+                        );
                         l.add_run_store = false;
                         l
                     }
@@ -149,7 +157,10 @@ impl CliSession {
                 let schema_path = match &self.req.schema {
                     Some(text) => {
                         std::fs::create_dir_all(&self.req.capture_dir)?;
-                        let p = self.req.capture_dir.join(format!("{}.schema.json", self.req.role.as_str()));
+                        let p = self
+                            .req
+                            .capture_dir
+                            .join(format!("{}.schema.json", self.req.role.as_str()));
                         std::fs::write(&p, text)?;
                         Some(p)
                     }
@@ -179,8 +190,13 @@ impl CliSession {
 
     fn cwd(&self) -> PathBuf {
         match (self.profile.kind, self.claude_mode) {
-            (ProfileKind::Claude, LaunchMode::CwdRunStore) if self.req.role != Role::Implementer => {
-                self.req.run_store.clone().unwrap_or_else(|| self.req.cwd.clone())
+            (ProfileKind::Claude, LaunchMode::CwdRunStore)
+                if self.req.role != Role::Implementer =>
+            {
+                self.req
+                    .run_store
+                    .clone()
+                    .unwrap_or_else(|| self.req.cwd.clone())
             }
             _ => self.req.cwd.clone(),
         }
@@ -225,7 +241,15 @@ impl AgentSession for CliSession {
                 }
             };
             let res = run_turn_with(
-                &profile_name, &profile, args, &cwd, &prompt, &capture, &label, opts, &mut on_line,
+                &profile_name,
+                &profile,
+                args,
+                &cwd,
+                &prompt,
+                &capture,
+                &label,
+                opts,
+                &mut on_line,
             );
             match res {
                 Ok(run) => {

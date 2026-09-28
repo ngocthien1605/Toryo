@@ -13,9 +13,24 @@ pub fn append(store: &Store, t: &TaskRow, kind: &str, body: &str) -> Result<()> 
     let head = super::artifacts::head(store, t, "decisions")?;
     let mut text = String::new();
     if head.is_none() {
-        text.push_str(&format!("# Decisions — {}\n\nHuman decisions for this task, oldest first (written by toryo).\n", t.id));
+        text.push_str(&format!(
+            "# Decisions — {}\n\nHuman decisions for this task, oldest first (written by toryo).\n",
+            t.id
+        ));
     }
-    text.push_str(&format!("\n## {} — {kind}\n\n{}\n", crate::evidence::now_rfc3339(), body.trim_end()));
-    super::artifacts::append(store, t, "decisions", "md", "decisions", &text, "DECISIONS.md")?;
+    text.push_str(&format!(
+        "\n## {} — {kind}\n\n{}\n",
+        crate::evidence::now_rfc3339(),
+        body.trim_end()
+    ));
+    super::artifacts::append(
+        store,
+        t,
+        "decisions",
+        "md",
+        "decisions",
+        &text,
+        "DECISIONS.md",
+    )?;
     Ok(())
 }

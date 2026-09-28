@@ -69,7 +69,12 @@ fn toryo(env: &Env, args: &[&str], stdin: &str, extra_env: &[(&str, &str)]) -> (
         c.env(k, v);
     }
     let mut child = c.spawn().unwrap();
-    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
     let o = child.wait_with_output().unwrap();
     let err = String::from_utf8_lossy(&o.stderr).to_string();
     if std::env::var("SHOW").is_ok() {
@@ -123,7 +128,12 @@ commands:
     };
     let (code, err) = toryo(
         &env,
-        &["spike", "init-fixture", "--into", env.repo.to_str().unwrap()],
+        &[
+            "spike",
+            "init-fixture",
+            "--into",
+            env.repo.to_str().unwrap(),
+        ],
         "",
         &[],
     );
@@ -133,11 +143,22 @@ commands:
 
 fn script(env: &Env, turns: Value) -> PathBuf {
     let p = env.root.join("agents.json");
-    std::fs::write(&p, serde_json::to_vec_pretty(&json!({ "turns": turns })).unwrap()).unwrap();
+    std::fs::write(
+        &p,
+        serde_json::to_vec_pretty(&json!({ "turns": turns })).unwrap(),
+    )
+    .unwrap();
     p
 }
 
-fn pipeline(env: &Env, script: &Path, id: &str, extra: &[&str], stdin: &str, extra_env: &[(&str, &str)]) -> (i32, String) {
+fn pipeline(
+    env: &Env,
+    script: &Path,
+    id: &str,
+    extra: &[&str],
+    stdin: &str,
+    extra_env: &[(&str, &str)],
+) -> (i32, String) {
     let task = env.repo.join("TASK.md");
     let mut args = vec![
         "spike",
@@ -157,14 +178,18 @@ fn pipeline(env: &Env, script: &Path, id: &str, extra: &[&str], stdin: &str, ext
 
 /// (pipeline record, its steps, the fake calls)
 fn outcome(env: &Env) -> (Value, Vec<Value>, Vec<Value>) {
-    let text = std::fs::read_to_string(env.data.join("m0").join("results.jsonl")).unwrap_or_default();
+    let text =
+        std::fs::read_to_string(env.data.join("m0").join("results.jsonl")).unwrap_or_default();
     let last: Value = text
         .lines()
         .rev()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .find(|r| r["spike"] == "pipeline")
         .expect("a pipeline record");
-    let steps = last["details"]["steps"].as_array().cloned().unwrap_or_default();
+    let steps = last["details"]["steps"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let run = PathBuf::from(last["run_dir"].as_str().unwrap());
     let calls: Vec<Value> =
         serde_json::from_slice(&std::fs::read(run.join("fake-calls.json")).unwrap()).unwrap();
@@ -176,7 +201,12 @@ fn calls_for<'a>(calls: &'a [Value], key: &str) -> Vec<&'a Value> {
 }
 
 fn git(repo: &Path, args: &[&str]) -> String {
-    let o = Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
+    let o = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
     String::from_utf8_lossy(&o.stdout).to_string()
 }
 
@@ -194,25 +224,52 @@ fn gate_reject_resumes_planner_then_fix_cycle_and_approval() {
             "reviewer": [turn(vec![review_changes()]), turn(vec![review_approved()])],
         }),
     );
-    let (code, err) = pipeline(&env, &s, "CALC-001", &[], "n\nplease also cover negative numbers\ny\ny\n", &[]);
+    let (code, err) = pipeline(
+        &env,
+        &s,
+        "CALC-001",
+        &[],
+        "n\nplease also cover negative numbers\ny\ny\n",
+        &[],
+    );
     assert_eq!(code, 0, "{err}");
     let (rec, steps, calls) = outcome(&env);
     assert_eq!(rec["pass"], true, "{err}");
     let has = |f: &dyn Fn(&Value) -> bool| steps.iter().any(f);
-    assert!(has(&|s| s["step"] == "plan-gate" && s["decision"] == "rejected" && s["reason"] == "please also cover negative numbers"));
-    assert!(has(&|s| s["step"] == "plan-gate" && s["decision"] == "approved"));
-    assert!(has(&|s| s["step"] == "review-0" && s["decision"] == "changes_requested"));
+    assert!(has(&|s| s["step"] == "plan-gate"
+        && s["decision"] == "rejected"
+        && s["reason"] == "please also cover negative numbers"));
+    assert!(has(
+        &|s| s["step"] == "plan-gate" && s["decision"] == "approved"
+    ));
+    assert!(has(
+        &|s| s["step"] == "review-0" && s["decision"] == "changes_requested"
+    ));
     assert!(has(&|s| s["step"] == "fix-1" && s["verify"] == true));
-    assert!(has(&|s| s["step"] == "review-1" && s["decision"] == "approved"));
-    assert!(has(&|s| s["step"] == "final-gate" && s["decision"] == "approved"));
+    assert!(has(
+        &|s| s["step"] == "review-1" && s["decision"] == "approved"
+    ));
+    assert!(has(
+        &|s| s["step"] == "final-gate" && s["decision"] == "approved"
+    ));
     // M2: the whole run went through the state machine
     assert_eq!(
         states(&rec),
         [
-            "Planning", "WaitingPlanApproval", "Planning", "WaitingPlanApproval",
-            "Implementing", "Checkpointing", "Verifying", "Reviewing",
-            "Fixing", "Checkpointing", "Verifying", "Reviewing",
-            "WaitingFinalApproval", "Completed",
+            "Planning",
+            "WaitingPlanApproval",
+            "Planning",
+            "WaitingPlanApproval",
+            "Implementing",
+            "Checkpointing",
+            "Verifying",
+            "Reviewing",
+            "Fixing",
+            "Checkpointing",
+            "Verifying",
+            "Reviewing",
+            "WaitingFinalApproval",
+            "Completed",
         ]
     );
     assert_eq!(rec["details"]["state"], "Completed");
@@ -222,24 +279,54 @@ fn gate_reject_resumes_planner_then_fix_cycle_and_approval() {
     assert_eq!(planner.len(), 2);
     assert!(planner[0]["resume"].is_null());
     assert!(planner[1]["resume"].is_string(), "{calls:?}");
-    assert!(planner[1]["prompt"].as_str().unwrap().contains("please also cover negative numbers"));
+    assert!(planner[1]["prompt"]
+        .as_str()
+        .unwrap()
+        .contains("please also cover negative numbers"));
     // every reviewer turn is a fresh session (correction turns aside)
-    assert!(calls_for(&calls, "reviewer").iter().all(|c| c["resume"].is_null()));
+    assert!(calls_for(&calls, "reviewer")
+        .iter()
+        .all(|c| c["resume"].is_null()));
 
     // checkpoints on the task branch with trailers; the fix prompt carries the review
-    let log = git(&env.repo, &["log", "--format=%s|%(trailers:key=Toryo-Stage,valueonly)", "main..toryo/CALC-001"]);
-    assert!(log.contains("toryo(CALC-001): implement|implement"), "{log}");
+    let log = git(
+        &env.repo,
+        &[
+            "log",
+            "--format=%s|%(trailers:key=Toryo-Stage,valueonly)",
+            "main..toryo/CALC-001",
+        ],
+    );
+    assert!(
+        log.contains("toryo(CALC-001): implement|implement"),
+        "{log}"
+    );
     assert!(log.contains("toryo(CALC-001): fix-1|fix-1"), "{log}");
     let run = PathBuf::from(rec["run_dir"].as_str().unwrap());
     let fix_prompt = std::fs::read_to_string(run.join("fix-1.prompt.md")).unwrap();
-    assert!(fix_prompt.contains("R-1") && fix_prompt.contains("AC-2 NOT MET"), "{fix_prompt}");
-    for f in ["TASK.md", "PLAN.md", "DIFF.patch", "DIFF-incremental.patch", "VERIFY_RESULT.json", "REVIEW.md", "SUMMARY.md"] {
+    assert!(
+        fix_prompt.contains("R-1") && fix_prompt.contains("AC-2 NOT MET"),
+        "{fix_prompt}"
+    );
+    for f in [
+        "TASK.md",
+        "PLAN.md",
+        "DIFF.patch",
+        "DIFF-incremental.patch",
+        "VERIFY_RESULT.json",
+        "REVIEW.md",
+        "SUMMARY.md",
+    ] {
         assert!(run.join("runstore").join(f).exists(), "missing {f}");
     }
     let summary = std::fs::read_to_string(run.join("runstore").join("SUMMARY.md")).unwrap();
     assert!(summary.contains("R-9"), "{summary}");
     // usage flowed through the events: 2 planner turns + 1 implementer turn
-    assert_eq!(rec["details"]["tokens"]["output"], 30, "{}", rec["details"]["tokens"]);
+    assert_eq!(
+        rec["details"]["tokens"]["output"], 30,
+        "{}",
+        rec["details"]["tokens"]
+    );
 }
 
 #[test]
@@ -270,14 +357,23 @@ fn fallback_is_sticky_and_keeps_the_configured_reviewer() {
     assert_eq!(claude.len(), 2, "{calls:?}");
     assert_eq!(claude[0]["label"], "implement-2");
     // the hand-over names the partial work left in the worktree
-    assert!(claude[0]["prompt"].as_str().unwrap().contains("Partial.ps1"));
+    assert!(claude[0]["prompt"]
+        .as_str()
+        .unwrap()
+        .contains("Partial.ps1"));
     // owner decision 15: the reviewer is the configured one, never the fallback
     let reviewers = calls_for(&calls, "reviewer");
     assert_eq!(reviewers.len(), 2);
-    assert!(reviewers.iter().all(|c| c["profile"] == "claude-review"), "{reviewers:?}");
+    assert!(
+        reviewers.iter().all(|c| c["profile"] == "claude-review"),
+        "{reviewers:?}"
+    );
     assert!(steps.iter().any(|s| s.get("implementer_switch").is_some()));
     // the partial Codex file is part of the first checkpoint
-    let files = git(&env.repo, &["log", "--name-only", "--format=", "main..toryo/CALC-FB"]);
+    let files = git(
+        &env.repo,
+        &["log", "--name-only", "--format=", "main..toryo/CALC-FB"],
+    );
     assert!(files.contains("src/Partial.ps1"), "{files}");
     let run = PathBuf::from(rec["run_dir"].as_str().unwrap());
     let summary = std::fs::read_to_string(run.join("runstore").join("SUMMARY.md")).unwrap();
@@ -292,7 +388,13 @@ fn quit_at_the_gate_runs_no_implementer() {
     assert_ne!(code, 0);
     let (rec, _, calls) = outcome(&env);
     assert_eq!(rec["pass"], false);
-    assert!(rec["summary"].as_str().unwrap().contains("cancelled at the plan gate"), "{err}");
+    assert!(
+        rec["summary"]
+            .as_str()
+            .unwrap()
+            .contains("cancelled at the plan gate"),
+        "{err}"
+    );
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0]["key"], "planner");
 }
@@ -318,27 +420,57 @@ fn rate_limit_retry_verify_failure_and_review_correction() {
             ],
         }),
     );
-    let (code, err) = pipeline(&env, &s, "CALC-R", &["--yes"], "", &[("TORYO_RETRY_BASE_SECS", "0")]);
+    let (code, err) = pipeline(
+        &env,
+        &s,
+        "CALC-R",
+        &["--yes"],
+        "",
+        &[("TORYO_RETRY_BASE_SECS", "0")],
+    );
     assert_eq!(code, 0, "{err}");
     let (rec, steps, calls) = outcome(&env);
     assert_eq!(rec["pass"], true);
-    assert!(steps.iter().any(|s| s["retry"] == 1 && s["error"] == "RateLimited"), "{steps:?}");
-    assert!(steps.iter().any(|s| s["step"] == "implement" && s["verify"] == false), "{steps:?}");
-    assert!(steps.iter().any(|s| s["step"] == "fix-1" && s["verify"] == true), "{steps:?}");
+    assert!(
+        steps
+            .iter()
+            .any(|s| s["retry"] == 1 && s["error"] == "RateLimited"),
+        "{steps:?}"
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|s| s["step"] == "implement" && s["verify"] == false),
+        "{steps:?}"
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|s| s["step"] == "fix-1" && s["verify"] == true),
+        "{steps:?}"
+    );
     let run = PathBuf::from(rec["run_dir"].as_str().unwrap());
     let fix_prompt = std::fs::read_to_string(run.join("fix-1.prompt.md")).unwrap();
     assert!(fix_prompt.contains("VERIFY FAILED"), "{fix_prompt}");
     let reviewers = calls_for(&calls, "reviewer");
     assert_eq!(reviewers.len(), 2);
     assert_eq!(reviewers[1]["label"], "review-1-1");
-    assert!(reviewers[1]["resume"].is_string(), "correction resumes the reviewer session");
+    assert!(
+        reviewers[1]["resume"].is_string(),
+        "correction resumes the reviewer session"
+    );
     assert!(reviewers[1]["prompt"].as_str().unwrap().contains("AC-3"));
 }
 
 #[test]
 fn all_implementers_out_of_quota_stops_and_keeps_partial_work() {
     let env = setup(None, &[]);
-    let quota = || turn(vec![write("src/Partial.ps1", "# partial\n"), json!({"kind":"fail","class":"QuotaExceeded","detail":"usage limit"})]);
+    let quota = || {
+        turn(vec![
+            write("src/Partial.ps1", "# partial\n"),
+            json!({"kind":"fail","class":"QuotaExceeded","detail":"usage limit"}),
+        ])
+    };
     let s = script(
         &env,
         json!({
@@ -351,9 +483,24 @@ fn all_implementers_out_of_quota_stops_and_keeps_partial_work() {
     let (code, err) = pipeline(&env, &s, "CALC-X", &["--yes"], "", &[]);
     assert_ne!(code, 0);
     let (rec, _, calls) = outcome(&env);
-    assert!(rec["summary"].as_str().unwrap().contains("out of quota"), "{err}");
-    assert_eq!(calls.iter().filter(|c| c["key"].as_str().unwrap().starts_with("implementer")).count(), 2);
-    assert!(env.root.join("wts").join("CALC-X").join("src").join("Partial.ps1").exists());
+    assert!(
+        rec["summary"].as_str().unwrap().contains("out of quota"),
+        "{err}"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| c["key"].as_str().unwrap().starts_with("implementer"))
+            .count(),
+        2
+    );
+    assert!(env
+        .root
+        .join("wts")
+        .join("CALC-X")
+        .join("src")
+        .join("Partial.ps1")
+        .exists());
 }
 
 /// The states the run went through (`to` of every transition).
@@ -400,16 +547,28 @@ fn final_gate_rejection_is_a_fix_cycle() {
         }),
     );
     // plan: y · final: n + reason · final: y
-    let (code, err) = pipeline(&env, &s, "CALC-F", &[], "y\nn\nrename the parameters to -Dividend/-Divisor\ny\n", &[]);
+    let (code, err) = pipeline(
+        &env,
+        &s,
+        "CALC-F",
+        &[],
+        "y\nn\nrename the parameters to -Dividend/-Divisor\ny\n",
+        &[],
+    );
     assert_eq!(code, 0, "{err}");
     let (rec, steps, _) = outcome(&env);
     assert_eq!(rec["details"]["state"], "Completed");
     assert_eq!(rec["details"]["fix_cycle"], 1);
-    assert!(steps.iter().any(|s| s["step"] == "final-gate" && s["decision"] == "rejected"));
+    assert!(steps
+        .iter()
+        .any(|s| s["step"] == "final-gate" && s["decision"] == "rejected"));
     assert!(events(&rec).contains(&"final_rejected".to_string()));
     let run = PathBuf::from(rec["run_dir"].as_str().unwrap());
     let fix = std::fs::read_to_string(run.join("fix-1.prompt.md")).unwrap();
-    assert!(fix.contains("HUMAN (final gate): rename the parameters"), "{fix}");
+    assert!(
+        fix.contains("HUMAN (final gate): rename the parameters"),
+        "{fix}"
+    );
 }
 
 #[test]
@@ -426,12 +585,30 @@ fn max_fix_cycles_escalates() {
             "reviewer": [turn(vec![review_changes()]), turn(vec![review_changes()])],
         }),
     );
-    let (code, err) = pipeline(&env, &s, "CALC-M", &["--yes", "--max-fix-cycles", "1"], "", &[]);
+    let (code, err) = pipeline(
+        &env,
+        &s,
+        "CALC-M",
+        &["--yes", "--max-fix-cycles", "1"],
+        "",
+        &[],
+    );
     assert_ne!(code, 0);
     let (rec, _, calls) = outcome(&env);
     assert_eq!(rec["details"]["state"], "Escalated", "{err}");
-    assert!(rec["summary"].as_str().unwrap().contains("not accepted after 1 fix cycle(s)"), "{}", rec["summary"]);
-    assert_eq!(calls_for(&calls, "implementer").len(), 2, "implement + 1 fix, then stop");
+    assert!(
+        rec["summary"]
+            .as_str()
+            .unwrap()
+            .contains("not accepted after 1 fix cycle(s)"),
+        "{}",
+        rec["summary"]
+    );
+    assert_eq!(
+        calls_for(&calls, "implementer").len(),
+        2,
+        "implement + 1 fix, then stop"
+    );
     assert_eq!(states(&rec).last().unwrap(), "Escalated");
 }
 
@@ -455,11 +632,18 @@ fn path_policy_violation_is_a_fix_cycle() {
     let (rec, steps, _) = outcome(&env);
     assert_eq!(rec["details"]["fix_cycle"], 1);
     assert!(events(&rec).contains(&"path_policy_violation".to_string()));
-    assert!(steps.iter().any(|s| s["protected_changed"].to_string().contains("TASK.md")));
+    assert!(steps
+        .iter()
+        .any(|s| s["protected_changed"].to_string().contains("TASK.md")));
     let run = PathBuf::from(rec["run_dir"].as_str().unwrap());
-    assert!(std::fs::read_to_string(run.join("fix-1.prompt.md")).unwrap().contains("POLICY"));
+    assert!(std::fs::read_to_string(run.join("fix-1.prompt.md"))
+        .unwrap()
+        .contains("POLICY"));
     // nothing of the violating turn was committed
-    let files = git(&env.repo, &["log", "--name-only", "--format=", "main..toryo/CALC-P"]);
+    let files = git(
+        &env.repo,
+        &["log", "--name-only", "--format=", "main..toryo/CALC-P"],
+    );
     assert!(!files.contains("TASK.md"), "{files}");
 }
 
@@ -490,7 +674,14 @@ fn human_plan_rejections_are_unlimited() {
         }),
     );
     // four rejections (the prototype used to stop at three), then approve, then accept
-    let (code, err) = pipeline(&env, &s, "CALC-H", &[], "n\na\nn\nb\nn\nc\nn\nd\ny\ny\n", &[]);
+    let (code, err) = pipeline(
+        &env,
+        &s,
+        "CALC-H",
+        &[],
+        "n\na\nn\nb\nn\nc\nn\nd\ny\ny\n",
+        &[],
+    );
     assert_eq!(code, 0, "{err}");
     let (rec, _, calls) = outcome(&env);
     assert_eq!(calls_for(&calls, "planner").len(), 5);
@@ -513,5 +704,8 @@ fn blocked_review_escalates() {
     assert_ne!(code, 0);
     let (rec, _, _) = outcome(&env);
     assert_eq!(rec["details"]["state"], "Escalated");
-    assert!(rec["summary"].as_str().unwrap().contains("reviewer blocked"));
+    assert!(rec["summary"]
+        .as_str()
+        .unwrap()
+        .contains("reviewer blocked"));
 }

@@ -116,7 +116,9 @@ struct Part {
 }
 
 fn read(p: &Path) -> Option<String> {
-    std::fs::read(p).ok().map(|b| String::from_utf8_lossy(&b).replace("\r\n", "\n"))
+    std::fs::read(p)
+        .ok()
+        .map(|b| String::from_utf8_lossy(&b).replace("\r\n", "\n"))
 }
 
 fn disp(p: &Path) -> String {
@@ -127,7 +129,12 @@ fn disp(p: &Path) -> String {
 pub fn assemble(req: &Request) -> Result<Assembled> {
     let mut parts: Vec<Part> = Vec::new();
     let mut skipped = Vec::new();
-    let mut add = |n: u8, label: &str, path: &Path, heading: String, rank: Option<u32>, skipped: &mut Vec<String>| match read(path) {
+    let mut add = |n: u8,
+                   label: &str,
+                   path: &Path,
+                   heading: String,
+                   rank: Option<u32>,
+                   skipped: &mut Vec<String>| match read(path) {
         Some(body) => parts.push(Part {
             n,
             label: label.to_string(),
@@ -145,30 +152,77 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
     // trim ranks: task-pack inline → path (10+), global (100), CLAUDE.md (110), AGENTS.md (120),
     // must-inline task pack (200+)
     if let Some(g) = &req.global {
-        add(1, "global.md", g, "Personal rules (global.md)".into(), Some(100), &mut skipped);
+        add(
+            1,
+            "global.md",
+            g,
+            "Personal rules (global.md)".into(),
+            Some(100),
+            &mut skipped,
+        );
     } else {
         skipped.push("1: no home directory for global.md".into());
     }
     if req.kind == ProfileKind::Claude {
-        add(2, "AGENTS.md", &req.repo.join("AGENTS.md"), "Project instructions (AGENTS.md)".into(), Some(120), &mut skipped);
-        add(2, "CLAUDE.md", &req.repo.join("CLAUDE.md"), "Project instructions (CLAUDE.md)".into(), Some(110), &mut skipped);
+        add(
+            2,
+            "AGENTS.md",
+            &req.repo.join("AGENTS.md"),
+            "Project instructions (AGENTS.md)".into(),
+            Some(120),
+            &mut skipped,
+        );
+        add(
+            2,
+            "CLAUDE.md",
+            &req.repo.join("CLAUDE.md"),
+            "Project instructions (CLAUDE.md)".into(),
+            Some(110),
+            &mut skipped,
+        );
     }
     let pol = req.repo.join(".toryo").join("context");
     let mut policy: Vec<PathBuf> = std::fs::read_dir(&pol)
-        .map(|d| d.flatten().map(|e| e.path()).filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md")).collect())
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md"))
+                .collect()
+        })
         .unwrap_or_default();
     policy.sort();
     if policy.is_empty() {
         skipped.push(format!("3: {}", disp(&pol.join("*.md"))));
     }
     for p in &policy {
-        let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        add(3, &format!(".toryo/context/{name}"), p, format!("Project policy ({name})"), None, &mut skipped);
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        add(
+            3,
+            &format!(".toryo/context/{name}"),
+            p,
+            format!("Project policy ({name})"),
+            None,
+            &mut skipped,
+        );
     }
     let role = req.role.as_str();
-    let custom = req.repo.join(".toryo").join("roles").join(format!("{role}.md"));
+    let custom = req
+        .repo
+        .join(".toryo")
+        .join("roles")
+        .join(format!("{role}.md"));
     if custom.is_file() {
-        add(4, &format!(".toryo/roles/{role}.md"), &custom, format!("Role: {role}"), None, &mut skipped);
+        add(
+            4,
+            &format!(".toryo/roles/{role}.md"),
+            &custom,
+            format!("Role: {role}"),
+            None,
+            &mut skipped,
+        );
     } else {
         let body = contracts::role(&format!("{role}.md")).replace("\r\n", "\n");
         parts.push(Part {
@@ -192,7 +246,11 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
         };
         let small = body.len() < INLINE_MAX;
         // inline → path first, larger files first; must-inline pack last, later items first
-        let rank = if req.inline_all { 200 + (req.pack.len() - i) as u32 } else { 10 + i as u32 };
+        let rank = if req.inline_all {
+            200 + (req.pack.len() - i) as u32
+        } else {
+            10 + i as u32
+        };
         parts.push(Part {
             n: 5,
             label: label.clone(),
@@ -209,7 +267,9 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
     let mut warnings = Vec::new();
     let mut text = render(req, &parts, pack_start);
     if text.len() > req.budget {
-        let mut order: Vec<usize> = (0..parts.len()).filter(|&i| parts[i].rank.is_some() && !parts[i].path_only).collect();
+        let mut order: Vec<usize> = (0..parts.len())
+            .filter(|&i| parts[i].rank.is_some() && !parts[i].path_only)
+            .collect();
         order.sort_by_key(|&i| parts[i].rank);
         for i in order {
             let over = text.len().saturating_sub(req.budget);
@@ -219,14 +279,23 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
             let p = &mut parts[i];
             if p.n == 5 && !req.inline_all {
                 p.path_only = true;
-                warnings.push(format!("context budget: {} is listed as a path instead of inlined ({} bytes)", p.label, p.original));
+                warnings.push(format!(
+                    "context budget: {} is listed as a path instead of inlined ({} bytes)",
+                    p.label, p.original
+                ));
             } else {
                 let keep = floor_char(&p.body, p.body.len().saturating_sub(over + 120));
                 let cut = p.body.len() - keep;
                 p.body.truncate(keep);
-                p.body.push_str(&format!("\n\n[… {cut} bytes trimmed by toryo: context budget {} KB]\n", req.budget / 1024));
+                p.body.push_str(&format!(
+                    "\n\n[… {cut} bytes trimmed by toryo: context budget {} KB]\n",
+                    req.budget / 1024
+                ));
                 p.truncated = true;
-                warnings.push(format!("context budget: {} truncated by {cut} of {} bytes", p.label, p.original));
+                warnings.push(format!(
+                    "context budget: {} truncated by {cut} of {} bytes",
+                    p.label, p.original
+                ));
             }
             text = render(req, &parts, pack_start);
         }
@@ -292,7 +361,12 @@ fn render(req: &Request, parts: &[Part], pack_start: usize) -> String {
         } else {
             s.push_str("Read-only files in the run store (outside the worktree). Small files are inlined below.\n\n");
             for p in pack {
-                s.push_str(&format!("- {}: {}{}\n", p.label, disp(&p.path), if p.path_only { "" } else { " (inlined below)" }));
+                s.push_str(&format!(
+                    "- {}: {}{}\n",
+                    p.label,
+                    disp(&p.path),
+                    if p.path_only { "" } else { " (inlined below)" }
+                ));
             }
         }
         for p in pack.iter().filter(|p| !p.path_only) {
@@ -341,10 +415,22 @@ fn pack_views(stage: &str) -> Result<Vec<String>> {
 
 /// The request for the next attempt of `stage` with `profile` — used by the engine and by
 /// `toryo context show`, so the preview is exactly what the agent gets.
-pub fn request(store: &Store, t: &TaskRow, cfg: &Effective, stage: &str, profile: &str) -> Result<Request> {
+pub fn request(
+    store: &Store,
+    t: &TaskRow,
+    cfg: &Effective,
+    stage: &str,
+    profile: &str,
+) -> Result<Request> {
     let role = stage_role(stage)?;
     let kind = cfg.profile(profile)?.kind;
-    let kb = cfg.repo.context.budget_kb.get(role.as_str()).copied().unwrap_or(DEFAULT_BUDGET_KB);
+    let kb = cfg
+        .repo
+        .context
+        .budget_kb
+        .get(role.as_str())
+        .copied()
+        .unwrap_or(DEFAULT_BUDGET_KB);
     Ok(Request {
         role,
         kind,
@@ -361,7 +447,10 @@ pub fn stage_profile(t: &TaskRow, stage: &str) -> Result<String> {
     Ok(match stage_role(stage)? {
         Role::Planner => t.planner.clone(),
         Role::Reviewer => t.reviewer.clone(),
-        Role::Implementer => t.current_implementer().map(str::to_string).unwrap_or_else(|| t.implementers.last().cloned().unwrap_or_default()),
+        Role::Implementer => t
+            .current_implementer()
+            .map(str::to_string)
+            .unwrap_or_else(|| t.implementers.last().cloned().unwrap_or_default()),
     })
 }
 
@@ -381,7 +470,10 @@ pub fn describe(a: &Assembled) -> String {
         &a.sha256[..12]
     );
     for x in &a.sources {
-        s.push_str(&format!("  [{}] {:<28} {:>7} B  {:<13} {}\n", x.n, x.label, x.bytes, x.mode, x.path));
+        s.push_str(&format!(
+            "  [{}] {:<28} {:>7} B  {:<13} {}\n",
+            x.n, x.label, x.bytes, x.mode, x.path
+        ));
     }
     for k in &a.skipped {
         s.push_str(&format!("  (skipped, not found) {k}\n"));
@@ -397,7 +489,15 @@ mod tests {
     use super::*;
 
     fn req(repo: &Path, kind: ProfileKind, role: Role) -> Request {
-        Request { role, kind, repo: repo.to_path_buf(), global: Some(repo.join("global.md")), pack: vec![], inline_all: false, budget: 40 * 1024 }
+        Request {
+            role,
+            kind,
+            repo: repo.to_path_buf(),
+            global: Some(repo.join("global.md")),
+            pack: vec![],
+            inline_all: false,
+            budget: 40 * 1024,
+        }
     }
 
     fn setup() -> tempfile::TempDir {
@@ -408,7 +508,11 @@ mod tests {
         std::fs::write(r.join("CLAUDE.md"), "CLAUDE-RULES\n").unwrap();
         std::fs::create_dir_all(r.join(".toryo/context")).unwrap();
         std::fs::write(r.join(".toryo/context/20-naming.md"), "NAMING\n").unwrap();
-        std::fs::write(r.join(".toryo/context/10-models.md"), "MODELS: ZZZ is local-only\n").unwrap();
+        std::fs::write(
+            r.join(".toryo/context/10-models.md"),
+            "MODELS: ZZZ is local-only\n",
+        )
+        .unwrap();
         std::fs::write(r.join(".toryo/context/notes.txt"), "not md\n").unwrap();
         d
     }
@@ -426,20 +530,35 @@ mod tests {
         assert!(pos("NAMING") < pos("Role: planner"));
         assert!(!t.contains("not md"));
         let x = assemble(&req(d.path(), ProfileKind::Codex, Role::Implementer)).unwrap();
-        assert!(!x.text.contains("AGENTS-RULES") && !x.text.contains("CLAUDE-RULES"), "Codex reads AGENTS.md natively (R20)");
+        assert!(
+            !x.text.contains("AGENTS-RULES") && !x.text.contains("CLAUDE-RULES"),
+            "Codex reads AGENTS.md natively (R20)"
+        );
         assert!(x.text.contains("MODELS") && x.text.contains("Role: implementer"));
         // deterministic
-        assert_eq!(assemble(&req(d.path(), ProfileKind::Claude, Role::Planner)).unwrap().sha256, c.sha256);
+        assert_eq!(
+            assemble(&req(d.path(), ProfileKind::Claude, Role::Planner))
+                .unwrap()
+                .sha256,
+            c.sha256
+        );
     }
 
     #[test]
     fn repo_role_template_overrides_the_embedded_one() {
         let d = setup();
         std::fs::create_dir_all(d.path().join(".toryo/roles")).unwrap();
-        std::fs::write(d.path().join(".toryo/roles/reviewer.md"), "CUSTOM REVIEWER\n").unwrap();
+        std::fs::write(
+            d.path().join(".toryo/roles/reviewer.md"),
+            "CUSTOM REVIEWER\n",
+        )
+        .unwrap();
         let c = assemble(&req(d.path(), ProfileKind::Claude, Role::Reviewer)).unwrap();
         assert!(c.text.contains("CUSTOM REVIEWER"));
-        assert!(c.sources.iter().any(|s| s.n == 4 && s.label == ".toryo/roles/reviewer.md"));
+        assert!(c
+            .sources
+            .iter()
+            .any(|s| s.n == 4 && s.label == ".toryo/roles/reviewer.md"));
     }
 
     #[test]
@@ -448,11 +567,18 @@ mod tests {
         std::fs::write(d.path().join("TASK.md"), "TASK-BODY\n").unwrap();
         std::fs::write(d.path().join("DIFF.patch"), "x".repeat(INLINE_MAX + 1)).unwrap();
         let mut r = req(d.path(), ProfileKind::Claude, Role::Reviewer);
-        r.pack = vec![("TASK.md".into(), d.path().join("TASK.md")), ("DIFF.patch".into(), d.path().join("DIFF.patch")), ("PLAN.md".into(), d.path().join("PLAN.md"))];
+        r.pack = vec![
+            ("TASK.md".into(), d.path().join("TASK.md")),
+            ("DIFF.patch".into(), d.path().join("DIFF.patch")),
+            ("PLAN.md".into(), d.path().join("PLAN.md")),
+        ];
         let c = assemble(&r).unwrap();
         assert!(c.text.contains("TASK-BODY"));
         assert!(!c.text.contains("xxxxxxxx"));
-        assert!(c.text.contains(&format!("- DIFF.patch: {}\n", d.path().join("DIFF.patch").display())));
+        assert!(c.text.contains(&format!(
+            "- DIFF.patch: {}\n",
+            d.path().join("DIFF.patch").display()
+        )));
         assert!(c.skipped.iter().any(|s| s.contains("PLAN.md")));
         // the Claude implementer gets everything inline (no run-store access)
         r.inline_all = true;
@@ -466,18 +592,38 @@ mod tests {
         let d = setup();
         std::fs::write(d.path().join("global.md"), "G".repeat(30_000)).unwrap();
         std::fs::write(d.path().join("AGENTS.md"), "A".repeat(3_000)).unwrap();
-        std::fs::write(d.path().join(".toryo/context/10-models.md"), "P".repeat(12_000)).unwrap();
+        std::fs::write(
+            d.path().join(".toryo/context/10-models.md"),
+            "P".repeat(12_000),
+        )
+        .unwrap();
         std::fs::write(d.path().join("PLAN.md"), "L".repeat(6_000)).unwrap();
         let mut r = req(d.path(), ProfileKind::Claude, Role::Implementer);
         r.pack = vec![("PLAN.md".into(), d.path().join("PLAN.md"))];
         r.budget = 20 * 1024;
         let c = assemble(&r).unwrap();
         assert!(c.text.len() <= r.budget, "{}", c.text.len());
-        assert!(c.text.contains(&"P".repeat(12_000)), "policy is never trimmed");
-        let modes: Vec<(String, String)> = c.sources.iter().map(|s| (s.label.clone(), s.mode.clone())).collect();
-        assert!(modes.contains(&("PLAN.md".into(), "path (budget)".into())), "{modes:?}");
-        assert!(modes.contains(&("global.md".into(), "trimmed".into())), "{modes:?}");
-        assert!(modes.contains(&("AGENTS.md".into(), "inline".into())), "AGENTS.md is trimmed after global.md: {modes:?}");
+        assert!(
+            c.text.contains(&"P".repeat(12_000)),
+            "policy is never trimmed"
+        );
+        let modes: Vec<(String, String)> = c
+            .sources
+            .iter()
+            .map(|s| (s.label.clone(), s.mode.clone()))
+            .collect();
+        assert!(
+            modes.contains(&("PLAN.md".into(), "path (budget)".into())),
+            "{modes:?}"
+        );
+        assert!(
+            modes.contains(&("global.md".into(), "trimmed".into())),
+            "{modes:?}"
+        );
+        assert!(
+            modes.contains(&("AGENTS.md".into(), "inline".into())),
+            "AGENTS.md is trimmed after global.md: {modes:?}"
+        );
         assert_eq!(c.warnings.len(), 2, "{:?}", c.warnings);
         // a budget below policy + role: reported, policy still intact
         r.budget = 4 * 1024;

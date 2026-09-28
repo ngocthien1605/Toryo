@@ -11,9 +11,9 @@ use serde_json::Value;
 use crate::config::{
     data_dir, expand_vars, resolve_profile_secrets, Billing, Effective, ProfileKind,
 };
+use crate::evidence::{self as results, evidence_status, run_version, EvidenceStatus};
 use crate::git::{GitCmd, Loc};
 use crate::process::env::{build_env, validate_provider_selection};
-use crate::evidence::{self as results, evidence_status, run_version, EvidenceStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, PartialOrd, Ord)]
 pub enum Level {
@@ -327,11 +327,20 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
         "verify boundary",
         "Low-IL boundary (R36, M0-VERIFY 9); run `toryo spike lowil-canary`",
     );
-    match evidence_status(&records, "git-canary", "", "git", results::git_version().as_deref()) {
+    match evidence_status(
+        &records,
+        "git-canary",
+        "",
+        "git",
+        results::git_version().as_deref(),
+    ) {
         st @ EvidenceStatus::Stale { .. } => r.add(
             Level::Warn,
             "git",
-            format!("{} — run `toryo doctor --canaries`", st.describe("git-canary")),
+            format!(
+                "{} — run `toryo doctor --canaries`",
+                st.describe("git-canary")
+            ),
         ),
         _ => evidence(
             &mut r,
@@ -361,13 +370,20 @@ fn verify_root_check(r: &mut Report, cfg: &Effective) {
         );
     }
     if cfg.repo.verify.boundary == "none" {
-        return r.add(Level::Warn, area, "verify.boundary: none — trusted-code mode, verification is NOT isolated (R36)");
+        return r.add(
+            Level::Warn,
+            area,
+            "verify.boundary: none — trusted-code mode, verification is NOT isolated (R36)",
+        );
     }
     match crate::engine::verify::probe(cfg) {
         Ok(()) => r.add(
             Level::Ok,
             area,
-            format!("{}: Low integrity label can be set (R36/R45)", root.display()),
+            format!(
+                "{}: Low integrity label can be set (R36/R45)",
+                root.display()
+            ),
         ),
         Err(e) => r.add(
             if cfg.repo.verify.boundary == "none" {
@@ -397,7 +413,11 @@ fn profile_evidence(
         EvidenceStatus::Verified { .. } => r.add(
             Level::Ok,
             area,
-            format!("{} for {} (R51)", st.describe(spike), current.unwrap_or("?")),
+            format!(
+                "{} for {} (R51)",
+                st.describe(spike),
+                current.unwrap_or("?")
+            ),
         ),
         EvidenceStatus::Missing => r.add(Level::Fail, area, format!("no M0 record: {hint}")),
         _ => r.add(

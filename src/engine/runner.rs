@@ -22,23 +22,26 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use super::checks::{parse_allow_protected, resolve_program, review_violations, verify_commands, verify_files, Protected};
+use super::checks::{
+    parse_allow_protected, resolve_program, review_violations, verify_commands, verify_files,
+    Protected,
+};
 use super::context;
 use super::contracts;
 use super::lock::TaskLock;
-use super::verify;
 use super::protect;
 use super::state::{GateKind, PipelineEvent as Ev, PipelineState as St};
 use super::store::{self, AttemptEnd, AttemptRow, AttemptStatus, NewAttempt, Store, TaskRow};
 use super::task::{frozen_config, sha256_hex, task_git};
+use super::verify;
 use super::worktree::{rel, Worktree, T_AGENT, T_ATTEMPT, T_NO_CHANGE, T_STAGE, T_TASK};
 use crate::agents::adapter::TurnHooks;
 use crate::agents::hub::AgentHub;
 use crate::config::{expand_vars, Billing, CommandSpec, Effective, ProfileKind};
 use crate::domain::{ErrorClass, OpenSession, Role, StageOutcome, Tri, TurnInput, TurnLimits};
-use crate::usage::{Accounting, Weights};
 use crate::git::GitCmd;
 use crate::runner::{CommandRunner, LocalRunner, RunSpec};
+use crate::usage::{Accounting, Weights};
 
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
@@ -85,10 +88,16 @@ pub fn task_policy(t: &TaskRow, cfg: &Effective) -> Result<(GitCmd, Protected, V
     // the allow list comes from the TASK.md snapshot (hashed at create, R28), not the repo
     let task_md = std::fs::read(t.artifacts().join("TASK.md")).unwrap_or_default();
     if sha256_hex(&task_md) != t.task_sha256 {
-        bail!("artifact_tampered: TASK.md of {} does not match tasks.task_sha256 (R27/R28)", t.id);
+        bail!(
+            "artifact_tampered: TASK.md of {} does not match tasks.task_sha256 (R27/R28)",
+            t.id
+        );
     }
     let task_md = String::from_utf8_lossy(&task_md).to_string();
-    let p = Protected::new(exact, &cfg.repo.policy.protected_paths).with_policy(&parse_allow_protected(&task_md), &cfg.repo.policy.deny_paths);
+    let p = Protected::new(exact, &cfg.repo.policy.protected_paths).with_policy(
+        &parse_allow_protected(&task_md),
+        &cfg.repo.policy.deny_paths,
+    );
     Ok((g, p, cmds))
 }
 
@@ -115,12 +124,31 @@ pub struct Engine<'a> {
 }
 
 impl<'a> Engine<'a> {
-    pub fn new(store: &'a Store, hub: &'a AgentHub, lock: &'a TaskLock, opts: RunOptions) -> Result<Self> {
+    pub fn new(
+        store: &'a Store,
+        hub: &'a AgentHub,
+        lock: &'a TaskLock,
+        opts: RunOptions,
+    ) -> Result<Self> {
         let id = lock.task.clone();
-        let t = { let i = id.clone(); store.call(move |tx| store::get_task(tx, &i))? };
+        let t = {
+            let i = id.clone();
+            store.call(move |tx| store::get_task(tx, &i))?
+        };
         let cfg = frozen_config(&t)?;
         let (g, protect, cmds) = task_policy(&t, &cfg)?;
-        Ok(Self { store, hub, lock, cfg, g, id, opts, protect, cmds, retries: 0 })
+        Ok(Self {
+            store,
+            hub,
+            lock,
+            cfg,
+            g,
+            id,
+            opts,
+            protect,
+            cmds,
+            retries: 0,
+        })
     }
 
     pub fn protected(&self) -> &Protected {
@@ -164,7 +192,12 @@ impl<'a> Engine<'a> {
     /// Stop request + session id hooks; for a live adapter (Claude) with a budget, also the
     /// R41 live interrupt: the turn is cancelled when its provisional usage reaches what is
     /// left of the budget (the returned flag says it was the budget, not a stop).
-    fn hooks(&self, attempt: &str, stop: &super::lock::StopWatch, profile: &str) -> Result<(TurnHooks, Arc<AtomicBool>)> {
+    fn hooks(
+        &self,
+        attempt: &str,
+        stop: &super::lock::StopWatch,
+        profile: &str,
+    ) -> Result<(TurnHooks, Arc<AtomicBool>)> {
         let (st, a) = (self.store.clone(), attempt.to_string());
         let hit = Arc::new(AtomicBool::new(false));
         let mut h = TurnHooks {
@@ -176,12 +209,15 @@ impl<'a> Engine<'a> {
             on_usage: None,
         };
         let t = self.task()?;
-        let live = self.hub.capabilities(profile)?.live && self.cfg.repo.pipeline.budget_live_interrupt.unwrap_or(true);
+        let live = self.hub.capabilities(profile)?.live
+            && self.cfg.repo.pipeline.budget_live_interrupt.unwrap_or(true);
         if let (true, Some(b)) = (live, t.budget_tokens) {
             let left = (b - t.spent_tokens - t.reserved_tokens).max(0) as u64;
             let (w, flag, h2) = (self.weights(), stop.flag.clone(), hit.clone());
             h.on_usage = Some(Arc::new(move |u: &crate::domain::TokenUsage| {
-                if u.buckets.is_some_and(|b| b.budget_tokens(&w) >= left) && !h2.swap(true, Ordering::SeqCst) {
+                if u.buckets.is_some_and(|b| b.budget_tokens(&w) >= left)
+                    && !h2.swap(true, Ordering::SeqCst)
+                {
                     flag.store(true, Ordering::SeqCst);
                 }
             }));
@@ -190,16 +226,29 @@ impl<'a> Engine<'a> {
     }
 
     fn weights(&self) -> Weights {
-        let m = self.cfg.repo.pipeline.budget_weights.clone().unwrap_or_default();
+        let m = self
+            .cfg
+            .repo
+            .pipeline
+            .budget_weights
+            .clone()
+            .unwrap_or_default();
         let g = |k: &str| m.get(k).copied().unwrap_or(1.0);
-        Weights { uncached_input: g("uncached_input"), cache_read: g("cache_read"), cache_write: g("cache_write"), output: g("output") }
+        Weights {
+            uncached_input: g("uncached_input"),
+            cache_read: g("cache_read"),
+            cache_write: g("cache_write"),
+            output: g("output"),
+        }
     }
 
     /// R41 admission: a turn starts only while `spent + reserved < budget`; otherwise the
     /// task pauses (`Paused(Budget)`) without starting it. Warns at 80 %.
     fn admitted(&self) -> Result<bool> {
         let t = self.task()?;
-        let Some(b) = t.budget_tokens else { return Ok(true) };
+        let Some(b) = t.budget_tokens else {
+            return Ok(true);
+        };
         let used = t.spent_tokens + t.reserved_tokens;
         if used >= b {
             eprintln!(
@@ -218,8 +267,21 @@ impl<'a> Engine<'a> {
     /// The live interrupt fired: the turn's provisional usage is recorded, the attempt is
     /// interrupted and the task pauses.
     fn budget_interrupted(&self, a: &AttemptRow, r: &StageOutcome) -> Result<Flow> {
-        eprintln!("!! budget reached during the turn — interrupted (R41 live interrupt), the task pauses");
-        self.end_and(a, AttemptStatus::Interrupted, r, AttemptEnd { error_class: Some("budget".into()), error_detail: Some("budget reached during the turn (R41 live interrupt)".into()), ..Default::default() }, Some(Ev::BudgetExceeded), None)?;
+        eprintln!(
+            "!! budget reached during the turn — interrupted (R41 live interrupt), the task pauses"
+        );
+        self.end_and(
+            a,
+            AttemptStatus::Interrupted,
+            r,
+            AttemptEnd {
+                error_class: Some("budget".into()),
+                error_detail: Some("budget reached during the turn (R41 live interrupt)".into()),
+                ..Default::default()
+            },
+            Some(Ev::BudgetExceeded),
+            None,
+        )?;
         Ok(Flow::Next)
     }
 
@@ -256,7 +318,11 @@ impl<'a> Engine<'a> {
                     if !self.opts.yes {
                         return Ok(RunEnd::Waiting(t.state));
                     }
-                    let kind = if t.state == St::WaitingPlanApproval { GateKind::Plan } else { GateKind::Final };
+                    let kind = if t.state == St::WaitingPlanApproval {
+                        GateKind::Plan
+                    } else {
+                        GateKind::Final
+                    };
                     eprintln!("({kind:?} gate approved automatically: --yes)");
                     approve_now(self.store, &t, kind, None)?;
                     Flow::Next
@@ -282,7 +348,11 @@ impl<'a> Engine<'a> {
 
     fn plan(&mut self, t: &TaskRow) -> Result<Flow> {
         let art = t.artifacts();
-        let prev = { let i = self.id.clone(); self.store.call(move |tx| store::last_attempt(tx, &i, "plan"))? };
+        let prev = {
+            let i = self.id.clone();
+            self.store
+                .call(move |tx| store::last_attempt(tx, &i, "plan"))?
+        };
         // R48: the Planner (Claude) resumes its session for a revision or after an interruption
         let resume = prev.as_ref().and_then(|p| p.external_session_id.clone());
         let prompt = match (&t.feedback, prev.as_ref().map(|p| p.status)) {
@@ -297,10 +367,19 @@ impl<'a> Engine<'a> {
             return Ok(Flow::Next);
         }
         let head = Worktree::new(&self.g, &t.worktree).head()?;
-        let a = self.begin(NewAttempt { stage: "plan", kind: "agent", profile: Some(&t.planner), fallback_from: None, head_before: Some(&head), subject_commit: None })?;
+        let a = self.begin(NewAttempt {
+            stage: "plan",
+            kind: "agent",
+            profile: Some(&t.planner),
+            fallback_from: None,
+            head_before: Some(&head),
+            subject_commit: None,
+        })?;
         eprintln!("\n── PLAN (attempt {}, {}) ──", a.attempt, t.planner);
         crash_point("plan:after_begin");
-        let Some(ctx) = self.context(t, &a, &t.planner)? else { return Ok(Flow::Next) };
+        let Some(ctx) = self.context(t, &a, &t.planner)? else {
+            return Ok(Flow::Next);
+        };
         let stop = self.lock.watch_stop();
         let (hooks, budget_hit) = self.hooks(&a.id, &stop, &t.planner)?;
         let r = self.hub.turn_with(
@@ -315,7 +394,12 @@ impl<'a> Engine<'a> {
                 model: self.role_model("planner"),
                 resume,
             },
-            TurnInput { prompt, label: format!("plan-{}", a.attempt), echo: true, env: self.capture_env() },
+            TurnInput {
+                prompt,
+                label: format!("plan-{}", a.attempt),
+                echo: true,
+                env: self.capture_env(),
+            },
             self.limits(),
             hooks,
         )?;
@@ -331,8 +415,19 @@ impl<'a> Engine<'a> {
             return Ok(flow);
         }
         let Some(plan) = r.structured.clone() else {
-            let reason = format!("planner returned no structured plan: {:?} {}", r.error_class, r.error_detail.clone().unwrap_or_default());
-            self.end_and(&a, AttemptStatus::Failed, &r, AttemptEnd::default(), Some(Ev::Escalate { reason }), None)?;
+            let reason = format!(
+                "planner returned no structured plan: {:?} {}",
+                r.error_class,
+                r.error_detail.clone().unwrap_or_default()
+            );
+            self.end_and(
+                &a,
+                AttemptStatus::Failed,
+                &r,
+                AttemptEnd::default(),
+                Some(Ev::Escalate { reason }),
+                None,
+            )?;
             return Ok(Flow::Next);
         };
         let bytes = serde_json::to_vec_pretty(&plan)?;
@@ -340,16 +435,39 @@ impl<'a> Engine<'a> {
         self.put(t, &a, "plan", "json", &bytes, "plan.json")?;
         self.put(t, &a, "plan-md", "md", md.as_bytes(), "PLAN.md")?;
         eprintln!("\n{md}");
-        let files: Vec<String> = plan["files_likely_involved"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect();
-        let bad: Vec<String> = files.iter().filter(|f| self.protect.violates(f)).cloned().collect();
+        let files: Vec<String> = plan["files_likely_involved"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        let bad: Vec<String> = files
+            .iter()
+            .filter(|f| self.protect.violates(f))
+            .cloned()
+            .collect();
         if !bad.is_empty() {
             eprintln!("!! the plan lists protected or denied paths {bad:?} — rejected automatically (plan-time policy)");
             let fb = format!("Your plan lists protected or denied paths {bad:?} (toryo.yaml policy), which may not change. Create the plan again without touching them.");
-            self.end_and(&a, AttemptStatus::Succeeded, &r, AttemptEnd::default(), Some(Ev::PlanPolicyViolation { paths: bad }), Some(Some(fb)))?;
+            self.end_and(
+                &a,
+                AttemptStatus::Succeeded,
+                &r,
+                AttemptEnd::default(),
+                Some(Ev::PlanPolicyViolation { paths: bad }),
+                Some(Some(fb)),
+            )?;
             return Ok(Flow::Next);
         }
         let subject = sha256_hex(&bytes);
-        self.end_and(&a, AttemptStatus::Succeeded, &r, AttemptEnd::default(), Some(Ev::PlanReady { subject }), Some(None))?;
+        self.end_and(
+            &a,
+            AttemptStatus::Succeeded,
+            &r,
+            AttemptEnd::default(),
+            Some(Ev::PlanReady { subject }),
+            Some(None),
+        )?;
         Ok(Flow::Next)
     }
 
@@ -362,8 +480,17 @@ impl<'a> Engine<'a> {
     fn implement(&mut self, t: &TaskRow) -> Result<Flow> {
         let stage = writing_stage(t.fix_cycle);
         let wt = Worktree::new(&self.g, &t.worktree);
-        let limit = if self.opts.no_fallback { 1 } else { t.implementers.len() };
-        let Some(profile) = t.implementers.get(t.implementer_index).filter(|_| t.implementer_index < limit).cloned() else {
+        let limit = if self.opts.no_fallback {
+            1
+        } else {
+            t.implementers.len()
+        };
+        let Some(profile) = t
+            .implementers
+            .get(t.implementer_index)
+            .filter(|_| t.implementer_index < limit)
+            .cloned()
+        else {
             let reason = format!(
                 "implementer_quota: no implementer left ({}{}); the worktree keeps any partial changes — `toryo resume` when the quota is back",
                 t.implementers.join(" → "),
@@ -373,7 +500,10 @@ impl<'a> Engine<'a> {
             return Ok(Flow::Next);
         };
         let kind = self.cfg.profile(&profile)?.kind;
-        let prev = { let (i, s) = (self.id.clone(), stage.clone()); self.store.call(move |tx| store::last_attempt(tx, &i, &s))? };
+        let prev = {
+            let (i, s) = (self.id.clone(), stage.clone());
+            self.store.call(move |tx| store::last_attempt(tx, &i, &s))?
+        };
         let mut prompt = "Implement the approved plan (PLAN.md) for the task (TASK.md) in this worktree, following your role and the project rules in the context.\n".to_string();
         if t.fix_cycle > 0 {
             if let Some(f) = &t.feedback {
@@ -386,16 +516,33 @@ impl<'a> Engine<'a> {
         // R48 recovery policy: Claude resumes the interrupted session, Codex starts fresh
         // (the hand-over note written by recovery names the partial commit)
         let resume = match (&prev, kind) {
-            (Some(p), ProfileKind::Claude) if p.status == AttemptStatus::Interrupted && p.profile.as_deref() == Some(profile.as_str()) => p.external_session_id.clone(),
+            (Some(p), ProfileKind::Claude)
+                if p.status == AttemptStatus::Interrupted
+                    && p.profile.as_deref() == Some(profile.as_str()) =>
+            {
+                p.external_session_id.clone()
+            }
             _ => None,
         };
-        let fallback_from = if t.implementer_index > 0 && prev.as_ref().is_none_or(|p| p.profile.as_deref() != Some(profile.as_str())) {
+        let fallback_from = if t.implementer_index > 0
+            && prev
+                .as_ref()
+                .is_none_or(|p| p.profile.as_deref() != Some(profile.as_str()))
+        {
             t.implementers.get(t.implementer_index - 1).cloned()
         } else {
             None
         };
         let (prompt, model) = match kind {
-            ProfileKind::Codex => (prompt, self.role_model("implementer").or_else(|| self.cfg.profile(&profile).ok().and_then(|p| p.model.clone()))),
+            ProfileKind::Codex => (
+                prompt,
+                self.role_model("implementer").or_else(|| {
+                    self.cfg
+                        .profile(&profile)
+                        .ok()
+                        .and_then(|p| p.model.clone())
+                }),
+            ),
             ProfileKind::Claude => (claude_implementer_prompt(&prompt), None),
         };
         if !self.admitted()? {
@@ -405,11 +552,27 @@ impl<'a> Engine<'a> {
         let tmp = t.worktree.join(".toryo-tmp");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp)?;
-        let env: BTreeMap<String, String> = [("TEMP", &tmp), ("TMP", &tmp)].into_iter().map(|(k, v)| (k.to_string(), v.display().to_string())).collect();
-        let a = self.begin(NewAttempt { stage: &stage, kind: "agent", profile: Some(&profile), fallback_from: fallback_from.as_deref(), head_before: Some(&head_before), subject_commit: None })?;
-        eprintln!("\n── {} (attempt {}, {profile}) ──", stage.to_uppercase(), a.attempt);
+        let env: BTreeMap<String, String> = [("TEMP", &tmp), ("TMP", &tmp)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.display().to_string()))
+            .collect();
+        let a = self.begin(NewAttempt {
+            stage: &stage,
+            kind: "agent",
+            profile: Some(&profile),
+            fallback_from: fallback_from.as_deref(),
+            head_before: Some(&head_before),
+            subject_commit: None,
+        })?;
+        eprintln!(
+            "\n── {} (attempt {}, {profile}) ──",
+            stage.to_uppercase(),
+            a.attempt
+        );
         crash_point("implement:after_begin");
-        let Some(ctx) = self.context(t, &a, &profile)? else { return Ok(Flow::Next) };
+        let Some(ctx) = self.context(t, &a, &profile)? else {
+            return Ok(Flow::Next);
+        };
         let stop = self.lock.watch_stop();
         let (hooks, budget_hit) = self.hooks(&a.id, &stop, &profile)?;
         let r = self.hub.turn_with(
@@ -424,7 +587,12 @@ impl<'a> Engine<'a> {
                 model,
                 resume,
             },
-            TurnInput { prompt, label: format!("{stage}-{}", a.attempt), env, echo: true },
+            TurnInput {
+                prompt,
+                label: format!("{stage}-{}", a.attempt),
+                env,
+                echo: true,
+            },
             self.limits(),
             hooks,
         )?;
@@ -438,28 +606,59 @@ impl<'a> Engine<'a> {
             return self.stopped();
         }
         if let Some(v) = &r.structured {
-            self.put(t, &a, "implementation", "json", &serde_json::to_vec_pretty(v)?, &format!("implementation-{}.json", t.fix_cycle))?;
+            self.put(
+                t,
+                &a,
+                "implementation",
+                "json",
+                &serde_json::to_vec_pretty(v)?,
+                &format!("implementation-{}.json", t.fix_cycle),
+            )?;
         }
         // quota / rate limits: retry, then the next implementer (sticky, R49)
         let switch = match r.error_class {
-            Some(ErrorClass::QuotaExceeded) => Some(format!("quota exhausted: {}", r.error_detail.clone().unwrap_or_default())),
+            Some(ErrorClass::QuotaExceeded) => Some(format!(
+                "quota exhausted: {}",
+                r.error_detail.clone().unwrap_or_default()
+            )),
             Some(ErrorClass::RateLimited | ErrorClass::Overloaded) if self.retries < 2 => {
                 self.retries += 1;
-                let base: u64 = std::env::var("TORYO_RETRY_BASE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+                let base: u64 = std::env::var("TORYO_RETRY_BASE_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(30);
                 let wait = base * u64::from(self.retries);
-                eprintln!("!! {profile}: {:?} — retry {}/2 in {wait}s", r.error_class, self.retries);
+                eprintln!(
+                    "!! {profile}: {:?} — retry {}/2 in {wait}s",
+                    r.error_class, self.retries
+                );
                 self.end(&a, AttemptStatus::Failed, &r, AttemptEnd::default())?;
                 std::thread::sleep(Duration::from_secs(wait));
                 return Ok(Flow::Next);
             }
-            Some(c @ (ErrorClass::RateLimited | ErrorClass::Overloaded)) => Some(format!("{c:?} after 2 retries")),
+            Some(c @ (ErrorClass::RateLimited | ErrorClass::Overloaded)) => {
+                Some(format!("{c:?} after 2 retries"))
+            }
             _ => None,
         };
         if let Some(reason) = switch {
             self.retries = 0;
-            let changed: Vec<String> = wt.changed()?.into_iter().map(|(s, p)| format!("{s} {p}")).collect();
-            let next = t.implementers.get(t.implementer_index + 1).filter(|_| t.implementer_index + 1 < limit).cloned();
-            eprintln!("!! implementer {profile}: {reason} → {}", next.as_deref().map(|n| format!("switching to {n}")).unwrap_or_else(|| "no fallback left".into()));
+            let changed: Vec<String> = wt
+                .changed()?
+                .into_iter()
+                .map(|(s, p)| format!("{s} {p}"))
+                .collect();
+            let next = t
+                .implementers
+                .get(t.implementer_index + 1)
+                .filter(|_| t.implementer_index + 1 < limit)
+                .cloned();
+            eprintln!(
+                "!! implementer {profile}: {reason} → {}",
+                next.as_deref()
+                    .map(|n| format!("switching to {n}"))
+                    .unwrap_or_else(|| "no fallback left".into())
+            );
             let note = if changed.is_empty() {
                 format!("\n## Hand-over\nThe previous implementer (`{profile}`) stopped before producing any change ({reason}). Start the task from the plan.\n")
             } else {
@@ -468,9 +667,15 @@ impl<'a> Engine<'a> {
                     changed.iter().map(|x| format!("- `{x}`")).collect::<Vec<_>>().join("\n")
                 )
             };
-            let (i, aid, idx, st2) = (self.id.clone(), a.id.clone(), t.implementer_index + 1, r.session_id.clone());
+            let (i, aid, idx, st2) = (
+                self.id.clone(),
+                a.id.clone(),
+                t.implementer_index + 1,
+                r.session_id.clone(),
+            );
             let pause = next.is_none();
-            let payload = json!({"from": profile, "to": next, "reason": reason, "partial_changes": changed});
+            let payload =
+                json!({"from": profile, "to": next, "reason": reason, "partial_changes": changed});
             self.store.call(move |tx| {
                 store::finish_attempt(tx, &aid, AttemptStatus::Failed, &AttemptEnd { error_class: Some("QuotaExceeded".into()), external_session_id: st2, ..Default::default() })?;
                 store::set_implementer_index(tx, &i, idx)?;
@@ -486,35 +691,90 @@ impl<'a> Engine<'a> {
         self.retries = 0;
         // HEAD guard (§8): agents must not commit
         if wt.head()? != head_before {
-            eprintln!("!! policy_violation: the agent moved HEAD — soft reset to {}", &head_before[..12]);
+            eprintln!(
+                "!! policy_violation: the agent moved HEAD — soft reset to {}",
+                &head_before[..12]
+            );
             wt.soft_reset(&head_before)?;
             let (i, aid) = (self.id.clone(), a.id.clone());
-            self.store.call(move |tx| store::event(tx, Some(&i), Some(&aid), "policy_violation", &json!({"kind": "agent commit", "action": "soft reset"})))?;
+            self.store.call(move |tx| {
+                store::event(
+                    tx,
+                    Some(&i),
+                    Some(&aid),
+                    "policy_violation",
+                    &json!({"kind": "agent commit", "action": "soft reset"}),
+                )
+            })?;
         }
         // R35: untracked/ignored protected files or Git metadata → Escalated, nothing else runs
         if let Some(reason) = self.protected_violation(t, true)? {
             eprintln!("!! {reason}");
-            self.end_and(&a, AttemptStatus::Failed, &r, AttemptEnd { error_class: Some(protect::REASON.into()), ..Default::default() }, Some(Ev::Escalate { reason }), None)?;
+            self.end_and(
+                &a,
+                AttemptStatus::Failed,
+                &r,
+                AttemptEnd {
+                    error_class: Some(protect::REASON.into()),
+                    ..Default::default()
+                },
+                Some(Ev::Escalate { reason }),
+                None,
+            )?;
             return Ok(Flow::Next);
         }
         let changed = wt.changed()?;
-        let prot: Vec<String> = changed.iter().map(|c| c.1.clone()).filter(|p| self.protect.violates(p)).collect();
+        let prot: Vec<String> = changed
+            .iter()
+            .map(|c| c.1.clone())
+            .filter(|p| self.protect.violates(p))
+            .collect();
         if !prot.is_empty() {
             eprintln!("!! protected or denied paths changed: {prot:?} — restored, nothing committed; sent back to the implementer");
             wt.restore(&prot)?;
             let fb = format!("- POLICY: you changed protected or denied paths {prot:?}. They were restored. Do not modify them; achieve the task another way.");
-            self.end_and(&a, AttemptStatus::Failed, &r, AttemptEnd { error_class: Some("policy_violation".into()), error_detail: Some(format!("{prot:?}")), ..Default::default() }, Some(Ev::PathPolicyViolation { paths: prot }), Some(Some(fb)))?;
+            self.end_and(
+                &a,
+                AttemptStatus::Failed,
+                &r,
+                AttemptEnd {
+                    error_class: Some("policy_violation".into()),
+                    error_detail: Some(format!("{prot:?}")),
+                    ..Default::default()
+                },
+                Some(Ev::PathPolicyViolation { paths: prot }),
+                Some(Some(fb)),
+            )?;
             return Ok(Flow::Next);
         }
         if !r.success && changed.is_empty() {
             r.print_summary();
-            let reason = format!("implementer failed: {:?} {}", r.error_class, r.error_detail.clone().unwrap_or_default());
-            self.end_and(&a, AttemptStatus::Failed, &r, AttemptEnd::default(), Some(Ev::Escalate { reason }), None)?;
+            let reason = format!(
+                "implementer failed: {:?} {}",
+                r.error_class,
+                r.error_detail.clone().unwrap_or_default()
+            );
+            self.end_and(
+                &a,
+                AttemptStatus::Failed,
+                &r,
+                AttemptEnd::default(),
+                Some(Ev::Escalate { reason }),
+                None,
+            )?;
             return Ok(Flow::Next);
         }
         let i = self.id.clone();
-        self.end_and(&a, AttemptStatus::Succeeded, &r, AttemptEnd::default(), Some(Ev::ImplementationDone), None)?;
-        self.store.call(move |tx| store::set_handoff(tx, &i, None))?;
+        self.end_and(
+            &a,
+            AttemptStatus::Succeeded,
+            &r,
+            AttemptEnd::default(),
+            Some(Ev::ImplementationDone),
+            None,
+        )?;
+        self.store
+            .call(move |tx| store::set_handoff(tx, &i, None))?;
         Ok(Flow::Next)
     }
 
@@ -523,17 +783,28 @@ impl<'a> Engine<'a> {
     fn checkpoint(&mut self, t: &TaskRow) -> Result<Flow> {
         let stage = writing_stage(t.fix_cycle);
         let wt = Worktree::new(&self.g, &t.worktree);
-        let a = { let (i, s) = (self.id.clone(), stage.clone()); self.store.call(move |tx| store::last_attempt(tx, &i, &s))? }
-            .with_context(|| format!("no `{stage}` attempt to checkpoint"))?;
+        let a = {
+            let (i, s) = (self.id.clone(), stage.clone());
+            self.store.call(move |tx| store::last_attempt(tx, &i, &s))?
+        }
+        .with_context(|| format!("no `{stage}` attempt to checkpoint"))?;
         let implementer = a.profile.clone().unwrap_or_default();
         let (head, kind) = match wt.find_checkpoint(&t.base_commit, &t.id, &stage, a.attempt)? {
             Some(c) if !c.partial => {
-                eprintln!("✔ checkpoint {} already committed (trailer match)", &c.sha[..12]);
+                eprintln!(
+                    "✔ checkpoint {} already committed (trailer match)",
+                    &c.sha[..12]
+                );
                 (c.sha, if c.no_change { "no_change" } else { "normal" })
             }
             _ => {
                 // §8: deny paths are checked again right before the commit
-                let denied: Vec<String> = wt.changed()?.into_iter().map(|c| c.1).filter(|p| self.protect.is_denied(p)).collect();
+                let denied: Vec<String> = wt
+                    .changed()?
+                    .into_iter()
+                    .map(|c| c.1)
+                    .filter(|p| self.protect.is_denied(p))
+                    .collect();
                 if !denied.is_empty() {
                     let reason = format!("policy_violation: denied paths {denied:?} would be committed (policy.deny_paths); nothing was committed");
                     eprintln!("!! {reason}");
@@ -555,24 +826,61 @@ impl<'a> Engine<'a> {
                 (sha, if no_change { "no_change" } else { "normal" })
             }
         };
-        let full = self.g.canonical_diff(&wt.loc, &t.base_commit, Some(&head))?;
+        let full = self
+            .g
+            .canonical_diff(&wt.loc, &t.base_commit, Some(&head))?;
         self.put(t, &a, "diff", "patch", &full, "DIFF.patch")?;
         let inc = match &t.last_reviewed_head {
             Some(h) => self.g.canonical_diff(&wt.loc, h, Some(&head))?,
             None => Vec::new(),
         };
-        self.put(t, &a, "diff-incremental", "patch", &inc, "DIFF-incremental.patch")?;
+        self.put(
+            t,
+            &a,
+            "diff-incremental",
+            "patch",
+            &inc,
+            "DIFF-incremental.patch",
+        )?;
         eprintln!("✔ checkpoint {} ({kind})", &head[..12]);
         // R35: a committed tracked protected change allowed by TASK.md becomes the new baseline
         let c = protect::check(self.store, t, &self.g, &self.protect)?;
-        let allowed: Vec<String> = c.changes.iter().filter(|x| !x.is_hard() && self.protect.is_allowed(&x.path)).map(|x| x.path.clone()).collect();
+        let allowed: Vec<String> = c
+            .changes
+            .iter()
+            .filter(|x| !x.is_hard() && self.protect.is_allowed(&x.path))
+            .map(|x| x.path.clone())
+            .collect();
         if !allowed.is_empty() && c.hard().is_empty() {
-            protect::take_baseline(self.store, t, &self.g, &self.protect, &format!("checkpoint {}: allowed protected change {allowed:?} (TASK.md)", &head[..12]))?;
+            protect::take_baseline(
+                self.store,
+                t,
+                &self.g,
+                &self.protect,
+                &format!(
+                    "checkpoint {}: allowed protected change {allowed:?} (TASK.md)",
+                    &head[..12]
+                ),
+            )?;
             eprintln!("   protected baseline renewed: {allowed:?} (## Allow protected)");
         }
-        let (i, aid, h, k) = (self.id.clone(), a.id.clone(), head.clone(), kind.to_string());
+        let (i, aid, h, k) = (
+            self.id.clone(),
+            a.id.clone(),
+            head.clone(),
+            kind.to_string(),
+        );
         self.store.call(move |tx| {
-            store::finish_attempt(tx, &aid, AttemptStatus::Succeeded, &AttemptEnd { head_after: Some(h.clone()), checkpoint_kind: Some(k), ..Default::default() })?;
+            store::finish_attempt(
+                tx,
+                &aid,
+                AttemptStatus::Succeeded,
+                &AttemptEnd {
+                    head_after: Some(h.clone()),
+                    checkpoint_kind: Some(k),
+                    ..Default::default()
+                },
+            )?;
             store::transition(tx, &i, Ev::Checkpointed { head: h })?;
             Ok(())
         })?;
@@ -582,20 +890,47 @@ impl<'a> Engine<'a> {
     // ── Verifying ────────────────────────────────────────────────────────────────────
 
     fn verify(&mut self, t: &TaskRow) -> Result<Flow> {
-        let head = t.machine.checkpoint().context("no checkpoint to verify")?.to_string();
-        let a = self.begin(NewAttempt { stage: "verify", kind: "command", profile: None, fallback_from: None, head_before: Some(&head), subject_commit: Some(&head) })?;
+        let head = t
+            .machine
+            .checkpoint()
+            .context("no checkpoint to verify")?
+            .to_string();
+        let a = self.begin(NewAttempt {
+            stage: "verify",
+            kind: "command",
+            profile: None,
+            fallback_from: None,
+            head_before: Some(&head),
+            subject_commit: Some(&head),
+        })?;
         crash_point("verify:after_begin");
         // R36/R45: the boundary is established or the stage stops — never a silent downgrade
-        let prepared = verify::boundary(&self.cfg).and_then(|b| verify::prepare(&self.g, t, &self.cfg, &head, b).map(|c| (b, c)));
+        let prepared = verify::boundary(&self.cfg)
+            .and_then(|b| verify::prepare(&self.g, t, &self.cfg, &head, b).map(|c| (b, c)));
         let (b, co) = match prepared {
             Ok(x) => x,
-            Err(e) if format!("{e:#}").starts_with(verify::UNAVAILABLE) || format!("{e:#}").starts_with(verify::MUTATED) => {
+            Err(e)
+                if format!("{e:#}").starts_with(verify::UNAVAILABLE)
+                    || format!("{e:#}").starts_with(verify::MUTATED) =>
+            {
                 let reason = format!("{e:#}");
                 eprintln!("!! {reason}");
-                let class = reason.split(':').next().unwrap_or(verify::UNAVAILABLE).to_string();
+                let class = reason
+                    .split(':')
+                    .next()
+                    .unwrap_or(verify::UNAVAILABLE)
+                    .to_string();
                 let (i, aid) = (self.id.clone(), a.id.clone());
                 self.store.call(move |tx| {
-                    store::finish_attempt(tx, &aid, AttemptStatus::Failed, &AttemptEnd { error_class: Some(class), ..Default::default() })?;
+                    store::finish_attempt(
+                        tx,
+                        &aid,
+                        AttemptStatus::Failed,
+                        &AttemptEnd {
+                            error_class: Some(class),
+                            ..Default::default()
+                        },
+                    )?;
                     store::transition(tx, &i, Ev::Escalate { reason })?;
                     Ok(())
                 })?;
@@ -603,7 +938,12 @@ impl<'a> Engine<'a> {
             }
             Err(e) => return Err(e),
         };
-        eprintln!("\n── VERIFY (attempt {}, {} in {}) ──", a.attempt, verify::describe(b), co.dir.display());
+        eprintln!(
+            "\n── VERIFY (attempt {}, {} in {}) ──",
+            a.attempt,
+            verify::describe(b),
+            co.dir.display()
+        );
         let stop = self.lock.watch_stop();
         let env = verify::env(&co);
         let mut results = Vec::new();
@@ -625,12 +965,25 @@ impl<'a> Engine<'a> {
             ))?;
             if res.cancelled || stop.stopped() {
                 let (aid,) = (a.id.clone(),);
-                self.store.call(move |tx| store::finish_attempt(tx, &aid, AttemptStatus::Interrupted, &AttemptEnd::default()))?;
+                self.store.call(move |tx| {
+                    store::finish_attempt(
+                        tx,
+                        &aid,
+                        AttemptStatus::Interrupted,
+                        &AttemptEnd::default(),
+                    )
+                })?;
                 return self.stopped();
             }
             let ok = res.ok();
             pass &= ok;
-            eprintln!("  {} {} (exit {:?}, {:.1}s)", if ok { "✔" } else { "✘" }, c.name, res.exit, res.duration_ms as f64 / 1000.0);
+            eprintln!(
+                "  {} {} (exit {:?}, {:.1}s)",
+                if ok { "✔" } else { "✘" },
+                c.name,
+                res.exit,
+                res.duration_ms as f64 / 1000.0
+            );
             // R50: LocalRunner strips ANSI (CSI/OSC) from everything it captures
             results.push(json!({"name": c.name, "argv": std::iter::once(c.program.clone()).chain(c.args.clone()).collect::<Vec<_>>(), "exit": res.exit, "ms": res.duration_ms, "output_tail": res.tail(40)}));
             if !ok {
@@ -639,7 +992,11 @@ impl<'a> Engine<'a> {
         }
         // R29/R47: the checkout must be exactly the checkpoint after the run
         let mutated = verify::mutated(&self.g, &co, &head)?;
-        let tree = self.g.run_str(&Worktree::new(&self.g, &t.worktree).loc, true, &["rev-parse", &format!("{head}^{{tree}}")])?;
+        let tree = self.g.run_str(
+            &Worktree::new(&self.g, &t.worktree).loc,
+            true,
+            &["rev-parse", &format!("{head}^{{tree}}")],
+        )?;
         let vr = json!({
             "head": head,
             "tree": tree.trim(),
@@ -652,12 +1009,27 @@ impl<'a> Engine<'a> {
             "mutated": mutated,
             "commands": results,
         });
-        self.put(t, &a, "verify-result", "json", &serde_json::to_vec_pretty(&vr)?, "VERIFY_RESULT.json")?;
+        self.put(
+            t,
+            &a,
+            "verify-result",
+            "json",
+            &serde_json::to_vec_pretty(&vr)?,
+            "VERIFY_RESULT.json",
+        )?;
         if let Some(reason) = mutated {
             eprintln!("!! {reason}");
             let (i, aid) = (self.id.clone(), a.id.clone());
             self.store.call(move |tx| {
-                store::finish_attempt(tx, &aid, AttemptStatus::Failed, &AttemptEnd { error_class: Some(verify::MUTATED.into()), ..Default::default() })?;
+                store::finish_attempt(
+                    tx,
+                    &aid,
+                    AttemptStatus::Failed,
+                    &AttemptEnd {
+                        error_class: Some(verify::MUTATED.into()),
+                        ..Default::default()
+                    },
+                )?;
                 store::transition(tx, &i, Ev::Escalate { reason })?;
                 Ok(())
             })?;
@@ -669,7 +1041,15 @@ impl<'a> Engine<'a> {
             let aid = a.id.clone();
             let i = self.id.clone();
             self.store.call(move |tx| {
-                store::finish_attempt(tx, &aid, AttemptStatus::Failed, &AttemptEnd { error_class: Some(protect::REASON.into()), ..Default::default() })?;
+                store::finish_attempt(
+                    tx,
+                    &aid,
+                    AttemptStatus::Failed,
+                    &AttemptEnd {
+                        error_class: Some(protect::REASON.into()),
+                        ..Default::default()
+                    },
+                )?;
                 store::transition(tx, &i, Ev::Escalate { reason })?;
                 Ok(())
             })?;
@@ -688,7 +1068,16 @@ impl<'a> Engine<'a> {
             ))
         };
         self.store.call(move |tx| {
-            store::finish_attempt(tx, &aid, if pass { AttemptStatus::Succeeded } else { AttemptStatus::Failed }, &AttemptEnd::default())?;
+            store::finish_attempt(
+                tx,
+                &aid,
+                if pass {
+                    AttemptStatus::Succeeded
+                } else {
+                    AttemptStatus::Failed
+                },
+                &AttemptEnd::default(),
+            )?;
             if pass {
                 store::transition(tx, &i, Ev::VerifyPassed { head: h })?;
             } else {
@@ -703,21 +1092,51 @@ impl<'a> Engine<'a> {
     // ── Reviewing ────────────────────────────────────────────────────────────────────
 
     fn review(&mut self, t: &TaskRow) -> Result<Flow> {
-        let head = t.machine.checkpoint().context("no checkpoint to review")?.to_string();
+        let head = t
+            .machine
+            .checkpoint()
+            .context("no checkpoint to review")?
+            .to_string();
         let art = t.artifacts();
         // R48: a review of the same checkpoint that was interrupted (crash, stop) resumes the
         // Reviewer's session
-        let prev = { let i = self.id.clone(); self.store.call(move |tx| store::last_attempt(tx, &i, "review"))? };
+        let prev = {
+            let i = self.id.clone();
+            self.store
+                .call(move |tx| store::last_attempt(tx, &i, "review"))?
+        };
         let mut resume: Option<String> = prev
-            .filter(|p| p.status == AttemptStatus::Interrupted && p.subject_commit.as_deref() == Some(head.as_str()) && p.profile.as_deref() == Some(t.reviewer.as_str()))
+            .filter(|p| {
+                p.status == AttemptStatus::Interrupted
+                    && p.subject_commit.as_deref() == Some(head.as_str())
+                    && p.profile.as_deref() == Some(t.reviewer.as_str())
+            })
             .and_then(|p| p.external_session_id);
         if !self.admitted()? {
             return Ok(Flow::Next);
         }
-        let a = self.begin(NewAttempt { stage: "review", kind: "agent", profile: Some(&t.reviewer), fallback_from: None, head_before: Some(&head), subject_commit: Some(&head) })?;
-        eprintln!("\n── REVIEW (attempt {}, {}{}) ──", a.attempt, t.reviewer, if resume.is_some() { ", resuming the interrupted session" } else { "" });
+        let a = self.begin(NewAttempt {
+            stage: "review",
+            kind: "agent",
+            profile: Some(&t.reviewer),
+            fallback_from: None,
+            head_before: Some(&head),
+            subject_commit: Some(&head),
+        })?;
+        eprintln!(
+            "\n── REVIEW (attempt {}, {}{}) ──",
+            a.attempt,
+            t.reviewer,
+            if resume.is_some() {
+                ", resuming the interrupted session"
+            } else {
+                ""
+            }
+        );
         crash_point("review:after_begin");
-        let Some(ctx) = self.context(t, &a, &t.reviewer)? else { return Ok(Flow::Next) };
+        let Some(ctx) = self.context(t, &a, &t.reviewer)? else {
+            return Ok(Flow::Next);
+        };
         let stop = self.lock.watch_stop();
         let mut prompt = format!(
             "Review the checkpoint {} in this worktree against TASK.md. DIFF.patch is base → checkpoint; DIFF-incremental.patch is the change since your last review (empty on the first). Acceptance criteria ids: {:?}.",
@@ -734,7 +1153,17 @@ impl<'a> Engine<'a> {
         for corr in 0..=2u32 {
             // R41: every turn is admitted, correction turns too
             if corr > 0 && !self.admitted()? {
-                self.end_and(&a, AttemptStatus::Failed, &last, AttemptEnd { error_class: Some("budget".into()), ..Default::default() }, Some(Ev::BudgetExceeded), None)?;
+                self.end_and(
+                    &a,
+                    AttemptStatus::Failed,
+                    &last,
+                    AttemptEnd {
+                        error_class: Some("budget".into()),
+                        ..Default::default()
+                    },
+                    Some(Ev::BudgetExceeded),
+                    None,
+                )?;
                 return Ok(Flow::Next);
             }
             let (hooks, budget_hit) = self.hooks(&a.id, &stop, &t.reviewer)?;
@@ -750,7 +1179,12 @@ impl<'a> Engine<'a> {
                     model: self.role_model("reviewer"),
                     resume: resume.clone(),
                 },
-                TurnInput { prompt: prompt.clone(), label: format!("review-{}-{corr}", a.attempt), echo: true, env: self.capture_env() },
+                TurnInput {
+                    prompt: prompt.clone(),
+                    label: format!("review-{}-{corr}", a.attempt),
+                    echo: true,
+                    env: self.capture_env(),
+                },
                 self.limits(),
                 hooks,
             )?;
@@ -779,16 +1213,44 @@ impl<'a> Engine<'a> {
         }
         if !valid {
             let reason = "InvalidOutput: the review was rejected 3 times (R22)".to_string();
-            self.end_and(&a, AttemptStatus::Failed, &last, AttemptEnd { error_class: Some("InvalidOutput".into()), correction_turns: Some(2), ..Default::default() }, Some(Ev::Escalate { reason }), None)?;
+            self.end_and(
+                &a,
+                AttemptStatus::Failed,
+                &last,
+                AttemptEnd {
+                    error_class: Some("InvalidOutput".into()),
+                    correction_turns: Some(2),
+                    ..Default::default()
+                },
+                Some(Ev::Escalate { reason }),
+                None,
+            )?;
             return Ok(Flow::Next);
         }
         let md = super::render::render("review", &review)?;
-        self.put(t, &a, "review", "json", &serde_json::to_vec_pretty(&review)?, "review.json")?;
+        self.put(
+            t,
+            &a,
+            "review",
+            "json",
+            &serde_json::to_vec_pretty(&review)?,
+            "review.json",
+        )?;
         self.put(t, &a, "review-md", "md", md.as_bytes(), "REVIEW.md")?;
         eprintln!("\n{md}");
         let mut decision = review["decision"].as_str().unwrap_or("").to_string();
-        let unmet: Vec<String> = review["acceptance_criteria"].as_array().into_iter().flatten().filter(|x| x["met"].as_bool() != Some(true)).filter_map(|x| x["id"].as_str().map(str::to_string)).collect();
-        let blocking = review["issues"].as_array().into_iter().flatten().any(|i| i["blocking"].as_bool() == Some(true));
+        let unmet: Vec<String> = review["acceptance_criteria"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|x| x["met"].as_bool() != Some(true))
+            .filter_map(|x| x["id"].as_str().map(str::to_string))
+            .collect();
+        let blocking = review["issues"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|i| i["blocking"].as_bool() == Some(true));
         if decision == "approved" && (!unmet.is_empty() || blocking) {
             eprintln!("!! review_inconsistent: `approved` with unmet {unmet:?} / blocking issues → changes_requested");
             decision = "changes_requested".into();
@@ -796,18 +1258,41 @@ impl<'a> Engine<'a> {
         let (event, feedback) = match decision.as_str() {
             "approved" => (Ev::ReviewApproved { head: head.clone() }, None),
             "blocked" => (Ev::ReviewBlocked { head: head.clone() }, None),
-            _ => (Ev::ChangesRequested { head: head.clone() }, Some(review_feedback(&review))),
+            _ => (
+                Ev::ChangesRequested { head: head.clone() },
+                Some(review_feedback(&review)),
+            ),
         };
         let (i, h) = (self.id.clone(), head.clone());
-        self.store.call(move |tx| store::set_last_reviewed(tx, &i, &h))?;
+        self.store
+            .call(move |tx| store::set_last_reviewed(tx, &i, &h))?;
         if decision == "approved" {
             // R53: non-blocking issues survive an approval as follow-ups
             let nb = non_blocking(&review);
             if !nb.is_empty() {
-                super::decisions::append(self.store, t, "follow-ups: non-blocking review issues (R53)", &format!("Review of checkpoint {} approved with these open issues:\n{}", &head[..12], nb.join("\n")))?;
+                super::decisions::append(
+                    self.store,
+                    t,
+                    "follow-ups: non-blocking review issues (R53)",
+                    &format!(
+                        "Review of checkpoint {} approved with these open issues:\n{}",
+                        &head[..12],
+                        nb.join("\n")
+                    ),
+                )?;
             }
         }
-        self.end_and(&a, AttemptStatus::Succeeded, &last, AttemptEnd { correction_turns: Some(corrections), ..Default::default() }, Some(event), feedback.map(Some))?;
+        self.end_and(
+            &a,
+            AttemptStatus::Succeeded,
+            &last,
+            AttemptEnd {
+                correction_turns: Some(corrections),
+                ..Default::default()
+            },
+            Some(event),
+            feedback.map(Some),
+        )?;
         Ok(Flow::Next)
     }
 
@@ -819,27 +1304,65 @@ impl<'a> Engine<'a> {
     /// escalation reason.
     fn protected_violation(&self, t: &TaskRow, only_hard: bool) -> Result<Option<String>> {
         let c = protect::check(self.store, t, &self.g, &self.protect)?;
-        let bad: Vec<&protect::Change> = c.changes.iter().filter(|x| x.is_hard() || (!only_hard && !self.protect.is_allowed(&x.path))).collect();
+        let bad: Vec<&protect::Change> = c
+            .changes
+            .iter()
+            .filter(|x| x.is_hard() || (!only_hard && !self.protect.is_allowed(&x.path)))
+            .collect();
         if bad.is_empty() {
             return Ok(None);
         }
-        let (i, payload) = (self.id.clone(), json!({"changes": bad, "baseline": c.baseline_id, "diff": c.diff_path}));
-        self.store.call(move |tx| store::event(tx, Some(&i), None, "protected_changed", &payload))?;
-        Ok(Some(protect::escalation_reason(&t.id, &bad, c.diff_path.as_deref())))
+        let (i, payload) = (
+            self.id.clone(),
+            json!({"changes": bad, "baseline": c.baseline_id, "diff": c.diff_path}),
+        );
+        self.store
+            .call(move |tx| store::event(tx, Some(&i), None, "protected_changed", &payload))?;
+        Ok(Some(protect::escalation_reason(
+            &t.id,
+            &bad,
+            c.diff_path.as_deref(),
+        )))
     }
 
     /// After a Planner/Reviewer turn: quota → `Paused` (no Planner/Reviewer fallback in
     /// v0.1, R49); a changed protected state → `Escalated`.
-    fn after_read_only_turn(&self, t: &TaskRow, a: &AttemptRow, r: &StageOutcome, role: &str) -> Result<Option<Flow>> {
-        if let Some(c @ (ErrorClass::QuotaExceeded | ErrorClass::RateLimited | ErrorClass::Overloaded)) = r.error_class {
+    fn after_read_only_turn(
+        &self,
+        t: &TaskRow,
+        a: &AttemptRow,
+        r: &StageOutcome,
+        role: &str,
+    ) -> Result<Option<Flow>> {
+        if let Some(
+            c @ (ErrorClass::QuotaExceeded | ErrorClass::RateLimited | ErrorClass::Overloaded),
+        ) = r.error_class
+        {
             let reason = format!("{role}_quota: {c:?} {} — `toryo resume {}` when the quota is back (no {role} fallback in v0.1)", r.error_detail.clone().unwrap_or_default(), t.id);
             eprintln!("!! {reason}");
-            self.end_and(a, AttemptStatus::Failed, r, AttemptEnd::default(), Some(Ev::Pause { reason }), None)?;
+            self.end_and(
+                a,
+                AttemptStatus::Failed,
+                r,
+                AttemptEnd::default(),
+                Some(Ev::Pause { reason }),
+                None,
+            )?;
             return Ok(Some(Flow::Next));
         }
         if let Some(reason) = self.protected_violation(t, false)? {
             eprintln!("!! {reason}");
-            self.end_and(a, AttemptStatus::Failed, r, AttemptEnd { error_class: Some(protect::REASON.into()), ..Default::default() }, Some(Ev::Escalate { reason }), None)?;
+            self.end_and(
+                a,
+                AttemptStatus::Failed,
+                r,
+                AttemptEnd {
+                    error_class: Some(protect::REASON.into()),
+                    ..Default::default()
+                },
+                Some(Ev::Escalate { reason }),
+                None,
+            )?;
             return Ok(Some(Flow::Next));
         }
         Ok(None)
@@ -848,8 +1371,25 @@ impl<'a> Engine<'a> {
     // ── attempt helpers ──────────────────────────────────────────────────────────────
 
     /// Publish an immutable artifact version for this attempt (R34) + its view.
-    fn put(&self, t: &TaskRow, a: &AttemptRow, logical: &str, ext: &str, bytes: &[u8], view: &str) -> Result<super::artifacts::Version> {
-        super::artifacts::put(self.store, t, Some(&a.id), logical, ext, logical, bytes, Some(view))
+    fn put(
+        &self,
+        t: &TaskRow,
+        a: &AttemptRow,
+        logical: &str,
+        ext: &str,
+        bytes: &[u8],
+        view: &str,
+    ) -> Result<super::artifacts::Version> {
+        super::artifacts::put(
+            self.store,
+            t,
+            Some(&a.id),
+            logical,
+            ext,
+            logical,
+            bytes,
+            Some(view),
+        )
     }
 
     /// Assemble the attempt's context (§7), store it as `context/<stage>-<attempt>` and
@@ -861,10 +1401,22 @@ impl<'a> Engine<'a> {
             Err(e) if format!("{e:#}").starts_with("artifact_") => {
                 let reason = format!("{e:#}");
                 eprintln!("!! {reason}");
-                let class = reason.split(':').next().unwrap_or("artifact_tampered").to_string();
+                let class = reason
+                    .split(':')
+                    .next()
+                    .unwrap_or("artifact_tampered")
+                    .to_string();
                 let (i, aid) = (self.id.clone(), a.id.clone());
                 self.store.call(move |tx| {
-                    store::finish_attempt(tx, &aid, AttemptStatus::Failed, &AttemptEnd { error_class: Some(class), ..Default::default() })?;
+                    store::finish_attempt(
+                        tx,
+                        &aid,
+                        AttemptStatus::Failed,
+                        &AttemptEnd {
+                            error_class: Some(class),
+                            ..Default::default()
+                        },
+                    )?;
                     store::transition(tx, &i, Ev::Escalate { reason })?;
                     Ok(())
                 })?;
@@ -876,9 +1428,23 @@ impl<'a> Engine<'a> {
         for w in &c.warnings {
             eprintln!("!! {w}");
         }
-        eprintln!("   context: {} bytes, {} sources, sha256 {}", c.text.len(), c.sources.len(), &c.sha256[..12]);
+        eprintln!(
+            "   context: {} bytes, {} sources, sha256 {}",
+            c.text.len(),
+            c.sources.len(),
+            &c.sha256[..12]
+        );
         let logical = format!("context/{}-{}", a.stage, a.attempt);
-        let v = super::artifacts::put(self.store, t, Some(&a.id), &logical, "md", "context", c.text.as_bytes(), Some(&format!("context/{}-{}.md", a.stage, a.attempt)))?;
+        let v = super::artifacts::put(
+            self.store,
+            t,
+            Some(&a.id),
+            &logical,
+            "md",
+            "context",
+            c.text.as_bytes(),
+            Some(&format!("context/{}-{}.md", a.stage, a.attempt)),
+        )?;
         let (tid, aid, sha) = (t.id.clone(), a.id.clone(), c.sha256.clone());
         let payload = json!({"sha256": c.sha256, "artifact": v.id, "sources": c.sources, "skipped": c.skipped, "warnings": c.warnings, "budget": c.budget});
         self.store.call(move |tx| {
@@ -932,8 +1498,22 @@ impl<'a> Engine<'a> {
                 x.accounting = Accounting::Provisional;
             }
         }
-        let reservation = self.cfg.repo.pipeline.unknown_turn_reservation_tokens.as_ref().and_then(|v| v.as_u64());
-        let (i, aid, stage, p, b, sess, w) = (self.id.clone(), a.id.clone(), a.stage.clone(), profile.to_string(), self.billing(profile), r.session_id.clone(), self.weights());
+        let reservation = self
+            .cfg
+            .repo
+            .pipeline
+            .unknown_turn_reservation_tokens
+            .as_ref()
+            .and_then(|v| v.as_u64());
+        let (i, aid, stage, p, b, sess, w) = (
+            self.id.clone(),
+            a.id.clone(),
+            a.stage.clone(),
+            profile.to_string(),
+            self.billing(profile),
+            r.session_id.clone(),
+            self.weights(),
+        );
         self.store.call(move |tx| {
             store::record_usage_in(
                 tx,
@@ -955,12 +1535,26 @@ impl<'a> Engine<'a> {
         })
     }
 
-    fn end(&self, a: &AttemptRow, status: AttemptStatus, r: &StageOutcome, end: AttemptEnd) -> Result<()> {
+    fn end(
+        &self,
+        a: &AttemptRow,
+        status: AttemptStatus,
+        r: &StageOutcome,
+        end: AttemptEnd,
+    ) -> Result<()> {
         self.end_and(a, status, r, end, None, None)
     }
 
     /// Finish the attempt, optionally set the feedback and apply a transition — one transaction.
-    fn end_and(&self, a: &AttemptRow, status: AttemptStatus, r: &StageOutcome, mut end: AttemptEnd, e: Option<Ev>, feedback: Option<Option<String>>) -> Result<()> {
+    fn end_and(
+        &self,
+        a: &AttemptRow,
+        status: AttemptStatus,
+        r: &StageOutcome,
+        mut end: AttemptEnd,
+        e: Option<Ev>,
+        feedback: Option<Option<String>>,
+    ) -> Result<()> {
         if end.error_class.is_none() {
             end.error_class = r.error_class.map(|c| format!("{c:?}"));
         }
@@ -1000,7 +1594,10 @@ pub fn non_blocking(review: &Value) -> Vec<String> {
                 "- {} [{}] {}{}",
                 i["id"].as_str().unwrap_or(""),
                 i["severity"].as_str().unwrap_or(""),
-                i["file"].as_str().map(|x| format!("{x}: ")).unwrap_or_default(),
+                i["file"]
+                    .as_str()
+                    .map(|x| format!("{x}: "))
+                    .unwrap_or_default(),
                 i["description"].as_str().unwrap_or("")
             )
         })
@@ -1015,7 +1612,10 @@ pub fn final_gate_notes(store: &Store, t: &TaskRow) -> Result<Vec<String>> {
         let v: Value = serde_json::from_slice(&b)?;
         let nb = non_blocking(&v);
         if !nb.is_empty() {
-            out.push(format!("non-blocking issues (follow-ups, also in DECISIONS.md):\n{}", nb.join("\n")));
+            out.push(format!(
+                "non-blocking issues (follow-ups, also in DECISIONS.md):\n{}",
+                nb.join("\n")
+            ));
         }
     }
     let cfg = frozen_config(t)?;
@@ -1023,12 +1623,19 @@ pub fn final_gate_notes(store: &Store, t: &TaskRow) -> Result<Vec<String>> {
     let atts = store.call(move |tx| store::attempts(tx, &i))?;
     let mut imps: Vec<String> = atts
         .iter()
-        .filter(|a| a.status == AttemptStatus::Succeeded && a.kind == "agent" && (a.stage == "implement" || a.stage.starts_with("fix-")))
+        .filter(|a| {
+            a.status == AttemptStatus::Succeeded
+                && a.kind == "agent"
+                && (a.stage == "implement" || a.stage.starts_with("fix-"))
+        })
         .filter_map(|a| a.profile.clone())
         .collect();
     imps.dedup();
     let kind = |p: &str| cfg.profile(p).map(|x| x.kind).ok();
-    let same: Vec<&String> = imps.iter().filter(|p| kind(p).is_some() && kind(p) == kind(&t.reviewer)).collect();
+    let same: Vec<&String> = imps
+        .iter()
+        .filter(|p| kind(p).is_some() && kind(p) == kind(&t.reviewer))
+        .collect();
     if !same.is_empty() {
         out.push(format!(
             "same vendor: {} implemented and {} reviewed ({:?} both) — the review is less independent (R49); read the diff yourself",
@@ -1042,16 +1649,32 @@ pub fn final_gate_notes(store: &Store, t: &TaskRow) -> Result<Vec<String>> {
 
 fn review_feedback(review: &Value) -> String {
     let mut f = String::new();
-    for ac in review["acceptance_criteria"].as_array().into_iter().flatten().filter(|x| x["met"].as_bool() != Some(true)) {
-        f.push_str(&format!("- {} NOT MET: {}\n", ac["id"].as_str().unwrap_or(""), ac["evidence"].as_str().unwrap_or("")));
+    for ac in review["acceptance_criteria"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|x| x["met"].as_bool() != Some(true))
+    {
+        f.push_str(&format!(
+            "- {} NOT MET: {}\n",
+            ac["id"].as_str().unwrap_or(""),
+            ac["evidence"].as_str().unwrap_or("")
+        ));
     }
     for i in review["issues"].as_array().into_iter().flatten() {
         f.push_str(&format!(
             "- {} [{}{}] {}{}\n",
             i["id"].as_str().unwrap_or(""),
             i["severity"].as_str().unwrap_or(""),
-            if i["blocking"].as_bool() == Some(true) { ", blocking" } else { "" },
-            i["file"].as_str().map(|x| format!("{x}: ")).unwrap_or_default(),
+            if i["blocking"].as_bool() == Some(true) {
+                ", blocking"
+            } else {
+                ""
+            },
+            i["file"]
+                .as_str()
+                .map(|x| format!("{x}: "))
+                .unwrap_or_default(),
             i["description"].as_str().unwrap_or("")
         ));
     }
@@ -1075,7 +1698,12 @@ fn claude_implementer_prompt(base: &str) -> String {
 /// Approve the open gate after re-checking its subject (R32): the plan on disk must still
 /// hash to the approved digest; the final gate's checkpoint must still be verified.
 pub fn approve_now(store: &Store, t: &TaskRow, kind: GateKind, expect: Option<&str>) -> Result<()> {
-    let gate = t.machine.gate().filter(|g| g.kind == kind).with_context(|| format!("{}: no open {kind:?} gate (state {:?})", t.id, t.state))?.clone();
+    let gate = t
+        .machine
+        .gate()
+        .filter(|g| g.kind == kind)
+        .with_context(|| format!("{}: no open {kind:?} gate (state {:?})", t.id, t.state))?
+        .clone();
     if let Some(e) = expect {
         let digest = gate_digest(store, &t.id, kind, gate.occurrence)?;
         if !digest.starts_with(e) {
@@ -1084,30 +1712,64 @@ pub fn approve_now(store: &Store, t: &TaskRow, kind: GateKind, expect: Option<&s
     }
     let e = match kind {
         GateKind::Plan => {
-            let (_, bytes) = super::artifacts::read_head(store, t, "plan")?.context("no registered plan")?;
+            let (_, bytes) =
+                super::artifacts::read_head(store, t, "plan")?.context("no registered plan")?;
             if sha256_hex(&bytes) != gate.subject {
                 bail!("subject_changed: plan.json no longer matches the plan under approval (R32)");
             }
-            Ev::PlanApproved { occurrence: gate.occurrence, subject: gate.subject.clone() }
+            Ev::PlanApproved {
+                occurrence: gate.occurrence,
+                subject: gate.subject.clone(),
+            }
         }
-        GateKind::Final => Ev::FinalApproved { occurrence: gate.occurrence, subject: gate.subject.clone() },
+        GateKind::Final => Ev::FinalApproved {
+            occurrence: gate.occurrence,
+            subject: gate.subject.clone(),
+        },
     };
     let i = t.id.clone();
     let m = store.call(move |tx| store::transition(tx, &i, e))?;
-    eprintln!("   [state] {:?} --{}_approved--> {:?}", t.state, if kind == GateKind::Plan { "plan" } else { "final" }, m.state());
+    eprintln!(
+        "   [state] {:?} --{}_approved--> {:?}",
+        t.state,
+        if kind == GateKind::Plan {
+            "plan"
+        } else {
+            "final"
+        },
+        m.state()
+    );
     let digest = gate_digest(store, &t.id, kind, gate.occurrence).unwrap_or_default();
     super::decisions::append(
         store,
         t,
-        &format!("{} gate approved", if kind == GateKind::Plan { "plan" } else { "final" }),
-        &format!("occurrence {} · subject {} · digest {} · by {}", gate.occurrence, &gate.subject[..12.min(gate.subject.len())], &digest[..12.min(digest.len())], store::whoami()),
+        &format!(
+            "{} gate approved",
+            if kind == GateKind::Plan {
+                "plan"
+            } else {
+                "final"
+            }
+        ),
+        &format!(
+            "occurrence {} · subject {} · digest {} · by {}",
+            gate.occurrence,
+            &gate.subject[..12.min(gate.subject.len())],
+            &digest[..12.min(digest.len())],
+            store::whoami()
+        ),
     )?;
     Ok(())
 }
 
 /// Reject the open gate with a reason; the revision opens a new occurrence (R44a).
 pub fn reject_now(store: &Store, t: &TaskRow, kind: GateKind, reason: &str) -> Result<()> {
-    let gate = t.machine.gate().filter(|g| g.kind == kind).with_context(|| format!("{}: no open {kind:?} gate (state {:?})", t.id, t.state))?.clone();
+    let gate = t
+        .machine
+        .gate()
+        .filter(|g| g.kind == kind)
+        .with_context(|| format!("{}: no open {kind:?} gate (state {:?})", t.id, t.state))?
+        .clone();
     let (i, r) = (t.id.clone(), reason.to_string());
     let m = store.call(move |tx| {
         let (e, fb) = match kind {
@@ -1124,8 +1786,20 @@ pub fn reject_now(store: &Store, t: &TaskRow, kind: GateKind, reason: &str) -> R
     super::decisions::append(
         store,
         t,
-        &format!("{} gate rejected", if kind == GateKind::Plan { "plan" } else { "final" }),
-        &format!("occurrence {} · subject {} · by {}\n\nReason: {reason}", gate.occurrence, &gate.subject[..12.min(gate.subject.len())], store::whoami()),
+        &format!(
+            "{} gate rejected",
+            if kind == GateKind::Plan {
+                "plan"
+            } else {
+                "final"
+            }
+        ),
+        &format!(
+            "occurrence {} · subject {} · by {}\n\nReason: {reason}",
+            gate.occurrence,
+            &gate.subject[..12.min(gate.subject.len())],
+            store::whoami()
+        ),
     )?;
     Ok(())
 }
@@ -1133,7 +1807,11 @@ pub fn reject_now(store: &Store, t: &TaskRow, kind: GateKind, reason: &str) -> R
 pub fn gate_digest(store: &Store, task: &str, kind: GateKind, occurrence: u32) -> Result<String> {
     let t = task.to_string();
     let rows = store.call(move |tx| store::approvals(tx, &t))?;
-    let g = if kind == GateKind::Plan { "plan" } else { "final" };
+    let g = if kind == GateKind::Plan {
+        "plan"
+    } else {
+        "final"
+    };
     rows.into_iter()
         .find(|r| r.gate == g && r.occurrence == occurrence)
         .map(|r| r.subject_digest)
@@ -1142,9 +1820,14 @@ pub fn gate_digest(store: &Store, task: &str, kind: GateKind, occurrence: u32) -
 
 /// Is there a passing, hash-checked verify result for the current checkpoint (R29)?
 pub fn verify_current(store: &Store, t: &TaskRow) -> Result<bool> {
-    let Some((_, b)) = super::artifacts::read_head(store, t, "verify-result")? else { return Ok(false) };
+    let Some((_, b)) = super::artifacts::read_head(store, t, "verify-result")? else {
+        return Ok(false);
+    };
     let v: Value = serde_json::from_slice(&b)?;
-    Ok(v["pass"].as_bool() == Some(true) && v["invalidated"].as_bool() != Some(true) && v["head"].as_str().is_some() && v["head"].as_str() == t.machine.checkpoint())
+    Ok(v["pass"].as_bool() == Some(true)
+        && v["invalidated"].as_bool() != Some(true)
+        && v["head"].as_str().is_some()
+        && v["head"].as_str() == t.machine.checkpoint())
 }
 
 /// What the human does next, for `status` and the end of `run`.
@@ -1203,7 +1886,10 @@ pub fn write_summary(store: &Store, t: &TaskRow) -> Result<PathBuf> {
             a.status,
             a.profile.unwrap_or_default(),
             a.error_class.unwrap_or_default(),
-            a.git_head_after.or(a.partial_commit.map(|p| format!("{p} (partial)"))).map(|h| h.chars().take(20).collect::<String>()).unwrap_or_default()
+            a.git_head_after
+                .or(a.partial_commit.map(|p| format!("{p} (partial)")))
+                .map(|h| h.chars().take(20).collect::<String>())
+                .unwrap_or_default()
         ));
     }
     if t.state == St::WaitingFinalApproval {

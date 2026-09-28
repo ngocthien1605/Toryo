@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::fixture;
-use crate::evidence::{append, new_run_dir, Record};
 use crate::config::{data_dir, home_dir};
+use crate::evidence::{append, new_run_dir, Record};
 use crate::git::Loc;
 use crate::process::env::build_env;
 use crate::process::redact::Redactions;

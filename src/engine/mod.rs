@@ -6,17 +6,17 @@ pub mod checks;
 pub mod context;
 pub mod contracts;
 pub mod decisions;
-pub mod state;
 pub mod lock;
 pub mod protect;
 pub mod recovery;
-pub mod snapshot;
 pub mod render;
 pub mod runner;
+pub mod snapshot;
+pub mod state;
+pub mod store;
 pub mod task;
 pub mod verify;
 pub mod worktree;
-pub mod store;
 
 pub use state::{
     Gate, GateKind, Machine, PipelineError, PipelineEvent, PipelineState, MAX_PLAN_AUTO_REJECTIONS,

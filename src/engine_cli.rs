@@ -12,7 +12,9 @@ use toryo::agents::claude::LaunchMode;
 use toryo::agents::hub::AgentHub;
 use toryo::engine::lock::{self, StopOutcome, TaskLock};
 use toryo::engine::recovery::Recovery;
-use toryo::engine::runner::{approve_now, next_action, reject_now, task_policy, write_summary, Engine, RunEnd, RunOptions};
+use toryo::engine::runner::{
+    approve_now, next_action, reject_now, task_policy, write_summary, Engine, RunEnd, RunOptions,
+};
 use toryo::engine::snapshot;
 use toryo::engine::store::{self, Store, TaskRow};
 use toryo::engine::task::{self, frozen_config, CreateArgs};
@@ -156,14 +158,30 @@ fn hub_for(t: &TaskRow, d: &DriveArgs) -> Result<AgentHub> {
     if fake.is_none() {
         // R51: isolation evidence must match the CLI versions installed now
         let mut ps: Vec<&str> = vec![&t.planner, &t.reviewer];
-        ps.extend(t.implementers.iter().skip(t.implementer_index).map(String::as_str));
+        ps.extend(
+            t.implementers
+                .iter()
+                .skip(t.implementer_index)
+                .map(String::as_str),
+        );
         let mut bad = toryo::evidence::unverified_profiles(&cfg, &ps)?;
-        let imps: Vec<&str> = t.implementers.iter().skip(t.implementer_index).map(String::as_str).collect();
+        let imps: Vec<&str> = t
+            .implementers
+            .iter()
+            .skip(t.implementer_index)
+            .map(String::as_str)
+            .collect();
         bad.extend(toryo::evidence::unverified_implementers(&cfg, &imps)?);
         if !bad.is_empty() {
-            let list = bad.iter().map(|(p, why)| format!("  - {p}: {why}")).collect::<Vec<_>>().join("\n");
+            let list = bad
+                .iter()
+                .map(|(p, why)| format!("  - {p}: {why}"))
+                .collect::<Vec<_>>()
+                .join("\n");
             if d.accept_unverified {
-                eprintln!("WARNING: running with unverified profiles (--accept-unverified):\n{list}");
+                eprintln!(
+                    "WARNING: running with unverified profiles (--accept-unverified):\n{list}"
+                );
             } else {
                 bail!("unverified profiles (R51):\n{list}\nrun `toryo doctor --canaries` (and `toryo spike claude-implementer-isolation --profile <p>` for a Claude implementer), or pass --accept-unverified");
             }
@@ -178,22 +196,45 @@ fn drive(store: &Store, lock: &TaskLock, d: &DriveArgs) -> Result<i32> {
     let t = get(store, &lock.task)?;
     let cfg = frozen_config(&t)?;
     let (g, protect, _) = task_policy(&t, &cfg)?;
-    let rec = Recovery { store, g: &g, protect: &protect, cfg: &cfg };
+    let rec = Recovery {
+        store,
+        g: &g,
+        protect: &protect,
+        cfg: &cfg,
+    };
     for n in rec.recover(&lock.task)? {
         eprintln!("↺ recovery: {n}");
     }
     let t = get(store, &lock.task)?;
     let waiting = t.state.is_terminal()
         || matches!(t.state, PipelineState::Escalated | PipelineState::Paused)
-        || (!d.yes && matches!(t.state, PipelineState::WaitingPlanApproval | PipelineState::WaitingFinalApproval));
+        || (!d.yes
+            && matches!(
+                t.state,
+                PipelineState::WaitingPlanApproval | PipelineState::WaitingFinalApproval
+            ));
     let end = if waiting {
-        if t.state.is_terminal() { RunEnd::Done(t.state) } else { RunEnd::Waiting(t.state) }
+        if t.state.is_terminal() {
+            RunEnd::Done(t.state)
+        } else {
+            RunEnd::Waiting(t.state)
+        }
     } else {
         let hub = hub_for(&t, d)?;
-        let mut eng = Engine::new(store, &hub, lock, RunOptions { yes: d.yes, no_fallback: d.no_fallback })?;
+        let mut eng = Engine::new(
+            store,
+            &hub,
+            lock,
+            RunOptions {
+                yes: d.yes,
+                no_fallback: d.no_fallback,
+            },
+        )?;
         let end = eng.run();
         if hub.is_fake() {
-            let p = t.captures().join(format!("fake-calls-{}.json", lock.generation));
+            let p = t
+                .captures()
+                .join(format!("fake-calls-{}.json", lock.generation));
             let _ = std::fs::create_dir_all(t.captures());
             std::fs::write(&p, serde_json::to_vec_pretty(&hub.fake_calls())?)?;
         }
@@ -211,21 +252,39 @@ fn drive(store: &Store, lock: &TaskLock, d: &DriveArgs) -> Result<i32> {
     eprintln!("summary: {}", summary.display());
     Ok(match end {
         RunEnd::Done(PipelineState::Completed) | RunEnd::Stopped => 0,
-        RunEnd::Waiting(PipelineState::WaitingPlanApproval | PipelineState::WaitingFinalApproval) => 0,
+        RunEnd::Waiting(
+            PipelineState::WaitingPlanApproval | PipelineState::WaitingFinalApproval,
+        ) => 0,
         _ => 1,
     })
 }
 
 pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
     match cmd {
-        TaskCmd::Create { file, id, repo, base, max_fix_cycles } => {
+        TaskCmd::Create {
+            file,
+            id,
+            repo,
+            base,
+            max_fix_cycles,
+        } => {
             let cfg = load_config(cli)?;
             let repo = match repo {
                 Some(r) => r.clone(),
                 None => PathBuf::from(toryo::config::expand_vars(&cfg.repo.project.root)?),
             };
             let st = store()?;
-            let t = task::create(&cfg, &st, CreateArgs { id: id.clone(), repo, file: file.clone(), base: base.clone(), max_fix_cycles: *max_fix_cycles })?;
+            let t = task::create(
+                &cfg,
+                &st,
+                CreateArgs {
+                    id: id.clone(),
+                    repo,
+                    file: file.clone(),
+                    base: base.clone(),
+                    max_fix_cycles: *max_fix_cycles,
+                },
+            )?;
             println!("{}", t.id);
             eprintln!(
                 "created {}: {} acceptance criteria {:?}\n  worktree {} · branch {} · base {}\n  planner {} · implementer {} · reviewer {}\n  run store {}\nnext: `toryo run {}`",
@@ -251,7 +310,10 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
             let lock = TaskLock::acquire(&st, id)?;
             let t = get(&st, id)?;
             if !t.state.is_terminal() && t.state != PipelineState::Escalated && !force {
-                bail!("{id} is {:?}: pass --force to cancel it and clean up", t.state);
+                bail!(
+                    "{id} is {:?}: pass --force to cancel it and clean up",
+                    t.state
+                );
             }
             if !t.state.is_terminal() {
                 let i = id.clone();
@@ -262,13 +324,20 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
             toryo::engine::verify::cleanup(&g, &t, &cfg)?;
             if t.worktree.exists() {
                 let w = t.worktree.display().to_string().replace('\\', "/");
-                g.run(&toryo::git::Loc::Discover(t.repo.clone()), false, &["worktree", "remove", "--force", &w])?;
+                g.run(
+                    &toryo::git::Loc::Discover(t.repo.clone()),
+                    false,
+                    &["worktree", "remove", "--force", &w],
+                )?;
             }
             if t.run_store.exists() {
-                std::fs::remove_dir_all(&t.run_store).with_context(|| format!("removing {}", t.run_store.display()))?;
+                std::fs::remove_dir_all(&t.run_store)
+                    .with_context(|| format!("removing {}", t.run_store.display()))?;
             }
             let i = id.clone();
-            st.call(move |tx| store::event(tx, Some(&i), None, "cleaned_up", &serde_json::json!({})))?;
+            st.call(move |tx| {
+                store::event(tx, Some(&i), None, "cleaned_up", &serde_json::json!({}))
+            })?;
             lock.release();
             eprintln!("removed the worktree and the run store of {id}; the branch {} is kept (`git branch -D {}` when you no longer need it)", t.branch, t.branch);
             Ok(0)
@@ -282,7 +351,10 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     if !reload {
         let t = get(&st, id)?;
         let text = std::fs::read_to_string(t.artifacts().join("config.json"))?;
-        eprintln!("{id}: frozen configuration, digest {}", &t.config_sha256[..12]);
+        eprintln!(
+            "{id}: frozen configuration, digest {}",
+            &t.config_sha256[..12]
+        );
         let v: serde_json::Value = serde_json::from_str(&text)?;
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(0);
@@ -297,7 +369,10 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     let new_text = new.canonical_json();
     let new_sha = sha256_hex(new_text.as_bytes());
     if new_sha == t.config_sha256 {
-        eprintln!("{id}: the effective configuration is unchanged ({})", &new_sha[..12]);
+        eprintln!(
+            "{id}: the effective configuration is unchanged ({})",
+            &new_sha[..12]
+        );
         lock.release();
         return Ok(0);
     }
@@ -305,32 +380,88 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     let dir = t.artifacts().join("config-history");
     std::fs::create_dir_all(&dir)?;
     let n = std::fs::read_dir(&dir)?.count() / 2 + 1;
-    let pretty = |s: &str| -> Result<String> { Ok(serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(s)?)? + "\n") };
-    let (a, b) = (dir.join(format!("{n}-old-{}.json", &t.config_sha256[..12])), dir.join(format!("{n}-new-{}.json", &new_sha[..12])));
+    let pretty = |s: &str| -> Result<String> {
+        Ok(serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(s)?)? + "\n")
+    };
+    let (a, b) = (
+        dir.join(format!("{n}-old-{}.json", &t.config_sha256[..12])),
+        dir.join(format!("{n}-new-{}.json", &new_sha[..12])),
+    );
     std::fs::write(&a, pretty(&old.canonical_json())?)?;
     std::fs::write(&b, pretty(&new_text)?)?;
     let g = task::task_git(&new, &t.repo)?; // R37 admission under the new machine config
-    let out = g.output(&toryo::git::Loc::Discover(dir.clone()), true, &["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--no-color", "--", &a.display().to_string(), &b.display().to_string()])?;
+    let out = g.output(
+        &toryo::git::Loc::Discover(dir.clone()),
+        true,
+        &[
+            "diff",
+            "--no-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--",
+            &a.display().to_string(),
+            &b.display().to_string(),
+        ],
+    )?;
     eprintln!("{}", String::from_utf8_lossy(&out.stdout));
-    eprintln!("{id}: new configuration digest {} (was {})", &new_sha[..12], &t.config_sha256[..12]);
+    eprintln!(
+        "{id}: new configuration digest {} (was {})",
+        &new_sha[..12],
+        &t.config_sha256[..12]
+    );
     if let Some(e) = expect {
         if !new_sha.starts_with(e) {
             bail!("subject_changed: the new configuration digest is {} — it does not start with --expect {e}; nothing was changed", &new_sha[..12]);
         }
     }
     let (planner, implementers, reviewer) = task::roles(&new)?;
-    let idx = t.current_implementer().and_then(|c| implementers.iter().position(|x| x == c)).unwrap_or(0);
-    let verify_changed = serde_json::to_value(&old.repo.commands.verify)? != serde_json::to_value(&new.repo.commands.verify)?
+    let idx = t
+        .current_implementer()
+        .and_then(|c| implementers.iter().position(|x| x == c))
+        .unwrap_or(0);
+    let verify_changed = serde_json::to_value(&old.repo.commands.verify)?
+        != serde_json::to_value(&new.repo.commands.verify)?
         || serde_json::to_value(&old.repo.verify)? != serde_json::to_value(&new.repo.verify)?;
-    toryo::engine::artifacts::put(&st, &t, None, "config", "json", "config", new_text.as_bytes(), Some("config.json"))?;
-    let mut notes = vec![format!("configuration {} → {} (diff: {})", &t.config_sha256[..12], &new_sha[..12], b.display())];
-    let reverify = verify_changed && toryo::engine::artifacts::head(&st, &t, "verify-result")?.is_some();
+    toryo::engine::artifacts::put(
+        &st,
+        &t,
+        None,
+        "config",
+        "json",
+        "config",
+        new_text.as_bytes(),
+        Some("config.json"),
+    )?;
+    let mut notes = vec![format!(
+        "configuration {} → {} (diff: {})",
+        &t.config_sha256[..12],
+        &new_sha[..12],
+        b.display()
+    )];
+    let reverify =
+        verify_changed && toryo::engine::artifacts::head(&st, &t, "verify-result")?.is_some();
     if reverify {
         let inv = serde_json::json!({"invalidated": true, "reason": "task config --reload changed the verify configuration", "config_sha256": new_sha});
-        toryo::engine::artifacts::put(&st, &t, None, "verify-result", "json", "verify_result", &serde_json::to_vec_pretty(&inv)?, Some("VERIFY_RESULT.json"))?;
+        toryo::engine::artifacts::put(
+            &st,
+            &t,
+            None,
+            "verify-result",
+            "json",
+            "verify_result",
+            &serde_json::to_vec_pretty(&inv)?,
+            Some("VERIFY_RESULT.json"),
+        )?;
         notes.push("the verify configuration changed: VERIFY_RESULT.json invalidated".into());
     }
-    let (i, sha, im, pl, rv) = (id.to_string(), new_sha.clone(), implementers.clone(), planner.clone(), reviewer.clone());
+    let (i, sha, im, pl, rv) = (
+        id.to_string(),
+        new_sha.clone(),
+        implementers.clone(),
+        planner.clone(),
+        reviewer.clone(),
+    );
     let to_verify = reverify && t.state == PipelineState::WaitingFinalApproval;
     let payload = serde_json::json!({"from": t.config_sha256, "to": new_sha, "verify_changed": verify_changed});
     st.call(move |tx| {
@@ -344,7 +475,16 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     if to_verify {
         notes.push("the final gate was withdrawn: the checkpoint is verified again".into());
     }
-    toryo::engine::decisions::append(&st, &t, "configuration reloaded (R35)", &notes.iter().map(|x| format!("- {x}")).collect::<Vec<_>>().join("\n"))?;
+    toryo::engine::decisions::append(
+        &st,
+        &t,
+        "configuration reloaded (R35)",
+        &notes
+            .iter()
+            .map(|x| format!("- {x}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )?;
     for x in &notes {
         eprintln!("{id}: {x}");
     }
@@ -362,33 +502,60 @@ pub fn run(id: &str, d: &DriveArgs) -> Result<i32> {
     code
 }
 
-pub fn approve(id: &str, gate: Gate, expect: Option<&str>, force: bool, cont: bool, d: &DriveArgs) -> Result<i32> {
+pub fn approve(
+    id: &str,
+    gate: Gate,
+    expect: Option<&str>,
+    force: bool,
+    cont: bool,
+    d: &DriveArgs,
+) -> Result<i32> {
     let st = store()?;
     let lock = TaskLock::acquire(&st, id)?;
     let t = get(&st, id)?;
     let kind: GateKind = gate.into();
     if force {
         if kind != GateKind::Final || t.state != PipelineState::Escalated {
-            bail!("--force only takes an Escalated task to the final gate (state {:?})", t.state);
+            bail!(
+                "--force only takes an Escalated task to the final gate (state {:?})",
+                t.state
+            );
         }
         if !toryo::engine::runner::verify_current(&st, &t)? {
             bail!("{id}: no passing VERIFY_RESULT.json for the current checkpoint (e.g. the verify configuration was reloaded) — `toryo resume {id} --note \"…\"` to verify again");
         }
         let i = id.to_string();
         st.call(move |tx| store::transition(tx, &i, PipelineEvent::ForceFinal).map(|_| ()))?;
-        toryo::engine::decisions::append(&st, &t, "final gate forced (reviewer skipped)", &format!("From Escalated: {}", t.machine.reason().unwrap_or("")))?;
+        toryo::engine::decisions::append(
+            &st,
+            &t,
+            "final gate forced (reviewer skipped)",
+            &format!("From Escalated: {}", t.machine.reason().unwrap_or("")),
+        )?;
         let t = get(&st, id)?;
-        eprintln!("{id}: reviewer skipped — the final gate is open for checkpoint {}", t.machine.checkpoint().unwrap_or(""));
+        eprintln!(
+            "{id}: reviewer skipped — the final gate is open for checkpoint {}",
+            t.machine.checkpoint().unwrap_or("")
+        );
         eprintln!("next: {}", next_action(&t));
         lock.release();
         return Ok(0);
     }
     if let Some(g) = t.machine.gate() {
-        let digest = toryo::engine::runner::gate_digest(&st, id, g.kind, g.occurrence).unwrap_or_default();
-        eprintln!("{id}: {:?} gate, occurrence {}, subject {} (digest {})", g.kind, g.occurrence, &g.subject[..12.min(g.subject.len())], &digest[..12.min(digest.len())]);
+        let digest =
+            toryo::engine::runner::gate_digest(&st, id, g.kind, g.occurrence).unwrap_or_default();
+        eprintln!(
+            "{id}: {:?} gate, occurrence {}, subject {} (digest {})",
+            g.kind,
+            g.occurrence,
+            &g.subject[..12.min(g.subject.len())],
+            &digest[..12.min(digest.len())]
+        );
     }
     approve_now(&st, &t, kind, expect)?;
-    let code = if cont { drive(&st, &lock, d)? } else {
+    let code = if cont {
+        drive(&st, &lock, d)?
+    } else {
         let t = get(&st, id)?;
         write_summary(&st, &t)?;
         eprintln!("next: {}", next_action(&t));
@@ -427,33 +594,69 @@ fn resume_protected(st: &Store, t: &TaskRow, accept: &[String]) -> Result<bool> 
     let cfg = frozen_config(t)?;
     let (g, protect, _) = task_policy(t, &cfg)?;
     let c = toryo::engine::protect::check(st, t, &g, &protect)?;
-    let bad: Vec<&toryo::engine::protect::Change> = c.changes.iter().filter(|x| x.is_hard() || !protect.is_allowed(&x.path)).collect();
+    let bad: Vec<&toryo::engine::protect::Change> = c
+        .changes
+        .iter()
+        .filter(|x| x.is_hard() || !protect.is_allowed(&x.path))
+        .collect();
     let i = t.id.clone();
     if bad.is_empty() {
         st.call(move |tx| {
-            store::event(tx, Some(&i), None, "protected_restored", &serde_json::json!({}))?;
+            store::event(
+                tx,
+                Some(&i),
+                None,
+                "protected_restored",
+                &serde_json::json!({}),
+            )?;
             store::transition(tx, &i, PipelineEvent::ResumeStage).map(|_| ())
         })?;
-        eprintln!("{}: protected state matches the baseline again — the stage continues", t.id);
+        eprintln!(
+            "{}: protected state matches the baseline again — the stage continues",
+            t.id
+        );
         return Ok(true);
     }
     let norm = |p: &str| p.replace('\\', "/").trim_start_matches("./").to_string();
     let accepted: Vec<String> = accept.iter().map(|p| norm(p)).collect();
-    let missing: Vec<String> = bad.iter().filter(|x| !accepted.contains(&x.path)).map(|x| format!("{} {}", x.kind, x.path)).collect();
+    let missing: Vec<String> = bad
+        .iter()
+        .filter(|x| !accepted.contains(&x.path))
+        .map(|x| format!("{} {}", x.kind, x.path))
+        .collect();
     if accept.is_empty() || !missing.is_empty() {
         eprintln!(
             "{}: protected state still differs from the baseline: {}
   diff: {}
   → restore, or `toryo resume {} --accept-protected-change <path>` for each",
             t.id,
-            if accept.is_empty() { bad.iter().map(|x| format!("{} {}", x.kind, x.path)).collect::<Vec<_>>().join(", ") } else { format!("not accepted: {}", missing.join(", ")) },
-            c.diff_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "`git diff` in the worktree".into()),
+            if accept.is_empty() {
+                bad.iter()
+                    .map(|x| format!("{} {}", x.kind, x.path))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                format!("not accepted: {}", missing.join(", "))
+            },
+            c.diff_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "`git diff` in the worktree".into()),
             t.id
         );
         return Ok(false);
     }
-    let list: Vec<String> = bad.iter().map(|x| format!("{} {}", x.kind, x.path)).collect();
-    let m = toryo::engine::protect::take_baseline(st, t, &g, &protect, &format!("accepted by the human: {}", list.join(", ")))?;
+    let list: Vec<String> = bad
+        .iter()
+        .map(|x| format!("{} {}", x.kind, x.path))
+        .collect();
+    let m = toryo::engine::protect::take_baseline(
+        st,
+        t,
+        &g,
+        &protect,
+        &format!("accepted by the human: {}", list.join(", ")),
+    )?;
     toryo::engine::decisions::append(
         st,
         t,
@@ -466,15 +669,27 @@ fn resume_protected(st: &Store, t: &TaskRow, accept: &[String]) -> Result<bool> 
         ),
     )?;
     st.call(move |tx| store::transition(tx, &i, PipelineEvent::ResumeStage).map(|_| ()))?;
-    eprintln!("{}: accepted {} — protected baseline v{}", t.id, list.join(", "), m.version);
+    eprintln!(
+        "{}: accepted {} — protected baseline v{}",
+        t.id,
+        list.join(", "),
+        m.version
+    );
     Ok(true)
 }
 
 fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
     let t = get(st, &lock.task)?;
-    let protected = t.state == PipelineState::Escalated && t.machine.reason().is_some_and(|x| x.starts_with(toryo::engine::protect::REASON));
+    let protected = t.state == PipelineState::Escalated
+        && t.machine
+            .reason()
+            .is_some_and(|x| x.starts_with(toryo::engine::protect::REASON));
     if !r.accept_protected.is_empty() && !protected {
-        bail!("--accept-protected-change: {} is not waiting on protected_config_changed (state {:?})", t.id, t.state);
+        bail!(
+            "--accept-protected-change: {} is not waiting on protected_config_changed (state {:?})",
+            t.id,
+            t.state
+        );
     }
     if protected && r.note.is_none() {
         if !resume_protected(st, &t, &r.accept_protected)? {
@@ -483,10 +698,28 @@ fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Res
     } else if r.discard_partial || r.keep_partial {
         let cfg = frozen_config(&t)?;
         let (g, protect, _) = task_policy(&t, &cfg)?;
-        let rec = Recovery { store: st, g: &g, protect: &protect, cfg: &cfg };
-        let msg = if r.discard_partial { rec.discard_partial(&t.id)? } else { rec.keep_partial(&t.id)? };
+        let rec = Recovery {
+            store: st,
+            g: &g,
+            protect: &protect,
+            cfg: &cfg,
+        };
+        let msg = if r.discard_partial {
+            rec.discard_partial(&t.id)?
+        } else {
+            rec.keep_partial(&t.id)?
+        };
         eprintln!("↺ {msg}");
-        toryo::engine::decisions::append(st, &t, if r.discard_partial { "partial work discarded (R31)" } else { "partial work kept (R31)" }, &msg)?;
+        toryo::engine::decisions::append(
+            st,
+            &t,
+            if r.discard_partial {
+                "partial work discarded (R31)"
+            } else {
+                "partial work kept (R31)"
+            },
+            &msg,
+        )?;
     } else if let Some(note) = &r.note {
         if t.state != PipelineState::Escalated {
             bail!("--note leaves Escalated; {} is {:?}", t.id, t.state);
@@ -497,15 +730,32 @@ fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Res
             store::transition(tx, &i, PipelineEvent::ResumeWithNote { note: n })?;
             Ok(())
         })?;
-        toryo::engine::decisions::append(st, &t, "resumed from Escalated with a note (R5)", &format!("Escalation: {}\n\nNote: {note}", t.machine.reason().unwrap_or("")))?;
+        toryo::engine::decisions::append(
+            st,
+            &t,
+            "resumed from Escalated with a note (R5)",
+            &format!(
+                "Escalation: {}\n\nNote: {note}",
+                t.machine.reason().unwrap_or("")
+            ),
+        )?;
     } else if t.state == PipelineState::Paused {
         // R49: after an implementer quota pause the chain starts again from the primary
-        let quota = t.machine.reason().is_some_and(|x| x.starts_with("implementer_quota"));
+        let quota = t
+            .machine
+            .reason()
+            .is_some_and(|x| x.starts_with("implementer_quota"));
         let i = t.id.clone();
         st.call(move |tx| {
             if quota {
                 store::set_implementer_index(tx, &i, 0)?;
-                store::event(tx, Some(&i), None, "implementer_chain_reset", &serde_json::json!({"index": 0}))?;
+                store::event(
+                    tx,
+                    Some(&i),
+                    None,
+                    "implementer_chain_reset",
+                    &serde_json::json!({"index": 0}),
+                )?;
             }
             store::transition(tx, &i, PipelineEvent::Unpause).map(|_| ())
         })?;
@@ -575,7 +825,14 @@ pub fn status(id: Option<&str>) -> Result<i32> {
         println!("no tasks (`toryo task create --file TASK.md`)");
     }
     for t in tasks {
-        let active = if lock::probe_free(&t.id)? { String::new() } else { format!(" · ACTIVE ({})", t.run_lock_owner.clone().unwrap_or_default()) };
+        let active = if lock::probe_free(&t.id)? {
+            String::new()
+        } else {
+            format!(
+                " · ACTIVE ({})",
+                t.run_lock_owner.clone().unwrap_or_default()
+            )
+        };
         println!(
             "{:<14} {:<22} fix {}/{} · tokens {}{}{}{}",
             t.id,
@@ -583,8 +840,14 @@ pub fn status(id: Option<&str>) -> Result<i32> {
             t.fix_cycle,
             t.machine.max_fix_cycles(),
             t.spent_tokens,
-            if t.reserved_tokens > 0 { format!(" (+~{} reserved)", t.reserved_tokens) } else { String::new() },
-            t.budget_tokens.map(|b| format!(" / {b} admission cap (may overshoot by one turn)")).unwrap_or_default(),
+            if t.reserved_tokens > 0 {
+                format!(" (+~{} reserved)", t.reserved_tokens)
+            } else {
+                String::new()
+            },
+            t.budget_tokens
+                .map(|b| format!(" / {b} admission cap (may overshoot by one turn)"))
+                .unwrap_or_default(),
             active
         );
         println!("               next: {}", next_action(&t));
@@ -596,7 +859,12 @@ fn show(id: &str) -> Result<i32> {
     status(Some(id))?;
     let st = store()?;
     let t = get(&st, id)?;
-    println!("               worktree: {} · branch {} · run store {}", t.worktree.display(), t.branch, t.run_store.display());
+    println!(
+        "               worktree: {} · branch {} · run store {}",
+        t.worktree.display(),
+        t.branch,
+        t.run_store.display()
+    );
     let i = id.to_string();
     let atts = st.call(move |tx| store::attempts(tx, &i))?;
     println!("\nstage attempts:");
@@ -607,8 +875,12 @@ fn show(id: &str) -> Result<i32> {
             format!("{:?}", a.status),
             a.profile.unwrap_or_default(),
             a.error_class.unwrap_or_default(),
-            a.git_head_after.map(|h| format!(" → {}", &h[..12])).unwrap_or_default(),
-            a.partial_commit.map(|h| format!(" partial {}", &h[..12])).unwrap_or_default()
+            a.git_head_after
+                .map(|h| format!(" → {}", &h[..12]))
+                .unwrap_or_default(),
+            a.partial_commit
+                .map(|h| format!(" partial {}", &h[..12]))
+                .unwrap_or_default()
         );
     }
     let i = id.to_string();
@@ -623,8 +895,13 @@ fn show(id: &str) -> Result<i32> {
             };
             println!(
                 "  #{uid:<4} {att:<22} {prof:<14} {acc:<11} {amount:>9}{}{}",
-                if inc { "  includes an earlier killed turn" } else { "" },
-                rec.map(|r| format!("  reconciled by #{r}")).unwrap_or_default()
+                if inc {
+                    "  includes an earlier killed turn"
+                } else {
+                    ""
+                },
+                rec.map(|r| format!("  reconciled by #{r}"))
+                    .unwrap_or_default()
             );
         }
     }
@@ -633,7 +910,14 @@ fn show(id: &str) -> Result<i32> {
     if !ap.is_empty() {
         println!("\ngates:");
         for a in ap {
-            println!("  {} #{} {:<10} digest {} {}", a.gate, a.occurrence, a.status, &a.subject_digest[..12], a.reason.unwrap_or_default());
+            println!(
+                "  {} #{} {:<10} digest {} {}",
+                a.gate,
+                a.occurrence,
+                a.status,
+                &a.subject_digest[..12],
+                a.reason.unwrap_or_default()
+            );
         }
     }
     Ok(0)
@@ -654,7 +938,13 @@ pub fn budget(cmd: &BudgetCmd) -> Result<i32> {
     let (i, n) = (id.clone(), new);
     st.call(move |tx| {
         store::set_budget(tx, &i, n)?;
-        store::event(tx, Some(&i), None, "budget_set", &serde_json::json!({"tokens": n}))
+        store::event(
+            tx,
+            Some(&i),
+            None,
+            "budget_set",
+            &serde_json::json!({"tokens": n}),
+        )
     })?;
     let used = t.spent_tokens + t.reserved_tokens;
     toryo::engine::decisions::append(
@@ -663,7 +953,9 @@ pub fn budget(cmd: &BudgetCmd) -> Result<i32> {
         "budget set (R41)",
         &format!(
             "Admission cap {} → {} ({} tokens used: {} spent + ~{} reserved).",
-            t.budget_tokens.map(|b| b.to_string()).unwrap_or_else(|| "none".into()),
+            t.budget_tokens
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "none".into()),
             new.map(|b| b.to_string()).unwrap_or_else(|| "none".into()),
             used,
             t.spent_tokens,
@@ -673,7 +965,11 @@ pub fn budget(cmd: &BudgetCmd) -> Result<i32> {
     eprintln!(
         "{id}: admission cap {} (used {used}; may overshoot by one turn){}",
         new.map(|b| b.to_string()).unwrap_or_else(|| "none".into()),
-        if t.state == PipelineState::Paused { format!(" — `toryo resume {id}` to continue") } else { String::new() }
+        if t.state == PipelineState::Paused {
+            format!(" — `toryo resume {id}` to continue")
+        } else {
+            String::new()
+        }
     );
     lock.release();
     Ok(0)
@@ -681,10 +977,19 @@ pub fn budget(cmd: &BudgetCmd) -> Result<i32> {
 
 pub fn context(cmd: &ContextCmd) -> Result<i32> {
     use toryo::engine::context as cx;
-    let ContextCmd::Show { id, stage, attempt, profile } = cmd;
+    let ContextCmd::Show {
+        id,
+        stage,
+        attempt,
+        profile,
+    } = cmd;
     let st = store()?;
     let t = get(&st, id)?;
-    let stage = if stage == "implement" { toryo::engine::runner::writing_stage(t.fix_cycle) } else { stage.clone() };
+    let stage = if stage == "implement" {
+        toryo::engine::runner::writing_stage(t.fix_cycle)
+    } else {
+        stage.clone()
+    };
     cx::stage_role(&stage)?;
     match attempt {
         Some(n) => {
@@ -694,8 +999,10 @@ pub fn context(cmd: &ContextCmd) -> Result<i32> {
                 .into_iter()
                 .find(|a| a.stage == s2 && a.attempt == *n)
                 .with_context(|| format!("{id}: no attempt {stage}/{n}"))?;
-            let v = toryo::engine::artifacts::head(&st, &t, &cx::logical(&stage, *n))?.with_context(|| format!("{id}/{stage}/{n}: no stored context"))?;
-            let bytes = std::fs::read(&v.path).with_context(|| format!("artifact_missing: {} ({})", v.id, v.path.display()))?;
+            let v = toryo::engine::artifacts::head(&st, &t, &cx::logical(&stage, *n))?
+                .with_context(|| format!("{id}/{stage}/{n}: no stored context"))?;
+            let bytes = std::fs::read(&v.path)
+                .with_context(|| format!("artifact_missing: {} ({})", v.id, v.path.display()))?;
             let text = String::from_utf8_lossy(&bytes).to_string();
             let sha = toryo::engine::task::sha256_hex(&bytes);
             let ok = a.context_sha256.as_deref() == Some(sha.as_str()) && v.sha256 == sha;
@@ -705,7 +1012,11 @@ pub fn context(cmd: &ContextCmd) -> Result<i32> {
                 a.id,
                 a.profile.unwrap_or_default(),
                 &sha[..12],
-                if ok { "matches stage_attempts.context_sha256" } else { "DOES NOT MATCH stage_attempts.context_sha256 (artifact_tampered)" }
+                if ok {
+                    "matches stage_attempts.context_sha256"
+                } else {
+                    "DOES NOT MATCH stage_attempts.context_sha256 (artifact_tampered)"
+                }
             );
             print!("{text}");
             Ok(if ok { 0 } else { 1 })
@@ -717,7 +1028,10 @@ pub fn context(cmd: &ContextCmd) -> Result<i32> {
                 None => cx::stage_profile(&t, &stage)?,
             };
             let c = cx::assemble(&cx::request(&st, &t, &cfg, &stage, &profile)?)?;
-            eprint!("{id}: next `{stage}` attempt with `{profile}` — {}", cx::describe(&c));
+            eprint!(
+                "{id}: next `{stage}` attempt with `{profile}` — {}",
+                cx::describe(&c)
+            );
             print!("{}", c.text);
             Ok(0)
         }
@@ -726,7 +1040,12 @@ pub fn context(cmd: &ContextCmd) -> Result<i32> {
 
 pub fn partial(cmd: &PartialCmd) -> Result<i32> {
     match cmd {
-        PartialCmd::Export { id, attempt, stage, into } => {
+        PartialCmd::Export {
+            id,
+            attempt,
+            stage,
+            into,
+        } => {
             // writes only into an empty directory outside the task: no lock (R38)
             let st = store()?;
             let t = get(&st, id)?;
@@ -735,7 +1054,11 @@ pub fn partial(cmd: &PartialCmd) -> Result<i32> {
             let a = atts
                 .into_iter()
                 .rev()
-                .find(|a| a.attempt == *attempt && a.partial_snapshot_id.is_some() && stage.as_deref().is_none_or(|s| s == a.stage))
+                .find(|a| {
+                    a.attempt == *attempt
+                        && a.partial_snapshot_id.is_some()
+                        && stage.as_deref().is_none_or(|s| s == a.stage)
+                })
                 .with_context(|| format!("{id}: no attempt {attempt} with a recovery snapshot"))?;
             let sid = a.partial_snapshot_id.clone().unwrap_or_default();
             let (_, rel, _) = st.call(move |tx| store::artifact(tx, &sid))?;

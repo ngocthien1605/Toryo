@@ -127,26 +127,58 @@ pub enum PipelineEvent {
     /// `New → Planning`.
     Start,
     /// The plan lists protected paths: re-plan (bounded), no gate is opened.
-    PlanPolicyViolation { paths: Vec<String> },
+    PlanPolicyViolation {
+        paths: Vec<String>,
+    },
     /// A valid plan exists: opens a plan gate occurrence.
-    PlanReady { subject: String },
-    PlanApproved { occurrence: u32, subject: String },
-    PlanRejected { occurrence: u32, reason: String },
+    PlanReady {
+        subject: String,
+    },
+    PlanApproved {
+        occurrence: u32,
+        subject: String,
+    },
+    PlanRejected {
+        occurrence: u32,
+        reason: String,
+    },
     /// The Implementer turn ended with a tree that passes the path policy.
     ImplementationDone,
     /// The Implementer changed protected paths: restored, nothing committed → fix cycle.
-    PathPolicyViolation { paths: Vec<String> },
+    PathPolicyViolation {
+        paths: Vec<String>,
+    },
     /// Checkpoint commit made (possibly an empty one, R40).
-    Checkpointed { head: String },
-    VerifyPassed { head: String },
-    VerifyFailed { head: String },
-    ReviewApproved { head: String },
-    ChangesRequested { head: String },
-    ReviewBlocked { head: String },
-    FinalApproved { occurrence: u32, subject: String },
-    FinalRejected { occurrence: u32, reason: String },
+    Checkpointed {
+        head: String,
+    },
+    VerifyPassed {
+        head: String,
+    },
+    VerifyFailed {
+        head: String,
+    },
+    ReviewApproved {
+        head: String,
+    },
+    ChangesRequested {
+        head: String,
+    },
+    ReviewBlocked {
+        head: String,
+    },
+    FinalApproved {
+        occurrence: u32,
+        subject: String,
+    },
+    FinalRejected {
+        occurrence: u32,
+        reason: String,
+    },
     /// `toryo resume --note` from `Escalated`.
-    ResumeWithNote { note: String },
+    ResumeWithNote {
+        note: String,
+    },
     /// `toryo approve --gate final --force` from `Escalated`.
     ForceFinal,
     /// Back from `Escalated` into the stage that escalated, without a new fix cycle — after
@@ -155,17 +187,23 @@ pub enum PipelineEvent {
     BudgetExceeded,
     /// A running stage cannot go on without a human, but nothing is wrong with the work:
     /// the implementer chain or the Planner/Reviewer is out of quota, `--no-fallback` (R49).
-    Pause { reason: String },
+    Pause {
+        reason: String,
+    },
     /// `toryo resume` from `Paused` (after `budget set`, or once the quota is back).
     Unpause,
     /// The verify configuration changed (`task config --reload`, R35): the current
     /// checkpoint must be verified again — from the final gate or `Escalated`.
     Reverify,
     /// A stop that needs a human (max cycles, InvalidOutput, quota, tampering, …).
-    Escalate { reason: String },
+    Escalate {
+        reason: String,
+    },
     Cancel,
     /// Unrecoverable error.
-    Fail { error: String },
+    Fail {
+        error: String,
+    },
 }
 
 impl PipelineEvent {
@@ -388,7 +426,13 @@ impl Machine {
                 m.open_gate(GateKind::Plan, subject.clone());
                 m.state = S::WaitingPlanApproval;
             }
-            (S::WaitingPlanApproval, E::PlanApproved { occurrence, subject }) => {
+            (
+                S::WaitingPlanApproval,
+                E::PlanApproved {
+                    occurrence,
+                    subject,
+                },
+            ) => {
                 m.close_gate(GateKind::Plan, *occurrence, Some(subject))?;
                 m.plan_approved = true;
                 m.state = S::Implementing;
@@ -437,7 +481,13 @@ impl Machine {
                 m.require_checkpoint("review", head)?;
                 m.escalate(S::Reviewing, "the reviewer blocked the task".into());
             }
-            (S::WaitingFinalApproval, E::FinalApproved { occurrence, subject }) => {
+            (
+                S::WaitingFinalApproval,
+                E::FinalApproved {
+                    occurrence,
+                    subject,
+                },
+            ) => {
                 m.close_gate(GateKind::Final, *occurrence, Some(subject))?;
                 m.require_checkpoint("final approval", subject)?;
                 m.require_verified()?;
@@ -467,7 +517,10 @@ impl Machine {
                 }
             }
             (S::Escalated, E::ResumeStage) => {
-                let back = m.escalated_from.filter(|s| s.is_running()).ok_or(invalid.clone())?;
+                let back = m
+                    .escalated_from
+                    .filter(|s| s.is_running())
+                    .ok_or(invalid.clone())?;
                 if back != S::Planning && !m.plan_approved {
                     return Err(invalid);
                 }

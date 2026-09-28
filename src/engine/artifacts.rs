@@ -41,11 +41,15 @@ fn staging(t: &TaskRow) -> PathBuf {
 
 /// A registered path (run-store relative, `/`-separated) as a native absolute path.
 fn abs(t: &TaskRow, rel: &str) -> PathBuf {
-    rel.split(['/', '\\']).filter(|c| !c.is_empty()).fold(t.run_store.clone(), |p, c| p.join(c))
+    rel.split(['/', '\\'])
+        .filter(|c| !c.is_empty())
+        .fold(t.run_store.clone(), |p, c| p.join(c))
 }
 
 fn rel(t: &TaskRow, p: &Path) -> String {
-    p.strip_prefix(&t.run_store).map(|r| r.display().to_string().replace('\\', "/")).unwrap_or_else(|_| p.display().to_string())
+    p.strip_prefix(&t.run_store)
+        .map(|r| r.display().to_string().replace('\\', "/"))
+        .unwrap_or_else(|_| p.display().to_string())
 }
 
 /// The version number the next `put` of `logical` gets.
@@ -70,15 +74,29 @@ fn sync_dir(_d: &Path) {
 /// Publish `bytes` as the next version of `logical` and register it (see the module doc).
 /// `view`: also (re)write this derived file under the run store root.
 #[allow(clippy::too_many_arguments)]
-pub fn put(store: &Store, t: &TaskRow, attempt: Option<&str>, logical: &str, ext: &str, kind: &str, bytes: &[u8], view: Option<&str>) -> Result<Version> {
+pub fn put(
+    store: &Store,
+    t: &TaskRow,
+    attempt: Option<&str>,
+    logical: &str,
+    ext: &str,
+    kind: &str,
+    bytes: &[u8],
+    view: Option<&str>,
+) -> Result<Version> {
     use std::io::Write;
     let version = next_version(store, t, logical)?;
     let sha = sha256_hex(bytes);
     // 1. staging, durable
     std::fs::create_dir_all(staging(t))?;
-    let tmp = staging(t).join(format!("{}-{version}-{}.{ext}", logical.replace('/', "_"), &sha[..12]));
+    let tmp = staging(t).join(format!(
+        "{}-{version}-{}.{ext}",
+        logical.replace('/', "_"),
+        &sha[..12]
+    ));
     {
-        let mut f = std::fs::File::create(&tmp).with_context(|| format!("staging {}", tmp.display()))?;
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("staging {}", tmp.display()))?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
@@ -90,7 +108,10 @@ pub fn put(store: &Store, t: &TaskRow, attempt: Option<&str>, logical: &str, ext
     if path.exists() {
         // a leftover of a crash between publish and commit that reconciliation has not seen
         if sha256_hex(&std::fs::read(&path)?) != sha {
-            bail!("artifact_tampered: {} exists with other content", path.display());
+            bail!(
+                "artifact_tampered: {} exists with other content",
+                path.display()
+            );
         }
         std::fs::remove_file(&tmp)?;
     } else {
@@ -99,8 +120,18 @@ pub fn put(store: &Store, t: &TaskRow, attempt: Option<&str>, logical: &str, ext
     sync_dir(&dir);
     super::runner::crash_point(&format!("artifact:{logical}@{version}:after_publish"));
     // 3. one transaction: row + head
-    let (tid, aid, l, k, r, s2, size) = (t.id.clone(), attempt.map(str::to_string), logical.to_string(), kind.to_string(), rel(t, &path), sha.clone(), bytes.len() as u64);
-    let id = store.call(move |tx| store::register_artifact(tx, &tid, aid.as_deref(), &l, &k, &r, &s2, size))?;
+    let (tid, aid, l, k, r, s2, size) = (
+        t.id.clone(),
+        attempt.map(str::to_string),
+        logical.to_string(),
+        kind.to_string(),
+        rel(t, &path),
+        sha.clone(),
+        bytes.len() as u64,
+    );
+    let id = store.call(move |tx| {
+        store::register_artifact(tx, &tid, aid.as_deref(), &l, &k, &r, &s2, size)
+    })?;
     if !id.ends_with(&format!("/{version}")) {
         bail!("artifact {id}: expected version {version} (concurrent writer?)");
     }
@@ -112,7 +143,13 @@ pub fn put(store: &Store, t: &TaskRow, attempt: Option<&str>, logical: &str, ext
         }
         std::fs::write(&p, bytes)?;
     }
-    Ok(Version { id, logical: logical.to_string(), version, path, sha256: sha })
+    Ok(Version {
+        id,
+        logical: logical.to_string(),
+        version,
+        path,
+        sha256: sha,
+    })
 }
 
 /// The head version of `logical`, if any (no hash check).
@@ -127,14 +164,25 @@ pub fn head(store: &Store, t: &TaskRow, logical: &str) -> Result<Option<Version>
             )
             .optional()?)
     })?;
-    Ok(row.map(|(id, v, p, sha)| Version { id, logical: logical.to_string(), version: v as u32, path: abs(t, &p), sha256: sha }))
+    Ok(row.map(|(id, v, p, sha)| Version {
+        id,
+        logical: logical.to_string(),
+        version: v as u32,
+        path: abs(t, &p),
+        sha256: sha,
+    }))
 }
 
 /// Read a version and check its hash: `artifact_missing` / `artifact_tampered` otherwise.
 pub fn read_version(v: &Version) -> Result<Vec<u8>> {
-    let b = std::fs::read(&v.path).map_err(|_| anyhow::anyhow!("artifact_missing: {} ({})", v.id, v.path.display()))?;
+    let b = std::fs::read(&v.path)
+        .map_err(|_| anyhow::anyhow!("artifact_missing: {} ({})", v.id, v.path.display()))?;
     if sha256_hex(&b) != v.sha256 {
-        bail!("artifact_tampered: {} ({}) does not match its registered SHA-256", v.id, v.path.display());
+        bail!(
+            "artifact_tampered: {} ({}) does not match its registered SHA-256",
+            v.id,
+            v.path.display()
+        );
     }
     Ok(b)
 }
@@ -151,8 +199,18 @@ pub fn read_head(store: &Store, t: &TaskRow, logical: &str) -> Result<Option<(Ve
 }
 
 /// Append-only text artifacts (DECISIONS.md): head content + `text` as a new version.
-pub fn append(store: &Store, t: &TaskRow, logical: &str, ext: &str, kind: &str, text: &str, view: &str) -> Result<Version> {
-    let mut cur = read_head(store, t, logical)?.map(|(_, b)| b).unwrap_or_default();
+pub fn append(
+    store: &Store,
+    t: &TaskRow,
+    logical: &str,
+    ext: &str,
+    kind: &str,
+    text: &str,
+    view: &str,
+) -> Result<Version> {
+    let mut cur = read_head(store, t, logical)?
+        .map(|(_, b)| b)
+        .unwrap_or_default();
     cur.extend_from_slice(text.as_bytes());
     put(store, t, None, logical, ext, kind, &cur, Some(view))
 }
@@ -185,26 +243,42 @@ pub fn reconcile(store: &Store, t: &TaskRow) -> Result<Reconciled> {
     if let Ok(rd) = std::fs::read_dir(staging(t)) {
         for e in rd.flatten() {
             let _ = std::fs::remove_file(e.path());
-            r.notes.push(format!("staging leftover removed: {}", e.file_name().to_string_lossy()));
+            r.notes.push(format!(
+                "staging leftover removed: {}",
+                e.file_name().to_string_lossy()
+            ));
         }
     }
     let tid = t.id.clone();
     let rows: Vec<(String, String, String, String)> = store.call(move |tx| {
-        let mut q = tx.prepare("SELECT id, path, sha256, kind FROM artifacts WHERE task_id = ?1")?;
-        let v = q.query_map([&tid], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?)))?.collect::<Result<Vec<_>, _>>()?;
+        let mut q =
+            tx.prepare("SELECT id, path, sha256, kind FROM artifacts WHERE task_id = ?1")?;
+        let v = q
+            .query_map([&tid], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(v)
     })?;
-    let registered: std::collections::BTreeSet<String> = rows.iter().map(|x| x.1.replace('\\', "/")).collect();
+    let registered: std::collections::BTreeSet<String> =
+        rows.iter().map(|x| x.1.replace('\\', "/")).collect();
     let mut published = Vec::new();
     files(&root(t), &mut published);
     for p in published.into_iter().filter(|p| !p.starts_with(staging(t))) {
         let rp = rel(t, &p);
         if !registered.contains(&rp) {
-            let dst = t.artifacts().join("orphans").join(p.strip_prefix(root(t)).unwrap_or(&p));
+            let dst = t
+                .artifacts()
+                .join("orphans")
+                .join(p.strip_prefix(root(t)).unwrap_or(&p));
             std::fs::create_dir_all(dst.parent().expect("parent"))?;
             std::fs::rename(&p, &dst)?;
-            r.notes.push(format!("orphan (published, never registered) moved to {}", dst.display()));
-            let (i, d) = (t.id.clone(), serde_json::json!({"file": rp, "moved_to": dst.display().to_string()}));
+            r.notes.push(format!(
+                "orphan (published, never registered) moved to {}",
+                dst.display()
+            ));
+            let (i, d) = (
+                t.id.clone(),
+                serde_json::json!({"file": rp, "moved_to": dst.display().to_string()}),
+            );
             store.call(move |tx| store::event(tx, Some(&i), None, "artifact_orphan", &d))?;
         }
     }
@@ -212,7 +286,13 @@ pub fn reconcile(store: &Store, t: &TaskRow) -> Result<Reconciled> {
         if kind == "partial_snapshot" {
             continue; // a directory; its manifest is checked by `snapshot::completion_check`
         }
-        let v = Version { id: id.clone(), logical: String::new(), version: 0, path: abs(t, &path), sha256: sha };
+        let v = Version {
+            id: id.clone(),
+            logical: String::new(),
+            version: 0,
+            path: abs(t, &path),
+            sha256: sha,
+        };
         if let Err(e) = read_version(&v) {
             r.problem.get_or_insert_with(|| format!("{e:#}"));
         }

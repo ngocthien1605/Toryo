@@ -7,10 +7,10 @@ use toryo::process::redact::{truncate_utf8, Redactions, Secret, StreamRedactor};
 
 fn secrets() -> Vec<Secret> {
     [
-        ("MB", "пароль-秘密-Ω🔑"),                // multibyte
-        ("A", "tok-AAAA"),                       // overlaps B
+        ("MB", "пароль-秘密-Ω🔑"), // multibyte
+        ("A", "tok-AAAA"),         // overlaps B
         ("B", "AAAA-SECRETPART"),
-        ("Q", "q\"uo\\te-7"),                    // differs when JSON-escaped
+        ("Q", "q\"uo\\te-7"), // differs when JSON-escaped
     ]
     .iter()
     .map(|(n, v)| Secret {
@@ -38,7 +38,11 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 fn assert_clean(out: &[u8], ctx: &str) {
     assert!(std::str::from_utf8(out).is_ok(), "not UTF-8: {ctx}");
     for f in forbidden() {
-        assert!(!contains(out, &f), "leaked {:?} ({ctx})", String::from_utf8_lossy(&f));
+        assert!(
+            !contains(out, &f),
+            "leaked {:?} ({ctx})",
+            String::from_utf8_lossy(&f)
+        );
     }
 }
 
@@ -60,7 +64,10 @@ fn stream(r: &Redactions, chunks: &[&[u8]]) -> Vec<u8> {
     for c in chunks {
         let e = s.push(c);
         // what has been emitted so far is already valid UTF-8 (a line reader may print it)
-        assert!(std::str::from_utf8(&e).is_ok(), "partial emission not UTF-8");
+        assert!(
+            std::str::from_utf8(&e).is_ok(),
+            "partial emission not UTF-8"
+        );
         out.extend(e);
     }
     out.extend(s.finish());
@@ -93,7 +100,10 @@ fn redaction_split_boundaries() {
         let out = stream(&r, &[&big[..CAP / 2], &big[CAP / 2..]]);
         let cut = truncate_utf8(&out, CAP);
         assert_clean(cut, "64 KB cut");
-        assert!(!contains(cut, "пароль".as_bytes()), "secret prefix at the cap (offset {off})");
+        assert!(
+            !contains(cut, "пароль".as_bytes()),
+            "secret prefix at the cap (offset {off})"
+        );
     }
 }
 

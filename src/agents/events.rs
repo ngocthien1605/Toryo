@@ -47,7 +47,12 @@ pub fn line_events(kind: ProfileKind, line: &[u8]) -> Vec<AgentEvent> {
                 }
             }
             Some("assistant") => {
-                for block in v.pointer("/message/content").and_then(Value::as_array).into_iter().flatten() {
+                for block in v
+                    .pointer("/message/content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
                     if block["type"] == "tool_use" {
                         out.push(AgentEvent::ToolActivity {
                             name: block["name"].as_str().unwrap_or("?").to_string(),
@@ -118,7 +123,11 @@ pub fn terminal_events(o: &TurnOutcome) -> Vec<AgentEvent> {
     }
     out.push(AgentEvent::Usage(TokenUsage {
         buckets: o.usage,
-        accounting: if o.usage.is_none() { Accounting::Unknown } else { o.accounting },
+        accounting: if o.usage.is_none() {
+            Accounting::Unknown
+        } else {
+            o.accounting
+        },
     }));
     if o.success {
         out.push(AgentEvent::TurnCompleted {

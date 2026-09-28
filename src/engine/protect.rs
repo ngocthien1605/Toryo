@@ -73,13 +73,32 @@ pub struct Scan {
 /// Git metadata outside the worktree that tools read on their own.
 fn git_meta(g: &GitCmd, wt: &Path) -> Result<Vec<(String, PathBuf)>> {
     let loc = Loc::Discover(wt.to_path_buf());
-    let common = PathBuf::from(g.run_str(&loc, true, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?.trim());
-    let own = PathBuf::from(g.run_str(&loc, true, &["rev-parse", "--absolute-git-dir"])?.trim());
+    let common = PathBuf::from(
+        g.run_str(
+            &loc,
+            true,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?
+        .trim(),
+    );
+    let own = PathBuf::from(
+        g.run_str(&loc, true, &["rev-parse", "--absolute-git-dir"])?
+            .trim(),
+    );
     let mut v = vec![
         (format!("{META}config"), common.join("config")),
-        (format!("{META}info/exclude"), common.join("info").join("exclude")),
-        (format!("{META}info/attributes"), common.join("info").join("attributes")),
-        (format!("{META}config.worktree"), own.join("config.worktree")),
+        (
+            format!("{META}info/exclude"),
+            common.join("info").join("exclude"),
+        ),
+        (
+            format!("{META}info/attributes"),
+            common.join("info").join("attributes"),
+        ),
+        (
+            format!("{META}config.worktree"),
+            own.join("config.worktree"),
+        ),
     ];
     if let Ok(d) = std::fs::read_dir(common.join("hooks")) {
         for e in d.flatten() {
@@ -92,12 +111,22 @@ fn git_meta(g: &GitCmd, wt: &Path) -> Result<Vec<(String, PathBuf)>> {
     Ok(v)
 }
 
-fn walk(root: &Path, dir: &Path, protect: &Protected, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
-    let Ok(rd) = std::fs::read_dir(dir) else { return Ok(()) };
+fn walk(
+    root: &Path,
+    dir: &Path,
+    protect: &Protected,
+    out: &mut Vec<(String, PathBuf)>,
+) -> Result<()> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
     for e in rd.flatten() {
         let ft = e.file_type()?;
         let p = e.path();
-        let rel = p.strip_prefix(root).map(|r| r.display().to_string().replace('\\', "/")).unwrap_or_default();
+        let rel = p
+            .strip_prefix(root)
+            .map(|r| r.display().to_string().replace('\\', "/"))
+            .unwrap_or_default();
         let name = e.file_name().to_string_lossy().to_string();
         if name == ".git" || rel == ".toryo-tmp" {
             continue;
@@ -119,7 +148,9 @@ fn walk(root: &Path, dir: &Path, protect: &Protected, out: &mut Vec<(String, Pat
 fn hash_file(p: &Path) -> Result<(u64, String)> {
     let md = std::fs::symlink_metadata(p)?;
     if md.file_type().is_symlink() {
-        let t = std::fs::read_link(p).map(|t| t.display().to_string()).unwrap_or_default();
+        let t = std::fs::read_link(p)
+            .map(|t| t.display().to_string())
+            .unwrap_or_default();
         return Ok((0, sha256_hex(format!("symlink:{t}").as_bytes())));
     }
     let b = std::fs::read(p).with_context(|| format!("reading {}", p.display()))?;
@@ -132,18 +163,43 @@ pub fn scan(g: &GitCmd, wt: &Path, protect: &Protected) -> Result<Scan> {
     walk(wt, wt, protect, &mut found)?;
     let tracked: BTreeSet<String> = {
         let out = g.run(&Loc::Discover(wt.to_path_buf()), true, &["ls-files", "-z"])?;
-        out.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).to_string()).collect()
+        out.split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).to_string())
+            .collect()
     };
     let mut entries = BTreeMap::new();
     for (rel, p) in found {
         let (size, sha256) = hash_file(&p)?;
         let t = tracked.contains(&rel);
-        entries.insert(rel, (p, PEntry { size, sha256, tracked: t, copy: false }));
+        entries.insert(
+            rel,
+            (
+                p,
+                PEntry {
+                    size,
+                    sha256,
+                    tracked: t,
+                    copy: false,
+                },
+            ),
+        );
     }
     for (k, p) in git_meta(g, wt)? {
         if p.is_file() {
             let (size, sha256) = hash_file(&p)?;
-            entries.insert(k, (p, PEntry { size, sha256, tracked: false, copy: false }));
+            entries.insert(
+                k,
+                (
+                    p,
+                    PEntry {
+                        size,
+                        sha256,
+                        tracked: false,
+                        copy: false,
+                    },
+                ),
+            );
         }
     }
     Ok(Scan { entries })
@@ -163,7 +219,11 @@ pub fn compare(base: &PManifest, now: &Scan) -> Vec<Change> {
             _ => continue,
         };
         let tracked = b.is_some_and(|e| e.tracked) || n.is_some_and(|e| e.tracked);
-        out.push(Change { path: k.clone(), kind, tracked });
+        out.push(Change {
+            path: k.clone(),
+            kind,
+            tracked,
+        });
     }
     out
 }
@@ -173,14 +233,21 @@ fn blobs(t: &TaskRow) -> PathBuf {
 }
 
 /// Take a new baseline version from the current state and make it the one in force.
-pub fn take_baseline(store: &Store, t: &TaskRow, g: &GitCmd, protect: &Protected, reason: &str) -> Result<PManifest> {
+pub fn take_baseline(
+    store: &Store,
+    t: &TaskRow,
+    g: &GitCmd,
+    protect: &Protected,
+    reason: &str,
+) -> Result<PManifest> {
     let now = scan(g, &t.worktree, protect)?;
     let version = super::artifacts::next_version(store, t, "protected")?;
     let mut total = 0u64;
     let mut entries = BTreeMap::new();
     std::fs::create_dir_all(blobs(t))?;
     for (k, (p, mut e)) in now.entries {
-        if (!e.tracked || k.starts_with(META)) && e.size <= MAX_COPY && total + e.size <= MAX_TOTAL {
+        if (!e.tracked || k.starts_with(META)) && e.size <= MAX_COPY && total + e.size <= MAX_TOTAL
+        {
             let dst = blobs(t).join(&e.sha256);
             if !dst.exists() && std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file()) {
                 std::fs::copy(&p, &dst)?;
@@ -190,12 +257,34 @@ pub fn take_baseline(store: &Store, t: &TaskRow, g: &GitCmd, protect: &Protected
         }
         entries.insert(k, e);
     }
-    let m = PManifest { version, created_at: crate::evidence::now_rfc3339(), reason: reason.to_string(), entries };
+    let m = PManifest {
+        version,
+        created_at: crate::evidence::now_rfc3339(),
+        reason: reason.to_string(),
+        entries,
+    };
     let bytes = serde_json::to_vec_pretty(&m)?;
-    super::artifacts::put(store, t, None, "protected", "json", "protected_manifest", &bytes, Some(&format!("protected/{version}.json")))?;
+    super::artifacts::put(
+        store,
+        t,
+        None,
+        "protected",
+        "json",
+        "protected_manifest",
+        &bytes,
+        Some(&format!("protected/{version}.json")),
+    )?;
     let (tid, r) = (t.id.clone(), reason.to_string());
     let n = m.entries.len();
-    store.call(move |tx| store::event(tx, Some(&tid), None, "protected_baseline", &serde_json::json!({"version": version, "reason": r, "entries": n})))?;
+    store.call(move |tx| {
+        store::event(
+            tx,
+            Some(&tid),
+            None,
+            "protected_baseline",
+            &serde_json::json!({"version": version, "reason": r, "entries": n}),
+        )
+    })?;
     Ok(m)
 }
 
@@ -209,7 +298,12 @@ pub fn baseline(store: &Store, t: &TaskRow) -> Result<Option<(String, PManifest)
 }
 
 /// The baseline in force, taking v1 if the task has none yet.
-pub fn baseline_or_init(store: &Store, t: &TaskRow, g: &GitCmd, protect: &Protected) -> Result<(String, PManifest)> {
+pub fn baseline_or_init(
+    store: &Store,
+    t: &TaskRow,
+    g: &GitCmd,
+    protect: &Protected,
+) -> Result<(String, PManifest)> {
     if let Some(b) = baseline(store, t)? {
         return Ok(b);
     }
@@ -219,7 +313,13 @@ pub fn baseline_or_init(store: &Store, t: &TaskRow, g: &GitCmd, protect: &Protec
 
 /// A readable diff of the changes against the baseline copies (`git diff --no-index`,
 /// canonical flags); tracked files diff against HEAD.
-pub fn render_changes(g: &GitCmd, t: &TaskRow, base: &PManifest, now: &Scan, changes: &[Change]) -> Result<String> {
+pub fn render_changes(
+    g: &GitCmd,
+    t: &TaskRow,
+    base: &PManifest,
+    now: &Scan,
+    changes: &[Change],
+) -> Result<String> {
     let mut s = String::new();
     let empty = t.artifacts().join("protected-blobs").join(".empty");
     std::fs::create_dir_all(empty.parent().expect("parent"))?;
@@ -227,14 +327,31 @@ pub fn render_changes(g: &GitCmd, t: &TaskRow, base: &PManifest, now: &Scan, cha
         std::fs::write(&empty, b"")?;
     }
     for c in changes {
-        s.push_str(&format!("### {} {} ({})\n", c.kind, c.path, if c.path.starts_with(META) { "Git metadata" } else if c.tracked { "tracked" } else { "untracked/ignored" }));
-        let before = base.entries.get(&c.path).filter(|e| e.copy).map(|e| blobs(t).join(&e.sha256));
+        s.push_str(&format!(
+            "### {} {} ({})\n",
+            c.kind,
+            c.path,
+            if c.path.starts_with(META) {
+                "Git metadata"
+            } else if c.tracked {
+                "tracked"
+            } else {
+                "untracked/ignored"
+            }
+        ));
+        let before = base
+            .entries
+            .get(&c.path)
+            .filter(|e| e.copy)
+            .map(|e| blobs(t).join(&e.sha256));
         let after = now.entries.get(&c.path).map(|x| x.0.clone());
         let a = match (&before, base.entries.contains_key(&c.path)) {
             (Some(p), _) => p.clone(),
             (None, false) => empty.clone(),
             (None, true) => {
-                s.push_str("(no baseline copy: file too large or tracked — compare with `git diff`)\n\n");
+                s.push_str(
+                    "(no baseline copy: file too large or tracked — compare with `git diff`)\n\n",
+                );
                 continue;
             }
         };
@@ -242,7 +359,16 @@ pub fn render_changes(g: &GitCmd, t: &TaskRow, base: &PManifest, now: &Scan, cha
         let out = g.output(
             &Loc::Discover(t.artifacts()),
             true,
-            &["diff", "--no-index", "--no-textconv", "--no-ext-diff", "--no-color", "--", &a.display().to_string(), &b.display().to_string()],
+            &[
+                "diff",
+                "--no-index",
+                "--no-textconv",
+                "--no-ext-diff",
+                "--no-color",
+                "--",
+                &a.display().to_string(),
+                &b.display().to_string(),
+            ],
         )?;
         let d = String::from_utf8_lossy(&out.stdout);
         let mut cut = d.len().min(16_000);
@@ -271,7 +397,17 @@ impl Check {
 
 /// The `Escalated` reason for a list of changes (§11 `protected_config_changed`).
 pub fn escalation_reason(task: &str, bad: &[&Change], diff: Option<&Path>) -> String {
-    let list: Vec<String> = bad.iter().map(|x| format!("{} {}{}", x.kind, x.path, if x.is_hard() { "" } else { " (tracked)" })).collect();
+    let list: Vec<String> = bad
+        .iter()
+        .map(|x| {
+            format!(
+                "{} {}{}",
+                x.kind,
+                x.path,
+                if x.is_hard() { "" } else { " (tracked)" }
+            )
+        })
+        .collect();
     format!(
         "{REASON}: {} (diff: {}) — restore and `toryo resume {task}`, or accept: `toryo resume {task} --accept-protected-change <path>`",
         list.join(", "),
@@ -288,11 +424,24 @@ pub fn check(store: &Store, t: &TaskRow, g: &GitCmd, protect: &Protected) -> Res
     if changes.iter().any(Change::is_hard) {
         let hard: Vec<Change> = changes.iter().filter(|c| c.is_hard()).cloned().collect();
         let text = render_changes(g, t, &base, &now, &hard)?;
-        let p = t.artifacts().join(format!("protected-changes-{}.md", super::artifacts::next_version(store, t, "protected")?));
-        std::fs::write(&p, format!("# Protected state changed (R35)\n\nbaseline v{} ({})\n\n{text}", base.version, base.reason))?;
+        let p = t.artifacts().join(format!(
+            "protected-changes-{}.md",
+            super::artifacts::next_version(store, t, "protected")?
+        ));
+        std::fs::write(
+            &p,
+            format!(
+                "# Protected state changed (R35)\n\nbaseline v{} ({})\n\n{text}",
+                base.version, base.reason
+            ),
+        )?;
         diff_path = Some(p);
     }
-    Ok(Check { baseline_id: id, changes, diff_path })
+    Ok(Check {
+        baseline_id: id,
+        changes,
+        diff_path,
+    })
 }
 
 #[cfg(test)]
@@ -301,8 +450,23 @@ mod tests {
 
     #[test]
     fn hard_changes() {
-        assert!(Change { path: ".claude/settings.local.json".into(), kind: "added", tracked: false }.is_hard());
-        assert!(Change { path: "@git/config".into(), kind: "modified", tracked: false }.is_hard());
-        assert!(!Change { path: "AGENTS.md".into(), kind: "modified", tracked: true }.is_hard());
+        assert!(Change {
+            path: ".claude/settings.local.json".into(),
+            kind: "added",
+            tracked: false
+        }
+        .is_hard());
+        assert!(Change {
+            path: "@git/config".into(),
+            kind: "modified",
+            tracked: false
+        }
+        .is_hard());
+        assert!(!Change {
+            path: "AGENTS.md".into(),
+            kind: "modified",
+            tracked: true
+        }
+        .is_hard());
     }
 }

@@ -58,7 +58,9 @@ impl<'a> Worktree<'a> {
     /// Put protected paths back (tracked → HEAD, new untracked → removed).
     pub fn restore(&self, paths: &[String]) -> Result<()> {
         for p in paths {
-            let _ = self.g.output(&self.loc, false, &["checkout", "-q", "HEAD", "--", p]);
+            let _ = self
+                .g
+                .output(&self.loc, false, &["checkout", "-q", "HEAD", "--", p]);
             if self
                 .g
                 .output(&self.loc, true, &["ls-files", "--error-unmatch", p])?
@@ -73,9 +75,20 @@ impl<'a> Worktree<'a> {
     }
 
     /// `git add -A` + commit with trailers (R40: `allow_empty` for a no-change checkpoint).
-    pub fn commit(&self, message: &str, trailers: &[(&str, String)], allow_empty: bool) -> Result<String> {
+    pub fn commit(
+        &self,
+        message: &str,
+        trailers: &[(&str, String)],
+        allow_empty: bool,
+    ) -> Result<String> {
         self.g.run(&self.loc, false, &["add", "-A"])?;
-        let mut args: Vec<String> = vec!["commit".into(), "-q".into(), "--no-verify".into(), "-m".into(), message.into()];
+        let mut args: Vec<String> = vec![
+            "commit".into(),
+            "-q".into(),
+            "--no-verify".into(),
+            "-m".into(),
+            message.into(),
+        ];
         for (k, v) in trailers {
             args.push("--trailer".into());
             args.push(format!("{k}: {v}"));
@@ -99,7 +112,13 @@ impl<'a> Worktree<'a> {
     }
 
     /// The checkpoint commit of `(task, stage, attempt)` on this branch since `base`, if any.
-    pub fn find_checkpoint(&self, base: &str, task: &str, stage: &str, attempt: u32) -> Result<Option<CheckpointCommit>> {
+    pub fn find_checkpoint(
+        &self,
+        base: &str,
+        task: &str,
+        stage: &str,
+        attempt: u32,
+    ) -> Result<Option<CheckpointCommit>> {
         let fmt = format!(
             "--format=%H%x1f%(trailers:key={T_TASK},valueonly)%x1f%(trailers:key={T_STAGE},valueonly)%x1f%(trailers:key={T_ATTEMPT},valueonly)%x1f%(trailers:key={T_PARTIAL},valueonly)%x1f%(trailers:key={T_NO_CHANGE},valueonly)%x1e"
         );
@@ -125,21 +144,34 @@ impl<'a> Worktree<'a> {
     pub fn contains(&self, commit: &str) -> Result<bool> {
         Ok(self
             .g
-            .output(&self.loc, true, &["merge-base", "--is-ancestor", commit, "HEAD"])?
+            .output(
+                &self.loc,
+                true,
+                &["merge-base", "--is-ancestor", commit, "HEAD"],
+            )?
             .status
             .success())
     }
 
     /// The worktree's own Git dir (for unfinished-operation markers).
     pub fn git_dir(&self) -> Result<PathBuf> {
-        let d = self.g.run_str(&self.loc, true, &["rev-parse", "--absolute-git-dir"])?;
+        let d = self
+            .g
+            .run_str(&self.loc, true, &["rev-parse", "--absolute-git-dir"])?;
         Ok(PathBuf::from(d))
     }
 
     /// R25/§10: an unfinished Git operation (merge, rebase, cherry-pick, revert, bisect).
     pub fn unfinished_operation(&self) -> Result<Option<String>> {
         let gd = self.git_dir()?;
-        for m in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "rebase-merge", "rebase-apply"] {
+        for m in [
+            "MERGE_HEAD",
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+            "BISECT_LOG",
+            "rebase-merge",
+            "rebase-apply",
+        ] {
             if gd.join(m).exists() {
                 return Ok(Some(m.to_string()));
             }
@@ -149,12 +181,14 @@ impl<'a> Worktree<'a> {
 
     /// Soft-reset HEAD to `to` (HEAD guard: agents must not commit).
     pub fn soft_reset(&self, to: &str) -> Result<()> {
-        self.g.run(&self.loc, false, &["reset", "-q", "--soft", to])?;
+        self.g
+            .run(&self.loc, false, &["reset", "-q", "--soft", to])?;
         Ok(())
     }
 
     pub fn hard_reset_and_clean(&self, to: &str) -> Result<()> {
-        self.g.run(&self.loc, false, &["reset", "-q", "--hard", to])?;
+        self.g
+            .run(&self.loc, false, &["reset", "-q", "--hard", to])?;
         self.g.run(&self.loc, false, &["clean", "-q", "-fd"])?;
         Ok(())
     }

@@ -116,7 +116,10 @@ pub fn collect_versions(cfg: Option<&Effective>, profiles: &[&str]) -> BTreeMap<
         if out.contains_key(*name) {
             continue;
         }
-        if let Some(v) = cfg.and_then(|c| c.profile(name).ok()).and_then(profile_version) {
+        if let Some(v) = cfg
+            .and_then(|c| c.profile(name).ok())
+            .and_then(profile_version)
+        {
             out.insert((*name).to_string(), v);
         }
     }
@@ -183,10 +186,15 @@ pub fn canary_spike(kind: ProfileKind) -> &'static str {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EvidenceStatus {
     /// Last record passed, for this version.
-    Verified { ts: String },
+    Verified {
+        ts: String,
+    },
     Missing,
     /// Last record failed.
-    Failed { ts: String, summary: String },
+    Failed {
+        ts: String,
+        summary: String,
+    },
     /// Last record passed, but for another (or an unrecorded) version.
     Stale {
         ts: String,
@@ -205,7 +213,11 @@ impl EvidenceStatus {
             EvidenceStatus::Verified { ts } => format!("{spike} passed @ {ts}"),
             EvidenceStatus::Missing => format!("no {spike} record"),
             EvidenceStatus::Failed { ts, summary } => format!("{spike} FAILED @ {ts}: {summary}"),
-            EvidenceStatus::Stale { ts, recorded, current } => format!(
+            EvidenceStatus::Stale {
+                ts,
+                recorded,
+                current,
+            } => format!(
                 "{spike} passed @ {ts} for version {} but the CLI is now {} (R51: unverified)",
                 recorded.as_deref().unwrap_or("<not recorded>"),
                 current.as_deref().unwrap_or("<unknown>")
@@ -268,7 +280,10 @@ pub fn unverified_profiles(cfg: &Effective, profiles: &[&str]) -> Result<Vec<(St
 
 /// R49 (V07-VERIFY 4): Claude profiles used as a fallback Implementer also need a passing
 /// `claude-implementer-isolation` record for the version installed now.
-pub fn unverified_implementers(cfg: &Effective, profiles: &[&str]) -> Result<Vec<(String, String)>> {
+pub fn unverified_implementers(
+    cfg: &Effective,
+    profiles: &[&str],
+) -> Result<Vec<(String, String)>> {
     let records = load();
     let mut out = Vec::new();
     for name in profiles {
@@ -373,26 +388,49 @@ mod tests {
             }
             r
         };
-        let st = |recs: &[Value], cur: Option<&str>| evidence_status(recs, "codex-canary", "cx", "cx", cur);
+        let st = |recs: &[Value], cur: Option<&str>| {
+            evidence_status(recs, "codex-canary", "cx", "cx", cur)
+        };
         assert_eq!(st(&[], Some("1.0.0")), EvidenceStatus::Missing);
         assert!(st(&[pass(Some("1.0.0"))], Some("1.0.0")).is_verified());
         // another version, an unrecorded version (pre-R51 record), an unknown current version
-        for (rec, cur) in [(Some("1.0.0"), Some("1.1.0")), (None, Some("1.0.0")), (Some("1.0.0"), None)] {
-            assert!(matches!(st(&[pass(rec)], cur), EvidenceStatus::Stale { .. }), "{rec:?} {cur:?}");
+        for (rec, cur) in [
+            (Some("1.0.0"), Some("1.1.0")),
+            (None, Some("1.0.0")),
+            (Some("1.0.0"), None),
+        ] {
+            assert!(
+                matches!(st(&[pass(rec)], cur), EvidenceStatus::Stale { .. }),
+                "{rec:?} {cur:?}"
+            );
         }
         // the latest record decides: a later failure is not hidden by an older pass
         let fail = json!({"spike": "codex-canary", "profile": "cx", "pass": false, "ts": "t2", "summary": "escaped"});
-        assert!(matches!(st(&[pass(Some("1.0.0")), fail], Some("1.0.0")), EvidenceStatus::Failed { .. }));
+        assert!(matches!(
+            st(&[pass(Some("1.0.0")), fail], Some("1.0.0")),
+            EvidenceStatus::Failed { .. }
+        ));
         // a new pass on the new version clears it
         assert!(st(&[pass(Some("1.0.0")), pass(Some("1.1.0"))], Some("1.1.0")).is_verified());
-        assert!(st(&[pass(Some("1.1.0"))], Some("1.1.0")).describe("codex-canary").contains("passed"));
+        assert!(st(&[pass(Some("1.1.0"))], Some("1.1.0"))
+            .describe("codex-canary")
+            .contains("passed"));
     }
 
     #[test]
     fn version_parsing() {
-        assert_eq!(parse_version("2.1.283 (Claude Code)").as_deref(), Some("2.1.283"));
-        assert_eq!(parse_version("codex-cli 0.157.1").as_deref(), Some("0.157.1"));
-        assert_eq!(parse_version("git version 2.47.1.windows.2").as_deref(), Some("2.47.1.windows.2"));
+        assert_eq!(
+            parse_version("2.1.283 (Claude Code)").as_deref(),
+            Some("2.1.283")
+        );
+        assert_eq!(
+            parse_version("codex-cli 0.157.1").as_deref(),
+            Some("0.157.1")
+        );
+        assert_eq!(
+            parse_version("git version 2.47.1.windows.2").as_deref(),
+            Some("2.47.1.windows.2")
+        );
         assert_eq!(parse_version("no version"), None);
     }
 }

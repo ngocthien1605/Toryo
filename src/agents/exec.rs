@@ -97,7 +97,15 @@ pub fn run_turn(
     opts: TurnOpts,
 ) -> Result<TurnRun> {
     run_turn_with(
-        profile_name, profile, args, cwd, prompt, run_dir, label, opts, &mut |_| {},
+        profile_name,
+        profile,
+        args,
+        cwd,
+        prompt,
+        run_dir,
+        label,
+        opts,
+        &mut |_| {},
     )
 }
 
@@ -166,14 +174,17 @@ pub fn run_turn_with(
     let started = Instant::now();
     let kill_after = opts.kill_after;
     let cancel_flag = opts.cancel.clone();
-    let cancel: Option<Box<dyn Fn() -> bool + Send>> = if kill_after.is_some() || cancel_flag.is_some() {
-        Some(Box::new(move || {
-            kill_after.is_some_and(|d| started.elapsed() >= d)
-                || cancel_flag.as_ref().is_some_and(|c| c.load(Ordering::SeqCst))
-        }))
-    } else {
-        None
-    };
+    let cancel: Option<Box<dyn Fn() -> bool + Send>> =
+        if kill_after.is_some() || cancel_flag.is_some() {
+            Some(Box::new(move || {
+                kill_after.is_some_and(|d| started.elapsed() >= d)
+                    || cancel_flag
+                        .as_ref()
+                        .is_some_and(|c| c.load(Ordering::SeqCst))
+            }))
+        } else {
+            None
+        };
     let wait = WaitOptions {
         max: Some(opts.max),
         stall: Some(opts.stall),

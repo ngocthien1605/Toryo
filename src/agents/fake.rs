@@ -24,25 +24,59 @@ use crate::usage::{Accounting, Buckets};
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FakeStep {
-    Delay { ms: u64 },
-    Text { text: String },
-    Tool { name: String, #[serde(default)] summary: String },
-    /// Write (or append to) a file relative to the session's cwd — an Implementer's edits.
-    WriteFile { path: String, content: String, #[serde(default)] append: bool },
-    Usage {
-        #[serde(default)] input: u64,
-        #[serde(default)] cache_read: u64,
-        #[serde(default)] output: u64,
+    Delay {
+        ms: u64,
     },
-    Deny { tool: String, #[serde(default)] detail: String },
-    Complete { #[serde(default)] text: String, #[serde(default)] structured: Option<Value> },
-    Fail { class: ErrorClass, #[serde(default)] detail: String },
+    Text {
+        text: String,
+    },
+    Tool {
+        name: String,
+        #[serde(default)]
+        summary: String,
+    },
+    /// Write (or append to) a file relative to the session's cwd — an Implementer's edits.
+    WriteFile {
+        path: String,
+        content: String,
+        #[serde(default)]
+        append: bool,
+    },
+    Usage {
+        #[serde(default)]
+        input: u64,
+        #[serde(default)]
+        cache_read: u64,
+        #[serde(default)]
+        output: u64,
+    },
+    Deny {
+        tool: String,
+        #[serde(default)]
+        detail: String,
+    },
+    Complete {
+        #[serde(default)]
+        text: String,
+        #[serde(default)]
+        structured: Option<Value>,
+    },
+    Fail {
+        class: ErrorClass,
+        #[serde(default)]
+        detail: String,
+    },
     /// The process died without a terminal event.
     Crash,
     /// Never answers again (until interrupted) — for stall/timeout tests.
     Hang,
     /// Replay a recorded stream (`claude` or `codex` JSONL) through the real parsers.
-    Replay { agent: String, file: PathBuf, #[serde(default)] exit_code: Option<i32> },
+    Replay {
+        agent: String,
+        file: PathBuf,
+        #[serde(default)]
+        exit_code: Option<i32>,
+    },
     /// Internal: an already-built event (replayed streams, the session id).
     #[serde(skip)]
     Emit(Box<AgentEvent>),
@@ -66,8 +100,10 @@ pub struct FakeScript {
 
 impl FakeScript {
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let mut s: FakeScript = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut s: FakeScript =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         // replay files are relative to the script
         let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
         for turns in s.turns.values_mut() {
@@ -156,7 +192,10 @@ impl AgentAdapter for FakeAgentAdapter {
         };
         Ok(Box::new(FakeSession {
             adapter: self.clone(),
-            external: req.resume.clone().or_else(|| Some(format!("fake-{}-{n}", self.profile))),
+            external: req
+                .resume
+                .clone()
+                .or_else(|| Some(format!("fake-{}-{n}", self.profile))),
             req,
             pending: VecDeque::new(),
             done: true,
@@ -176,7 +215,10 @@ impl AgentAdapter for FakeAgentAdapter {
 
     fn usage_capabilities(&self) -> UsageCapabilities {
         let s = self.shared.lock().expect("lock");
-        s.capabilities.get(&self.profile).copied().unwrap_or_else(|| super::cli::capabilities(self.kind))
+        s.capabilities
+            .get(&self.profile)
+            .copied()
+            .unwrap_or_else(|| super::cli::capabilities(self.kind))
     }
 }
 
@@ -204,20 +246,37 @@ impl AgentSession for FakeSession {
         let key_p = format!("{role}@{}", self.adapter.profile);
         let turn = {
             let mut s = self.adapter.shared.lock().expect("lock");
-            let key = if s.queues.contains_key(&key_p) { key_p.clone() } else { role.to_string() };
+            let key = if s.queues.contains_key(&key_p) {
+                key_p.clone()
+            } else {
+                role.to_string()
+            };
             s.calls.push(FakeCall {
                 key: key.clone(),
                 profile: self.adapter.profile.clone(),
                 label: input.label.clone(),
                 prompt: input.prompt.clone(),
-                resume: if self.turns > 0 || self.req.resume.is_some() { self.external.clone() } else { None },
-                context: self.req.context_file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()),
+                resume: if self.turns > 0 || self.req.resume.is_some() {
+                    self.external.clone()
+                } else {
+                    None
+                },
+                context: self
+                    .req
+                    .context_file
+                    .as_ref()
+                    .and_then(|f| std::fs::read_to_string(f).ok()),
             });
             s.queues.get_mut(&key).and_then(VecDeque::pop_front)
         };
         // like the real adapter, keep the prompt next to the capture
         std::fs::create_dir_all(&self.req.capture_dir)?;
-        std::fs::write(self.req.capture_dir.join(format!("{}.prompt.md", input.label)), &input.prompt)?;
+        std::fs::write(
+            self.req
+                .capture_dir
+                .join(format!("{}.prompt.md", input.label)),
+            &input.prompt,
+        )?;
         self.pending = match turn {
             Some(t) => t.steps.into_iter().collect(),
             None => VecDeque::from([FakeStep::Fail {
@@ -229,7 +288,8 @@ impl AgentSession for FakeSession {
             self.announced = true;
             let replays = matches!(self.pending.front(), Some(FakeStep::Replay { .. }));
             if let (false, Some(id)) = (replays, self.external.clone()) {
-                self.pending.push_front(FakeStep::Emit(Box::new(AgentEvent::SessionIdentified(id))));
+                self.pending
+                    .push_front(FakeStep::Emit(Box::new(AgentEvent::SessionIdentified(id))));
             }
         }
         self.done = false;
@@ -254,8 +314,14 @@ impl AgentSession for FakeSession {
             match step {
                 FakeStep::Delay { ms } => tokio::time::sleep(Duration::from_millis(ms)).await,
                 FakeStep::Text { text } => return Some(AgentEvent::TextDelta(text)),
-                FakeStep::Tool { name, summary } => return Some(AgentEvent::ToolActivity { name, summary }),
-                FakeStep::WriteFile { path, content, append } => {
+                FakeStep::Tool { name, summary } => {
+                    return Some(AgentEvent::ToolActivity { name, summary })
+                }
+                FakeStep::WriteFile {
+                    path,
+                    content,
+                    append,
+                } => {
                     // `$TEMP/x` writes into the turn's TEMP (R46), like a test runner would
                     let p = match (path.strip_prefix("$TEMP/"), self.env.get("TEMP")) {
                         (Some(r), Some(t)) => PathBuf::from(t).join(r),
@@ -266,27 +332,53 @@ impl AgentSession for FakeSession {
                     }
                     let res = if append {
                         use std::io::Write;
-                        std::fs::OpenOptions::new().create(true).append(true).open(&p).and_then(|mut f| f.write_all(content.as_bytes()))
+                        std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&p)
+                            .and_then(|mut f| f.write_all(content.as_bytes()))
                     } else {
                         std::fs::write(&p, content)
                     };
                     let _ = res;
-                    return Some(AgentEvent::ToolActivity { name: "file_change".into(), summary: path });
+                    return Some(AgentEvent::ToolActivity {
+                        name: "file_change".into(),
+                        summary: path,
+                    });
                 }
-                FakeStep::Usage { input, cache_read, output } => {
+                FakeStep::Usage {
+                    input,
+                    cache_read,
+                    output,
+                } => {
                     return Some(AgentEvent::Usage(TokenUsage {
-                        buckets: Some(Buckets { uncached_input: input, cache_read, cache_write: 0, output, reasoning: None }),
+                        buckets: Some(Buckets {
+                            uncached_input: input,
+                            cache_read,
+                            cache_write: 0,
+                            output,
+                            reasoning: None,
+                        }),
                         accounting: Accounting::Exact,
                     }))
                 }
-                FakeStep::Deny { tool, detail } => return Some(AgentEvent::PermissionDenied { tool, detail }),
+                FakeStep::Deny { tool, detail } => {
+                    return Some(AgentEvent::PermissionDenied { tool, detail })
+                }
                 FakeStep::Complete { text, structured } => {
                     self.done = true;
-                    return Some(AgentEvent::TurnCompleted { final_text: text, structured });
+                    return Some(AgentEvent::TurnCompleted {
+                        final_text: text,
+                        structured,
+                    });
                 }
                 FakeStep::Fail { class, detail } => {
                     self.done = true;
-                    return Some(AgentEvent::TurnFailed { class, detail, structured: None });
+                    return Some(AgentEvent::TurnFailed {
+                        class,
+                        detail,
+                        structured: None,
+                    });
                 }
                 FakeStep::Crash => {
                     self.done = true;
@@ -302,8 +394,16 @@ impl AgentSession for FakeSession {
                     }
                     return Some(*e);
                 }
-                FakeStep::Replay { agent, file, exit_code } => {
-                    let kind = if agent == "codex" { ProfileKind::Codex } else { ProfileKind::Claude };
+                FakeStep::Replay {
+                    agent,
+                    file,
+                    exit_code,
+                } => {
+                    let kind = if agent == "codex" {
+                        ProfileKind::Codex
+                    } else {
+                        ProfileKind::Claude
+                    };
                     let text = std::fs::read_to_string(&file).unwrap_or_default();
                     let events = replay(kind, &text, exit_code.or(Some(0)));
                     for e in events.into_iter().rev() {

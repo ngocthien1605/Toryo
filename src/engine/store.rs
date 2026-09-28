@@ -174,13 +174,18 @@ impl Store {
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d)?;
         }
-        let mut conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let mut conn =
+            Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         configure(&conn)?;
         {
             let tx = conn.transaction()?;
             tx.execute_batch(SCHEMA)?;
             let v: Option<String> = tx
-                .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
+                .query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
                 .optional()?;
             match v {
                 None => {
@@ -190,7 +195,10 @@ impl Store {
                     )?;
                 }
                 Some(v) if v == SCHEMA_VERSION.to_string() => {}
-                Some(v) => bail!("database {} has schema version {v}; this toryo expects {SCHEMA_VERSION}", path.display()),
+                Some(v) => bail!(
+                    "database {} has schema version {v}; this toryo expects {SCHEMA_VERSION}",
+                    path.display()
+                ),
             }
             // additive migrations within schema version 1
             let cols: Vec<String> = {
@@ -232,7 +240,8 @@ impl Store {
         let (rtx, rrx) = mpsc::channel();
         let job: Job = Box::new(move |conn: &mut Connection| {
             let res = (|| {
-                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let v = f(&tx)?;
                 tx.commit()?;
                 Ok(v)
@@ -294,7 +303,9 @@ impl TaskRow {
         self.run_store.join("captures")
     }
     pub fn current_implementer(&self) -> Option<&str> {
-        self.implementers.get(self.implementer_index).map(String::as_str)
+        self.implementers
+            .get(self.implementer_index)
+            .map(String::as_str)
     }
 }
 
@@ -401,34 +412,60 @@ pub fn insert_task(tx: &Transaction, t: &NewTask) -> Result<()> {
     if n == 0 {
         bail!("task {} already exists", t.id);
     }
-    event(tx, Some(&t.id), None, "task_created", &serde_json::json!({"branch": t.branch, "base": t.base_commit}))?;
+    event(
+        tx,
+        Some(&t.id),
+        None,
+        "task_created",
+        &serde_json::json!({"branch": t.branch, "base": t.base_commit}),
+    )?;
     Ok(())
 }
 
 pub fn get_task(tx: &Transaction, id: &str) -> Result<TaskRow> {
-    tx.query_row(&format!("SELECT {TASK_COLS} FROM tasks WHERE id = ?1"), [id], task_from_row)
-        .optional()?
-        .ok_or_else(|| anyhow!("no task `{id}`"))
+    tx.query_row(
+        &format!("SELECT {TASK_COLS} FROM tasks WHERE id = ?1"),
+        [id],
+        task_from_row,
+    )
+    .optional()?
+    .ok_or_else(|| anyhow!("no task `{id}`"))
 }
 
 pub fn list_tasks(tx: &Transaction) -> Result<Vec<TaskRow>> {
-    let mut st = tx.prepare(&format!("SELECT {TASK_COLS} FROM tasks ORDER BY created_at, id"))?;
+    let mut st = tx.prepare(&format!(
+        "SELECT {TASK_COLS} FROM tasks ORDER BY created_at, id"
+    ))?;
     let rows = st.query_map([], task_from_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 pub fn set_feedback(tx: &Transaction, id: &str, feedback: Option<&str>) -> Result<()> {
-    tx.execute("UPDATE tasks SET feedback = ?2, updated_at = ?3 WHERE id = ?1", params![id, feedback, now()])?;
+    tx.execute(
+        "UPDATE tasks SET feedback = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, feedback, now()],
+    )?;
     Ok(())
 }
 
 pub fn set_handoff(tx: &Transaction, id: &str, handoff: Option<&str>) -> Result<()> {
-    tx.execute("UPDATE tasks SET handoff = ?2, updated_at = ?3 WHERE id = ?1", params![id, handoff, now()])?;
+    tx.execute(
+        "UPDATE tasks SET handoff = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, handoff, now()],
+    )?;
     Ok(())
 }
 
 /// `toryo task config --reload` (R35): the new frozen configuration and the roles it resolves.
-pub fn set_config(tx: &Transaction, id: &str, config_sha256: &str, planner: &str, implementers: &[String], reviewer: &str, idx: usize) -> Result<()> {
+pub fn set_config(
+    tx: &Transaction,
+    id: &str,
+    config_sha256: &str,
+    planner: &str,
+    implementers: &[String],
+    reviewer: &str,
+    idx: usize,
+) -> Result<()> {
     tx.execute(
         "UPDATE tasks SET config_sha256 = ?2, planner = ?3, implementers = ?4, reviewer = ?5, implementer_index = ?6, updated_at = ?7 WHERE id = ?1",
         params![id, config_sha256, planner, serde_json::to_string(implementers)?, reviewer, idx as i64, now()],
@@ -437,16 +474,28 @@ pub fn set_config(tx: &Transaction, id: &str, config_sha256: &str, planner: &str
 }
 
 pub fn set_implementer_index(tx: &Transaction, id: &str, idx: usize) -> Result<()> {
-    tx.execute("UPDATE tasks SET implementer_index = ?2, updated_at = ?3 WHERE id = ?1", params![id, idx as i64, now()])?;
+    tx.execute(
+        "UPDATE tasks SET implementer_index = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, idx as i64, now()],
+    )?;
     Ok(())
 }
 
 pub fn set_last_reviewed(tx: &Transaction, id: &str, head: &str) -> Result<()> {
-    tx.execute("UPDATE tasks SET last_reviewed_head = ?2, updated_at = ?3 WHERE id = ?1", params![id, head, now()])?;
+    tx.execute(
+        "UPDATE tasks SET last_reviewed_head = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, head, now()],
+    )?;
     Ok(())
 }
 
-pub fn event(tx: &Transaction, task: Option<&str>, attempt: Option<&str>, kind: &str, payload: &Value) -> Result<()> {
+pub fn event(
+    tx: &Transaction,
+    task: Option<&str>,
+    attempt: Option<&str>,
+    kind: &str,
+    payload: &Value,
+) -> Result<()> {
     tx.execute(
         "INSERT INTO events (task_id, stage_attempt_id, kind, payload, at) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![task, attempt, kind, payload.to_string(), now()],
@@ -455,14 +504,20 @@ pub fn event(tx: &Transaction, task: Option<&str>, attempt: Option<&str>, kind: 
 }
 
 pub fn events(tx: &Transaction, task: &str) -> Result<Vec<(i64, String, Value, String)>> {
-    let mut st = tx.prepare("SELECT seq, kind, payload, at FROM events WHERE task_id = ?1 ORDER BY seq")?;
+    let mut st =
+        tx.prepare("SELECT seq, kind, payload, at FROM events WHERE task_id = ?1 ORDER BY seq")?;
     let rows = st.query_map([task], |r| {
         Ok((r.get(0)?, r.get(1)?, r.get::<_, String>(2)?, r.get(3)?))
     })?;
     let mut out = Vec::new();
     for r in rows {
         let (seq, kind, payload, at) = r?;
-        out.push((seq, kind, serde_json::from_str(&payload).unwrap_or(Value::Null), at));
+        out.push((
+            seq,
+            kind,
+            serde_json::from_str(&payload).unwrap_or(Value::Null),
+            at,
+        ));
     }
     Ok(out)
 }
@@ -480,9 +535,13 @@ fn gate_name(k: GateKind) -> &'static str {
 pub fn transition(tx: &Transaction, task_id: &str, e: PipelineEvent) -> Result<Machine> {
     let t = get_task(tx, task_id)?;
     let before = t.machine.clone();
-    let after = before
-        .transition(&e)
-        .map_err(|err| anyhow!("{task_id}: state machine refused `{}` in {:?}: {err}", e.name(), before.state()))?;
+    let after = before.transition(&e).map_err(|err| {
+        anyhow!(
+            "{task_id}: state machine refused `{}` in {:?}: {err}",
+            e.name(),
+            before.state()
+        )
+    })?;
     let at = now();
     tx.execute(
         "UPDATE tasks SET state = ?2, fix_cycle = ?3, paused_from_state = ?4, machine = ?5, updated_at = ?6 WHERE id = ?1",
@@ -504,7 +563,8 @@ pub fn transition(tx: &Transaction, task_id: &str, e: PipelineEvent) -> Result<M
                 _ => "superseded",
             };
             let reason = match &e {
-                PipelineEvent::PlanRejected { reason, .. } | PipelineEvent::FinalRejected { reason, .. } => Some(reason.clone()),
+                PipelineEvent::PlanRejected { reason, .. }
+                | PipelineEvent::FinalRejected { reason, .. } => Some(reason.clone()),
                 _ => None,
             };
             tx.execute(
@@ -549,9 +609,19 @@ pub fn transition(tx: &Transaction, task_id: &str, e: PipelineEvent) -> Result<M
 }
 
 /// R32: `sha256(kind|subject_sha256|subject_commit|verify_head)`.
-pub fn subject_digest(kind: &str, sha: Option<&str>, commit: Option<&str>, verify: Option<&str>) -> String {
+pub fn subject_digest(
+    kind: &str,
+    sha: Option<&str>,
+    commit: Option<&str>,
+    verify: Option<&str>,
+) -> String {
     use sha2::{Digest, Sha256};
-    let s = format!("{kind}|{}|{}|{}", sha.unwrap_or(""), commit.unwrap_or(""), verify.unwrap_or(""));
+    let s = format!(
+        "{kind}|{}|{}|{}",
+        sha.unwrap_or(""),
+        commit.unwrap_or(""),
+        verify.unwrap_or("")
+    );
     hex::encode(Sha256::digest(s.as_bytes()))
 }
 
@@ -583,8 +653,12 @@ pub fn approvals(tx: &Transaction, task: &str) -> Result<Vec<ApprovalRow>> {
 }
 
 pub fn whoami() -> String {
-    let user = std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "?".into());
-    let host = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "localhost".into());
+    let user = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "?".into());
+    let host = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "localhost".into());
     format!("{user}@{host}")
 }
 
@@ -698,7 +772,10 @@ pub fn process_identity() -> (i64, String) {
 /// Is the process recorded as (pid, created) still running?
 pub fn identity_alive(pid: i64, created: &str) -> bool {
     match created.parse::<u64>() {
-        Ok(c) => crate::process::is_alive(crate::process::ProcId { pid: pid as u32, created: c }),
+        Ok(c) => crate::process::is_alive(crate::process::ProcId {
+            pid: pid as u32,
+            created: c,
+        }),
         Err(_) => false,
     }
 }
@@ -716,18 +793,30 @@ pub fn begin_attempt(tx: &Transaction, task: &str, a: &NewAttempt) -> Result<Att
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'running', ?10, ?11, ?12)",
         params![id, task, a.stage, n, a.kind, a.fallback_from, a.profile, pid, created, a.head_before, a.subject_commit, now()],
     )?;
-    event(tx, Some(task), Some(&id), "attempt_started", &serde_json::json!({"stage": a.stage, "attempt": n, "profile": a.profile}))?;
+    event(
+        tx,
+        Some(task),
+        Some(&id),
+        "attempt_started",
+        &serde_json::json!({"stage": a.stage, "attempt": n, "profile": a.profile}),
+    )?;
     get_attempt(tx, &id)
 }
 
 pub fn get_attempt(tx: &Transaction, id: &str) -> Result<AttemptRow> {
-    tx.query_row(&format!("SELECT {ATTEMPT_COLS} FROM stage_attempts WHERE id = ?1"), [id], attempt_from_row)
-        .optional()?
-        .ok_or_else(|| anyhow!("no stage attempt `{id}`"))
+    tx.query_row(
+        &format!("SELECT {ATTEMPT_COLS} FROM stage_attempts WHERE id = ?1"),
+        [id],
+        attempt_from_row,
+    )
+    .optional()?
+    .ok_or_else(|| anyhow!("no stage attempt `{id}`"))
 }
 
 pub fn attempts(tx: &Transaction, task: &str) -> Result<Vec<AttemptRow>> {
-    let mut st = tx.prepare(&format!("SELECT {ATTEMPT_COLS} FROM stage_attempts WHERE task_id = ?1 ORDER BY started_at, rowid"))?;
+    let mut st = tx.prepare(&format!(
+        "SELECT {ATTEMPT_COLS} FROM stage_attempts WHERE task_id = ?1 ORDER BY started_at, rowid"
+    ))?;
     let rows = st.query_map([task], attempt_from_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
@@ -755,7 +844,12 @@ pub struct AttemptEnd {
     pub correction_turns: Option<u32>,
 }
 
-pub fn finish_attempt(tx: &Transaction, id: &str, status: AttemptStatus, end: &AttemptEnd) -> Result<()> {
+pub fn finish_attempt(
+    tx: &Transaction,
+    id: &str,
+    status: AttemptStatus,
+    end: &AttemptEnd,
+) -> Result<()> {
     tx.execute(
         "UPDATE stage_attempts SET status = ?2, error_class = COALESCE(?3, error_class), error_detail = COALESCE(?4, error_detail),
            external_session_id = COALESCE(?5, external_session_id), git_head_after = COALESCE(?6, git_head_after),
@@ -778,26 +872,42 @@ pub fn finish_attempt(tx: &Transaction, id: &str, status: AttemptStatus, end: &A
         ],
     )?;
     let a = get_attempt(tx, id)?;
-    event(tx, Some(&a.task_id), Some(id), "attempt_finished", &serde_json::json!({"status": status, "error": end.error_class, "checkpoint_kind": end.checkpoint_kind, "partial_commit": end.partial_commit}))?;
+    event(
+        tx,
+        Some(&a.task_id),
+        Some(id),
+        "attempt_finished",
+        &serde_json::json!({"status": status, "error": end.error_class, "checkpoint_kind": end.checkpoint_kind, "partial_commit": end.partial_commit}),
+    )?;
     Ok(())
 }
 
 /// Update the external session id as soon as it is known (so a crash can still resume it).
 /// The SHA-256 of the context an attempt received (§7).
 pub fn set_attempt_context(tx: &Transaction, id: &str, sha256: &str) -> Result<()> {
-    tx.execute("UPDATE stage_attempts SET context_sha256 = ?2 WHERE id = ?1", params![id, sha256])?;
+    tx.execute(
+        "UPDATE stage_attempts SET context_sha256 = ?2 WHERE id = ?1",
+        params![id, sha256],
+    )?;
     Ok(())
 }
 
 pub fn set_attempt_session(tx: &Transaction, id: &str, session: &str) -> Result<()> {
-    tx.execute("UPDATE stage_attempts SET external_session_id = ?2 WHERE id = ?1", params![id, session])?;
+    tx.execute(
+        "UPDATE stage_attempts SET external_session_id = ?2 WHERE id = ?1",
+        params![id, session],
+    )?;
     Ok(())
 }
 
 // ── usage (R41, minimal until M7) ────────────────────────────────────────────────────
 
 pub fn has_usage(tx: &Transaction, attempt: &str) -> Result<bool> {
-    Ok(tx.query_row("SELECT COUNT(*) FROM usage WHERE stage_attempt_id = ?1", [attempt], |r| r.get::<_, i64>(0))? > 0)
+    Ok(tx.query_row(
+        "SELECT COUNT(*) FROM usage WHERE stage_attempt_id = ?1",
+        [attempt],
+        |r| r.get::<_, i64>(0),
+    )? > 0)
 }
 
 /// What one turn's usage row is recorded from (R41).
@@ -825,7 +935,13 @@ fn counters(b: &Buckets) -> Value {
 
 fn from_counters(v: &Value) -> Buckets {
     let g = |k: &str| v[k].as_u64().unwrap_or(0);
-    Buckets { uncached_input: g("uncached_input"), cache_read: g("cache_read"), cache_write: g("cache_write"), output: g("output"), reasoning: v["reasoning"].as_u64() }
+    Buckets {
+        uncached_input: g("uncached_input"),
+        cache_read: g("cache_read"),
+        cache_write: g("cache_write"),
+        output: g("output"),
+        reasoning: v["reasoning"].as_u64(),
+    }
 }
 
 /// Record one turn's usage (R41) and update the task's spent / reserved tokens. Returns the
@@ -857,7 +973,10 @@ pub fn record_usage_in(tx: &Transaction, u: &UsageIn) -> Result<i64> {
                 "INSERT INTO usage (task_id, stage_attempt_id, profile, billing_kind, accounting, reservation_tokens, at) VALUES (?1, ?2, ?3, ?4, 'unknown', ?5, ?6)",
                 params![u.task, u.attempt, u.profile, u.billing, res, at],
             )?;
-            tx.execute("UPDATE tasks SET reserved_tokens = reserved_tokens + ?2 WHERE id = ?1", params![u.task, res])?;
+            tx.execute(
+                "UPDATE tasks SET reserved_tokens = reserved_tokens + ?2 WHERE id = ?1",
+                params![u.task, res],
+            )?;
             Ok(tx.last_insert_rowid())
         }
         Some((b, acc)) => {
@@ -871,7 +990,10 @@ pub fn record_usage_in(tx: &Transaction, u: &UsageIn) -> Result<i64> {
                     .optional()?;
                 if let Some(base) = base {
                     let bb = from_counters(&serde_json::from_str(&base)?);
-                    let reset = b.uncached_input < bb.uncached_input || b.cache_read < bb.cache_read || b.cache_write < bb.cache_write || b.output < bb.output;
+                    let reset = b.uncached_input < bb.uncached_input
+                        || b.cache_read < bb.cache_read
+                        || b.cache_write < bb.cache_write
+                        || b.output < bb.output;
                     if !reset {
                         delta = Buckets {
                             uncached_input: b.uncached_input - bb.uncached_input,
@@ -897,7 +1019,11 @@ pub fn record_usage_in(tx: &Transaction, u: &UsageIn) -> Result<i64> {
                        AND u.id > COALESCE((SELECT MAX(u2.id) FROM usage u2 JOIN stage_attempts a2 ON a2.id = u2.stage_attempt_id
                                             WHERE u2.task_id = ?1 AND u2.profile = ?2 AND a2.external_session_id = ?3 AND u2.accounting = 'exact'), 0)",
                 )?;
-                absorb = q.query_map(params![u.task, u.profile, sess, u.attempt], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<Vec<_>, _>>()?;
+                absorb = q
+                    .query_map(params![u.task, u.profile, sess, u.attempt], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
                 includes_unreported = !absorb.is_empty();
             }
             let budget = delta.budget_tokens(&u.weights) as i64;
@@ -921,11 +1047,21 @@ pub fn record_usage_in(tx: &Transaction, u: &UsageIn) -> Result<i64> {
                 ],
             )?;
             let id = tx.last_insert_rowid();
-            tx.execute("UPDATE tasks SET spent_tokens = spent_tokens + ?2 WHERE id = ?1", params![u.task, budget])?;
+            tx.execute(
+                "UPDATE tasks SET spent_tokens = spent_tokens + ?2 WHERE id = ?1",
+                params![u.task, budget],
+            )?;
             if u.killed_included {
                 for (rid, acc, res, spent) in absorb {
-                    tx.execute("UPDATE usage SET reconciled_by = ?2 WHERE id = ?1", params![rid, id])?;
-                    let (ds, dr) = if acc == "unknown" { (0, res) } else { (spent, 0) };
+                    tx.execute(
+                        "UPDATE usage SET reconciled_by = ?2 WHERE id = ?1",
+                        params![rid, id],
+                    )?;
+                    let (ds, dr) = if acc == "unknown" {
+                        (0, res)
+                    } else {
+                        (spent, 0)
+                    };
                     tx.execute("UPDATE tasks SET spent_tokens = spent_tokens - ?2, reserved_tokens = reserved_tokens - ?3 WHERE id = ?1", params![u.task, ds, dr])?;
                 }
             }
@@ -935,27 +1071,80 @@ pub fn record_usage_in(tx: &Transaction, u: &UsageIn) -> Result<i64> {
 }
 
 /// Record a turn's usage with default settings (no session, weights 1.0).
-pub fn record_usage(tx: &Transaction, task: &str, attempt: &str, profile: &str, billing: &str, u: Option<TokenUsage>) -> Result<()> {
-    let stage: String = tx.query_row("SELECT stage FROM stage_attempts WHERE id = ?1", [attempt], |r| r.get(0)).unwrap_or_default();
+pub fn record_usage(
+    tx: &Transaction,
+    task: &str,
+    attempt: &str,
+    profile: &str,
+    billing: &str,
+    u: Option<TokenUsage>,
+) -> Result<()> {
+    let stage: String = tx
+        .query_row(
+            "SELECT stage FROM stage_attempts WHERE id = ?1",
+            [attempt],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
     record_usage_in(
         tx,
-        &UsageIn { task, attempt, stage: &stage, profile, billing, session: None, cumulative: false, killed_included: false, usage: u, weights: Weights::default(), reservation: None },
+        &UsageIn {
+            task,
+            attempt,
+            stage: &stage,
+            profile,
+            billing,
+            session: None,
+            cumulative: false,
+            killed_included: false,
+            usage: u,
+            weights: Weights::default(),
+            reservation: None,
+        },
     )?;
     Ok(())
 }
 
 /// `toryo budget set` (R41).
 pub fn set_budget(tx: &Transaction, id: &str, tokens: Option<i64>) -> Result<()> {
-    tx.execute("UPDATE tasks SET budget_tokens = ?2, updated_at = ?3 WHERE id = ?1", params![id, tokens, now()])?;
+    tx.execute(
+        "UPDATE tasks SET budget_tokens = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, tokens, now()],
+    )?;
     Ok(())
 }
 
 /// Usage rows of a task: (id, attempt, profile, accounting, budget_tokens, reservation, reconciled_by, includes_unreported).
 #[allow(clippy::type_complexity)]
-pub fn usage_rows(tx: &Transaction, task: &str) -> Result<Vec<(i64, String, String, String, Option<i64>, Option<i64>, Option<i64>, bool)>> {
+pub fn usage_rows(
+    tx: &Transaction,
+    task: &str,
+) -> Result<
+    Vec<(
+        i64,
+        String,
+        String,
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        bool,
+    )>,
+> {
     let mut q = tx.prepare("SELECT id, stage_attempt_id, profile, accounting, budget_tokens, reservation_tokens, reconciled_by, includes_unreported FROM usage WHERE task_id = ?1 ORDER BY id")?;
     let v = q
-        .query_map([task], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get::<_, i64>(7)? != 0)))?
+        .query_map([task], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get::<_, i64>(7)? != 0,
+            ))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(v)
 }
@@ -974,12 +1163,22 @@ pub fn claim_lock(tx: &Transaction, task: &str, owner: &str) -> Result<i64> {
     if n == 0 {
         bail!("no task `{task}`");
     }
-    let g: i64 = tx.query_row("SELECT lock_generation FROM tasks WHERE id = ?1", [task], |r| r.get(0))?;
+    let g: i64 = tx.query_row(
+        "SELECT lock_generation FROM tasks WHERE id = ?1",
+        [task],
+        |r| r.get(0),
+    )?;
     let expired = tx.execute(
         "UPDATE control_requests SET handled_at = ?3, outcome = 'expired' WHERE task_id = ?1 AND handled_at IS NULL AND target_generation < ?2",
         params![task, g, at],
     )?;
-    event(tx, Some(task), None, "lock_acquired", &serde_json::json!({"owner": owner, "generation": g, "expired_requests": expired}))?;
+    event(
+        tx,
+        Some(task),
+        None,
+        "lock_acquired",
+        &serde_json::json!({"owner": owner, "generation": g, "expired_requests": expired}),
+    )?;
     Ok(g)
 }
 
@@ -1063,13 +1262,26 @@ pub fn set_control_outcome(tx: &Transaction, id: i64, outcome: &str) -> Result<(
 }
 
 pub fn lock_generation(tx: &Transaction, task: &str) -> Result<i64> {
-    Ok(tx.query_row("SELECT lock_generation FROM tasks WHERE id = ?1", [task], |r| r.get(0))?)
+    Ok(tx.query_row(
+        "SELECT lock_generation FROM tasks WHERE id = ?1",
+        [task],
+        |r| r.get(0),
+    )?)
 }
 
 // ── artifacts (registration only; immutable versions are M6, R34) ────────────────────
 
 #[allow(clippy::too_many_arguments)]
-pub fn register_artifact(tx: &Transaction, task: &str, attempt: Option<&str>, logical: &str, kind: &str, path: &str, sha256: &str, size: u64) -> Result<String> {
+pub fn register_artifact(
+    tx: &Transaction,
+    task: &str,
+    attempt: Option<&str>,
+    logical: &str,
+    kind: &str,
+    path: &str,
+    sha256: &str,
+    size: u64,
+) -> Result<String> {
     let v: i64 = tx.query_row(
         "SELECT COALESCE(MAX(version), 0) + 1 FROM artifacts WHERE task_id = ?1 AND logical_name = ?2",
         params![task, logical],
@@ -1081,10 +1293,17 @@ pub fn register_artifact(tx: &Transaction, task: &str, attempt: Option<&str>, lo
         params![id, task, attempt, logical, v, kind, path, sha256, size as i64, now()],
     )?;
     let prev: Option<String> = tx
-        .query_row("SELECT artifact_id FROM artifact_heads WHERE task_id = ?1 AND logical_name = ?2", params![task, logical], |r| r.get(0))
+        .query_row(
+            "SELECT artifact_id FROM artifact_heads WHERE task_id = ?1 AND logical_name = ?2",
+            params![task, logical],
+            |r| r.get(0),
+        )
         .optional()?;
     if let Some(p) = prev {
-        tx.execute("UPDATE artifacts SET superseded_by = ?2 WHERE id = ?1", params![p, id])?;
+        tx.execute(
+            "UPDATE artifacts SET superseded_by = ?2 WHERE id = ?1",
+            params![p, id],
+        )?;
     }
     tx.execute(
         "INSERT INTO artifact_heads (task_id, logical_name, artifact_id) VALUES (?1, ?2, ?3)
@@ -1096,7 +1315,11 @@ pub fn register_artifact(tx: &Transaction, task: &str, attempt: Option<&str>, lo
 
 /// (id, path, sha256) of an artifact version.
 pub fn artifact(tx: &Transaction, id: &str) -> Result<(String, String, String)> {
-    Ok(tx.query_row("SELECT id, path, sha256 FROM artifacts WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?)
+    Ok(tx.query_row(
+        "SELECT id, path, sha256 FROM artifacts WHERE id = ?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?)
 }
 
 #[cfg(test)]
@@ -1130,20 +1353,77 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let s = Store::open(&d.path().join("t.db")).unwrap();
         s.call(|tx| insert_task(tx, &new_task("T-1"))).unwrap();
-        assert!(s.call(|tx| insert_task(tx, &new_task("T-1"))).is_err(), "duplicate id");
+        assert!(
+            s.call(|tx| insert_task(tx, &new_task("T-1"))).is_err(),
+            "duplicate id"
+        );
         s.call(|tx| transition(tx, "T-1", E::Start)).unwrap();
-        s.call(|tx| transition(tx, "T-1", E::PlanReady { subject: "p1".into() })).unwrap();
-        s.call(|tx| transition(tx, "T-1", E::PlanRejected { occurrence: 1, reason: "no".into() })).unwrap();
-        s.call(|tx| transition(tx, "T-1", E::PlanReady { subject: "p2".into() })).unwrap();
+        s.call(|tx| {
+            transition(
+                tx,
+                "T-1",
+                E::PlanReady {
+                    subject: "p1".into(),
+                },
+            )
+        })
+        .unwrap();
+        s.call(|tx| {
+            transition(
+                tx,
+                "T-1",
+                E::PlanRejected {
+                    occurrence: 1,
+                    reason: "no".into(),
+                },
+            )
+        })
+        .unwrap();
+        s.call(|tx| {
+            transition(
+                tx,
+                "T-1",
+                E::PlanReady {
+                    subject: "p2".into(),
+                },
+            )
+        })
+        .unwrap();
         // a refused transition writes nothing (the whole transaction rolls back)
-        assert!(s.call(|tx| transition(tx, "T-1", E::PlanApproved { occurrence: 1, subject: "p2".into() })).is_err());
+        assert!(s
+            .call(|tx| transition(
+                tx,
+                "T-1",
+                E::PlanApproved {
+                    occurrence: 1,
+                    subject: "p2".into()
+                }
+            ))
+            .is_err());
         let t = s.call(|tx| get_task(tx, "T-1")).unwrap();
         assert_eq!(t.state, PipelineState::WaitingPlanApproval);
         let ap = s.call(|tx| approvals(tx, "T-1")).unwrap();
         assert_eq!(ap.len(), 2);
-        assert_eq!((ap[0].occurrence, ap[0].status.as_str(), ap[0].reason.as_deref()), (1, "rejected", Some("no")));
+        assert_eq!(
+            (
+                ap[0].occurrence,
+                ap[0].status.as_str(),
+                ap[0].reason.as_deref()
+            ),
+            (1, "rejected", Some("no"))
+        );
         assert_eq!((ap[1].occurrence, ap[1].status.as_str()), (2, "open"));
-        s.call(|tx| transition(tx, "T-1", E::PlanApproved { occurrence: 2, subject: "p2".into() })).unwrap();
+        s.call(|tx| {
+            transition(
+                tx,
+                "T-1",
+                E::PlanApproved {
+                    occurrence: 2,
+                    subject: "p2".into(),
+                },
+            )
+        })
+        .unwrap();
         let t = s.call(|tx| get_task(tx, "T-1")).unwrap();
         assert_eq!(t.state, PipelineState::Implementing);
         assert_eq!(t.machine.state(), PipelineState::Implementing);
@@ -1151,7 +1431,10 @@ mod tests {
         assert_eq!(ev.iter().filter(|e| e.1 == "transition").count(), 5);
         // a second store (another process) sees the same data
         let s2 = Store::open(&d.path().join("t.db")).unwrap();
-        assert_eq!(s2.call(|tx| get_task(tx, "T-1")).unwrap().state, PipelineState::Implementing);
+        assert_eq!(
+            s2.call(|tx| get_task(tx, "T-1")).unwrap().state,
+            PipelineState::Implementing
+        );
     }
 
     #[test]
@@ -1159,23 +1442,80 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let s = Store::open(&d.path().join("t.db")).unwrap();
         s.call(|tx| insert_task(tx, &new_task("T-2"))).unwrap();
-        let a1 = s.call(|tx| begin_attempt(tx, "T-2", &NewAttempt { stage: "implement", kind: "agent", profile: Some("codex"), fallback_from: None, head_before: Some("h0"), subject_commit: None })).unwrap();
-        let a2 = s.call(|tx| begin_attempt(tx, "T-2", &NewAttempt { stage: "implement", kind: "agent", profile: Some("claude"), fallback_from: Some("codex"), head_before: Some("h0"), subject_commit: None })).unwrap();
+        let a1 = s
+            .call(|tx| {
+                begin_attempt(
+                    tx,
+                    "T-2",
+                    &NewAttempt {
+                        stage: "implement",
+                        kind: "agent",
+                        profile: Some("codex"),
+                        fallback_from: None,
+                        head_before: Some("h0"),
+                        subject_commit: None,
+                    },
+                )
+            })
+            .unwrap();
+        let a2 = s
+            .call(|tx| {
+                begin_attempt(
+                    tx,
+                    "T-2",
+                    &NewAttempt {
+                        stage: "implement",
+                        kind: "agent",
+                        profile: Some("claude"),
+                        fallback_from: Some("codex"),
+                        head_before: Some("h0"),
+                        subject_commit: None,
+                    },
+                )
+            })
+            .unwrap();
         assert_eq!((a1.attempt, a2.attempt), (1, 2));
         assert_eq!(a1.id, "T-2/implement/1");
         let id = a1.id.clone();
-        s.call(move |tx| finish_attempt(tx, &id, AttemptStatus::Interrupted, &AttemptEnd { partial_commit: Some("pc".into()), ..Default::default() })).unwrap();
+        s.call(move |tx| {
+            finish_attempt(
+                tx,
+                &id,
+                AttemptStatus::Interrupted,
+                &AttemptEnd {
+                    partial_commit: Some("pc".into()),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
         let back = s.call(|tx| get_attempt(tx, "T-2/implement/1")).unwrap();
-        assert_eq!((back.status, back.partial_commit.as_deref()), (AttemptStatus::Interrupted, Some("pc")));
-        assert_eq!(s.call(|tx| last_attempt(tx, "T-2", "implement")).unwrap().unwrap().attempt, 2);
+        assert_eq!(
+            (back.status, back.partial_commit.as_deref()),
+            (AttemptStatus::Interrupted, Some("pc"))
+        );
+        assert_eq!(
+            s.call(|tx| last_attempt(tx, "T-2", "implement"))
+                .unwrap()
+                .unwrap()
+                .attempt,
+            2
+        );
 
         let g1 = s.call(|tx| claim_lock(tx, "T-2", "a")).unwrap();
         let r = s.call(move |tx| insert_stop(tx, "T-2", g1, "me")).unwrap();
-        assert_eq!(s.call(move |tx| pending_stop(tx, "T-2", g1)).unwrap(), Some(r));
+        assert_eq!(
+            s.call(move |tx| pending_stop(tx, "T-2", g1)).unwrap(),
+            Some(r)
+        );
         let g2 = s.call(|tx| claim_lock(tx, "T-2", "b")).unwrap();
         assert_eq!(g2, g1 + 1);
         let row = s.call(move |tx| control_request(tx, r)).unwrap();
-        assert_eq!(row.outcome.as_deref(), Some("expired"), "a request never reaches a newer owner");
+        assert_eq!(
+            row.outcome.as_deref(),
+            Some("expired"),
+            "a request never reaches a newer owner"
+        );
         assert_eq!(s.call(move |tx| pending_stop(tx, "T-2", g2)).unwrap(), None);
     }
 
@@ -1185,12 +1525,23 @@ mod tests {
         let s = Store::open(&d.path().join("t.db")).unwrap();
         s.call(|tx| insert_task(tx, &new_task("T-3"))).unwrap();
         let u = TokenUsage {
-            buckets: Some(crate::usage::Buckets { uncached_input: 10, cache_read: 5, cache_write: 0, output: 2, reasoning: None }),
+            buckets: Some(crate::usage::Buckets {
+                uncached_input: 10,
+                cache_read: 5,
+                cache_write: 0,
+                output: 2,
+                reasoning: None,
+            }),
             accounting: Accounting::Exact,
         };
-        s.call(move |tx| record_usage(tx, "T-3", "a", "codex", "subscription", Some(u))).unwrap();
-        s.call(|tx| record_usage(tx, "T-3", "b", "codex", "subscription", None)).unwrap();
+        s.call(move |tx| record_usage(tx, "T-3", "a", "codex", "subscription", Some(u)))
+            .unwrap();
+        s.call(|tx| record_usage(tx, "T-3", "b", "codex", "subscription", None))
+            .unwrap();
         let t = s.call(|tx| get_task(tx, "T-3")).unwrap();
-        assert_eq!((t.spent_tokens, t.reserved_tokens), (17, DEFAULT_UNKNOWN_RESERVATION));
+        assert_eq!(
+            (t.spent_tokens, t.reserved_tokens),
+            (17, DEFAULT_UNKNOWN_RESERVATION)
+        );
     }
 }
