@@ -100,7 +100,7 @@ fn setup_with(escape: bool, lazy: bool) -> Env {
     let repo = root.join("project");
     std::fs::create_dir_all(&repo).unwrap();
     let data = root.join("data");
-    let config = root.join("thien.yaml");
+    let config = root.join("toryo.yaml");
     std::fs::write(
         &config,
         format!(
@@ -116,7 +116,7 @@ profiles:
     env:
       FAKE_DENY: "{deny}"
     secret_env:
-      FAKE_SECRET: env:THIEN_E2E_SECRET
+      FAKE_SECRET: env:TORYO_E2E_SECRET
   codex-foundry:
     kind: codex
     billing: foundry
@@ -151,15 +151,15 @@ roles:
     }
 }
 
-fn thien(env: &Env, args: &[&str]) -> (i32, String, String) {
-    let o = Command::new(env!("CARGO_BIN_EXE_thien"))
+fn toryo(env: &Env, args: &[&str]) -> (i32, String, String) {
+    let o = Command::new(env!("CARGO_BIN_EXE_toryo"))
         .arg("--config")
         .arg(&env.config)
         .arg("--machine-config")
         .arg(env.root.join("none.yaml"))
         .args(args)
-        .env("THIEN_DATA_DIR", &env.data)
-        .env("THIEN_E2E_SECRET", "s3cr3t-value-e2e")
+        .env("TORYO_DATA_DIR", &env.data)
+        .env("TORYO_E2E_SECRET", "s3cr3t-value-e2e")
         .current_dir(&env.root)
         .output()
         .unwrap();
@@ -192,7 +192,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 #[test]
 fn claude_isolation_probe_passes_with_well_behaved_fake() {
     let env = setup(false);
-    let (code, _out, err) = thien(
+    let (code, _out, err) = toryo(
         &env,
         &["spike", "claude-isolation", "--profile", "claude-max"],
     );
@@ -221,7 +221,7 @@ fn claude_turn_writes_structured_output_and_fixture_capture() {
     let rs = env.root.join("rs");
     std::fs::create_dir_all(&rs).unwrap();
     let out = env.root.join("plan.json");
-    let (code, _o, err) = thien(
+    let (code, _o, err) = toryo(
         &env,
         &[
             "spike",
@@ -248,7 +248,7 @@ fn claude_turn_writes_structured_output_and_fixture_capture() {
     std::fs::create_dir_all(&rs2).unwrap();
     let p2 = env2.root.join("p.md");
     std::fs::write(&p2, "Plan something").unwrap();
-    let (code, _o, err) = thien(
+    let (code, _o, err) = toryo(
         &env2,
         &[
             "spike",
@@ -277,7 +277,7 @@ fn claude_launch_without_restricted_is_caught() {
     std::fs::write(&prompt, "x").unwrap();
     let rs = env.root.join("rs");
     std::fs::create_dir_all(&rs).unwrap();
-    let (code, _o, err) = thien(
+    let (code, _o, err) = toryo(
         &env,
         &[
             "spike",
@@ -299,13 +299,13 @@ fn claude_launch_without_restricted_is_caught() {
 #[test]
 fn codex_canary_passes_when_nothing_escapes_and_fails_when_it_does() {
     let good = setup(false);
-    let (code, _o, err) = thien(
+    let (code, _o, err) = toryo(
         &good,
         &["spike", "codex-canary", "--profile", "codex-foundry"],
     );
     assert_eq!(code, 0, "{err}");
     let bad = setup(true);
-    let (code, _o, err) = thien(
+    let (code, _o, err) = toryo(
         &bad,
         &["spike", "codex-canary", "--profile", "codex-foundry"],
     );
@@ -316,7 +316,7 @@ fn codex_canary_passes_when_nothing_escapes_and_fails_when_it_does() {
     );
     // A model that skips a step must not produce a PASS (nothing was tested).
     let lazy = setup_with(false, true);
-    let (code, _o, err) = thien(
+    let (code, _o, err) = toryo(
         &lazy,
         &["spike", "codex-canary", "--profile", "codex-foundry"],
     );
@@ -326,7 +326,7 @@ fn codex_canary_passes_when_nothing_escapes_and_fails_when_it_does() {
         "{err}"
     );
     // doctor must now report the Codex profile as unusable
-    let (dcode, dout, _) = thien(&bad, &["doctor"]);
+    let (dcode, dout, _) = toryo(&bad, &["doctor"]);
     assert_eq!(dcode, 1);
     assert!(dout.contains("codex-canary"), "{dout}");
 }
@@ -335,7 +335,7 @@ fn codex_canary_passes_when_nothing_escapes_and_fails_when_it_does() {
 fn killed_resume_records_provisional_and_unknown_usage() {
     for profile in ["claude-max", "codex-foundry"] {
         let env = setup(false);
-        let (code, _o, err) = thien(
+        let (code, _o, err) = toryo(
             &env,
             &[
                 "spike",
@@ -362,7 +362,7 @@ fn killed_resume_records_provisional_and_unknown_usage() {
 #[test]
 fn job_test_stop_and_fault_injection_pass_on_unix() {
     let env = setup(false);
-    let (_code, _o, err) = thien(&env, &["spike", "job-test"]);
+    let (_code, _o, err) = toryo(&env, &["spike", "job-test"]);
     let r = records(&env);
     let res = r.last().unwrap()["details"]["results"]
         .as_array()
@@ -376,13 +376,13 @@ fn job_test_stop_and_fault_injection_pass_on_unix() {
 #[test]
 fn git_canary_and_report_and_render() {
     let env = setup(false);
-    let (code, _o, err) = thien(&env, &["spike", "git-canary"]);
+    let (code, _o, err) = toryo(&env, &["spike", "git-canary"]);
     assert_eq!(code, 0, "{err}");
-    let (code, out, _) = thien(&env, &["spike", "report"]);
+    let (code, out, _) = toryo(&env, &["spike", "report"]);
     assert_eq!(code, 0);
     assert!(out.contains("git-canary") && out.contains("PASS"));
     let fx = env.root.join("calc");
-    let (code, _o, err) = thien(
+    let (code, _o, err) = toryo(
         &env,
         &[
             "spike",
@@ -400,7 +400,7 @@ fn git_canary_and_report_and_render() {
         .exists());
     let plan = env.root.join("plan.json");
     std::fs::write(&plan, r#"{"understanding":"u","files_likely_involved":["src/a"],"steps":["s1"],"validation":["v"],"plan_markdown":"md"}"#).unwrap();
-    let (code, out, _) = thien(
+    let (code, out, _) = toryo(
         &env,
         &["spike", "render", "--kind", "plan", plan.to_str().unwrap()],
     );
@@ -411,7 +411,7 @@ fn git_canary_and_report_and_render() {
 #[test]
 fn doctor_reports_config_and_profiles() {
     let env = setup(false);
-    let (code, out, err) = thien(&env, &["doctor"]);
+    let (code, out, err) = toryo(&env, &["doctor"]);
     assert_eq!(code, 1, "no codex canary yet → FAIL; {err}");
     assert!(out.contains("profile claude-max"), "{out}");
     assert!(out.contains("windows.sandbox = unelevated"), "{out}");
@@ -421,7 +421,7 @@ fn doctor_reports_config_and_profiles() {
 #[test]
 fn smoke_orchestrates_both_fakes_end_to_end() {
     let env = setup(false);
-    let (_code, _o, err) = thien(
+    let (_code, _o, err) = toryo(
         &env,
         &[
             "spike",
@@ -453,16 +453,16 @@ fn smoke_orchestrates_both_fakes_end_to_end() {
     // verify needs pwsh; on hosts without it that step fails, which is expected here
 }
 
-fn thien_stdin(env: &Env, args: &[&str], input: &str) -> (i32, String) {
+fn toryo_stdin(env: &Env, args: &[&str], input: &str) -> (i32, String) {
     use std::io::Write;
-    let mut c = Command::new(env!("CARGO_BIN_EXE_thien"))
+    let mut c = Command::new(env!("CARGO_BIN_EXE_toryo"))
         .arg("--config")
         .arg(&env.config)
         .arg("--machine-config")
         .arg(env.root.join("none.yaml"))
         .args(args)
-        .env("THIEN_DATA_DIR", &env.data)
-        .env("THIEN_E2E_SECRET", "s3cr3t-value-e2e")
+        .env("TORYO_DATA_DIR", &env.data)
+        .env("TORYO_E2E_SECRET", "s3cr3t-value-e2e")
         .current_dir(&env.root)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -490,14 +490,14 @@ fn pipeline_plan_gate_fix_cycle_and_approval() {
     );
     std::fs::write(&env.config, cfg).unwrap();
     let repo = env.root.join("calc");
-    let (code, _, err) = thien(
+    let (code, _, err) = toryo(
         &env,
         &["spike", "init-fixture", "--into", repo.to_str().unwrap()],
     );
     assert_eq!(code, 0, "{err}");
     let task = repo.join("TASK.md");
     // reject the first plan with a reason, approve the second
-    let (code, err) = thien_stdin(
+    let (code, err) = toryo_stdin(
         &env,
         &[
             "spike",
@@ -553,17 +553,17 @@ fn pipeline_plan_gate_fix_cycle_and_approval() {
                 "-C",
                 repo.to_str().unwrap(),
                 "log",
-                "--format=%s|%(trailers:key=Thien-Stage,valueonly)",
-                "main..thien/CALC-001",
+                "--format=%s|%(trailers:key=Toryo-Stage,valueonly)",
+                "main..toryo/CALC-001",
             ])
             .output()
             .unwrap();
         let log = String::from_utf8_lossy(&log.stdout);
         assert!(
-            log.contains("thien(CALC-001): implement|implement"),
+            log.contains("toryo(CALC-001): implement|implement"),
             "{log}"
         );
-        assert!(log.contains("thien(CALC-001): fix-1|fix-1"), "{log}");
+        assert!(log.contains("toryo(CALC-001): fix-1|fix-1"), "{log}");
         let run = std::path::PathBuf::from(last["run_dir"].as_str().unwrap());
         for f in [
             "TASK.md",
@@ -578,7 +578,7 @@ fn pipeline_plan_gate_fix_cycle_and_approval() {
         }
         // per-task TEMP inside the worktree, excluded from the checkpoints
         let wt = env.root.join("wts").join("CALC-001");
-        assert!(wt.join(".thien-tmp").join("fake-temp.txt").exists());
+        assert!(wt.join(".toryo-tmp").join("fake-temp.txt").exists());
         let files = Command::new("git")
             .args([
                 "-C",
@@ -586,14 +586,14 @@ fn pipeline_plan_gate_fix_cycle_and_approval() {
                 "log",
                 "--name-only",
                 "--format=",
-                "main..thien/CALC-001",
+                "main..toryo/CALC-001",
             ])
             .output()
             .unwrap();
-        assert!(!String::from_utf8_lossy(&files.stdout).contains(".thien-tmp"));
+        assert!(!String::from_utf8_lossy(&files.stdout).contains(".toryo-tmp"));
         let meta = std::fs::read_to_string(run.join("implement.meta.json")).unwrap();
         assert!(
-            meta.contains(".thien-tmp"),
+            meta.contains(".toryo-tmp"),
             "TEMP passed to the implementer: {meta}"
         );
         // non-blocking issues of the final review are listed for follow-up
@@ -610,7 +610,7 @@ fn pipeline_plan_gate_fix_cycle_and_approval() {
         );
     }
     // a second run with the same id refuses to clobber the worktree
-    let (code, err) = thien_stdin(
+    let (code, err) = toryo_stdin(
         &env,
         &[
             "spike",
@@ -633,7 +633,7 @@ fn pipeline_plan_gate_fix_cycle_and_approval() {
 fn pipeline_quit_at_gate_and_batch_rename_fixture() {
     let env = setup(false);
     let repo = env.root.join("br");
-    let (code, out, err) = thien(
+    let (code, out, err) = toryo(
         &env,
         &[
             "spike",
@@ -656,7 +656,7 @@ fn pipeline_quit_at_gate_and_batch_rename_fixture() {
         assert!(repo.join(f).exists(), "{f}");
     }
     let task = repo.join("tasks").join("BR-001.md");
-    let (code, err) = thien_stdin(
+    let (code, err) = toryo_stdin(
         &env,
         &[
             "spike",
@@ -700,7 +700,7 @@ fn pipeline_env(quota: bool, review_once: bool) -> (Env, PathBuf) {
     }
     std::fs::write(&env.config, cfg).unwrap();
     let repo = env.root.join("calc");
-    let (code, _, err) = thien(
+    let (code, _, err) = toryo(
         &env,
         &["spike", "init-fixture", "--into", repo.to_str().unwrap()],
     );
@@ -722,7 +722,7 @@ fn steps_of(env: &Env) -> (serde_json::Value, Vec<serde_json::Value>) {
 fn pipeline_falls_back_to_claude_when_codex_is_out_of_quota() {
     let (env, repo) = pipeline_env(true, true);
     let r = repo.to_str().unwrap();
-    let (code, err) = thien_stdin(
+    let (code, err) = toryo_stdin(
         &env,
         &[
             "spike", "pipeline", "--repo", r, "--task", "TASK.md", "--id", "Q-1", "--yes",
@@ -778,8 +778,8 @@ fn pipeline_falls_back_to_claude_when_codex_is_out_of_quota() {
                 "-C",
                 r,
                 "log",
-                "--format=%(trailers:key=Thien-Implementer,valueonly)",
-                "main..thien/Q-1",
+                "--format=%(trailers:key=Toryo-Implementer,valueonly)",
+                "main..toryo/Q-1",
             ])
             .output()
             .unwrap();
@@ -797,7 +797,7 @@ fn pipeline_falls_back_to_claude_when_codex_is_out_of_quota() {
 fn pipeline_no_fallback_stops_and_simulate_quota_switches() {
     let (env, repo) = pipeline_env(true, false);
     let r = repo.to_str().unwrap();
-    let (code, err) = thien_stdin(
+    let (code, err) = toryo_stdin(
         &env,
         &[
             "spike",
@@ -833,7 +833,7 @@ fn pipeline_no_fallback_stops_and_simulate_quota_switches() {
 
     let (env, repo) = pipeline_env(false, false);
     let r = repo.to_str().unwrap();
-    let (_code, err) = thien_stdin(
+    let (_code, err) = toryo_stdin(
         &env,
         &[
             "spike",

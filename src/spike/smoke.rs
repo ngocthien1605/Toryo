@@ -1,6 +1,6 @@
-//! `thien spike smoke` — the smallest end-to-end orchestration of both CLIs:
-//! Claude plans (read-only) → Codex implements (sandboxed) → thien checkpoints with
-//! `GitCmd` and builds the canonical diff → thien runs the fixture's verify scripts →
+//! `toryo spike smoke` — the smallest end-to-end orchestration of both CLIs:
+//! Claude plans (read-only) → Codex implements (sandboxed) → toryo checkpoints with
+//! `GitCmd` and builds the canonical diff → toryo runs the fixture's verify scripts →
 //! Claude reviews. It is runbook §5 automated, with no human gate (smoke test only).
 //!
 //! For the Claude steps it tries the plan's launch mode first and then the two §6.2
@@ -199,7 +199,7 @@ pub fn smoke(cfg: &Effective, a: SmokeArgs) -> Result<bool> {
             "add",
             "-q",
             "-b",
-            "thien/CALC-001",
+            "toryo/CALC-001",
             &fwd(&wt),
             "main",
         ],
@@ -214,7 +214,7 @@ pub fn smoke(cfg: &Effective, a: SmokeArgs) -> Result<bool> {
         &mut steps,
         "setup",
         true,
-        format!("fixture main={}, worktree thien/CALC-001", &base[..12]),
+        format!("fixture main={}, worktree toryo/CALC-001", &base[..12]),
     );
 
     // 1. plan (Claude, read-only)
@@ -352,7 +352,7 @@ pub fn smoke(cfg: &Effective, a: SmokeArgs) -> Result<bool> {
         );
     }
 
-    // 3. checkpoint (thien owns commits) + canonical diff
+    // 3. checkpoint (toryo owns commits) + canonical diff
     g.run(&wtl, false, &["add", "-A"])?;
     let no_change = g
         .output(&wtl, true, &["diff", "--cached", "--quiet"])?
@@ -363,17 +363,17 @@ pub fn smoke(cfg: &Effective, a: SmokeArgs) -> Result<bool> {
         "-q",
         "--no-verify",
         "-m",
-        "thien(CALC-001): implement attempt 1",
+        "toryo(CALC-001): implement attempt 1",
         "--trailer",
-        "Thien-Task: CALC-001",
+        "Toryo-Task: CALC-001",
         "--trailer",
-        "Thien-Stage: implement",
+        "Toryo-Stage: implement",
         "--trailer",
-        "Thien-Attempt: 1",
+        "Toryo-Attempt: 1",
     ];
     if no_change {
         commit.push("--allow-empty");
-        commit.extend(["--trailer", "Thien-No-Change: true"]);
+        commit.extend(["--trailer", "Toryo-No-Change: true"]);
     }
     g.run(&wtl, false, &commit)?;
     let checkpoint = g.run_str(&wtl, true, &["rev-parse", "HEAD"])?;

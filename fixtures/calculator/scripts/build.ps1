@@ -13,7 +13,7 @@ foreach ($f in $files) {
 }
 $manifest = $files | ForEach-Object { "{0} {1}" -f (Get-FileHash -Algorithm SHA256 $_.FullName).Hash, $_.FullName.Substring($root.Length + 1) }
 Set-Content -Path (Join-Path $out 'manifest.txt') -Value $manifest -Encoding utf8
-$tmpProbe = Join-Path ([System.IO.Path]::GetTempPath()) ("thien-build-probe-{0}.txt" -f $PID)
+$tmpProbe = Join-Path ([System.IO.Path]::GetTempPath()) ("toryo-build-probe-{0}.txt" -f $PID)
 Set-Content -Path $tmpProbe -Value 'temp write ok' -Encoding utf8
 Remove-Item $tmpProbe -Force
 if ($errors) { $errors | ForEach-Object { Write-Error $_ -ErrorAction Continue }; exit 1 }

@@ -1,4 +1,4 @@
-//! `thien doctor` (plan §15): environment, profiles, repository configuration and the
+//! `toryo doctor` (plan §15): environment, profiles, repository configuration and the
 //! M0 evidence recorded so far. Exit code 1 when any check FAILs.
 
 use std::collections::BTreeMap;
@@ -97,7 +97,7 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
     let mut r = Report::default();
     r.add(
         Level::Info,
-        "thien",
+        "toryo",
         format!(
             "version {} on {}",
             env!("CARGO_PKG_VERSION"),
@@ -141,7 +141,7 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
         r.add(
             Level::Fail,
             "config",
-            cfg_err.unwrap_or_else(|| "thien.yaml not loaded".into()),
+            cfg_err.unwrap_or_else(|| "toryo.yaml not loaded".into()),
         );
         return finish(r, json);
     };
@@ -163,7 +163,7 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
         None => r.add(
             Level::Info,
             "config",
-            "no machine config (%USERPROFILE%\\.thien\\thien.local.yaml): no trusted Git filters",
+            "no machine config (%USERPROFILE%\\.toryo\\toryo.local.yaml): no trusted Git filters",
         ),
     }
     verify_root_check(&mut r, cfg);
@@ -281,7 +281,7 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
                     "claude-isolation",
                     name,
                     &area,
-                    "launch-mode isolation (R44b); run `thien spike claude-isolation`",
+                    "launch-mode isolation (R44b); run `toryo spike claude-isolation`",
                 );
             }
             ProfileKind::Codex => {
@@ -309,7 +309,7 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
                         "foundry billing but no codex.provider block",
                     );
                 }
-                evidence(&mut r, &records, "codex-canary", name, &area, "sandbox canary (R18/R27); run `thien spike codex-canary` — profile is UNUSABLE until it passes");
+                evidence(&mut r, &records, "codex-canary", name, &area, "sandbox canary (R18/R27); run `toryo spike codex-canary` — profile is UNUSABLE until it passes");
             }
         }
     }
@@ -341,7 +341,7 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
         "job-test",
         "",
         "process",
-        "Job Object tests (R23); run `thien spike job-test`",
+        "Job Object tests (R23); run `toryo spike job-test`",
     );
     evidence(
         &mut r,
@@ -349,7 +349,7 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
         "lowil-canary",
         "",
         "verify boundary",
-        "Low-IL boundary (R36, M0-VERIFY 9); run `thien spike lowil-canary`",
+        "Low-IL boundary (R36, M0-VERIFY 9); run `toryo spike lowil-canary`",
     );
     evidence(
         &mut r,
@@ -357,7 +357,7 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
         "git-canary",
         "",
         "git",
-        "hook/filter/textconv canary (R33/R37, M0-VERIFY 10); run `thien spike git-canary`",
+        "hook/filter/textconv canary (R33/R37, M0-VERIFY 10); run `toryo spike git-canary`",
     );
     finish(r, json)
 }
@@ -534,7 +534,7 @@ fn repo_checks(r: &mut Report, cfg: &Effective, root: &Path, gc: Option<GitCmd>)
     }
     for (file, lvl, why) in [
         ("AGENTS.override.md", Level::Warn, "takes precedence in Codex (R20)"),
-        ("thien.local.yaml", Level::Warn, "in-repo machine override is ignored; use %USERPROFILE%\\.thien\\thien.local.yaml (R35)"),
+        ("toryo.local.yaml", Level::Warn, "in-repo machine override is ignored; use %USERPROFILE%\\.toryo\\toryo.local.yaml (R35)"),
         (".mcp.json", Level::Warn, "project MCP config — must have no effect under --safe-mode (R30)"),
         (".claude/settings.json", Level::Warn, "project Claude settings — must have no effect under --restricted (R30)"),
         (".claude/settings.local.json", Level::Warn, "project Claude settings — must have no effect under --restricted (R30)"),

@@ -1,6 +1,6 @@
-//! `thien.yaml` + machine config (`%USERPROFILE%\.thien\thien.local.yaml`), plan §14 / R35 / R37.
+//! `toryo.yaml` + machine config (`%USERPROFILE%\.toryo\toryo.local.yaml`), plan §14 / R35 / R37.
 //!
-//! The effective configuration of a task is the repo `thien.yaml` merged with the
+//! The effective configuration of a task is the repo `toryo.yaml` merged with the
 //! machine config, serialised canonically (sorted keys) and hashed. From M3 on it
 //! is frozen per task (`config.json` artifact); in the M0 spike it is loaded per run
 //! and its hash is printed so results can be tied to a configuration.
@@ -39,7 +39,7 @@ pub struct Project {
 }
 
 fn default_runs_root() -> String {
-    "%LOCALAPPDATA%\\thien\\runs".into()
+    "%LOCALAPPDATA%\\toryo\\runs".into()
 }
 fn default_base_branch() -> String {
     "main".into()
@@ -70,7 +70,7 @@ pub struct CodexSettings {
     pub project_doc_max_bytes: Option<u64>,
     pub model_reasoning_effort: Option<String>,
     /// Extra `-c key=value` overrides (value is a TOML literal), e.g. imported from a
-    /// `[profiles.<name>]` of the user's ~/.codex/config.toml by `thien spike init-config`.
+    /// `[profiles.<name>]` of the user's ~/.codex/config.toml by `toryo spike init-config`.
     /// Passed on every exec AND exec resume, like everything else (R19).
     #[serde(default)]
     pub overrides: BTreeMap<String, String>,
@@ -172,7 +172,7 @@ fn default_boundary() -> String {
     "low_integrity".into()
 }
 fn default_verify_root() -> String {
-    "%LOCALAPPDATA%\\thien-verify".into()
+    "%LOCALAPPDATA%\\toryo-verify".into()
 }
 fn default_true() -> bool {
     true
@@ -205,7 +205,7 @@ pub struct Timeouts {
     pub agent_stage_max_min: Option<u64>,
 }
 
-/// Repo-level `thien.yaml`.
+/// Repo-level `toryo.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoConfig {
@@ -276,7 +276,7 @@ impl Effective {
         let mut repo: RepoConfig = serde_yaml::from_str(&text)
             .with_context(|| format!("parsing {}", repo_path.display()))?;
         if repo.version != 1 {
-            bail!("unsupported thien.yaml version {}", repo.version);
+            bail!("unsupported toryo.yaml version {}", repo.version);
         }
         let mut trusted_filters = BTreeMap::new();
         let mut used_machine = None;
@@ -330,9 +330,9 @@ impl Effective {
     }
 }
 
-/// `%USERPROFILE%\.thien\thien.local.yaml` (or `~/.thien/thien.local.yaml`).
+/// `%USERPROFILE%\.toryo\toryo.local.yaml` (or `~/.toryo/toryo.local.yaml`).
 pub fn default_machine_config_path() -> Option<PathBuf> {
-    home_dir().map(|h| h.join(".thien").join("thien.local.yaml"))
+    home_dir().map(|h| h.join(".toryo").join("toryo.local.yaml"))
 }
 
 pub fn home_dir() -> Option<PathBuf> {
@@ -341,22 +341,22 @@ pub fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// `%LOCALAPPDATA%\thien` (or `$XDG_DATA_HOME/thien`, `~/.local/share/thien`).
+/// `%LOCALAPPDATA%\toryo` (or `$XDG_DATA_HOME/toryo`, `~/.local/share/toryo`).
 pub fn data_dir() -> PathBuf {
-    if let Some(p) = std::env::var_os("THIEN_DATA_DIR") {
+    if let Some(p) = std::env::var_os("TORYO_DATA_DIR") {
         return PathBuf::from(p);
     }
     if let Some(p) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(p).join("thien");
+        return PathBuf::from(p).join("toryo");
     }
     if let Some(p) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(p).join("thien");
+        return PathBuf::from(p).join("toryo");
     }
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".local")
         .join("share")
-        .join("thien")
+        .join("toryo")
 }
 
 /// Expand `%VAR%` (Windows style) and `${VAR}` / `$VAR`-free paths. Unknown variables are an error.
@@ -366,7 +366,7 @@ pub fn expand_vars(s: &str) -> Result<String> {
     let out = re.replace_all(s, |c: &regex::Captures| match std::env::var(&c[1]) {
         Ok(v) => v,
         Err(_) => {
-            // Fall back for the two locations thien uses when running on non-Windows hosts.
+            // Fall back for the two locations toryo uses when running on non-Windows hosts.
             match &c[1] {
                 "LOCALAPPDATA" => data_dir()
                     .parent()
@@ -401,8 +401,8 @@ pub fn resolve_secret(reference: &str) -> Result<String> {
 
 #[cfg(windows)]
 fn resolve_credman(target: &str) -> Result<String> {
-    // `thien/claude-max-oauth` → service "thien", user "claude-max-oauth"
-    let (service, user) = target.split_once('/').unwrap_or(("thien", target));
+    // `toryo/claude-max-oauth` → service "toryo", user "claude-max-oauth"
+    let (service, user) = target.split_once('/').unwrap_or(("toryo", target));
     let entry = keyring::Entry::new(service, user).context("opening Credential Manager entry")?;
     entry
         .get_password()
@@ -416,7 +416,7 @@ fn resolve_credman(target: &str) -> Result<String> {
 
 #[cfg(windows)]
 pub fn store_secret(target: &str, value: &str) -> Result<()> {
-    let (service, user) = target.split_once('/').unwrap_or(("thien", target));
+    let (service, user) = target.split_once('/').unwrap_or(("toryo", target));
     keyring::Entry::new(service, user)?.set_password(value)?;
     Ok(())
 }
@@ -451,7 +451,7 @@ profiles:
   claude-max:
     kind: claude
     billing: subscription
-    exe: C:\Users\thien\.local\bin\claude.exe
+    exe: C:\Users\toryo\.local\bin\claude.exe
   codex-foundry:
     kind: codex
     billing: foundry
@@ -471,7 +471,7 @@ policy:
     #[test]
     fn loads_and_hashes_stably() {
         let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("thien.yaml");
+        let p = d.path().join("toryo.yaml");
         std::fs::write(&p, SAMPLE).unwrap();
         let a = Effective::load(&p, None).unwrap();
         let b = Effective::load(&p, None).unwrap();
@@ -482,7 +482,7 @@ policy:
     #[test]
     fn machine_config_overrides_roles_and_changes_hash() {
         let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("thien.yaml");
+        let p = d.path().join("toryo.yaml");
         std::fs::write(&p, SAMPLE).unwrap();
         let m = d.path().join("machine.yaml");
         std::fs::write(
@@ -500,7 +500,7 @@ policy:
     #[test]
     fn unknown_keys_are_rejected() {
         let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("thien.yaml");
+        let p = d.path().join("toryo.yaml");
         std::fs::write(&p, format!("{SAMPLE}\nbogus: 1\n")).unwrap();
         assert!(Effective::load(&p, None).is_err());
     }
@@ -508,7 +508,7 @@ policy:
     #[test]
     fn role_with_unknown_profile_is_rejected() {
         let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("thien.yaml");
+        let p = d.path().join("toryo.yaml");
         std::fs::write(
             &p,
             SAMPLE.replace("profile: claude-max, model: opus", "profile: nope"),
@@ -519,8 +519,8 @@ policy:
 
     #[test]
     fn secret_reference_forms() {
-        std::env::set_var("THIEN_TEST_SECRET_X", "v");
-        assert_eq!(resolve_secret("env:THIEN_TEST_SECRET_X").unwrap(), "v");
+        std::env::set_var("TORYO_TEST_SECRET_X", "v");
+        assert_eq!(resolve_secret("env:TORYO_TEST_SECRET_X").unwrap(), "v");
         assert!(resolve_secret("plain").is_err());
     }
 }

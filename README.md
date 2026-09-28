@@ -1,6 +1,11 @@
-# thien — M0 spike kit
+# toryo — M0 spike kit
 
-Rust implementation of **milestone M0** of the Thien Orchestrator plan (v0.6, §17): the pieces needed
+> **Toryo** (棟梁, *tōryō*) is the master carpenter who leads a building crew: he does not cut the wood himself,
+> he hands out the work, checks every joint and signs off each stage. That is this tool's job — Claude Code and
+> Codex are the craftsmen; `toryo` plans the order of work, enforces the rules, checkpoints and verifies.
+> (Renamed from `thien` on 2026-09-28, plan v0.7 R55.)
+
+Rust implementation of **milestone M0** of the Toryo plan (v0.6, §17): the pieces needed
 to answer the twelve `M0-VERIFY` questions on the real Windows machine, before any pipeline code
 (M1–M8) is written — the plan's stop rule.
 
@@ -14,32 +19,32 @@ to answer the twelve `M0-VERIFY` questions on the real Windows machine, before a
 | `agents::codex` | R18, R19, R21, R22 | canonical `-c` argv (identical on resume), JSONL parser, message classifier |
 | `usage` | R21, R41 | disjoint token buckets, cumulative deltas with reset |
 | `git` | R33, R37 | `GitCmd` hardening prefix, `<CANON_DIFF>`, trusted/neutralised filter plan, canaries, pkt-line filter |
-| `config` | §14, R35 | `thien.yaml` + machine config, canonical hash, Credential Manager secrets |
+| `config` | §14, R35 | `toryo.yaml` + machine config, canonical hash, Credential Manager secrets |
 | `doctor` | §15 | environment / profile / repo checks + recorded M0 evidence |
 | `spike::*` | §17 | the M0 commands (see `docs/M0-RUNBOOK.md`) |
 | `spike::pipeline` | §5.2, R28, R40 | prototype workflow on a real repo: plan gate, guards, checkpoints, verify, exact-AC review, fix cycles |
 
 ```
-thien doctor
-thien spike job-test | git-canary | lowil-canary
-thien spike claude-isolation --profile claude-max [--mode restricted|setting-sources|cwd-run-store]
-thien spike codex-canary --profile codex-foundry
-thien spike codex-project-config --profile codex-foundry
-thien spike killed-resume --profile <claude-max|codex-foundry>
-thien spike smoke                 # end-to-end: plan → implement → checkpoint → verify → review
-thien spike pipeline --repo R --task T.md   # one real task: plan → HUMAN GATE → implement → verify → review → fix cycles
+toryo doctor
+toryo spike job-test | git-canary | lowil-canary
+toryo spike claude-isolation --profile claude-max [--mode restricted|setting-sources|cwd-run-store]
+toryo spike codex-canary --profile codex-foundry
+toryo spike codex-project-config --profile codex-foundry
+toryo spike killed-resume --profile <claude-max|codex-foundry>
+toryo spike smoke                 # end-to-end: plan → implement → checkpoint → verify → review
+toryo spike pipeline --repo R --task T.md   # one real task: plan → HUMAN GATE → implement → verify → review → fix cycles
                                             # (implementer out of quota → fallback, e.g. codex-openai → claude-max)
-thien spike claude|codex …        # single turns for the manual dry-run
-thien spike init-fixture | render | diff | report
+toryo spike claude|codex …        # single turns for the manual dry-run
+toryo spike init-fixture | render | diff | report
 ```
 
-**Quick start on Windows (no Rust needed):** `bin\thien.exe` is a prebuilt binary (cross-compiled,
+**Quick start on Windows (no Rust needed):** `bin\toryo.exe` is a prebuilt binary (cross-compiled,
 x86_64-pc-windows-gnu, stripped). One command installs Claude Code if missing, checks the Claude/Codex
-logins, writes `C:\.thien\m0\thien.yaml`, and runs `doctor`, `job-test`, `git-canary` and the
-end-to-end `smoke` (Claude plans → Codex implements → thien checkpoints + verifies → Claude reviews):
+logins, writes `C:\.thien\m0\toryo.yaml`, and runs `doctor`, `job-test`, `git-canary` and the
+end-to-end `smoke` (Claude plans → Codex implements → toryo checkpoints + verifies → Claude reviews):
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File C:\.thien\AgentOrchestrator\thien\scripts\m0-smoke.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File C:\.thien\AgentOrchestrator\toryo\scripts\m0-smoke.ps1
 ```
 
 Results land in `C:\.thien\AgentOrchestrator\thien-m0-data\`.
@@ -61,9 +66,9 @@ On Linux the tests run the whole spike harness against fake `claude`/`codex` scr
 (`tests/spike_e2e.rs`) and the Git canaries against the real `git` (`tests/git_canary.rs`). The
 Windows-only paths (Job Object, Low integrity) compile on Linux via
 `cargo check --target x86_64-pc-windows-gnu` but only *run* on Windows — `cargo test` and
-`thien spike job-test` / `lowil-canary` there are part of M0.
+`toryo spike job-test` / `lowil-canary` there are part of M0.
 
 ## Status
 
-M0 kit — not the orchestrator. No `thien task`, `run`, `approve` yet: they start in M1 once M0's
+M0 kit — not the orchestrator. No `toryo task`, `run`, `approve` yet: they start in M1 once M0's
 evidence is in plan v0.7.

@@ -1,12 +1,12 @@
 //! R33 hook canary + R37 filter/textconv canary against the real `git` on this machine
-//! (closes M0-VERIFY 10 for this Git version; re-run `thien spike git-canary` on Windows).
+//! (closes M0-VERIFY 10 for this Git version; re-run `toryo spike git-canary` on Windows).
 
-use thien::git::canary::{run_all, Variant};
+use toryo::git::canary::{run_all, Variant};
 
 #[test]
 fn git_canaries_pass() {
     let work = tempfile::tempdir().unwrap();
-    let exe = env!("CARGO_BIN_EXE_thien").replace('\\', "/");
+    let exe = env!("CARGO_BIN_EXE_toryo").replace('\\', "/");
     let trusted = format!("'{exe}' spike filter-process --marker");
     let reports = run_all(std::path::Path::new("git"), work.path(), Some(&trusted)).unwrap();
     for r in &reports {

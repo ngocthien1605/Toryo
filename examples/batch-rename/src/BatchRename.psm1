@@ -1,4 +1,4 @@
-# BatchRename — small PowerShell module used to learn the thien workflow.
+# BatchRename — small PowerShell module used to learn the toryo workflow.
 Set-StrictMode -Version Latest
 
 function ConvertTo-SafeFileName {

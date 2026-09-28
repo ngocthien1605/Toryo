@@ -200,7 +200,7 @@ pub fn claude_isolation(
         }
     };
     let settings = json!({
-        "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:9", "THIEN_PROBE_ENV": "loaded" },
+        "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:9", "TORYO_PROBE_ENV": "loaded" },
         "apiKeyHelper": marker_cmd("apiKeyHelper"),
         "awsAuthRefresh": marker_cmd("awsAuthRefresh"),
         "hooks": { "SessionStart": [ { "hooks": [ { "type": "command", "command": marker_cmd("hook-SessionStart") } ] } ],
@@ -409,7 +409,7 @@ pub fn codex_canary(cfg: &Effective, profile: &str, model: Option<String>) -> Re
             "add",
             "-q",
             "-b",
-            "thien/canary",
+            "toryo/canary",
             &fwd(&wt),
             "HEAD",
         ],
@@ -500,7 +500,7 @@ pub fn codex_canary(cfg: &Effective, profile: &str, model: Option<String>) -> Re
         eprintln!("[{}] {n}", if *ok { "PASS" } else { "FAIL" });
     }
     if !pass {
-        eprintln!("=> thien doctor will mark profile `{profile}` UNUSABLE until this canary passes (R18).");
+        eprintln!("=> toryo doctor will mark profile `{profile}` UNUSABLE until this canary passes (R18).");
     }
     let ws = cfg
         .profile(profile)?
@@ -689,12 +689,12 @@ pub fn codex_project_config(
     std::fs::create_dir_all(repo.join(".codex"))?;
     std::fs::write(
         repo.join(".codex").join("config.toml"),
-        format!("# M0-VERIFY 8 probe\n[shell_environment_policy]\nset = {{ THIEN_PROBE = \"{token}\" }}\n"),
+        format!("# M0-VERIFY 8 probe\n[shell_environment_policy]\nset = {{ TORYO_PROBE = \"{token}\" }}\n"),
     )?;
     let schema_path = root.join("implementation.schema.json");
     std::fs::write(&schema_path, fixture::schema("implementation.schema.json")?)?;
-    let prompt = "Run exactly one shell command that prints the value of the environment variable THIEN_PROBE \
-        (PowerShell: `$env:THIEN_PROBE`; sh: `echo \"$THIEN_PROBE\"`). Do not read any files. Return the JSON object with \
+    let prompt = "Run exactly one shell command that prints the value of the environment variable TORYO_PROBE \
+        (PowerShell: `$env:TORYO_PROBE`; sh: `echo \"$TORYO_PROBE\"`). Do not read any files. Return the JSON object with \
         `summary` = the exact printed value (or `EMPTY` if nothing was printed); other fields = [].";
     let r = codex_turn(
         cfg,

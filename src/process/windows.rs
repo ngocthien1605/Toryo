@@ -5,7 +5,7 @@
 //!   If assignment fails the child is terminated while still suspended.
 //! * `Job::terminate` = `TerminateJobObject`; `wait_empty` polls
 //!   `JobObjectBasicAccountingInformation.ActiveProcesses == 0`.
-//! * If thien.exe dies, its Job handles close and Windows kills every descendant.
+//! * If toryo.exe dies, its Job handles close and Windows kills every descendant.
 //! * `Boundary::LowIntegrity`: a duplicate of the caller's token with the
 //!   integrity level lowered to Low (S-1-16-4096), started via
 //!   `CreateProcessAsUserW`. Windows Mandatory Integrity Control's default
@@ -128,11 +128,11 @@ impl Job {
     }
 
     fn assign(&self, process: HANDLE) -> Result<()> {
-        if std::env::var_os("THIEN_FAULT_ASSIGN").is_some() {
+        if std::env::var_os("TORYO_FAULT_ASSIGN").is_some() {
             // Keep the (suspended) child alive long enough that an UNsuspended child would
             // certainly have written its marker — otherwise the test could not tell the difference.
             std::thread::sleep(std::time::Duration::from_secs(2));
-            bail!("fault injection: AssignProcessToJobObject failed (THIEN_FAULT_ASSIGN)");
+            bail!("fault injection: AssignProcessToJobObject failed (TORYO_FAULT_ASSIGN)");
         }
         // SAFETY: both handles valid for the duration of the call.
         if unsafe { AssignProcessToJobObject(self.raw(), process) } == 0 {

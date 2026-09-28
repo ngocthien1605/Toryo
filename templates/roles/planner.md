@@ -11,7 +11,7 @@ Inputs (absolute paths are listed in the task pack below):
 Produce a plan that:
 1. Restates the goal in your own words (`understanding`).
 2. Lists every file you expect to be created or changed (`files_likely_involved`, repo-relative).
-   Never list protected paths (build/test scripts, `thien.yaml`, `AGENTS.md`, `.gitattributes`) unless
+   Never list protected paths (build/test scripts, `toryo.yaml`, `AGENTS.md`, `.gitattributes`) unless
    TASK.md lists them under `## Allow protected`.
 3. Gives small, ordered, verifiable `steps`.
 4. States how each acceptance criterion will be verified (`validation`).

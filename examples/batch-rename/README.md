@@ -1,6 +1,6 @@
-# BatchRename (sample app for thien)
+# BatchRename (sample app for toryo)
 
-A tiny PowerShell 7 module used to learn how `thien spike pipeline` turns a `TASK.md` into
+A tiny PowerShell 7 module used to learn how `toryo spike pipeline` turns a `TASK.md` into
 reviewed, tested commits. Start state: one function, `ConvertTo-SafeFileName`.
 
 ```powershell

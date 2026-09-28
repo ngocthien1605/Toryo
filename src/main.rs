@@ -1,4 +1,4 @@
-//! `thien` CLI — M0 spike kit (plan v0.6 §15, §17).
+//! `toryo` CLI — M0 spike kit (plan v0.6 §15, §17).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -7,24 +7,24 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use thien::agents::claude::LaunchMode;
-use thien::config::{default_machine_config_path, Effective};
-use thien::spike::agents::{self as sa, ClaudeArgs, CodexArgs};
-use thien::spike::results::{self, new_run_dir};
-use thien::spike::turn::TurnOpts;
-use thien::spike::{fixture, job, lowil, render};
+use toryo::agents::claude::LaunchMode;
+use toryo::config::{default_machine_config_path, Effective};
+use toryo::spike::agents::{self as sa, ClaudeArgs, CodexArgs};
+use toryo::spike::results::{self, new_run_dir};
+use toryo::spike::turn::TurnOpts;
+use toryo::spike::{fixture, job, lowil, render};
 
 #[derive(Parser)]
 #[command(
-    name = "thien",
+    name = "toryo",
     version,
-    about = "Thien Orchestrator — M0 spike kit (plan v0.6)"
+    about = "Toryo — M0 spike kit (plan v0.6)"
 )]
 struct Cli {
-    /// Repository config (default: ./thien.yaml, then $THIEN_CONFIG)
+    /// Repository config (default: ./toryo.yaml, then $TORYO_CONFIG)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
-    /// Machine config (default: %USERPROFILE%\.thien\thien.local.yaml)
+    /// Machine config (default: %USERPROFILE%\.toryo\toryo.local.yaml)
     #[arg(long, global = true)]
     machine_config: Option<PathBuf>,
     #[command(subcommand)]
@@ -53,7 +53,7 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum SecretsCmd {
-    /// Store a secret read from stdin (one line), e.g. `Read-Host -MaskInput | thien secrets set thien/foundry-openai`.
+    /// Store a secret read from stdin (one line), e.g. `Read-Host -MaskInput | toryo secrets set toryo/foundry-openai`.
     Set { target: String },
 }
 
@@ -149,7 +149,7 @@ enum SpikeCmd {
         #[arg(long)]
         model: Option<String>,
     },
-    /// Write thien.yaml for this machine; translate Codex `[profiles.<name>]` into -c overrides.
+    /// Write toryo.yaml for this machine; translate Codex `[profiles.<name>]` into -c overrides.
     InitConfig {
         #[arg(long)]
         out: PathBuf,
@@ -166,7 +166,7 @@ enum SpikeCmd {
         /// Usually %USERPROFILE%\.codex\config.toml
         #[arg(long)]
         codex_config: Option<PathBuf>,
-        /// Codex profile names to import, e.g. openai,foundry → thien profiles codex-openai, codex-foundry
+        /// Codex profile names to import, e.g. openai,foundry → toryo profiles codex-openai, codex-foundry
         #[arg(long, value_delimiter = ',')]
         codex_profiles: Vec<String>,
         #[arg(long, default_value = "unelevated")]
@@ -178,7 +178,7 @@ enum SpikeCmd {
         #[arg(long)]
         lenient: bool,
     },
-    /// End-to-end smoke test: Claude plans → Codex implements → thien checkpoints/verifies → Claude reviews.
+    /// End-to-end smoke test: Claude plans → Codex implements → toryo checkpoints/verifies → Claude reviews.
     Smoke {
         #[arg(long, default_value = "claude-max")]
         claude_profile: String,
@@ -198,7 +198,7 @@ enum SpikeCmd {
         modes: Vec<LaunchMode>,
     },
     /// Run one task through the whole workflow on a real repo: Claude plans → you approve
-    /// → Codex implements → thien checkpoints + verifies → Claude reviews → fix cycles.
+    /// → Codex implements → toryo checkpoints + verifies → Claude reviews → fix cycles.
     Pipeline {
         /// The Git repository (its current branch is the base unless --base is given)
         #[arg(long)]
@@ -212,10 +212,10 @@ enum SpikeCmd {
         /// Base branch/commit (default: the repo's current branch)
         #[arg(long)]
         base: Option<String>,
-        /// Claude profile (default: roles.planner from thien.yaml)
+        /// Claude profile (default: roles.planner from toryo.yaml)
         #[arg(long)]
         claude_profile: Option<String>,
-        /// Implementer profile (default: roles.implementer from thien.yaml)
+        /// Implementer profile (default: roles.implementer from toryo.yaml)
         #[arg(long, alias = "codex-profile")]
         implementer: Option<String>,
         /// Fallback implementers when the current one is out of quota, in order
@@ -241,7 +241,7 @@ enum SpikeCmd {
         #[arg(long)]
         simulate_quota: bool,
     },
-    /// Job Object tests: stop one stage, thien.exe crash, assign-failure injection (R23).
+    /// Job Object tests: stop one stage, toryo.exe crash, assign-failure injection (R23).
     JobTest,
     /// Low-integrity verify boundary canary + fixture build at Low IL (M0-VERIFY 9, R36).
     LowilCanary,
@@ -316,8 +316,8 @@ fn load_config(cli: &Cli) -> Result<Effective> {
     let path = cli
         .config
         .clone()
-        .or_else(|| std::env::var_os("THIEN_CONFIG").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("thien.yaml"));
+        .or_else(|| std::env::var_os("TORYO_CONFIG").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("toryo.yaml"));
     let machine = cli
         .machine_config
         .clone()
@@ -332,7 +332,7 @@ fn opts(kill_after_secs: Option<u64>) -> TurnOpts {
     }
 }
 
-fn write_out(out: &Option<PathBuf>, r: &thien::spike::turn::TurnRun) -> Result<()> {
+fn write_out(out: &Option<PathBuf>, r: &toryo::spike::turn::TurnRun) -> Result<()> {
     if let Some(p) = out {
         match &r.outcome.structured {
             Some(v) => {
@@ -352,7 +352,7 @@ fn run(cli: Cli) -> Result<i32> {
                 Ok(c) => (Some(c), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             };
-            thien::doctor::run(cfg.as_ref(), err, *json)
+            toryo::doctor::run(cfg.as_ref(), err, *json)
         }
         Cmd::Secrets {
             cmd: SecretsCmd::Set { target },
@@ -363,7 +363,7 @@ fn run(cli: Cli) -> Result<i32> {
             if v.is_empty() {
                 bail!("empty secret on stdin");
             }
-            thien::config::store_secret(target, v)?;
+            toryo::config::store_secret(target, v)?;
             eprintln!("stored credman:{target}");
             Ok(0)
         }
@@ -494,7 +494,7 @@ fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
             codex_home,
             lenient,
         } => {
-            thien::spike::init_config::init_config(&thien::spike::init_config::InitArgs {
+            toryo::spike::init_config::init_config(&toryo::spike::init_config::InitArgs {
                 out: out.clone(),
                 project_root: project_root.clone(),
                 worktrees_root: worktrees_root.clone(),
@@ -519,10 +519,10 @@ fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
             modes,
         } => {
             let cfg = load_config(cli)?;
-            thien::spike::smoke::preflight(&cfg, &[claude_profile, codex_profile])?;
-            ok(thien::spike::smoke::smoke(
+            toryo::spike::smoke::preflight(&cfg, &[claude_profile, codex_profile])?;
+            ok(toryo::spike::smoke::smoke(
                 &cfg,
-                thien::spike::smoke::SmokeArgs {
+                toryo::spike::smoke::SmokeArgs {
                     claude_profile: claude_profile.clone(),
                     codex_profile: codex_profile.clone(),
                     claude_model: claude_model.clone(),
@@ -562,7 +562,7 @@ fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
                 .clone()
                 .unwrap_or_else(|| role("implementer", "codex"));
             let model = |r: &str| cfg.repo.roles.get(r).and_then(|x| x.model.clone());
-            thien::spike::smoke::preflight(&cfg, &[&cp, &xp])?;
+            toryo::spike::smoke::preflight(&cfg, &[&cp, &xp])?;
             let mut chain = vec![xp.clone()];
             if !*no_fallback {
                 let configured = cfg
@@ -582,15 +582,15 @@ fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
                     if chain.contains(&f) {
                         continue;
                     }
-                    match thien::spike::smoke::preflight(&cfg, &[&f]) {
+                    match toryo::spike::smoke::preflight(&cfg, &[&f]) {
                         Ok(()) => chain.push(f),
                         Err(e) => eprintln!("WARNING: fallback implementer `{f}` skipped: {e:#}"),
                     }
                 }
             }
-            ok(thien::spike::pipeline::pipeline(
+            ok(toryo::spike::pipeline::pipeline(
                 &cfg,
-                thien::spike::pipeline::PipelineArgs {
+                toryo::spike::pipeline::PipelineArgs {
                     repo: repo.clone(),
                     task: task.clone(),
                     id: id.clone(),
@@ -611,7 +611,7 @@ fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
             // verify.verify_root from the config when there is one, else the default
             let vr = load_config(cli)
                 .ok()
-                .and_then(|c| thien::config::expand_vars(&c.repo.verify.verify_root).ok())
+                .and_then(|c| toryo::config::expand_vars(&c.repo.verify.verify_root).ok())
                 .map(PathBuf::from);
             ok(lowil::lowil_canary(vr)?)
         }
@@ -625,7 +625,7 @@ fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
                 .to_string()
                 .replace('\\', "/");
             let trusted = format!("'{exe}' spike filter-process --marker");
-            let reports = thien::git::canary::run_all(&fixture::git_exe(), &dir, Some(&trusted))?;
+            let reports = toryo::git::canary::run_all(&fixture::git_exe(), &dir, Some(&trusted))?;
             let pass = reports.iter().all(|r| r.pass);
             for r in &reports {
                 eprintln!(
@@ -694,7 +694,7 @@ fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
             out,
         } => {
             let g = fixture::gitcmd()?;
-            let d = g.canonical_diff(&thien::git::Loc::Discover(repo.clone()), from, Some(to))?;
+            let d = g.canonical_diff(&toryo::git::Loc::Discover(repo.clone()), from, Some(to))?;
             std::fs::write(out, &d)?;
             eprintln!("{} bytes → {}", d.len(), out.display());
             Ok(0)
@@ -730,7 +730,7 @@ fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
         SpikeCmd::FilterProcess { marker } => {
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
-            thien::git::filter_process::serve(&mut stdin.lock(), &mut stdout.lock(), marker)?;
+            toryo::git::filter_process::serve(&mut stdin.lock(), &mut stdout.lock(), marker)?;
             Ok(0)
         }
     }

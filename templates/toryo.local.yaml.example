@@ -1,4 +1,4 @@
-# Machine config — lives OUTSIDE every repository: %USERPROFILE%\.thien\thien.local.yaml (R35/R37).
+# Machine config — lives OUTSIDE every repository: %USERPROFILE%\.toryo\toryo.local.yaml (R35/R37).
 # Selects profiles per machine and holds the ONLY trusted Git filter commands.
 roles:
   planner:  { profile: claude-max, model: opus }

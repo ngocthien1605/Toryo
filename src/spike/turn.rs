@@ -21,7 +21,7 @@ use crate::usage::CodexSubsets;
 pub struct TurnOpts {
     pub max: Duration,
     pub stall: Duration,
-    /// Terminate the Job this many seconds after start (simulates `thien stop` / a crash).
+    /// Terminate the Job this many seconds after start (simulates `toryo stop` / a crash).
     pub kill_after: Option<Duration>,
     /// Print text deltas / items to the console while running.
     pub echo: bool,

@@ -110,7 +110,7 @@ pub const ROLES: &[(&str, &str)] = &[
 ];
 
 pub fn git_exe() -> PathBuf {
-    std::env::var_os("THIEN_GIT")
+    std::env::var_os("TORYO_GIT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("git"))
 }
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn fixture_commits_on_main() {
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("THIEN_DATA_DIR", d.path().join("data"));
+        std::env::set_var("TORYO_DATA_DIR", d.path().join("data"));
         let repo = d.path().join("calc");
         let head = init_repo(&repo).unwrap();
         assert_eq!(head.len(), 40);

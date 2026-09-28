@@ -1,5 +1,8 @@
 # M0 findings
 
+> **Note (2026-09-28):** the tool was renamed from `thien` to `toryo` (plan v0.7, R55). This record keeps the
+> names, commands and paths exactly as they were used during the M0 runs (`thien …`, `THIEN_*`, `thien-m0-data`).
+
 F1–F6 came from implementing and testing the kit on Linux (Git 2.43.0, Rust 1.95). F7–F13 came from
 the Windows runs on 2026-09-27/28 (see `M0-RESULTS.md`). All of them feed plan v0.7.
 

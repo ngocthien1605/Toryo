@@ -110,7 +110,7 @@ fn run_low(
 /// Modify, so labelling there fails with ERROR_ACCESS_DENIED.
 pub fn default_verify_root() -> PathBuf {
     PathBuf::from(
-        crate::config::expand_vars("%LOCALAPPDATA%\\thien-verify")
+        crate::config::expand_vars("%LOCALAPPDATA%\\toryo-verify")
             .unwrap_or_else(|_| data_dir().join("verify").display().to_string()),
     )
 }
@@ -171,7 +171,7 @@ fn lowil_inner(root: &Path, verify_root: &Path) -> Result<bool> {
             "add",
             "-q",
             "-b",
-            "thien/lowil",
+            "toryo/lowil",
             &vwt_arg(&wt),
             "HEAD",
         ],
@@ -203,16 +203,16 @@ fn lowil_inner(root: &Path, verify_root: &Path) -> Result<bool> {
     let real_data = data_dir().join(format!("lowil-probe-{pid}.txt"));
     let real_machine = home_dir()
         .unwrap_or_default()
-        .join(".thien")
+        .join(".toryo")
         .join(format!("lowil-probe-{pid}.txt"));
     let targets = vec![
         Target { label: "run store".into(), path: run_store.join("probe.txt"), expect: "deny".into(), info: false },
-        Target { label: "thien data dir (%LOCALAPPDATA%\\thien)".into(), path: real_data.clone(), expect: "deny".into(), info: false },
-        Target { label: "machine config dir (%USERPROFILE%\\.thien)".into(), path: real_machine.clone(), expect: "deny".into(), info: false },
+        Target { label: "toryo data dir (%LOCALAPPDATA%\\toryo)".into(), path: real_data.clone(), expect: "deny".into(), info: false },
+        Target { label: "machine config dir (%USERPROFILE%\\.toryo)".into(), path: real_machine.clone(), expect: "deny".into(), info: false },
         Target { label: "task worktree".into(), path: wt.join("probe.txt"), expect: "deny".into(), info: false },
         Target { label: "repo .git".into(), path: repo.join(".git").join("probe.txt"), expect: "deny".into(), info: false },
         Target { label: "verify admin dir (.git/worktrees/wt.verify)".into(), path: repo.join(".git").join("worktrees").join("wt.verify").join("probe.txt"), expect: "deny".into(), info: false },
-        Target { label: "verify checkout .git pointer file (B1: expected writable → thien uses explicit --git-dir)".into(), path: vwt.join(".git"), expect: "allow".into(), info: true },
+        Target { label: "verify checkout .git pointer file (B1: expected writable → toryo uses explicit --git-dir)".into(), path: vwt.join(".git"), expect: "allow".into(), info: true },
         Target { label: "build output dir".into(), path: build.join("out.txt"), expect: "allow".into(), info: false },
         Target { label: "TEMP (Low tmp)".into(), path: tmp.join("t.txt"), expect: "allow".into(), info: false },
         Target { label: "verify checkout".into(), path: vwt.join("build").join("x.txt"), expect: "allow".into(), info: false },

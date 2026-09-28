@@ -120,8 +120,8 @@ pub fn spawn_in_job(spec: &SpawnSpec) -> Result<Spawned> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    if std::env::var_os("THIEN_FAULT_ASSIGN").is_some() {
-        bail!("fault injection: job assignment failed before the child ran (THIEN_FAULT_ASSIGN)");
+    if std::env::var_os("TORYO_FAULT_ASSIGN").is_some() {
+        bail!("fault injection: job assignment failed before the child ran (TORYO_FAULT_ASSIGN)");
     }
     let mut child = cmd
         .spawn()

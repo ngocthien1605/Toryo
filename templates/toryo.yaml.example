@@ -1,33 +1,33 @@
-# thien.yaml for the M0 spike — copy to a working folder (e.g. C:\.thien\m0\thien.yaml) and edit paths.
-# No secrets in this file. Secrets: `thien secrets set thien/<name>` (Windows Credential Manager).
+# toryo.yaml for the M0 spike — copy to a working folder (e.g. C:\.thien\m0\toryo.yaml) and edit paths.
+# No secrets in this file. Secrets: `toryo secrets set toryo/<name>` (Windows Credential Manager).
 version: 1
 project:
-  root: C:\.thien\m0\calc                 # created by: thien spike init-fixture --into C:\.thien\m0\calc
+  root: C:\.thien\m0\calc                 # created by: toryo spike init-fixture --into C:\.thien\m0\calc
   worktrees_root: C:\.thien\m0\worktrees
-  runs_root: '%LOCALAPPDATA%\thien\runs'
+  runs_root: '%LOCALAPPDATA%\toryo\runs'
   base_branch: main
 
 profiles:
   claude-max:                              # personal machine: Claude Max subscription
     kind: claude
     billing: subscription                  # R30: every Claude profile runs --restricted --safe-mode
-    exe: C:\Users\thien\.local\bin\claude.exe
+    exe: C:\Users\toryo\.local\bin\claude.exe
     version: "2.1.x"                       # doctor: needs >= 2.1.259 (--permission-prompts), >= 2.1.248 (--restricted)
     env:
       CLAUDE_CODE_GIT_BASH_PATH: C:\Program Files\Git\bin\bash.exe
     # secret_env:                          # optional; omit to use the interactive /login of this Windows user
-    #   CLAUDE_CODE_OAUTH_TOKEN: credman:thien/claude-max-oauth
+    #   CLAUDE_CODE_OAUTH_TOKEN: credman:toryo/claude-max-oauth
 
   claude-foundry:                          # company laptop only
     kind: claude
     billing: foundry
-    exe: C:\Users\thien\.local\bin\claude.exe
+    exe: C:\Users\toryo\.local\bin\claude.exe
     env:
       CLAUDE_CODE_USE_FOUNDRY: "1"
       ANTHROPIC_FOUNDRY_RESOURCE: my-foundry
       CLAUDE_CODE_GIT_BASH_PATH: C:\Program Files\Git\bin\bash.exe
     secret_env:
-      ANTHROPIC_FOUNDRY_API_KEY: credman:thien/foundry-claude
+      ANTHROPIC_FOUNDRY_API_KEY: credman:toryo/foundry-claude
 
   codex-foundry:
     kind: codex
@@ -35,9 +35,9 @@ profiles:
     exe: C:\tools\codex\codex.exe          # or the npm shim, e.g. %APPDATA%\npm\codex.cmd
     model: gpt-5-codex                     # your Foundry deployment name
     env:
-      CODEX_HOME: C:\Users\thien\.thien\codex-home   # auth + sessions only; config.toml there is ignored
+      CODEX_HOME: C:\Users\<you>\.toryo\codex-home   # auth + sessions only; config.toml there is ignored
     secret_env:
-      AZURE_OPENAI_API_KEY: credman:thien/foundry-openai
+      AZURE_OPENAI_API_KEY: credman:toryo/foundry-openai
     codex:
       sandbox_mode: workspace-write
       windows_sandbox: unelevated          # R18: WITHOUT THIS THE WINDOWS SANDBOX IS OFF
@@ -56,7 +56,7 @@ roles:
 
 policy:
   deny_paths: ["**/ZZZ/**", "**/*.pfx", "**/.env*"]
-  protected_paths: ["@verify-scripts", "thien.yaml", ".thien/**", "AGENTS.md", "CLAUDE.md", ".claude/**", ".codex/**", ".mcp.json", ".gitattributes", ".githooks/**", "thien.local.yaml", ".gitmodules"]
+  protected_paths: ["@verify-scripts", "toryo.yaml", ".toryo/**", "AGENTS.md", "CLAUDE.md", ".claude/**", ".codex/**", ".mcp.json", ".gitattributes", ".githooks/**", "toryo.local.yaml", ".gitmodules"]
   neutralize_untrusted_filters: false
   allow_submodules: false
   allow_codex_project_config: false
@@ -64,7 +64,7 @@ policy:
 verify:
   checkout: clean
   boundary: low_integrity
-  verify_root: '%LOCALAPPDATA%\thien-verify'
+  verify_root: '%LOCALAPPDATA%\toryo-verify'
   final_clean: true
 
 commands:

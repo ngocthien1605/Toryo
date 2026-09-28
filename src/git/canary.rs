@@ -146,7 +146,7 @@ fn build_fixture(git: &Path, root: &Path, process_cmd: Option<&str>) -> Result<F
         &format!("{}\ncat", marker_body(&markers, "repo-filter-evil-clean")),
     )?;
     // The review's C4 case: a program configured under the *trusted name* `lfs`.
-    // With the thien binary available this is a well-behaved process filter (so the plain-git
+    // With the toryo binary available this is a well-behaved process filter (so the plain-git
     // control runs the whole lifecycle and reaches every hook and the textconv helper);
     // otherwise a script that records the call and fails.
     let lfs_process = match process_cmd {
@@ -209,7 +209,7 @@ fn list_markers(dir: &Path) -> Vec<String> {
 
 /// Run one canary variant in a fresh directory under `work`.
 /// `trusted_process`: command for the trusted `lfs` process driver, e.g.
-/// `'<thien.exe>' spike filter-process --marker` (the marker path is appended).
+/// `'<toryo.exe>' spike filter-process --marker` (the marker path is appended).
 pub fn run(
     git: &Path,
     work: &Path,
@@ -242,7 +242,7 @@ pub fn run(
     let mut trusted: BTreeMap<String, TrustedFilter> = BTreeMap::new();
     if matches!(variant, Variant::TrustedLfs | Variant::Admission) {
         let Some(tp) = trusted_process else {
-            report.note = "skipped: needs the thien binary as the trusted process filter".into();
+            report.note = "skipped: needs the toryo binary as the trusted process filter".into();
             report.pass = false;
             return Ok(report);
         };
@@ -282,7 +282,7 @@ pub fn run(
         }
         plain(
             &fx.repo,
-            &["worktree", "add", "-q", "-b", "thien/t1", &fwd(&wt), "HEAD"],
+            &["worktree", "add", "-q", "-b", "toryo/t1", &fwd(&wt), "HEAD"],
         )?;
         if wt.exists() {
             std::fs::write(wt.join("img.bin"), [9u8, 0, 9, 0, 9])?;
@@ -371,9 +371,9 @@ pub fn run(
     g.run(
         &repo,
         false,
-        &["worktree", "add", "-q", "-b", "thien/t1", &fwd(&wt), "HEAD"],
+        &["worktree", "add", "-q", "-b", "toryo/t1", &fwd(&wt), "HEAD"],
     )?;
-    steps.push("worktree add -b thien/t1".into());
+    steps.push("worktree add -b toryo/t1".into());
     let wtl = Loc::Discover(wt.clone());
     std::fs::write(wt.join("img.bin"), [9u8, 0, 9, 0, 9])?;
     std::fs::write(wt.join("a.txt"), "hello\nworld\n")?;
@@ -386,7 +386,7 @@ pub fn run(
             "-q",
             "--no-verify",
             "-m",
-            "thien(t1): implement attempt 1",
+            "toryo(t1): implement attempt 1",
         ],
     )?;
     steps.push("checkpoint commit in worktree".into());
@@ -442,7 +442,7 @@ pub fn run(
             "--no-verify",
             "--allow-empty",
             "-m",
-            "thien(t1): no change",
+            "toryo(t1): no change",
         ],
     )?;
     steps.push("show (canonical); reset --soft; empty commit".into());

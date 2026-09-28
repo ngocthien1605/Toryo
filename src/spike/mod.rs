@@ -1,4 +1,4 @@
-//! `thien spike …` — the M0 spike commands (plan §17). Each one answers one or more
+//! `toryo spike …` — the M0 spike commands (plan §17). Each one answers one or more
 //! `M0-VERIFY` items against the real CLIs / OS on this machine and records the
 //! evidence in `<data_dir>/m0/results.jsonl`.
 

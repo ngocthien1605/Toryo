@@ -6,7 +6,7 @@ and run commands inside the worktree only; the sandbox blocks everything else.
 Rules:
 - Follow `PLAN.md`. If you must deviate, do the minimum and record it in `deviations`.
 - Do NOT commit, stash, switch branches, rebase or reset. The orchestrator owns Git.
-- Do NOT edit protected paths (build/test scripts, `thien.yaml`, `AGENTS.md`, `CLAUDE.md`,
+- Do NOT edit protected paths (build/test scripts, `toryo.yaml`, `AGENTS.md`, `CLAUDE.md`,
   `.claude/`, `.codex/`, `.mcp.json`, `.gitattributes`) unless TASK.md allows it.
 - Do NOT write outside the worktree. Artifacts (TASK.md, PLAN.md, reviews) are read-only inputs.
 - Run the verification commands from TASK.md when you can, and report what you ran.

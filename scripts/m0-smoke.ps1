@@ -1,17 +1,17 @@
 <#
 .SYNOPSIS
-  One-shot M0 smoke run for the Thien Orchestrator on this Windows machine.
+  One-shot M0 smoke run for the Toryo on this Windows machine.
 
 .DESCRIPTION
   1. Installs Claude Code (official installer, https://claude.ai/install.ps1) if it is missing.
   2. Checks Claude login, Codex CLI, Git, PowerShell 7.
-  3. Writes C:\.thien\m0\thien.yaml for the detected paths (Claude Max + your Codex login).
-  4. Runs thien.exe: doctor, job-test, git-canary, and the end-to-end smoke test
-     (Claude plans -> Codex implements -> thien checkpoints + verifies -> Claude reviews).
+  3. Writes C:\.thien\m0\toryo.yaml for the detected paths (Claude Max + your Codex login).
+  4. Runs toryo.exe: doctor, job-test, git-canary, and the end-to-end smoke test
+     (Claude plans -> Codex implements -> toryo checkpoints + verifies -> Claude reviews).
   Everything is logged to C:\.thien\AgentOrchestrator\thien-m0-data\ so the results can be read back.
 
 .EXAMPLE
-  pwsh -NoProfile -ExecutionPolicy Bypass -File C:\.thien\AgentOrchestrator\thien\scripts\m0-smoke.ps1
+  pwsh -NoProfile -ExecutionPolicy Bypass -File C:\.thien\AgentOrchestrator\toryo\scripts\m0-smoke.ps1
 .EXAMPLE
   ... m0-smoke.ps1 -SmokeCodexProfile foundry      # use the Foundry (API) profile as Implementer
 #>
@@ -35,18 +35,18 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$root     = Split-Path -Parent $PSScriptRoot                     # ...\thien
-$thien    = Join-Path $root 'bin\thien.exe'
-if ($env:THIEN_EXE) { $thien = $env:THIEN_EXE }   # testing hook
+$root     = Split-Path -Parent $PSScriptRoot                     # ...\toryo
+$toryo    = Join-Path $root 'bin\toryo.exe'
+if ($env:TORYO_EXE) { $toryo = $env:TORYO_EXE }   # testing hook
 $dataDir  = Join-Path (Split-Path -Parent $root) 'thien-m0-data' # ...\AgentOrchestrator\thien-m0-data
 $m0       = $WorkDir
 New-Item -ItemType Directory -Force -Path $dataDir, $m0 | Out-Null
-$env:THIEN_DATA_DIR = $dataDir
+$env:TORYO_DATA_DIR = $dataDir
 $log = Join-Path $dataDir ("smoke-console-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))
 Start-Transcript -Path $log | Out-Null
 
 # Native-command output is not always captured by Start-Transcript: pipe it through the host.
-function T { & $thien @args 2>&1 | ForEach-Object { "$_" } | Out-Host; $global:LASTEXITCODE = $LASTEXITCODE }
+function T { & $toryo @args 2>&1 | ForEach-Object { "$_" } | Out-Host; $global:LASTEXITCODE = $LASTEXITCODE }
 function Section($t) { Write-Host "`n==== $t ====" -ForegroundColor Cyan }
 function Save($name, $text) { Set-Content -Path (Join-Path $dataDir $name) -Value $text -Encoding utf8 }
 
@@ -55,11 +55,11 @@ Section "Environment"
 $regPath = @([Environment]::GetEnvironmentVariable('Path', 'Machine'), [Environment]::GetEnvironmentVariable('Path', 'User')) -join ';'
 foreach ($d in ($regPath -split ';')) { if ($d -and ($env:PATH -split ';') -notcontains $d) { $env:PATH = "$env:PATH;$d" } }
 "PowerShell $($PSVersionTable.PSVersion) on $([Environment]::OSVersion.VersionString)"
-if (-not (Test-Path $thien)) { Write-Error "thien.exe not found at $thien"; Stop-Transcript | Out-Null; exit 2 }
-& $thien --version
-$initHelp = & $thien spike init-config --help 2>&1 | Out-String
+if (-not (Test-Path $toryo)) { Write-Error "toryo.exe not found at $toryo"; Stop-Transcript | Out-Null; exit 2 }
+& $toryo --version
+$initHelp = & $toryo spike init-config --help 2>&1 | Out-String
 if ($initHelp -notmatch '--lenient') {
-    Write-Error "bin\thien.exe is older than this script (no --lenient). Re-copy thien.exe from the latest delivery."
+    Write-Error "bin\toryo.exe is older than this script (no --lenient). Re-copy toryo.exe from the latest delivery."
     Stop-Transcript | Out-Null; exit 2
 }
 
@@ -127,13 +127,13 @@ $gitPath = if ($git) { $git.Source } else {
       Where-Object { Test-Path $_ } | Select-Object -First 1
 }
 if (-not $gitPath) {
-    Write-Host "Git for Windows is not installed. thien needs it (worktrees, checkpoints, canaries); Claude Code also uses its Git Bash." -ForegroundColor Yellow
+    Write-Host "Git for Windows is not installed. toryo needs it (worktrees, checkpoints, canaries); Claude Code also uses its Git Bash." -ForegroundColor Yellow
     Write-Host "Install it, then re-run this script (no new terminal needed):" -ForegroundColor Yellow
     Write-Host "    winget install --id Git.Git -e --source winget" -ForegroundColor Yellow
     Stop-Transcript | Out-Null
     exit 7
 }
-$env:THIEN_GIT = $gitPath
+$env:TORYO_GIT = $gitPath
 if (($env:PATH -split ';') -notcontains (Split-Path $gitPath)) { $env:PATH = "$(Split-Path $gitPath);$env:PATH" }
 "git: $gitPath"
 & $gitPath --version
@@ -141,7 +141,7 @@ $gitBash = @('C:\Program Files\Git\bin\bash.exe', "$env:LOCALAPPDATA\Programs\Gi
 "Git Bash: $gitBash"
 
 # ---------------------------------------------------------------- config
-Section "thien.yaml"
+Section "toryo.yaml"
 $calc = Join-Path $m0 'calc'
 $contracts = Join-Path $m0 'contracts'
 if ((Test-Path $calc) -and -not (Test-Path (Join-Path $calc '.git'))) {
@@ -150,24 +150,24 @@ if ((Test-Path $calc) -and -not (Test-Path (Join-Path $calc '.git'))) {
     Move-Item -Path $calc -Destination $aside
     "moved incomplete fixture to $aside"
 }
-if (-not (Test-Path (Join-Path $calc '.git'))) { & $thien spike init-fixture --into $calc --contracts $contracts }
-elseif (-not (Test-Path $contracts)) { & $thien spike init-fixture --into (Join-Path $m0 ("calc-{0}" -f (Get-Date -Format yyyyMMddHHmmss))) --contracts $contracts }
-$cfgPath = Join-Path $m0 'thien.yaml'
+if (-not (Test-Path (Join-Path $calc '.git'))) { & $toryo spike init-fixture --into $calc --contracts $contracts }
+elseif (-not (Test-Path $contracts)) { & $toryo spike init-fixture --into (Join-Path $m0 ("calc-{0}" -f (Get-Date -Format yyyyMMddHHmmss))) --contracts $contracts }
+$cfgPath = Join-Path $m0 'toryo.yaml'
 $initArgs = @('spike', 'init-config', '--out', $cfgPath, '--project-root', $calc, '--worktrees-root', "$m0\worktrees",
               '--claude-exe', $claudeExe, '--codex-exe', $codexExe, '--codex-config', $codexCfg,
               '--codex-profiles', ($CodexProfiles -join ','), '--lenient')
 if ($gitBash) { $initArgs += @('--git-bash', $gitBash) }
 T @initArgs
 if ($LASTEXITCODE -ne 0) { Write-Error "init-config failed"; Stop-Transcript | Out-Null; exit 6 }
-Copy-Item $cfgPath (Join-Path $dataDir 'thien.yaml') -Force
+Copy-Item $cfgPath (Join-Path $dataDir 'toryo.yaml') -Force
 
-# ---------------------------------------------------------------- thien
+# ---------------------------------------------------------------- toryo
 Set-Location $m0
-Section "thien doctor"
+Section "toryo doctor"
 T --config $cfgPath doctor
-Section "thien spike job-test (R23)"
+Section "toryo spike job-test (R23)"
 T --config $cfgPath spike job-test
-Section "thien spike git-canary (R33/R37, M0-VERIFY 10)"
+Section "toryo spike git-canary (R33/R37, M0-VERIFY 10)"
 T --config $cfgPath spike git-canary
 Section "Codex quick check per profile (one turn each, no edits)"
 $probePrompt = Join-Path $m0 'codex-probe.md'
@@ -184,7 +184,7 @@ if (-not $SkipSmoke -and $generated -notmatch "(?m)^\s+codex-${SmokeCodexProfile
     $SkipSmoke = $true
 }
 if (-not $SkipSmoke) {
-    Section "thien spike smoke (Claude plans -> Codex [$SmokeCodexProfile] implements -> verify -> Claude reviews)"
+    Section "toryo spike smoke (Claude plans -> Codex [$SmokeCodexProfile] implements -> verify -> Claude reviews)"
     $smokeArgs = @('--config', $cfgPath, 'spike', 'smoke', '--claude-profile', 'claude-max', '--codex-profile', "codex-$SmokeCodexProfile")
     if ($ClaudeModel) { $smokeArgs += @('--claude-model', $ClaudeModel) }
     if ($CodexModel)  { $smokeArgs += @('--codex-model', $CodexModel) }

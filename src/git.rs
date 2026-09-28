@@ -86,8 +86,8 @@ impl GitCmd {
         c("core.fsmonitor", "false");
         c("commit.gpgSign", "false");
         c("tag.gpgSign", "false");
-        c("user.name", "thien");
-        c("user.email", "thien@local.invalid");
+        c("user.name", "toryo");
+        c("user.email", "toryo@local.invalid");
         c("submodule.recurse", "false");
         c("diff.external", "");
         c("color.ui", "never");

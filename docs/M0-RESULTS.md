@@ -1,5 +1,8 @@
 # M0 results (input for plan v0.7)
 
+> **Note (2026-09-28):** the tool was renamed from `thien` to `toryo` (plan v0.7, R55). This record keeps the
+> names, commands and paths exactly as they were used during the M0 runs (`thien …`, `THIEN_*`, `thien-m0-data`).
+
 Machine: MSI · Windows 10.0.26200 (Windows 11) · PowerShell 7.6.6 · Git 2.55.0.windows.5 ·
 Claude Code 2.1.283 (Max subscription) · Codex CLI 0.157.1 (ChatGPT login) · thien 0.0.1 ·
 Runs: 2026-09-27 and 2026-09-28 (`thien-m0-data\m0\results.jsonl`, `thien-m0-data\runs\`).

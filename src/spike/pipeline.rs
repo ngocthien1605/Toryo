@@ -1,9 +1,9 @@
-//! `thien spike pipeline` — the plan's workflow (§5.2) on a real repository, as a
+//! `toryo spike pipeline` — the plan's workflow (§5.2) on a real repository, as a
 //! single-process prototype of M2–M8:
 //!
 //! ```text
 //! TASK.md → Claude plans (read-only) → HUMAN plan gate (approve / reject+reason)
-//!   → Codex implements (sandboxed worktree) → thien: HEAD guard + protected paths
+//!   → Codex implements (sandboxed worktree) → toryo: HEAD guard + protected paths
 //!   → checkpoint commit → Verify (commands.verify) → Claude reviews (exact AC set)
 //!   → approved: done · changes_requested / verify fail: Codex fix → … (max N cycles)
 //! ```
@@ -160,7 +160,7 @@ pub fn review_violations(v: &Value, ac_ids: &[String]) -> Vec<String> {
 }
 
 /// Protected paths (plan §8/§14, simplified): verify scripts, the task file, instruction /
-/// config files, and `policy.protected_paths` globs from thien.yaml.
+/// config files, and `policy.protected_paths` globs from toryo.yaml.
 pub struct Protected {
     exact: Vec<String>,
     globs: Vec<regex::Regex>,
@@ -211,11 +211,11 @@ impl Protected {
                     | "CLAUDE.local.md"
                     | ".mcp.json"
                     | ".gitattributes"
-                    | "thien.yaml"
-                    | "thien.local.yaml"
+                    | "toryo.yaml"
+                    | "toryo.local.yaml"
                     | ".gitmodules"
             )
-            || [".claude/", ".codex/", ".thien/", ".githooks/", ".git/"]
+            || [".claude/", ".codex/", ".toryo/", ".githooks/", ".git/"]
                 .iter()
                 .any(|d| p.starts_with(d) || p.contains(&format!("/{d}")))
     }
@@ -286,7 +286,7 @@ fn verify_commands(cfg: &Effective, repo: &Path) -> Result<Vec<CommandSpec>> {
         }
     }
     if v.is_empty() {
-        bail!("no verify commands: add `commands.verify` to thien.yaml (or scripts/build.ps1 / scripts/test.ps1 to the repo)");
+        bail!("no verify commands: add `commands.verify` to toryo.yaml (or scripts/build.ps1 / scripts/test.ps1 to the repo)");
     }
     Ok(v)
 }
@@ -374,7 +374,7 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
     if wt.exists() {
         bail!("worktree {} already exists — use another --id, or remove it: git -C \"{}\" worktree remove --force \"{}\"", wt.display(), repo.display(), wt.display());
     }
-    let branch = format!("thien/{id}");
+    let branch = format!("toryo/{id}");
     if g.output(
         &repol,
         true,
@@ -406,7 +406,7 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
     )?;
     let wtl = Loc::Discover(wt.clone());
     // Per-task TEMP inside the worktree, invisible to Git (info/exclude of the common dir).
-    let task_tmp = wt.join(".thien-tmp");
+    let task_tmp = wt.join(".toryo-tmp");
     {
         let common = g.run_str(
             &wtl,
@@ -415,12 +415,12 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
         )?;
         let excl = PathBuf::from(common.trim()).join("info").join("exclude");
         let cur = std::fs::read_to_string(&excl).unwrap_or_default();
-        if !cur.lines().any(|l| l.trim() == "/.thien-tmp/") {
+        if !cur.lines().any(|l| l.trim() == "/.toryo-tmp/") {
             std::fs::create_dir_all(excl.parent().expect("parent"))?;
             std::fs::write(
                 &excl,
                 format!(
-                    "{cur}{}/.thien-tmp/\n",
+                    "{cur}{}/.toryo-tmp/\n",
                     if cur.is_empty() || cur.ends_with('\n') {
                         ""
                     } else {
@@ -687,20 +687,20 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
                     ),
                 ));
             }
-            // checkpoint (thien owns commits; no-change → empty checkpoint, R40)
+            // checkpoint (toryo owns commits; no-change → empty checkpoint, R40)
             g.run(&wtl, false, &["add", "-A"])?;
             let no_change = g
                 .output(&wtl, true, &["diff", "--cached", "--quiet"])?
                 .status
                 .success();
-            let msg = format!("thien({id}): {stage}");
+            let msg = format!("toryo({id}): {stage}");
             let mut c: Vec<&str> = vec!["commit", "-q", "--no-verify", "-m", &msg];
-            let t1 = format!("Thien-Task: {id}");
-            let t2 = format!("Thien-Stage: {stage}");
-            let t3 = format!("Thien-Implementer: {implementer}");
+            let t1 = format!("Toryo-Task: {id}");
+            let t2 = format!("Toryo-Stage: {stage}");
+            let t3 = format!("Toryo-Implementer: {implementer}");
             c.extend(["--trailer", &t1, "--trailer", &t2, "--trailer", &t3]);
             if no_change {
-                c.extend(["--allow-empty", "--trailer", "Thien-No-Change: true"]);
+                c.extend(["--allow-empty", "--trailer", "Toryo-No-Change: true"]);
             }
             g.run(&wtl, false, &c)?;
             let checkpoint = g.run_str(&wtl, true, &["rev-parse", "HEAD"])?;
@@ -984,7 +984,7 @@ fn implement_turn(
     totals: &mut Totals,
     log: &mut Vec<Value>,
 ) -> Result<Option<(TurnRun, String)>> {
-    let retry_base: u64 = std::env::var("THIEN_RETRY_BASE_SECS")
+    let retry_base: u64 = std::env::var("TORYO_RETRY_BASE_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
@@ -1195,7 +1195,7 @@ fn finish(f: &Fin, ok: bool, why: &str, totals: &Totals, log: Vec<Value>) -> Res
     );
     let r = repo.display();
     if ok {
-        eprintln!("\nNext (you decide — thien never merges or pushes):");
+        eprintln!("\nNext (you decide — toryo never merges or pushes):");
         eprintln!("  git -C \"{r}\" log --oneline {base}..{branch}      # the checkpoints");
         eprintln!("  git -C \"{r}\" diff {base}...{branch}              # the full change");
         eprintln!("  git -C \"{r}\" merge --squash {branch}; git -C \"{r}\" commit -m \"{id}\"");

@@ -27,7 +27,7 @@ use redact::{Redactions, StreamRedactor};
 /// Execution boundary for the spawned tree (R36).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Boundary {
-    /// Same token as thien (agents: their own sandbox is the boundary).
+    /// Same token as toryo (agents: their own sandbox is the boundary).
     None,
     /// Windows Low Integrity Level copy of the user token.
     LowIntegrity,
@@ -272,7 +272,7 @@ pub fn is_alive(p: ProcId) -> bool {
     platform::is_alive(p)
 }
 
-/// Terminate one process by id (used to simulate `Stop-Process -Force` on thien.exe).
+/// Terminate one process by id (used to simulate `Stop-Process -Force` on toryo.exe).
 pub fn kill_pid(pid: u32) -> Result<()> {
     platform::kill_pid(pid)
 }

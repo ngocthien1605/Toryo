@@ -1,4 +1,4 @@
-# Calculator module — fixture repository for the Thien Orchestrator M0 dry-run.
+# Calculator module — fixture repository for the Toryo M0 dry-run.
 Set-StrictMode -Version Latest
 
 function Add-Numbers {

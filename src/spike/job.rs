@@ -1,4 +1,4 @@
-//! Job Object tests (plan §13): stop one stage, crash of thien.exe, assign-failure injection.
+//! Job Object tests (plan §13): stop one stage, crash of toryo.exe, assign-failure injection.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -69,7 +69,7 @@ pub fn job_child(
     Ok(())
 }
 
-/// Hidden `spike job-supervisor`: plays thien.exe — owns a Job with a 3-level tree,
+/// Hidden `spike job-supervisor`: plays toryo.exe — owns a Job with a 3-level tree,
 /// writes the owned (pid, created) set, then waits to be killed from outside.
 pub fn job_supervisor(snapshot: &Path) -> Result<()> {
     let ready = snapshot.with_extension("ready");
@@ -119,7 +119,7 @@ pub fn job_test() -> Result<bool> {
     let root = new_run_dir("job-test", "all")?;
     let mut results = Vec::new();
 
-    // 1. stop: TerminateJobObject for one stage while thien keeps running; a second stage is untouched.
+    // 1. stop: TerminateJobObject for one stage while toryo keeps running; a second stage is untouched.
     {
         let (ready_a, ready_b) = (root.join("a.ready"), root.join("b.ready"));
         let a = spawn(
@@ -143,7 +143,7 @@ pub fn job_test() -> Result<bool> {
             "ok": ok, "owned": ids_a.len(), "active_zero": gone, "still_alive": alive_a, "other_stage_untouched": b_untouched}));
     }
 
-    // 2. crash: kill the supervisor (thien.exe stand-in) from outside; KILL_ON_JOB_CLOSE must take the tree down.
+    // 2. crash: kill the supervisor (toryo.exe stand-in) from outside; KILL_ON_JOB_CLOSE must take the tree down.
     {
         let snap = root.join("supervisor-snapshot.json");
         let mut sup = std::process::Command::new(self_exe()?)
@@ -167,7 +167,7 @@ pub fn job_test() -> Result<bool> {
         } else {
             "non-Windows: process groups have no kill-on-close; expected to FAIL here (Windows-only guarantee)"
         };
-        results.push(json!({"test": "thien.exe killed from outside → every owned (pid, creation time) is gone",
+        results.push(json!({"test": "toryo.exe killed from outside → every owned (pid, creation time) is gone",
             "ok": ok, "owned": ids.len(), "still_alive": alive, "note": note}));
         // Clean up leftovers on non-Windows hosts.
         for p in alive {
@@ -178,7 +178,7 @@ pub fn job_test() -> Result<bool> {
     // 3. fault injection: assignment fails → the child never runs a user instruction.
     {
         let marker = root.join("fault-marker.txt");
-        std::env::set_var("THIEN_FAULT_ASSIGN", "1");
+        std::env::set_var("TORYO_FAULT_ASSIGN", "1");
         let spec = child_spec(
             vec![
                 "spike".into(),
@@ -193,7 +193,7 @@ pub fn job_test() -> Result<bool> {
             &root,
         )?;
         let r = spawn(&spec, &Redactions::empty());
-        std::env::remove_var("THIEN_FAULT_ASSIGN");
+        std::env::remove_var("TORYO_FAULT_ASSIGN");
         std::thread::sleep(Duration::from_millis(1500));
         let ok = r.is_err() && !marker.exists();
         results.push(json!({"test": "AssignProcessToJobObject failure → child terminated while suspended (no marker written)",
