@@ -59,6 +59,9 @@ pub struct FakeTurn {
 pub struct FakeScript {
     #[serde(default)]
     pub turns: BTreeMap<String, Vec<FakeTurn>>,
+    /// Per-profile usage capabilities instead of the real adapter's (R41 fixtures).
+    #[serde(default)]
+    pub capabilities: BTreeMap<String, UsageCapabilities>,
 }
 
 impl FakeScript {
@@ -97,6 +100,7 @@ pub struct FakeCall {
 #[derive(Default)]
 struct Shared {
     queues: HashMap<String, VecDeque<FakeTurn>>,
+    capabilities: BTreeMap<String, UsageCapabilities>,
     calls: Vec<FakeCall>,
     sessions: u32,
 }
@@ -111,6 +115,7 @@ pub struct FakeAgentAdapter {
 
 impl FakeAgentAdapter {
     pub fn new(script: FakeScript) -> Self {
+        let capabilities = script.capabilities.clone();
         let queues = script
             .turns
             .into_iter()
@@ -119,6 +124,7 @@ impl FakeAgentAdapter {
         Self {
             shared: Arc::new(Mutex::new(Shared {
                 queues,
+                capabilities,
                 ..Default::default()
             })),
             profile: String::new(),
@@ -169,7 +175,8 @@ impl AgentAdapter for FakeAgentAdapter {
     }
 
     fn usage_capabilities(&self) -> UsageCapabilities {
-        super::cli::capabilities(self.kind)
+        let s = self.shared.lock().expect("lock");
+        s.capabilities.get(&self.profile).copied().unwrap_or_else(|| super::cli::capabilities(self.kind))
     }
 }
 

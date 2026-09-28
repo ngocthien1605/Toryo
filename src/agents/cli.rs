@@ -52,12 +52,14 @@ pub fn capabilities(kind: ProfileKind) -> UsageCapabilities {
             live: true,
             terminal: true,
             cumulative_on_resume: Tri::No,
+            killed_turn_in_resume: Tri::No,
         },
         // Codex exec: usage only at turn.completed; cumulative per thread (R21).
         ProfileKind::Codex => UsageCapabilities {
             live: false,
             terminal: true,
             cumulative_on_resume: Tri::Yes,
+            killed_turn_in_resume: Tri::Unknown,
         },
     }
 }

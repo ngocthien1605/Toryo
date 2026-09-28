@@ -58,7 +58,7 @@ pub enum Tri {
 }
 
 /// R41/R48: what an adapter's usage telemetry can actually support.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageCapabilities {
     /// Usage arrives while the turn runs (Claude stream events: yes; Codex exec: no).
     pub live: bool,
@@ -66,6 +66,14 @@ pub struct UsageCapabilities {
     pub terminal: bool,
     /// Usage on a resumed session is cumulative for the session (Codex: yes; Claude: no, M0-VERIFY 4).
     pub cumulative_on_resume: Tri,
+    /// A killed turn's tokens are proven to be inside the next cumulative total of its
+    /// session (R41). Codex: cannot be shown (no telemetry for the killed turn); Claude: no.
+    #[serde(default = "tri_unknown")]
+    pub killed_turn_in_resume: Tri,
+}
+
+fn tri_unknown() -> Tri {
+    Tri::Unknown
 }
 
 /// Token usage of one turn. `buckets = None` means nothing is known (never stored as 0, R41).

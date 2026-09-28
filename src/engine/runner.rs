@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,7 +35,8 @@ use super::worktree::{rel, Worktree, T_AGENT, T_ATTEMPT, T_NO_CHANGE, T_STAGE, T
 use crate::agents::adapter::TurnHooks;
 use crate::agents::hub::AgentHub;
 use crate::config::{expand_vars, Billing, CommandSpec, Effective, ProfileKind};
-use crate::domain::{ErrorClass, OpenSession, Role, StageOutcome, TurnInput, TurnLimits};
+use crate::domain::{ErrorClass, OpenSession, Role, StageOutcome, Tri, TurnInput, TurnLimits};
+use crate::usage::{Accounting, Weights};
 use crate::git::GitCmd;
 use crate::runner::{CommandRunner, LocalRunner, RunSpec};
 
@@ -159,15 +161,66 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn hooks(&self, attempt: &str, stop: &super::lock::StopWatch) -> TurnHooks {
+    /// Stop request + session id hooks; for a live adapter (Claude) with a budget, also the
+    /// R41 live interrupt: the turn is cancelled when its provisional usage reaches what is
+    /// left of the budget (the returned flag says it was the budget, not a stop).
+    fn hooks(&self, attempt: &str, stop: &super::lock::StopWatch, profile: &str) -> Result<(TurnHooks, Arc<AtomicBool>)> {
         let (st, a) = (self.store.clone(), attempt.to_string());
-        TurnHooks {
+        let hit = Arc::new(AtomicBool::new(false));
+        let mut h = TurnHooks {
             cancel: Some(stop.flag.clone()),
             on_session: Some(Arc::new(move |sid: &str| {
                 let (a, s) = (a.clone(), sid.to_string());
                 let _ = st.call(move |tx| store::set_attempt_session(tx, &a, &s));
             })),
+            on_usage: None,
+        };
+        let t = self.task()?;
+        let live = self.hub.capabilities(profile)?.live && self.cfg.repo.pipeline.budget_live_interrupt.unwrap_or(true);
+        if let (true, Some(b)) = (live, t.budget_tokens) {
+            let left = (b - t.spent_tokens - t.reserved_tokens).max(0) as u64;
+            let (w, flag, h2) = (self.weights(), stop.flag.clone(), hit.clone());
+            h.on_usage = Some(Arc::new(move |u: &crate::domain::TokenUsage| {
+                if u.buckets.is_some_and(|b| b.budget_tokens(&w) >= left) && !h2.swap(true, Ordering::SeqCst) {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            }));
         }
+        Ok((h, hit))
+    }
+
+    fn weights(&self) -> Weights {
+        let m = self.cfg.repo.pipeline.budget_weights.clone().unwrap_or_default();
+        let g = |k: &str| m.get(k).copied().unwrap_or(1.0);
+        Weights { uncached_input: g("uncached_input"), cache_read: g("cache_read"), cache_write: g("cache_write"), output: g("output") }
+    }
+
+    /// R41 admission: a turn starts only while `spent + reserved < budget`; otherwise the
+    /// task pauses (`Paused(Budget)`) without starting it. Warns at 80 %.
+    fn admitted(&self) -> Result<bool> {
+        let t = self.task()?;
+        let Some(b) = t.budget_tokens else { return Ok(true) };
+        let used = t.spent_tokens + t.reserved_tokens;
+        if used >= b {
+            eprintln!(
+                "!! admission cap reached: {used} tokens used ({} spent + ~{} reserved) of {b} — paused before the turn (`toryo budget set {} --tokens N`, then `toryo resume {}`)",
+                t.spent_tokens, t.reserved_tokens, t.id, t.id
+            );
+            self.apply(Ev::BudgetExceeded)?;
+            return Ok(false);
+        }
+        if used * 10 >= b * 8 {
+            eprintln!("!! budget: {used} of {b} tokens used (≥ 80 %; admission cap, may overshoot by one turn)");
+        }
+        Ok(true)
+    }
+
+    /// The live interrupt fired: the turn's provisional usage is recorded, the attempt is
+    /// interrupted and the task pauses.
+    fn budget_interrupted(&self, a: &AttemptRow, r: &StageOutcome) -> Result<Flow> {
+        eprintln!("!! budget reached during the turn — interrupted (R41 live interrupt), the task pauses");
+        self.end_and(a, AttemptStatus::Interrupted, r, AttemptEnd { error_class: Some("budget".into()), error_detail: Some("budget reached during the turn (R41 live interrupt)".into()), ..Default::default() }, Some(Ev::BudgetExceeded), None)?;
+        Ok(Flow::Next)
     }
 
     fn stopped(&self) -> Result<Flow> {
@@ -240,12 +293,16 @@ impl<'a> Engine<'a> {
             ),
             _ => format!("Create the plan for the task in {}.", art.join("TASK.md").display()),
         };
+        if !self.admitted()? {
+            return Ok(Flow::Next);
+        }
         let head = Worktree::new(&self.g, &t.worktree).head()?;
         let a = self.begin(NewAttempt { stage: "plan", kind: "agent", profile: Some(&t.planner), fallback_from: None, head_before: Some(&head), subject_commit: None })?;
         eprintln!("\n── PLAN (attempt {}, {}) ──", a.attempt, t.planner);
         crash_point("plan:after_begin");
         let Some(ctx) = self.context(t, &a, &t.planner)? else { return Ok(Flow::Next) };
         let stop = self.lock.watch_stop();
+        let (hooks, budget_hit) = self.hooks(&a.id, &stop, &t.planner)?;
         let r = self.hub.turn_with(
             OpenSession {
                 profile: t.planner.clone(),
@@ -260,9 +317,12 @@ impl<'a> Engine<'a> {
             },
             TurnInput { prompt, label: format!("plan-{}", a.attempt), echo: true, env: self.capture_env() },
             self.limits(),
-            self.hooks(&a.id, &stop),
+            hooks,
         )?;
         self.usage(&a, &t.planner, &r)?;
+        if budget_hit.load(Ordering::SeqCst) {
+            return self.budget_interrupted(&a, &r);
+        }
         if r.cancelled {
             self.end(&a, AttemptStatus::Interrupted, &r, AttemptEnd::default())?;
             return self.stopped();
@@ -338,6 +398,9 @@ impl<'a> Engine<'a> {
             ProfileKind::Codex => (prompt, self.role_model("implementer").or_else(|| self.cfg.profile(&profile).ok().and_then(|p| p.model.clone()))),
             ProfileKind::Claude => (claude_implementer_prompt(&prompt), None),
         };
+        if !self.admitted()? {
+            return Ok(Flow::Next);
+        }
         let head_before = wt.head()?;
         let tmp = t.worktree.join(".toryo-tmp");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -348,6 +411,7 @@ impl<'a> Engine<'a> {
         crash_point("implement:after_begin");
         let Some(ctx) = self.context(t, &a, &profile)? else { return Ok(Flow::Next) };
         let stop = self.lock.watch_stop();
+        let (hooks, budget_hit) = self.hooks(&a.id, &stop, &profile)?;
         let r = self.hub.turn_with(
             OpenSession {
                 profile: profile.clone(),
@@ -362,10 +426,13 @@ impl<'a> Engine<'a> {
             },
             TurnInput { prompt, label: format!("{stage}-{}", a.attempt), env, echo: true },
             self.limits(),
-            self.hooks(&a.id, &stop),
+            hooks,
         )?;
         crash_point("implement:after_turn");
         self.usage(&a, &profile, &r)?;
+        if budget_hit.load(Ordering::SeqCst) {
+            return self.budget_interrupted(&a, &r);
+        }
         if r.cancelled {
             self.end(&a, AttemptStatus::Interrupted, &r, AttemptEnd::default())?;
             return self.stopped();
@@ -644,6 +711,9 @@ impl<'a> Engine<'a> {
         let mut resume: Option<String> = prev
             .filter(|p| p.status == AttemptStatus::Interrupted && p.subject_commit.as_deref() == Some(head.as_str()) && p.profile.as_deref() == Some(t.reviewer.as_str()))
             .and_then(|p| p.external_session_id);
+        if !self.admitted()? {
+            return Ok(Flow::Next);
+        }
         let a = self.begin(NewAttempt { stage: "review", kind: "agent", profile: Some(&t.reviewer), fallback_from: None, head_before: Some(&head), subject_commit: Some(&head) })?;
         eprintln!("\n── REVIEW (attempt {}, {}{}) ──", a.attempt, t.reviewer, if resume.is_some() { ", resuming the interrupted session" } else { "" });
         crash_point("review:after_begin");
@@ -662,6 +732,12 @@ impl<'a> Engine<'a> {
         let mut last = StageOutcome::default();
         let mut corrections = 0u32;
         for corr in 0..=2u32 {
+            // R41: every turn is admitted, correction turns too
+            if corr > 0 && !self.admitted()? {
+                self.end_and(&a, AttemptStatus::Failed, &last, AttemptEnd { error_class: Some("budget".into()), ..Default::default() }, Some(Ev::BudgetExceeded), None)?;
+                return Ok(Flow::Next);
+            }
+            let (hooks, budget_hit) = self.hooks(&a.id, &stop, &t.reviewer)?;
             let r = self.hub.turn_with(
                 OpenSession {
                     profile: t.reviewer.clone(),
@@ -676,9 +752,12 @@ impl<'a> Engine<'a> {
                 },
                 TurnInput { prompt: prompt.clone(), label: format!("review-{}-{corr}", a.attempt), echo: true, env: self.capture_env() },
                 self.limits(),
-                self.hooks(&a.id, &stop),
+                hooks,
             )?;
             self.usage(&a, &t.reviewer, &r)?;
+            if budget_hit.load(Ordering::SeqCst) {
+                return self.budget_interrupted(&a, &r);
+            }
             if r.cancelled {
                 self.end(&a, AttemptStatus::Interrupted, &r, AttemptEnd::default())?;
                 return self.stopped();
@@ -721,6 +800,13 @@ impl<'a> Engine<'a> {
         };
         let (i, h) = (self.id.clone(), head.clone());
         self.store.call(move |tx| store::set_last_reviewed(tx, &i, &h))?;
+        if decision == "approved" {
+            // R53: non-blocking issues survive an approval as follow-ups
+            let nb = non_blocking(&review);
+            if !nb.is_empty() {
+                super::decisions::append(self.store, t, "follow-ups: non-blocking review issues (R53)", &format!("Review of checkpoint {} approved with these open issues:\n{}", &head[..12], nb.join("\n")))?;
+            }
+        }
         self.end_and(&a, AttemptStatus::Succeeded, &last, AttemptEnd { correction_turns: Some(corrections), ..Default::default() }, Some(event), feedback.map(Some))?;
         Ok(Flow::Next)
     }
@@ -836,9 +922,37 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// Record the turn's usage (R41): cumulative adapters store the delta against the
+    /// session baseline; a turn that did not complete counts its streamed usage as provisional.
     fn usage(&self, a: &AttemptRow, profile: &str, r: &StageOutcome) -> Result<()> {
-        let (i, aid, p, b, u) = (self.id.clone(), a.id.clone(), profile.to_string(), self.billing(profile), r.usage);
-        self.store.call(move |tx| store::record_usage(tx, &i, &aid, &p, b, u))
+        let caps = self.hub.capabilities(profile)?;
+        let mut u = r.usage;
+        if let Some(x) = &mut u {
+            if !r.success && (r.cancelled || r.timed_out) && x.accounting == Accounting::Exact {
+                x.accounting = Accounting::Provisional;
+            }
+        }
+        let reservation = self.cfg.repo.pipeline.unknown_turn_reservation_tokens.as_ref().and_then(|v| v.as_u64());
+        let (i, aid, stage, p, b, sess, w) = (self.id.clone(), a.id.clone(), a.stage.clone(), profile.to_string(), self.billing(profile), r.session_id.clone(), self.weights());
+        self.store.call(move |tx| {
+            store::record_usage_in(
+                tx,
+                &store::UsageIn {
+                    task: &i,
+                    attempt: &aid,
+                    stage: &stage,
+                    profile: &p,
+                    billing: b,
+                    session: sess.as_deref(),
+                    cumulative: caps.cumulative_on_resume == Tri::Yes,
+                    killed_included: caps.killed_turn_in_resume == Tri::Yes,
+                    usage: u,
+                    weights: w,
+                    reservation,
+                },
+            )
+            .map(|_| ())
+        })
     }
 
     fn end(&self, a: &AttemptRow, status: AttemptStatus, r: &StageOutcome, end: AttemptEnd) -> Result<()> {
@@ -872,6 +986,58 @@ impl<'a> Engine<'a> {
         }
         Ok(())
     }
+}
+
+/// The non-blocking issues of a review, one line each (R53).
+pub fn non_blocking(review: &Value) -> Vec<String> {
+    review["issues"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|i| i["blocking"].as_bool() != Some(true))
+        .map(|i| {
+            format!(
+                "- {} [{}] {}{}",
+                i["id"].as_str().unwrap_or(""),
+                i["severity"].as_str().unwrap_or(""),
+                i["file"].as_str().map(|x| format!("{x}: ")).unwrap_or_default(),
+                i["description"].as_str().unwrap_or("")
+            )
+        })
+        .collect()
+}
+
+/// What the human should see at the final gate (R53, R49): the approved review's
+/// non-blocking issues, and a note when the implementer and the reviewer share a vendor.
+pub fn final_gate_notes(store: &Store, t: &TaskRow) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    if let Some((_, b)) = super::artifacts::read_head(store, t, "review")? {
+        let v: Value = serde_json::from_slice(&b)?;
+        let nb = non_blocking(&v);
+        if !nb.is_empty() {
+            out.push(format!("non-blocking issues (follow-ups, also in DECISIONS.md):\n{}", nb.join("\n")));
+        }
+    }
+    let cfg = frozen_config(t)?;
+    let i = t.id.clone();
+    let atts = store.call(move |tx| store::attempts(tx, &i))?;
+    let mut imps: Vec<String> = atts
+        .iter()
+        .filter(|a| a.status == AttemptStatus::Succeeded && a.kind == "agent" && (a.stage == "implement" || a.stage.starts_with("fix-")))
+        .filter_map(|a| a.profile.clone())
+        .collect();
+    imps.dedup();
+    let kind = |p: &str| cfg.profile(p).map(|x| x.kind).ok();
+    let same: Vec<&String> = imps.iter().filter(|p| kind(p).is_some() && kind(p) == kind(&t.reviewer)).collect();
+    if !same.is_empty() {
+        out.push(format!(
+            "same vendor: {} implemented and {} reviewed ({:?} both) — the review is less independent (R49); read the diff yourself",
+            same.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+            t.reviewer,
+            kind(&t.reviewer).map(|k| format!("{k:?}")).unwrap_or_default()
+        ));
+    }
+    Ok(out)
 }
 
 fn review_feedback(review: &Value) -> String {
@@ -922,13 +1088,20 @@ pub fn approve_now(store: &Store, t: &TaskRow, kind: GateKind, expect: Option<&s
             if sha256_hex(&bytes) != gate.subject {
                 bail!("subject_changed: plan.json no longer matches the plan under approval (R32)");
             }
-            Ev::PlanApproved { occurrence: gate.occurrence, subject: gate.subject }
+            Ev::PlanApproved { occurrence: gate.occurrence, subject: gate.subject.clone() }
         }
-        GateKind::Final => Ev::FinalApproved { occurrence: gate.occurrence, subject: gate.subject },
+        GateKind::Final => Ev::FinalApproved { occurrence: gate.occurrence, subject: gate.subject.clone() },
     };
     let i = t.id.clone();
     let m = store.call(move |tx| store::transition(tx, &i, e))?;
     eprintln!("   [state] {:?} --{}_approved--> {:?}", t.state, if kind == GateKind::Plan { "plan" } else { "final" }, m.state());
+    let digest = gate_digest(store, &t.id, kind, gate.occurrence).unwrap_or_default();
+    super::decisions::append(
+        store,
+        t,
+        &format!("{} gate approved", if kind == GateKind::Plan { "plan" } else { "final" }),
+        &format!("occurrence {} · subject {} · digest {} · by {}", gate.occurrence, &gate.subject[..12.min(gate.subject.len())], &digest[..12.min(digest.len())], store::whoami()),
+    )?;
     Ok(())
 }
 
@@ -948,6 +1121,12 @@ pub fn reject_now(store: &Store, t: &TaskRow, kind: GateKind, reason: &str) -> R
         store::transition(tx, &i, e)
     })?;
     eprintln!("   [state] {:?} --rejected--> {:?}", t.state, m.state());
+    super::decisions::append(
+        store,
+        t,
+        &format!("{} gate rejected", if kind == GateKind::Plan { "plan" } else { "final" }),
+        &format!("occurrence {} · subject {} · by {}\n\nReason: {reason}", gate.occurrence, &gate.subject[..12.min(gate.subject.len())], store::whoami()),
+    )?;
     Ok(())
 }
 
@@ -984,6 +1163,11 @@ pub fn next_action(t: &TaskRow) -> String {
                 format!("{why}\n  → `toryo resume {id} --note \"…\"` (another fix cycle), `toryo approve {id} --gate final --force`, or give up: `toryo task cleanup {id}`")
             }
         }
+        St::Paused if t.machine.reason() == Some("budget") => format!(
+            "paused (budget): {} of {} tokens used — `toryo budget set {id} --tokens N`, then `toryo resume {id}`",
+            t.spent_tokens + t.reserved_tokens,
+            t.budget_tokens.unwrap_or(0)
+        ),
         St::Paused => format!("paused — {}\n  → `toryo resume {id}`", t.machine.reason().unwrap_or("")),
         St::Completed => format!("done — merge `{}` yourself (toryo never merges); `toryo task cleanup {id}` afterwards", t.branch),
         St::Cancelled => format!("cancelled — `toryo task cleanup {id}`"),
@@ -998,7 +1182,7 @@ pub fn write_summary(store: &Store, t: &TaskRow) -> Result<PathBuf> {
     let i = t.id.clone();
     let atts = store.call(move |tx| store::attempts(tx, &i))?;
     let mut s = format!(
-        "# {} — {:?}\n\n{}\n\n- branch: `{}` (base `{}`) in `{}`\n- fix cycles: {} / {}\n- tokens: {} spent{}\n- next: {}\n\n## Stage attempts\n\n| attempt | status | profile | error | checkpoint |\n|---|---|---|---|---|\n",
+        "# {} — {:?}\n\n{}\n\n- branch: `{}` (base `{}`) in `{}`\n- fix cycles: {} / {}\n- tokens: {} spent{}{}\n- next: {}\n\n## Stage attempts\n\n| attempt | status | profile | error | checkpoint |\n|---|---|---|---|---|\n",
         t.id,
         t.state,
         t.title,
@@ -1009,6 +1193,7 @@ pub fn write_summary(store: &Store, t: &TaskRow) -> Result<PathBuf> {
         t.machine.max_fix_cycles(),
         t.spent_tokens,
         if t.reserved_tokens > 0 { format!(" + ~{} reserved (unknown usage, R41)", t.reserved_tokens) } else { String::new() },
+        t.budget_tokens.map(|b| format!(" of {b} (admission cap, may overshoot by one turn)")).unwrap_or_default(),
         next_action(t)
     );
     for a in atts {
@@ -1021,10 +1206,11 @@ pub fn write_summary(store: &Store, t: &TaskRow) -> Result<PathBuf> {
             a.git_head_after.or(a.partial_commit.map(|p| format!("{p} (partial)"))).map(|h| h.chars().take(20).collect::<String>()).unwrap_or_default()
         ));
     }
-    let review: Value = std::fs::read(t.artifacts().join("review.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
-    let open: Vec<String> = review["issues"].as_array().into_iter().flatten().map(|i| format!("- {} [{}] {}", i["id"].as_str().unwrap_or(""), i["severity"].as_str().unwrap_or(""), i["description"].as_str().unwrap_or(""))).collect();
-    if !open.is_empty() {
-        s.push_str(&format!("\n## Open review issues (R53)\n{}\n", open.join("\n")));
+    if t.state == St::WaitingFinalApproval {
+        let notes = final_gate_notes(store, t).unwrap_or_default();
+        if !notes.is_empty() {
+            s.push_str(&format!("\n## Final gate\n\n{}\n", notes.join("\n\n")));
+        }
     }
     let p = t.artifacts().join("SUMMARY.md");
     std::fs::write(&p, s)?;

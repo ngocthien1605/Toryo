@@ -150,6 +150,7 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         implementers,
         planner,
         reviewer,
+        budget_tokens: cfg.repo.pipeline.budget_tokens.map(|b| b as i64),
     };
     let res = store.call(move |tx| {
         store::insert_task(tx, &nt)?;

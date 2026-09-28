@@ -55,6 +55,9 @@ pub async fn run_to_completion(
 /// Called with the external session id as soon as it is known.
 pub type SessionHook = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Called with the turn's usage so far on every usage event (live adapters, R41).
+pub type UsageHook = Arc<dyn Fn(&crate::domain::TokenUsage) + Send + Sync>;
+
 /// Optional hooks for one turn.
 #[derive(Clone, Default)]
 pub struct TurnHooks {
@@ -63,6 +66,8 @@ pub struct TurnHooks {
     /// Called as soon as the external session id is known, so a crash mid-turn can still
     /// resume the session (R48).
     pub on_session: Option<SessionHook>,
+    /// R41: live usage (Claude), e.g. to interrupt a turn when the budget is crossed.
+    pub on_usage: Option<UsageHook>,
 }
 
 /// Like [`run_to_completion`], with [`TurnHooks`].
@@ -100,6 +105,9 @@ pub async fn run_to_completion_with(
                 last_event = tokio::time::Instant::now();
                 if let (AgentEvent::SessionIdentified(id), Some(f)) = (&e, &hooks.on_session) {
                     f(id);
+                }
+                if let (AgentEvent::Usage(u), Some(f)) = (&e, &hooks.on_usage) {
+                    f(u);
                 }
                 let terminal = e.is_terminal();
                 out.apply(&e);

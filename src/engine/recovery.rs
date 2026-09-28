@@ -47,6 +47,8 @@ impl<'a> Recovery<'a> {
         let (aid, tid) = (a.id.clone(), a.task_id.clone());
         // R41: an agent turn killed with its owner reported no usage: record it as `unknown`
         // with a reservation — never as zero
+        let reservation = self.cfg.repo.pipeline.unknown_turn_reservation_tokens.as_ref().and_then(|v| v.as_u64());
+        let (stage, sess) = (a.stage.clone(), a.external_session_id.clone());
         let killed = (a.status == AttemptStatus::Running && a.kind == "agent").then(|| {
             let p = a.profile.clone().unwrap_or_default();
             let billing = match self.cfg.profile(&p).map(|x| x.billing) {
@@ -59,7 +61,22 @@ impl<'a> Recovery<'a> {
         self.store.call(move |tx| {
             if let Some((p, b)) = killed {
                 if !store::has_usage(tx, &aid)? {
-                    store::record_usage(tx, &tid, &aid, &p, b, None)?;
+                    store::record_usage_in(
+                        tx,
+                        &store::UsageIn {
+                            task: &tid,
+                            attempt: &aid,
+                            stage: &stage,
+                            profile: &p,
+                            billing: b,
+                            session: sess.as_deref(),
+                            cumulative: false,
+                            killed_included: false,
+                            usage: None,
+                            weights: Default::default(),
+                            reservation,
+                        },
+                    )?;
                 }
             }
             store::finish_attempt(tx, &aid, status, &end)?;

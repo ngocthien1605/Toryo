@@ -15,7 +15,7 @@ mod engine_cli;
 #[cfg(feature = "m0-kit")]
 mod spike_cli;
 
-use engine_cli::{ContextCmd, DriveArgs, Gate, PartialCmd, ResumeArgs, TaskCmd};
+use engine_cli::{BudgetCmd, ContextCmd, DriveArgs, Gate, PartialCmd, ResumeArgs, TaskCmd};
 #[cfg(feature = "m0-kit")]
 use spike_cli::{run_canaries, spike, SpikeCmd};
 
@@ -118,6 +118,11 @@ enum Cmd {
     },
     /// Tasks, their state and the next human action.
     Status { id: Option<String> },
+    /// 🔒 The token admission cap of a task (R41).
+    Budget {
+        #[command(subcommand)]
+        cmd: BudgetCmd,
+    },
     /// What an agent receives: the assembled project context (plan §7).
     Context {
         #[command(subcommand)]
@@ -225,6 +230,7 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Status { id } => engine_cli::status(id.as_deref()),
         Cmd::Partial { cmd } => engine_cli::partial(cmd),
         Cmd::Context { cmd } => engine_cli::context(cmd),
+        Cmd::Budget { cmd } => engine_cli::budget(cmd),
     }
 }
 

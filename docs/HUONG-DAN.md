@@ -1,4 +1,4 @@
-# Hướng dẫn sử dụng Toryo (M0 kit · M1 adapter · M2 state machine · M3 engine + recovery)
+# Hướng dẫn sử dụng Toryo (M0 kit · M1 adapter · M2 state machine · M3 engine + recovery · M4–M7)
 
 > **Toryo (棟梁 — tōryō)** = "thợ cả": người chỉ huy đội thợ, không tự đục đẽo mà giao việc, kiểm tra từng mối nối
 > và nghiệm thu từng giai đoạn. Tên cũ của tool là `thien` (đổi ngày 2026-09-28, plan v0.7 R55).
@@ -164,6 +164,16 @@ commands:
     - { name: test,  program: pwsh, args: [-NoProfile, -NonInteractive, -File, scripts/test.ps1],  timeout_min: 20 }
 policy:
   protected_paths: ["docs/**", "*.lock"]  # thêm các file agent không được sửa (glob)
+  deny_paths: ["**/ZZZ/**"]               # M5: không bao giờ được plan / sửa / commit (không phân biệt hoa thường)
+verify:                                   # M6
+  boundary: low_integrity                 # mặc định; `none` = chạy verify không cách ly (luôn ghi rõ "not isolated")
+  verify_root: '%LOCALAPPDATA%\toryo-verify'   # phải là thư mục anh có WRITE_OWNER (R45) — để mặc định
+  checkout: clean                         # `tracked`: giữ cache build (ignored) giữa các lần verify
+pipeline:                                 # M7
+  budget_tokens: 2000000                  # trần token (admission cap) — bỏ trống = không giới hạn
+  budget_live_interrupt: true             # Claude: ngắt ngay giữa lượt khi chạm trần
+context:                                  # M4
+  budget_kb: { implementer: 60 }          # mặc định 40 KB mỗi role
 ```
 
 Thêm model riêng cho role: `planner: { profile: claude-max, model: opus }` (hoặc dùng `--claude-model` / `--codex-model` trên dòng lệnh).
@@ -181,12 +191,16 @@ Muốn dùng Codex qua **Foundry (API)**: thêm `[profiles.foundry]` trong `~/.c
 `%LOCALAPPDATA%\toryo\` (hoặc `$env:TORYO_DATA_DIR` nếu anh đặt):
 
 ```text
-runs\BR-001-20260927T130000Z\
-  runstore\TASK.md  PLAN.md  plan.json  DIFF.patch  DIFF-incremental.patch
-           VERIFY_RESULT.json  REVIEW.md  review.json  SUMMARY.md
-  plan-1.prompt.md / .stdout.jsonl / .stderr.txt / .outcome.json    ← mỗi lượt agent
-  implement.* , review-0-0.* , fix-1.* ...
-m0\results.jsonl                                                    ← lịch sử mọi lần chạy
+toryo.db                                   ← trạng thái mọi task (SQLite)
+runs\BR-004\
+  runstore\artifacts\<tên>\<version>-<sha12>.<ext>   ← BẰNG CHỨNG: file bất biến, hash ghi trong DB (M6)
+           TASK.md PLAN.md REVIEW.md VERIFY_RESULT.json DIFF.patch DECISIONS.md SUMMARY.md …
+                                             ← "view" để anh đọc, luôn = bản mới nhất; sửa view không ảnh hưởng gì
+           context\<stage>-<n>.md            ← đúng nội dung agent nhận ở lượt đó (M4)
+           protected\<n>.json                ← baseline file protected (M5)
+  captures\                                  ← prompt + stream JSON của từng lượt agent
+m0\results.jsonl                             ← evidence (canary) theo version CLI
+%LOCALAPPDATA%\toryo-verify\BR-004\BR-004.verify   ← bản checkout sạch để chạy verify (M6)
 ```
 
 Mỗi lượt agent được lưu đầy đủ prompt + stream JSON (đã redact secret) → dễ debug "vì sao AI làm vậy".
@@ -199,7 +213,8 @@ Mỗi lượt agent được lưu đầy đủ prompt + stream JSON (đã redact
 |---|---|
 | `toryo doctor` | kiểm tra exe, profile, config, và evidence có khớp version CLI hiện tại không (R51) |
 | `toryo doctor --canaries` | **sau mỗi lần nâng cấp Claude Code / Codex / Git**: chạy lại job-test, git-canary, lowil-canary, `claude-isolation` cho từng profile Claude, `codex-canary` cho từng profile Codex, rồi chạy `doctor` |
-| `toryo spike pipeline --repo <repo> --task <TASK.md>` | **chạy 1 task hoàn chỉnh** (lệnh chính) |
+| `toryo task create` + `toryo run` | **chạy 1 task hoàn chỉnh** (lệnh chính, mục 5.4–5.5) |
+| `toryo spike pipeline --repo <repo> --task <TASK.md>` | prototype tham chiếu (R52), không có tính năng M4–M7 |
 | `toryo spike init-fixture --app batch-rename --into <dir>` | tạo repo mẫu để tập |
 | `toryo spike smoke` | test nhanh cả 2 agent trên fixture calculator (không có gate) |
 | `toryo spike report --out <file.md>` | tổng hợp kết quả M0 |
@@ -244,7 +259,11 @@ Codex (codex-openai) ──hết quota──► Claude (claude-max) làm tiếp
 - **Claude làm Implementer** bị giới hạn chặt: chỉ `Read/Grep/Glob/Edit/Write`, **không có Bash/PowerShell**,
   `--restricted` + `--permission-mode acceptEdits` → chỉ sửa được file trong worktree; file settings/git/cấu hình tool
   bị từ chối. TASK.md và PLAN.md được đưa thẳng vào prompt (không mở quyền vào run store). Build/test vẫn do Toryo chạy.
-- **Minh bạch**: commit checkpoint có trailer `Toryo-Implementer: <profile>`; `SUMMARY.md` có mục *Implementer fallback*.
+- **Minh bạch**: commit checkpoint có trailer `Toryo-Agent: <profile>` (M3 ghi `Toryo-Implementer`); attempt ghi `fallback_from`.
+- **Hết sạch quota / `--no-fallback`** (M5): task chuyển **Paused** (không phải Escalated) — code dở vẫn giữ.
+  Khi quota có lại: `toryo resume ID` → chạy lại từ Implementer chính. Planner/Reviewer hết quota cũng → Paused.
+- **Trước khi dùng Claude làm Implementer** (trên repo thật): `toryo spike claude-implementer-isolation --profile claude-max`
+  phải PASS cho version Claude hiện tại (R51) — `doctor --canaries` tự chạy nó cho profile Claude nằm trong chuỗi fallback.
 - **Reviewer không đổi** (quyết định #15 của anh): reviewer luôn là `roles.reviewer` (mặc định = profile planner),
   fallback của Implementer không ảnh hưởng. Nếu Implementer và Reviewer cùng hãng, Toryo chỉ in một dòng *note*
   để biết; review vẫn chạy ở session mới. Claude Max dùng chung quota cho plan, review và code.
@@ -319,8 +338,58 @@ toryo task show BR-003                             # stage attempts, các lần 
 | Chạy lệnh trên task đang chạy ở cửa sổ khác | **từ chối**, exit code 3 `task_active` (lock-first, R38) | chờ, hoặc `toryo stop` |
 
 Ghi chú: `run`/`resume` vẫn kiểm tra R51 (canary theo version CLI). Recovery không gọi agent nên không cần.
-Chưa có trong engine (các milestone sau): ProjectContextLoader (M4), so sánh protected snapshot (M5),
-artifact bất biến + verify ở Low-IL (M6), budget (M7). Prototype `toryo spike pipeline` vẫn dùng được như cũ.
+Prototype `toryo spike pipeline` chỉ còn để tham chiếu (R52) — in cảnh báo, không có các tính năng M4–M7.
+
+### 5.5 M4–M7: ngữ cảnh, file được bảo vệ, verify cách ly, budget
+
+**M4 — ProjectContextLoader.** Giống **bộ hồ sơ bàn giao** trước mỗi ca: `--safe-mode` làm Claude không tự đọc
+CLAUDE.md, nên Toryo tự ghép một bộ ngữ cảnh cố định cho *mỗi lượt*: `%USERPROFILE%\.toryo\context\global.md`
+→ `AGENTS.md` + `CLAUDE.md` (chỉ Claude; Codex tự đọc AGENTS.md) → `.toryo\context\*.md` (quy định dự án,
+ví dụ `10-d365fo-models.md`: ZZZ chỉ local — **không bao giờ bị cắt**) → role template → task pack (đường dẫn
+file trong run store, file < 8 KB đưa thẳng vào). Lưu lại đúng bản đã gửi + hash.
+
+```powershell
+toryo context show BR-004 --stage implement            # xem trước: agent sắp nhận gì
+toryo context show BR-004 --stage review --attempt 1   # bản đã gửi ở lượt đó (kiểm hash)
+```
+
+**M5 — file protected (R35).** Giống **niêm phong tủ hồ sơ**: Toryo chụp "baseline" các file protected — kể cả
+file bị `.gitignore` (ví dụ `.claude\settings.local.json`, `toryo.local.yaml`) và `.git\config`, hooks — rồi so
+**trước mỗi stage và sau mỗi lượt agent / verify**. Có thay đổi → **Escalated `protected_config_changed`** kèm diff,
+không chạy thêm process nào.
+
+| Anh muốn | Lệnh |
+|---|---|
+| Khôi phục file rồi chạy tiếp | sửa lại file, `toryo resume ID` (Toryo so lại) |
+| Chấp nhận thay đổi (ghi vào DECISIONS.md, baseline mới) | `toryo resume ID --accept-protected-change .claude/settings.local.json` (lặp lại cho từng file) |
+| Cho phép task sửa một file protected đã track | thêm vào TASK.md: `## Allow protected` + `- AGENTS.md` |
+| Đổi toryo.yaml cho task đang dở | `toryo task config ID --reload` (chỉ khi đang chờ: gate / Escalated / Paused; in diff; ghi DECISIONS.md; đổi verify thì verify lại) |
+
+Config của task bị **đóng băng** lúc `task create`: sửa `toryo.yaml` giữa chừng không ảnh hưởng task đang chạy.
+
+**M6 — artifact bất biến + verify cách ly.** Giống **sổ cái kế toán**: không sửa dòng cũ, chỉ ghi dòng mới.
+Mỗi PLAN/REVIEW/DIFF/VERIFY_RESULT là một file mới `artifacts\…\<version>-<sha12>`; hash nằm trong DB; trước
+khi đưa cho agent hoặc duyệt gate Toryo kiểm hash lại (`artifact_tampered` / `artifact_missing` → Escalated).
+Verify chạy trong **bản checkout sạch của đúng commit checkpoint** dưới `verify_root`, với quyền **Low Integrity**:
+script test do AI viết **không ghi được** vào worktree, `.git`, run store, DB, config — chỉ ghi được thư mục
+checkout và `build/cache/tmp/home` bên cạnh. Script sửa file đã track hoặc sửa `.git` của checkout →
+`verify_mutated_tree`. Không lập được boundary → `verify_boundary_unavailable` (không tự hạ xuống chạy không cách ly).
+
+**M7 — budget + DECISIONS.md.** Budget là **hạn mức duyệt chi**: trước *mỗi lượt* agent, nếu đã dùng ≥ trần →
+**Paused(Budget)**, lượt đó không chạy. Codex chỉ báo token khi xong lượt nên có thể vượt tối đa một lượt; Claude
+bị ngắt ngay khi chạm trần. Lượt bị kill không có số liệu → ghi dạng *unknown* với **reservation** (`~200000`),
+không bao giờ ghi 0.
+
+```powershell
+toryo budget set BR-004 --tokens 3000000   # nâng trần, rồi:
+toryo resume BR-004
+toryo task show BR-004                      # từng dòng usage: exact / provisional / ~unknown
+```
+
+`runstore\DECISIONS.md` ghi mọi quyết định của anh (duyệt/từ chối gate kèm digest, note, chấp nhận thay đổi
+protected, reload config, budget) và các **issue không chặn** của review đã approve (R53) như việc cần làm sau.
+Ở final gate Toryo in lại các issue này, và nhắc nếu **cùng hãng** vừa code vừa review (ví dụ Claude làm thay
+Codex rồi Claude review).
 
 ---
 
@@ -457,11 +526,11 @@ Khi có lệnh build/test X++ chạy không tương tác trên dev VM, chỉ c�
 
 | Giới hạn | Hệ quả / cách xử lý |
 |---|---|
-| Verify chạy **với quyền user của anh** trong worktree (chưa có Low-IL boundary) | Chỉ dùng cho repo và task anh tin tưởng. Script test do AI viết sẽ được chạy thật! |
+| Low IL chặn **ghi**, không chặn **đọc** hay mạng | Verify đọc được file user đọc được; không để secret trong môi trường verify |
 | `spike pipeline` chưa có resume sau crash / Ctrl+C | Dùng engine (mục 5.4): `toryo task create` + `toryo run` + `toryo resume` |
-| Fallback mới áp dụng cho Implementer (planner/reviewer Claude hết quota thì dừng) | Chờ reset quota rồi chạy lại |
+| Fallback chỉ áp dụng cho Implementer (planner/reviewer hết quota → Paused) | Chờ reset quota rồi `toryo resume` |
 | Canary chỉ kiểm tra launch mode `restricted` (mặc định) | Nếu dùng `--mode` khác cho pipeline: `toryo doctor --canaries --claude-mode <mode>` |
-| Chưa có budget cap theo token | Xem token ở cuối mỗi lượt và trong `SUMMARY.md`; giữ `--max-fix-cycles` nhỏ |
+| Budget là admission cap (Codex có thể vượt 1 lượt) | Đặt trần thấp hơn mức chịu được một lượt lớn |
 | Một task mỗi lần chạy, chạy tuần tự | Chạy nhiều terminal với các `--id` khác nhau nếu cần |
 | Protected paths dùng glob đơn giản | Ghi rõ quy tắc trong `AGENTS.md` để agent tự tránh |
 
@@ -480,4 +549,10 @@ Khi có lệnh build/test X++ chạy không tương tác trên dev VM, chỉ c�
 | `doctor` báo `cannot give … a Low integrity label` (verify root) | Thư mục tạo trực tiếp dưới `C:\` chỉ cho user quyền Modify (thiếu `WRITE_OWNER`). Để `verify.verify_root` trong `%LOCALAPPDATA%` (mặc định), xem F7 trong `M0-FINDINGS.md` |
 | Test tạo thư mục tạm bị lỗi quyền khi Codex chạy | Toryo đã cấp TEMP riêng `<worktree>\.toryo-tmp` (git bỏ qua). Nếu vẫn lỗi, xem `implement.meta.json` có biến `TEMP` không |
 | `unverified profiles (R51)` khi chạy pipeline | Vừa nâng cấp Claude Code/Codex, hoặc chưa có record có version → `toryo doctor --canaries` (shell thường, không Admin) |
-| Muốn xem AI "nghĩ" gì | `runs\<ID>-…\*.stdout.jsonl` (stream đầy đủ) và `*.prompt.md` (prompt đã gửi) |
+| Muốn xem AI "nghĩ" gì | `runs\<ID>\captures\*.stdout.jsonl` (stream đầy đủ), `*.prompt.md`, và `toryo context show` |
+| `protected_config_changed` | Mở file diff được nêu trong lý do; khôi phục rồi `toryo resume ID`, hoặc `--accept-protected-change <path>` |
+| `verify_boundary_unavailable` | `verify_root` không gán được Low label (thiếu WRITE_OWNER) → để mặc định `%LOCALAPPDATA%\toryo-verify`; `toryo doctor` nêu nguyên nhân |
+| `verify_mutated_tree` | Script verify đã sửa file đã track / `.git` của bản checkout → sửa script (hoặc code agent viết), rồi `toryo resume ID --note "…"` |
+| `artifact_tampered` / `artifact_missing` | Có người sửa/xoá file trong `runstore\artifacts\` → khôi phục file, hoặc `toryo task cleanup ID` |
+| `Paused` — `admission cap reached` | `toryo budget set ID --tokens N` rồi `toryo resume ID` |
+| `unverified profiles (R51)` nhắc `claude-implementer-isolation` | `toryo spike claude-implementer-isolation --profile claude-max` (hoặc `doctor --canaries`) |

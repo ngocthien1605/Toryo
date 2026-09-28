@@ -94,6 +94,20 @@ pub enum TaskCmd {
 }
 
 #[derive(Subcommand)]
+pub enum BudgetCmd {
+    /// Set (raise) the admission cap; a task paused on its budget continues with `toryo resume`.
+    Set {
+        id: String,
+        /// Tokens (weighted sum of the four buckets, R41)
+        #[arg(long, conflicts_with = "none")]
+        tokens: Option<u64>,
+        /// Remove the cap
+        #[arg(long)]
+        none: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum ContextCmd {
     /// Print exactly what the agent of a stage receives: the source list on stderr, the
     /// context itself on stdout. Without --attempt: the next attempt (assembled now, nothing
@@ -188,6 +202,11 @@ fn drive(store: &Store, lock: &TaskLock, d: &DriveArgs) -> Result<i32> {
     let t = get(store, &lock.task)?;
     let summary = write_summary(store, &t)?;
     eprintln!("\n══════════ {}: {:?} ══════════", t.id, t.state);
+    if t.state == PipelineState::WaitingFinalApproval {
+        for n in toryo::engine::runner::final_gate_notes(store, &t)? {
+            eprintln!("final gate — {n}");
+        }
+    }
     eprintln!("next: {}", next_action(&t));
     eprintln!("summary: {}", summary.display());
     Ok(match end {
@@ -357,6 +376,7 @@ pub fn approve(id: &str, gate: Gate, expect: Option<&str>, force: bool, cont: bo
         }
         let i = id.to_string();
         st.call(move |tx| store::transition(tx, &i, PipelineEvent::ForceFinal).map(|_| ()))?;
+        toryo::engine::decisions::append(&st, &t, "final gate forced (reviewer skipped)", &format!("From Escalated: {}", t.machine.reason().unwrap_or("")))?;
         let t = get(&st, id)?;
         eprintln!("{id}: reviewer skipped — the final gate is open for checkpoint {}", t.machine.checkpoint().unwrap_or(""));
         eprintln!("next: {}", next_action(&t));
@@ -466,6 +486,7 @@ fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Res
         let rec = Recovery { store: st, g: &g, protect: &protect, cfg: &cfg };
         let msg = if r.discard_partial { rec.discard_partial(&t.id)? } else { rec.keep_partial(&t.id)? };
         eprintln!("↺ {msg}");
+        toryo::engine::decisions::append(st, &t, if r.discard_partial { "partial work discarded (R31)" } else { "partial work kept (R31)" }, &msg)?;
     } else if let Some(note) = &r.note {
         if t.state != PipelineState::Escalated {
             bail!("--note leaves Escalated; {} is {:?}", t.id, t.state);
@@ -476,6 +497,7 @@ fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Res
             store::transition(tx, &i, PipelineEvent::ResumeWithNote { note: n })?;
             Ok(())
         })?;
+        toryo::engine::decisions::append(st, &t, "resumed from Escalated with a note (R5)", &format!("Escalation: {}\n\nNote: {note}", t.machine.reason().unwrap_or("")))?;
     } else if t.state == PipelineState::Paused {
         // R49: after an implementer quota pause the chain starts again from the primary
         let quota = t.machine.reason().is_some_and(|x| x.starts_with("implementer_quota"));
@@ -555,13 +577,14 @@ pub fn status(id: Option<&str>) -> Result<i32> {
     for t in tasks {
         let active = if lock::probe_free(&t.id)? { String::new() } else { format!(" · ACTIVE ({})", t.run_lock_owner.clone().unwrap_or_default()) };
         println!(
-            "{:<14} {:<22} fix {}/{} · tokens {}{}{}",
+            "{:<14} {:<22} fix {}/{} · tokens {}{}{}{}",
             t.id,
             format!("{:?}", t.state),
             t.fix_cycle,
             t.machine.max_fix_cycles(),
             t.spent_tokens,
             if t.reserved_tokens > 0 { format!(" (+~{} reserved)", t.reserved_tokens) } else { String::new() },
+            t.budget_tokens.map(|b| format!(" / {b} admission cap (may overshoot by one turn)")).unwrap_or_default(),
             active
         );
         println!("               next: {}", next_action(&t));
@@ -572,6 +595,8 @@ pub fn status(id: Option<&str>) -> Result<i32> {
 fn show(id: &str) -> Result<i32> {
     status(Some(id))?;
     let st = store()?;
+    let t = get(&st, id)?;
+    println!("               worktree: {} · branch {} · run store {}", t.worktree.display(), t.branch, t.run_store.display());
     let i = id.to_string();
     let atts = st.call(move |tx| store::attempts(tx, &i))?;
     println!("\nstage attempts:");
@@ -587,6 +612,23 @@ fn show(id: &str) -> Result<i32> {
         );
     }
     let i = id.to_string();
+    let rows = st.call(move |tx| store::usage_rows(tx, &i))?;
+    if !rows.is_empty() {
+        println!("\nusage (R41; ~ = reservation for a turn with no telemetry):");
+        for (uid, att, prof, acc, budget, res, rec, inc) in rows {
+            let amount = match (acc.as_str(), budget, res) {
+                ("unknown", _, Some(r)) => format!("~{r}"),
+                (_, Some(b), _) => b.to_string(),
+                _ => "?".into(),
+            };
+            println!(
+                "  #{uid:<4} {att:<22} {prof:<14} {acc:<11} {amount:>9}{}{}",
+                if inc { "  includes an earlier killed turn" } else { "" },
+                rec.map(|r| format!("  reconciled by #{r}")).unwrap_or_default()
+            );
+        }
+    }
+    let i = id.to_string();
     let ap = st.call(move |tx| store::approvals(tx, &i))?;
     if !ap.is_empty() {
         println!("\ngates:");
@@ -594,6 +636,46 @@ fn show(id: &str) -> Result<i32> {
             println!("  {} #{} {:<10} digest {} {}", a.gate, a.occurrence, a.status, &a.subject_digest[..12], a.reason.unwrap_or_default());
         }
     }
+    Ok(0)
+}
+
+pub fn budget(cmd: &BudgetCmd) -> Result<i32> {
+    let BudgetCmd::Set { id, tokens, none } = cmd;
+    if tokens.is_none() && !none {
+        bail!("give --tokens N or --none");
+    }
+    let st = store()?;
+    let lock = TaskLock::acquire(&st, id)?;
+    let t = get(&st, id)?;
+    if t.state.is_terminal() {
+        bail!("{id} is {:?}", t.state);
+    }
+    let new = tokens.map(|n| n as i64);
+    let (i, n) = (id.clone(), new);
+    st.call(move |tx| {
+        store::set_budget(tx, &i, n)?;
+        store::event(tx, Some(&i), None, "budget_set", &serde_json::json!({"tokens": n}))
+    })?;
+    let used = t.spent_tokens + t.reserved_tokens;
+    toryo::engine::decisions::append(
+        &st,
+        &t,
+        "budget set (R41)",
+        &format!(
+            "Admission cap {} → {} ({} tokens used: {} spent + ~{} reserved).",
+            t.budget_tokens.map(|b| b.to_string()).unwrap_or_else(|| "none".into()),
+            new.map(|b| b.to_string()).unwrap_or_else(|| "none".into()),
+            used,
+            t.spent_tokens,
+            t.reserved_tokens
+        ),
+    )?;
+    eprintln!(
+        "{id}: admission cap {} (used {used}; may overshoot by one turn){}",
+        new.map(|b| b.to_string()).unwrap_or_else(|| "none".into()),
+        if t.state == PipelineState::Paused { format!(" — `toryo resume {id}` to continue") } else { String::new() }
+    );
+    lock.release();
     Ok(0)
 }
 
