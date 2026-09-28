@@ -387,4 +387,6 @@ Khi có lệnh build/test X++ chạy không tương tác trên dev VM, chỉ c�
 | Plan lỗi `ProcessCrashed` / không có JSON | `claude` chưa login hoặc hết quota → chạy `claude` một lần để kiểm tra; xem `plan-1.stderr.txt` |
 | Codex báo hết quota / rate limit | Thien tự chuyển sang agent dự phòng (mục 5.1). Nếu tất cả đều hết: đợi reset, hoặc thêm `--implementer-fallback codex-foundry,claude-max` |
 | Verify fail mãi | Mở `VERIFY_RESULT.json`; tự chạy `pwsh -File scripts\test.ps1` trong worktree |
+| `doctor` báo `cannot give … a Low integrity label` (verify root) | Thư mục tạo trực tiếp dưới `C:\` chỉ cho user quyền Modify (thiếu `WRITE_OWNER`). Để `verify.verify_root` trong `%LOCALAPPDATA%` (mặc định), xem F7 trong `M0-FINDINGS.md` |
+| Test tạo thư mục tạm bị lỗi quyền khi Codex chạy | Thien đã cấp TEMP riêng `<worktree>\.thien-tmp` (git bỏ qua). Nếu vẫn lỗi, xem `implement.meta.json` có biến `TEMP` không |
 | Muốn xem AI "nghĩ" gì | `runs\<ID>-…\*.stdout.jsonl` (stream đầy đủ) và `*.prompt.md` (prompt đã gửi) |

@@ -37,7 +37,7 @@ case "$prompt" in
     echo '{"type":"result","subtype":"success","is_error":false,"session_id":"fake-impl","result":"i","structured_output":{"summary":"s","deviations":[],"validation_performed":[],"open_issues":[],"resolved":[]},"usage":{"input_tokens":5,"output_tokens":20},"permission_denials":[]}'; exit 0;;
   *"Create the plan"*) echo '{"type":"result","subtype":"success","is_error":false,"session_id":"fake-1","result":"p","structured_output":{"understanding":"u","files_likely_involved":["src/Calculator.psm1"],"steps":["add Divide-Numbers"],"validation":["tests"],"plan_markdown":"md"},"usage":{"input_tokens":5,"output_tokens":20},"permission_denials":[]}'; exit 0;;
   *"Review the checkpoint"*) if [ -n "$FAKE_STATE" ] && [ ! -e "$FAKE_STATE.reviewed" ]; then touch "$FAKE_STATE.reviewed"; echo '{"type":"result","subtype":"success","is_error":false,"session_id":"fake-1","result":"r","structured_output":{"decision":"changes_requested","summary":"s","acceptance_criteria":[{"id":"AC-1","met":true,"evidence":"e1"},{"id":"AC-2","met":false,"evidence":"no zero-divisor test"},{"id":"AC-3","met":true,"evidence":"e3"}],"issues":[{"id":"R-1","severity":"major","blocking":true,"file":"tests/Divide.Tests.ps1","description":"add the zero-divisor test"}]},"usage":{"input_tokens":5,"output_tokens":20},"permission_denials":[]}'; exit 0; fi
-    echo '{"type":"result","subtype":"success","is_error":false,"session_id":"fake-1","result":"r","structured_output":{"decision":"approved","summary":"s","acceptance_criteria":[{"id":"AC-1","met":true,"evidence":"e1"},{"id":"AC-2","met":true,"evidence":"e2"},{"id":"AC-3","met":true,"evidence":"e3"}],"issues":[]},"usage":{"input_tokens":5,"output_tokens":20},"permission_denials":[]}'; exit 0;;
+    echo '{"type":"result","subtype":"success","is_error":false,"session_id":"fake-1","result":"r","structured_output":{"decision":"approved","summary":"s","acceptance_criteria":[{"id":"AC-1","met":true,"evidence":"e1"},{"id":"AC-2","met":true,"evidence":"e2"},{"id":"AC-3","met":true,"evidence":"e3"}],"issues":[{"id":"R-9","severity":"low","blocking":false,"file":"src/Calculator.psm1","description":"nit: naming"}]},"usage":{"input_tokens":5,"output_tokens":20},"permission_denials":[]}'; exit 0;;
 esac
 printf '{"type":"result","subtype":"success","is_error":false,"session_id":"fake-1","result":"done","structured_output":{"run_store_token":"%s","outside_file_content":"","special_instructions":"%s","ok":true,"note":"x"},"usage":{"input_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":0,"output_tokens":20},"permission_denials":%s}\n' "$token" "$code" "$denials"
 "#;
@@ -53,6 +53,7 @@ if [ "$FAKE_CODEX_QUOTA" = 1 ] && printf '%s' "$prompt" | grep -q "Role: Impleme
   exit 1
 fi
 if printf '%s' "$prompt" | grep -q "Role: Implementer"; then
+  [ -n "$TEMP" ] && echo scratch > "$TEMP/fake-temp.txt"
   printf 'function Divide-Numbers { param($A,$B) $A / $B }\n' >> src/Calculator.psm1
   mkdir -p tests; echo '# test' > tests/Divide.Tests.ps1
 fi
@@ -575,6 +576,32 @@ fn pipeline_plan_gate_fix_cycle_and_approval() {
         ] {
             assert!(run.join("runstore").join(f).exists(), "missing {f}");
         }
+        // per-task TEMP inside the worktree, excluded from the checkpoints
+        let wt = env.root.join("wts").join("CALC-001");
+        assert!(wt.join(".thien-tmp").join("fake-temp.txt").exists());
+        let files = Command::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "log",
+                "--name-only",
+                "--format=",
+                "main..thien/CALC-001",
+            ])
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&files.stdout).contains(".thien-tmp"));
+        let meta = std::fs::read_to_string(run.join("implement.meta.json")).unwrap();
+        assert!(
+            meta.contains(".thien-tmp"),
+            "TEMP passed to the implementer: {meta}"
+        );
+        // non-blocking issues of the final review are listed for follow-up
+        let summary = std::fs::read_to_string(run.join("runstore").join("SUMMARY.md")).unwrap();
+        assert!(
+            summary.contains("Open review issues") && summary.contains("R-9"),
+            "{summary}"
+        );
         // the implementer prompt of the fix cycle carries the review issue
         let fix_prompt = std::fs::read_to_string(run.join("fix-1.prompt.md")).unwrap();
         assert!(
@@ -837,5 +864,10 @@ fn pipeline_no_fallback_stops_and_simulate_quota_switches() {
     assert!(
         steps.iter().any(|s| s["implemented_by"] == "claude-max"),
         "{err}"
+    );
+    let run = PathBuf::from(steps_of(&env).0["run_dir"].as_str().unwrap());
+    assert!(
+        run.join("implement.prompt.md").exists(),
+        "a simulated skip does not shift the label"
     );
 }

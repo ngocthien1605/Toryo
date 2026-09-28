@@ -162,7 +162,10 @@ pub(crate) fn run_verify(script: &Path, cwd: &Path) -> Result<(Option<i32>, Stri
             out.extend(b)
         },
     )?;
-    Ok((info.code, String::from_utf8_lossy(&out).into_owned()))
+    Ok((
+        info.code,
+        crate::process::strip_ansi(&String::from_utf8_lossy(&out)),
+    ))
 }
 
 pub(crate) fn which(name: &str) -> Option<PathBuf> {

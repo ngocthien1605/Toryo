@@ -615,6 +615,14 @@ pub fn set_low_label(dir: &Path) -> Result<()> {
             sacl,
         );
         LocalFree(sd as _);
+        if rc == 5 {
+            bail!(
+                "cannot give {} a Low integrity label: access denied (the account lacks WRITE_OWNER there). \
+                 Folders created directly under C:\\ give a standard / UAC-filtered user only Modify. \
+                 Put verify.verify_root under %LOCALAPPDATA% (the default), or grant yourself Full Control on that folder",
+                dir.display()
+            );
+        }
         if rc != 0 {
             bail!(
                 "SetNamedSecurityInfoW(Low label) on {} failed: Win32 error {rc}",

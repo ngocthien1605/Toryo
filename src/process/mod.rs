@@ -299,6 +299,17 @@ pub fn label_low(dirs: &[PathBuf]) -> Result<()> {
 }
 
 /// Quote one argument for a Windows command line (CommandLineToArgvW rules).
+/// Remove ANSI escape sequences (CSI / OSC) from captured tool output. pwsh colours
+/// warnings even with NO_COLOR set (M0 run); stored artifacts must be plain text.
+pub fn strip_ansi(s: &str) -> String {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
+            .expect("regex")
+    });
+    re.replace_all(s, "").into_owned()
+}
+
 pub fn quote_windows_arg(arg: &str) -> String {
     if !arg.is_empty()
         && !arg
@@ -332,6 +343,16 @@ pub fn quote_windows_arg(arg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_ansi_removes_colour_codes() {
+        assert_eq!(
+            strip_ansi("\u{1b}[33;1mWARNING: x\u{1b}[0m\r\nok"),
+            "WARNING: x\r\nok"
+        );
+        assert_eq!(strip_ansi("\u{1b}]0;title\u{7}plain"), "plain");
+        assert_eq!(strip_ansi("no codes"), "no codes");
+    }
 
     #[test]
     fn windows_quoting() {

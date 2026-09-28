@@ -99,13 +99,50 @@ fn run_low(
     )?;
     Ok((
         info.code,
-        String::from_utf8_lossy(&out).into_owned(),
-        String::from_utf8_lossy(&err).into_owned(),
+        crate::process::strip_ansi(&String::from_utf8_lossy(&out)),
+        crate::process::strip_ansi(&String::from_utf8_lossy(&err)),
     ))
 }
 
-pub fn lowil_canary() -> Result<bool> {
+/// The default `verify.verify_root` (R36): under the user profile, where a standard
+/// (UAC-filtered) user has Full Control and therefore WRITE_OWNER, which setting a Low
+/// label needs. M0 finding F7: folders created directly under `C:\` only give such a user
+/// Modify, so labelling there fails with ERROR_ACCESS_DENIED.
+pub fn default_verify_root() -> PathBuf {
+    PathBuf::from(
+        crate::config::expand_vars("%LOCALAPPDATA%\\thien-verify")
+            .unwrap_or_else(|_| data_dir().join("verify").display().to_string()),
+    )
+}
+
+/// `verify_root`: the Low-labelled verify checkout and its build/cache/tmp/home go here
+/// (plan §8 / R36), not in the data dir.
+pub fn lowil_canary(verify_root: Option<PathBuf>) -> Result<bool> {
     let root = new_run_dir("lowil-canary", "fixture")?;
+    let verify_root = verify_root.unwrap_or_else(default_verify_root);
+    match lowil_inner(&root, &verify_root) {
+        Ok(pass) => Ok(pass),
+        Err(e) => {
+            // Record the failure too: an M0 spike that errors must still leave evidence.
+            let msg = format!("{e:#}");
+            let mut rec = Record::new(
+                "lowil-canary",
+                None,
+                &["M0-VERIFY 9", "R36", "verify_boundary_writes (spike)"],
+            );
+            rec.pass = Some(false);
+            rec.summary = format!("error: {msg}");
+            rec.details = json!({"error": msg, "verify_root": verify_root});
+            rec.run_dir = Some(root.display().to_string());
+            append(&rec)?;
+            eprintln!("[FAIL] lowil-canary: {msg}");
+            Ok(false)
+        }
+    }
+}
+
+fn lowil_inner(root: &Path, verify_root: &Path) -> Result<bool> {
+    let root = root.to_path_buf();
     if !cfg!(windows) {
         let mut rec = Record::new("lowil-canary", None, &["M0-VERIFY 9", "R36"]);
         rec.pass = None;
@@ -119,7 +156,13 @@ pub fn lowil_canary() -> Result<bool> {
     fixture::init_repo(&repo)?;
     let g = fixture::gitcmd()?;
     let wt = root.join("wt");
-    let vwt = root.join("wt.verify");
+    let vbase = verify_root.join(format!(
+        "lowil-{}",
+        root.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default()
+    ));
+    let vwt = vbase.join("wt.verify");
     g.run(
         &Loc::Discover(repo.clone()),
         false,
@@ -141,7 +184,7 @@ pub fn lowil_canary() -> Result<bool> {
     let run_store = root.join("runstore");
     std::fs::create_dir_all(&run_store)?;
     // Low locations (R36): the verify checkout and its build/cache/tmp/home.
-    let vroot = root.join("verify-root");
+    let vroot = vbase.join("verify-root");
     let (build, cache, tmp, home) = (
         vroot.join("build"),
         vroot.join("cache"),
@@ -303,7 +346,7 @@ pub fn lowil_canary() -> Result<bool> {
     );
     rec.pass = Some(pass);
     rec.summary = format!("low boundary writes as expected={low_ok}; negative control={control_ok}; build+tests at Low={build_ok}");
-    rec.details = json!({"phases": phases, "build": build_result});
+    rec.details = json!({"phases": phases, "build": build_result, "verify_root": verify_root});
     rec.run_dir = Some(root.display().to_string());
     append(&rec)?;
     Ok(pass)

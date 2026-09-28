@@ -607,7 +607,14 @@ fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
             )?)
         }
         SpikeCmd::JobTest => ok(job::job_test()?),
-        SpikeCmd::LowilCanary => ok(lowil::lowil_canary()?),
+        SpikeCmd::LowilCanary => {
+            // verify.verify_root from the config when there is one, else the default
+            let vr = load_config(cli)
+                .ok()
+                .and_then(|c| thien::config::expand_vars(&c.repo.verify.verify_root).ok())
+                .map(PathBuf::from);
+            ok(lowil::lowil_canary(vr)?)
+        }
         SpikeCmd::GitCanary { work } => {
             let dir = match work {
                 Some(w) => w.clone(),

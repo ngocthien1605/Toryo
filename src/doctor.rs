@@ -166,6 +166,7 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
             "no machine config (%USERPROFILE%\\.thien\\thien.local.yaml): no trusted Git filters",
         ),
     }
+    verify_root_check(&mut r, cfg);
 
     // Profiles
     let records = results::load();
@@ -359,6 +360,42 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
         "hook/filter/textconv canary (R33/R37, M0-VERIFY 10); run `thien spike git-canary`",
     );
     finish(r, json)
+}
+
+/// R36 precondition (M0 finding F7): the Low-IL verify boundary needs a `verify_root`
+/// where this account may set a Low label (WRITE_OWNER). Probe it with a scratch dir.
+fn verify_root_check(r: &mut Report, cfg: &Effective) {
+    let area = "verify root";
+    let root = match expand_vars(&cfg.repo.verify.verify_root) {
+        Ok(v) => PathBuf::from(v),
+        Err(e) => return r.add(Level::Fail, area, format!("{e:#}")),
+    };
+    if !cfg!(windows) {
+        return r.add(
+            Level::Info,
+            area,
+            format!("{} (Low label check is Windows-only)", root.display()),
+        );
+    }
+    let probe = root.join(format!(".label-probe-{}", std::process::id()));
+    let res = crate::process::label_low(std::slice::from_ref(&probe));
+    let _ = std::fs::remove_dir_all(&probe);
+    match res {
+        Ok(()) => r.add(
+            Level::Ok,
+            area,
+            format!("{}: Low integrity label can be set (R36)", root.display()),
+        ),
+        Err(e) => r.add(
+            if cfg.repo.verify.boundary == "none" {
+                Level::Warn
+            } else {
+                Level::Fail
+            },
+            area,
+            format!("{e:#}"),
+        ),
+    }
 }
 
 fn evidence(r: &mut Report, records: &[Value], spike: &str, profile: &str, area: &str, hint: &str) {

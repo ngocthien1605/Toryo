@@ -25,6 +25,9 @@ pub struct TurnOpts {
     pub kill_after: Option<Duration>,
     /// Print text deltas / items to the console while running.
     pub echo: bool,
+    /// Extra environment for this turn (e.g. a per-task TEMP inside the worktree),
+    /// applied after the profile env; keys replace case-insensitively.
+    pub env: BTreeMap<String, String>,
 }
 
 impl Default for TurnOpts {
@@ -34,6 +37,7 @@ impl Default for TurnOpts {
             stall: Duration::from_secs(10 * 60),
             kill_after: None,
             echo: true,
+            env: BTreeMap::new(),
         }
     }
 }
@@ -86,7 +90,11 @@ pub fn run_turn(
     label: &str,
     opts: TurnOpts,
 ) -> Result<TurnRun> {
-    let (env, red, secret_keys) = profile_env(profile_name, profile)?;
+    let (mut env, red, secret_keys) = profile_env(profile_name, profile)?;
+    for (k, v) in &opts.env {
+        env.retain(|e, _| !e.eq_ignore_ascii_case(k));
+        env.insert(k.clone(), v.clone());
+    }
     let program = PathBuf::from(crate::config::expand_vars(&profile.exe)?);
     std::fs::create_dir_all(run_dir)?;
     let argv_view: Vec<String> = std::iter::once(program.display().to_string())

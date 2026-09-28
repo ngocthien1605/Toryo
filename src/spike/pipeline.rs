@@ -12,7 +12,7 @@
 //! immutable run-store versions, the Low-IL verify boundary, budget pause. Every turn's
 //! stream, prompt and outcome is still captured under the run directory.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -259,7 +259,7 @@ fn run_command(spec: &CommandSpec, cwd: &Path) -> Result<(Option<i32>, String, u
     )?;
     Ok((
         if info.timed_out { None } else { info.code },
-        String::from_utf8_lossy(&out).into_owned(),
+        crate::process::strip_ansi(&String::from_utf8_lossy(&out)),
         info.duration_ms,
     ))
 }
@@ -405,6 +405,31 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
         &["worktree", "add", "-q", "-b", &branch, &fwd(&wt), &base],
     )?;
     let wtl = Loc::Discover(wt.clone());
+    // Per-task TEMP inside the worktree, invisible to Git (info/exclude of the common dir).
+    let task_tmp = wt.join(".thien-tmp");
+    {
+        let common = g.run_str(
+            &wtl,
+            true,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let excl = PathBuf::from(common.trim()).join("info").join("exclude");
+        let cur = std::fs::read_to_string(&excl).unwrap_or_default();
+        if !cur.lines().any(|l| l.trim() == "/.thien-tmp/") {
+            std::fs::create_dir_all(excl.parent().expect("parent"))?;
+            std::fs::write(
+                &excl,
+                format!(
+                    "{cur}{}/.thien-tmp/\n",
+                    if cur.is_empty() || cur.ends_with('\n') {
+                        ""
+                    } else {
+                        "\n"
+                    }
+                ),
+            )?;
+        }
+    }
     eprintln!(
         "\n■ {id}: repo {} · base {base_ref} ({}) · worktree {} · branch {branch}",
         repo.display(),
@@ -565,7 +590,14 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
                 prompt.push_str(&format!("\n## Fix cycle {cycle}\nThe previous checkpoint was not accepted. Address the following, then report the issue ids you fixed in `resolved`:\n\n{f}\n"));
             }
             let head_before = g.run_str(&wtl, true, &["rev-parse", "HEAD"])?;
+            // fresh per-task temp dir for every implementer turn
+            let _ = std::fs::remove_dir_all(&task_tmp);
+            std::fs::create_dir_all(&task_tmp)?;
             let ctx = ImplCtx {
+                task_env: [("TEMP", &task_tmp), ("TMP", &task_tmp)]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.display().to_string()))
+                    .collect(),
                 g: &g,
                 wtl: &wtl,
                 wt: &wt,
@@ -809,9 +841,29 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
                 eprintln!("!! review_inconsistent: `approved` with unmet {unmet:?} / blocking issues → changes_requested");
                 decision = "changes_requested".into();
             }
-            log.push(
-                json!({"step": format!("review-{cycle}"), "decision": decision, "unmet": unmet}),
-            );
+            let issues: Vec<String> = review["issues"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|i| {
+                    format!(
+                        "{} [{}{}] {}{}",
+                        i["id"].as_str().unwrap_or(""),
+                        i["severity"].as_str().unwrap_or(""),
+                        if i["blocking"].as_bool() == Some(true) {
+                            ", blocking"
+                        } else {
+                            ""
+                        },
+                        i["file"]
+                            .as_str()
+                            .map(|x| format!("`{x}`: "))
+                            .unwrap_or_default(),
+                        i["description"].as_str().unwrap_or("")
+                    )
+                })
+                .collect();
+            log.push(json!({"step": format!("review-{cycle}"), "decision": decision, "unmet": unmet, "issues": issues}));
             match decision.as_str() {
                 "approved" => {
                     return Ok((
@@ -892,6 +944,9 @@ struct Implementers {
 }
 
 struct ImplCtx<'a> {
+    /// Per-task TEMP/TMP inside the worktree (M0 finding: the Codex sandbox cannot write
+    /// %TEMP%, so tests that create temp folders failed until the agent redirected TEMP).
+    task_env: BTreeMap<String, String>,
     g: &'a GitCmd,
     wtl: &'a Loc,
     wt: &'a Path,
@@ -939,11 +994,11 @@ fn implement_turn(
             return Ok(None);
         };
         let kind = cfg.profile(&profile)?.kind;
-        attempt += 1;
-        let label = if attempt == 1 {
+        // label by turns actually run (a simulated skip does not use a number)
+        let label = if attempt == 0 {
             stage.to_string()
         } else {
-            format!("{stage}-{attempt}")
+            format!("{stage}-{}", attempt + 1)
         };
         let who = match kind {
             ProfileKind::Codex => "Codex",
@@ -972,6 +1027,7 @@ fn implement_turn(
                         label: label.clone(),
                         opts: TurnOpts {
                             max: Duration::from_secs(30 * 60),
+                            env: c.task_env.clone(),
                             ..Default::default()
                         },
                     },
@@ -988,11 +1044,13 @@ fn implement_turn(
                     &label,
                     TurnOpts {
                         max: Duration::from_secs(30 * 60),
+                        env: c.task_env.clone(),
                         ..Default::default()
                     },
                     c.run,
                 )?,
             };
+            attempt += 1;
             totals.add(&r, "implementer");
             match r.outcome.error_class {
                 Some(ErrorClass::QuotaExceeded) => Some(format!(
@@ -1092,6 +1150,26 @@ fn finish(f: &Fin, ok: bool, why: &str, totals: &Totals, log: Vec<Value>) -> Res
             )
         })
         .collect();
+    // Issues the last review left open (non-blocking when approved) — follow-up candidates.
+    if let Some(last) = log.iter().rev().find(|v| v.get("issues").is_some()) {
+        let issues: Vec<&str> = last["issues"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if !issues.is_empty() {
+            summary.push_str(&format!(
+                "\n## Open review issues ({})\n{}\n",
+                last["step"].as_str().unwrap_or(""),
+                issues
+                    .iter()
+                    .map(|i| format!("- {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+    }
     if !switches.is_empty() {
         summary.push_str(&format!(
             "\n## Implementer fallback\n{}\n",
