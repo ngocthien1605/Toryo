@@ -2,13 +2,14 @@
 //! (shell scripts speaking the documented stream formats). This proves the harness —
 //! argv, env, Job, redaction, capture, parsing, checks, evidence records — before the
 //! first real run on Windows. Unix-only (the fakes are sh scripts).
-#![cfg(unix)]
+#![cfg(all(unix, feature = "m0-kit"))]
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
+[ "$1" = "--version" ] && { echo "${FAKE_VERSION:-2.1.300} (Claude Code)"; exit 0; }
 prompt=$(cat)
 ctx=""; prev=""; resume=0
 for a in "$@"; do
@@ -43,6 +44,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"fake
 "#;
 
 const FAKE_CODEX: &str = r#"#!/bin/sh
+[ "$1" = "--version" ] && { echo "codex-cli ${FAKE_VERSION:-0.200.0}"; exit 0; }
 prompt=$(cat)
 echo '{"type":"thread.started","thread_id":"th-fake"}'
 echo '{"type":"turn.started"}'
@@ -453,7 +455,17 @@ fn smoke_orchestrates_both_fakes_end_to_end() {
     // verify needs pwsh; on hosts without it that step fails, which is expected here
 }
 
+/// Pipeline runs here accept unverified profiles: the fakes have no canary records unless a
+/// test runs them. The R51 gate itself is covered by `version_bound_evidence`.
 fn toryo_stdin(env: &Env, args: &[&str], input: &str) -> (i32, String) {
+    let mut a = args.to_vec();
+    if a.starts_with(&["spike", "pipeline"]) {
+        a.push("--accept-unverified");
+    }
+    toryo_stdin_strict(env, &a, input)
+}
+
+fn toryo_stdin_strict(env: &Env, args: &[&str], input: &str) -> (i32, String) {
     use std::io::Write;
     let mut c = Command::new(env!("CARGO_BIN_EXE_toryo"))
         .arg("--config")
@@ -870,4 +882,64 @@ fn pipeline_no_fallback_stops_and_simulate_quota_switches() {
         run.join("implement.prompt.md").exists(),
         "a simulated skip does not shift the label"
     );
+}
+
+/// R51: isolation evidence is bound to the CLI version; a different version is unverified
+/// and the pipeline refuses it unless --accept-unverified; `doctor --canaries` re-verifies.
+#[test]
+fn version_bound_evidence() {
+    let (env, repo) = pipeline_env(false, false);
+    let r = repo.to_str().unwrap();
+    let run = |extra: &[&str]| {
+        let mut a = vec!["spike", "pipeline", "--repo", r, "--task", "TASK.md", "--id"];
+        a.extend_from_slice(extra);
+        toryo_stdin_strict(&env, &a, "q\n")
+    };
+    // 1. no canary records: refused before anything is created
+    let (code, err) = run(&["V-1"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("unverified profiles (R51)"), "{err}");
+    assert!(err.contains("no claude-isolation record") && err.contains("no codex-canary record"), "{err}");
+    assert!(!env.root.join("wts").join("V-1").exists());
+
+    // 2. doctor --canaries records versioned evidence for every profile + host
+    let (_code, out, err) = toryo(&env, &["doctor", "--canaries"]);
+    assert!(err.contains("canary: claude-isolation claude-max"), "{err}");
+    assert!(err.contains("canary: codex-canary codex-foundry"), "{err}");
+    let recs = records(&env);
+    let find = |spike: &str| recs.iter().rev().find(|x| x["spike"] == spike).cloned().unwrap();
+    assert_eq!(find("claude-isolation")["cli_versions"]["claude-max"], "2.1.300");
+    assert_eq!(find("codex-canary")["cli_versions"]["codex-foundry"], "0.200.0");
+    assert!(find("git-canary")["cli_versions"]["git"].is_string());
+    assert!(out.contains("codex-canary passed") && out.contains("for 0.200.0 (R51)"), "{out}");
+
+    // 3. verified: the pipeline starts (and stops at the gate)
+    let (_, err) = run(&["V-2"]);
+    assert!(err.contains("cancelled at the plan gate") || err.contains("STOPPED"), "{err}");
+    assert!(!err.contains("unverified profiles"), "{err}");
+    let last = recs_last(&env);
+    assert_eq!(last["cli_versions"]["codex-foundry"], "0.200.0", "{last}");
+
+    // 4. the Codex CLI is upgraded: its evidence is stale
+    let cfg = std::fs::read_to_string(&env.config).unwrap().replace(
+        "FAKE_ESCAPE: \"0\"",
+        "FAKE_ESCAPE: \"0\"\n      FAKE_VERSION: \"0.201.0\"",
+    );
+    std::fs::write(&env.config, cfg).unwrap();
+    let (code, err) = run(&["V-3"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("codex-foundry: codex-canary passed") && err.contains("for version 0.200.0 but the CLI is now 0.201.0"), "{err}");
+    assert!(!err.contains("claude-max:"), "Claude is still verified: {err}");
+    let (dcode, dout, _) = toryo(&env, &["doctor"]);
+    assert_eq!(dcode, 1);
+    assert!(dout.contains("R51: unverified"), "{dout}");
+
+    // 5. --accept-unverified runs anyway, with a warning
+    let (_, err) = run(&["V-4", "--accept-unverified"]);
+    assert!(err.contains("running with unverified profiles"), "{err}");
+    assert!(err.contains("cancelled at the plan gate") || err.contains("STOPPED"), "{err}");
+}
+
+fn recs_last(env: &Env) -> serde_json::Value {
+    records(env).last().cloned().unwrap()
 }

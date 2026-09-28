@@ -236,6 +236,18 @@ impl GitCmd {
 }
 
 /// Names from `filter.<name>.<var>` keys in every config scope.
+/// The Git executable: `TORYO_GIT`, else `git` from `PATH`.
+pub fn git_exe() -> PathBuf {
+    std::env::var_os("TORYO_GIT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("git"))
+}
+
+/// `GitCmd` with the data dir's empty hooks directory (R33).
+pub fn default_gitcmd() -> Result<GitCmd> {
+    GitCmd::new(git_exe(), crate::config::data_dir().join("empty-hooks"))
+}
+
 pub fn defined_filter_names(g: &GitCmd, loc: &Loc) -> Result<BTreeSet<String>> {
     let out = g.output(loc, true, &["config", "-z", "--get-regexp", r"^filter\."])?;
     // exit 1 = no matching key

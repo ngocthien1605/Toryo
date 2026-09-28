@@ -1,4 +1,4 @@
-# Hướng dẫn sử dụng Toryo (bản prototype M0)
+# Hướng dẫn sử dụng Toryo (prototype M0 + lớp adapter M1)
 
 > **Toryo (棟梁 — tōryō)** = "thợ cả": người chỉ huy đội thợ, không tự đục đẽo mà giao việc, kiểm tra từng mối nối
 > và nghiệm thu từng giai đoạn. Tên cũ của tool là `thien` (đổi ngày 2026-09-28, plan v0.7 R55).
@@ -181,7 +181,8 @@ Mỗi lượt agent được lưu đầy đủ prompt + stream JSON (đã redact
 
 | Lệnh | Dùng khi |
 |---|---|
-| `toryo doctor` | kiểm tra exe, profile, config |
+| `toryo doctor` | kiểm tra exe, profile, config, và evidence có khớp version CLI hiện tại không (R51) |
+| `toryo doctor --canaries` | **sau mỗi lần nâng cấp Claude Code / Codex / Git**: chạy lại job-test, git-canary, lowil-canary, `claude-isolation` cho từng profile Claude, `codex-canary` cho từng profile Codex, rồi chạy `doctor` |
 | `toryo spike pipeline --repo <repo> --task <TASK.md>` | **chạy 1 task hoàn chỉnh** (lệnh chính) |
 | `toryo spike init-fixture --app batch-rename --into <dir>` | tạo repo mẫu để tập |
 | `toryo spike smoke` | test nhanh cả 2 agent trên fixture calculator (không có gate) |
@@ -204,6 +205,7 @@ Tuỳ chọn của `pipeline`:
 | `--claude-model` / `--codex-model` | mặc định của CLI | chọn model |
 | `--max-fix-cycles` | 2 | số vòng sửa tối đa |
 | `--mode` | `restricted` | launch mode của Claude (M0 đã xác nhận `restricted` chạy được) |
+| `--accept-unverified` | tắt | vẫn chạy dù profile chưa được canary xác nhận cho version CLI hiện tại (R51) — nên chạy `doctor --canaries` thay vì dùng cờ này |
 | `--yes` | tắt | bỏ qua plan gate (chỉ dùng cho demo) |
 
 Exit code: `0` = approved, khác `0` = dừng (xem `SUMMARY.md`).
@@ -227,13 +229,50 @@ Codex (codex-openai) ──hết quota──► Claude (claude-max) làm tiếp
   `--restricted` + `--permission-mode acceptEdits` → chỉ sửa được file trong worktree; file settings/git/cấu hình tool
   bị từ chối. TASK.md và PLAN.md được đưa thẳng vào prompt (không mở quyền vào run store). Build/test vẫn do Toryo chạy.
 - **Minh bạch**: commit checkpoint có trailer `Toryo-Implementer: <profile>`; `SUMMARY.md` có mục *Implementer fallback*.
-- **Lưu ý**: khi Claude vừa code vừa review, review chạy ở session mới nhưng kém độc lập hơn cặp Codex/Claude
-  (Toryo in cảnh báo). Claude Max dùng chung quota cho plan, review và code.
+- **Reviewer không đổi** (quyết định #15 của anh): reviewer luôn là `roles.reviewer` (mặc định = profile planner),
+  fallback của Implementer không ảnh hưởng. Nếu Implementer và Reviewer cùng hãng, Toryo chỉ in một dòng *note*
+  để biết; review vẫn chạy ở session mới. Claude Max dùng chung quota cho plan, review và code.
 
 Thử đường fallback mà không cần chờ hết quota thật:
 
 ```powershell
 toryo spike pipeline --repo C:\.thien\demo\batch-rename --task tasks\BR-001.md --id BR-001-fb --simulate-quota
+```
+
+### 5.2 Evidence gắn với version CLI (R51) — `doctor --canaries`
+
+Giống **chứng chỉ an toàn của máy móc trong xưởng**: chứng chỉ ghi rõ số hiệu máy; thay máy mới (nâng cấp
+Claude Code/Codex) thì chứng chỉ cũ không còn giá trị, phải kiểm định lại trước khi cho vào dây chuyền.
+
+- Mỗi canary (`claude-isolation`, `codex-canary`, `git-canary`, …) giờ lưu thêm `cli_versions`
+  (ví dụ `{"claude-max": "2.1.283", "git": "2.47.1"}`) trong `results.jsonl`.
+- `spike pipeline` kiểm tra planner, implementer, reviewer: nếu canary của profile **chưa có**, **fail**, hoặc
+  **pass ở version khác** version đang cài → từ chối chạy, in lý do. Profile dự phòng chưa xác nhận thì bị bỏ qua (WARNING).
+- Record M0 cũ (trước v0.7) không có `cli_versions` → coi là *unverified*. **Sau khi cập nhật toryo.exe, chạy một lần:**
+
+```powershell
+# shell thường (KHÔNG chạy as Administrator), TORYO_CONFIG trỏ tới toryo.yaml
+toryo doctor --canaries
+# chỉ một vài profile:
+toryo doctor --canaries --profile claude-max --profile codex-openai
+```
+
+Kết quả mong đợi: mỗi profile có dòng `… passed @ <thời điểm> for <version> (R51)`, `doctor` 0 FAIL.
+
+### 5.3 Chạy thử pipeline không tốn token (FakeAgent)
+
+Từ M1, pipeline chạy trên lớp adapter mới (`AgentHub` → adapter Claude/Codex thật, hoặc `FakeAgentAdapter`).
+Test `tests/pipeline_fake.rs` dùng cờ ẩn `--fake-agents <script.json>`: mỗi role có danh sách lượt được viết sẵn
+(viết file, báo usage, hết quota, rate limit, review `changes_requested`…) nên thử được mọi nhánh của flow mà
+không gọi Claude/Codex thật. Ví dụ một script:
+
+```json
+{ "turns": {
+  "planner":                  [ { "steps": [ { "kind": "complete", "structured": { "understanding": "…", "files_likely_involved": [], "steps": ["…"], "validation": [], "plan_markdown": "…" } } ] } ],
+  "implementer@codex-openai": [ { "steps": [ { "kind": "fail", "class": "QuotaExceeded", "detail": "usage limit" } ] } ],
+  "implementer@claude-max":   [ { "steps": [ { "kind": "write_file", "path": "src/X.ps1", "content": "…" }, { "kind": "complete", "structured": { "summary": "…", "deviations": [], "validation_performed": [], "open_issues": [], "resolved": [] } } ] } ],
+  "reviewer":                 [ { "steps": [ { "kind": "replay", "agent": "claude", "file": "fixtures/captured/claude-review-changes-requested.jsonl" } ] } ]
+} }
 ```
 
 ---
@@ -374,6 +413,7 @@ Khi có lệnh build/test X++ chạy không tương tác trên dev VM, chỉ c�
 | Verify chạy **với quyền user của anh** trong worktree (chưa có Low-IL boundary) | Chỉ dùng cho repo và task anh tin tưởng. Script test do AI viết sẽ được chạy thật! |
 | Chưa có resume sau crash / Ctrl+C | Chạy lại với `--id` khác, hoặc xoá worktree + branch cũ (lệnh in ra cuối mỗi lần chạy) |
 | Fallback mới áp dụng cho Implementer (planner/reviewer Claude hết quota thì dừng) | Chờ reset quota rồi chạy lại |
+| Canary chỉ kiểm tra launch mode `restricted` (mặc định) | Nếu dùng `--mode` khác cho pipeline: `toryo doctor --canaries --claude-mode <mode>` |
 | Chưa có budget cap theo token | Xem token ở cuối mỗi lượt và trong `SUMMARY.md`; giữ `--max-fix-cycles` nhỏ |
 | Một task mỗi lần chạy, chạy tuần tự | Chạy nhiều terminal với các `--id` khác nhau nếu cần |
 | Protected paths dùng glob đơn giản | Ghi rõ quy tắc trong `AGENTS.md` để agent tự tránh |
@@ -392,4 +432,5 @@ Khi có lệnh build/test X++ chạy không tương tác trên dev VM, chỉ c�
 | Verify fail mãi | Mở `VERIFY_RESULT.json`; tự chạy `pwsh -File scripts\test.ps1` trong worktree |
 | `doctor` báo `cannot give … a Low integrity label` (verify root) | Thư mục tạo trực tiếp dưới `C:\` chỉ cho user quyền Modify (thiếu `WRITE_OWNER`). Để `verify.verify_root` trong `%LOCALAPPDATA%` (mặc định), xem F7 trong `M0-FINDINGS.md` |
 | Test tạo thư mục tạm bị lỗi quyền khi Codex chạy | Toryo đã cấp TEMP riêng `<worktree>\.toryo-tmp` (git bỏ qua). Nếu vẫn lỗi, xem `implement.meta.json` có biến `TEMP` không |
+| `unverified profiles (R51)` khi chạy pipeline | Vừa nâng cấp Claude Code/Codex, hoặc chưa có record có version → `toryo doctor --canaries` (shell thường, không Admin) |
 | Muốn xem AI "nghĩ" gì | `runs\<ID>-…\*.stdout.jsonl` (stream đầy đủ) và `*.prompt.md` (prompt đã gửi) |

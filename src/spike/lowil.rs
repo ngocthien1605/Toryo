@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::fixture;
-use super::results::{append, new_run_dir, Record};
+use crate::evidence::{append, new_run_dir, Record};
 use crate::config::{data_dir, home_dir};
 use crate::git::Loc;
 use crate::process::env::build_env;
@@ -345,6 +345,7 @@ fn lowil_inner(root: &Path, verify_root: &Path) -> Result<bool> {
         &["M0-VERIFY 9", "R36", "verify_boundary_writes (spike)"],
     );
     rec.pass = Some(pass);
+    rec.bind_versions(None, &[]); // R51
     rec.summary = format!("low boundary writes as expected={low_ok}; negative control={control_ok}; build+tests at Low={build_ok}");
     rec.details = json!({"phases": phases, "build": build_result, "verify_root": verify_root});
     rec.run_dir = Some(root.display().to_string());

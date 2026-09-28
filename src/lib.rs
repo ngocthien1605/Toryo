@@ -1,14 +1,22 @@
-//! Toryo — M0 spike kit (plan v0.6).
+//! Toryo (棟梁) — orchestrates Claude Code and Codex (plan v0.7).
 //!
-//! Only the pieces M0 needs to answer its twelve `M0-VERIFY` questions live here:
-//! process containment and the verify boundary, streaming redaction, the exact
-//! Claude/Codex launch lines and stream parsers, the `GitCmd` builder with its
-//! canaries, and `toryo doctor`. The pipeline itself (M1–M8) starts after M0.
+//! Core (M1): vendor-neutral domain types (`domain`), the agent adapter layer (`agents`:
+//! `AgentAdapter`/`AgentSession`, the Claude/Codex CLI adapters, `FakeAgentAdapter`,
+//! `AgentHub`), `CommandRunner` (`runner`), process containment and redaction
+//! (`process`), `GitCmd` + canaries (`git`), usage buckets, config, version-bound
+//! evidence (`evidence`, R51) and `doctor`.
+//!
+//! `spike` (feature `m0-kit`, default on) is the M0 kit, including the single-process
+//! pipeline prototype — the behavioural reference for M2–M8 (R52).
 
 pub mod agents;
 pub mod config;
 pub mod doctor;
+pub mod domain;
+pub mod evidence;
 pub mod git;
 pub mod process;
+pub mod runner;
+#[cfg(feature = "m0-kit")]
 pub mod spike;
 pub mod usage;

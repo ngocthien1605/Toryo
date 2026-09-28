@@ -1,8 +1,11 @@
 //! Run one real agent turn inside a Job, capture the redacted stream, parse it.
+//! (M0 kit `spike::turn`, moved to the core in M1 — the Claude/Codex adapters build on it.)
 
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -28,6 +31,8 @@ pub struct TurnOpts {
     /// Extra environment for this turn (e.g. a per-task TEMP inside the worktree),
     /// applied after the profile env; keys replace case-insensitively.
     pub env: BTreeMap<String, String>,
+    /// Set to `true` to terminate the turn's Job (adapter `interrupt()`, `toryo stop`).
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Default for TurnOpts {
@@ -38,6 +43,7 @@ impl Default for TurnOpts {
             kill_after: None,
             echo: true,
             env: BTreeMap::new(),
+            cancel: None,
         }
     }
 }
@@ -90,6 +96,25 @@ pub fn run_turn(
     label: &str,
     opts: TurnOpts,
 ) -> Result<TurnRun> {
+    run_turn_with(
+        profile_name, profile, args, cwd, prompt, run_dir, label, opts, &mut |_| {},
+    )
+}
+
+/// `run_turn`, calling `on_line` with every complete (redacted) stdout line as it arrives —
+/// the adapters turn these into live `AgentEvent`s.
+#[allow(clippy::too_many_arguments)]
+pub fn run_turn_with(
+    profile_name: &str,
+    profile: &Profile,
+    args: Vec<String>,
+    cwd: &Path,
+    prompt: &str,
+    run_dir: &Path,
+    label: &str,
+    opts: TurnOpts,
+    on_line: &mut (dyn FnMut(&[u8]) + Send),
+) -> Result<TurnRun> {
     let (mut env, red, secret_keys) = profile_env(profile_name, profile)?;
     for (k, v) in &opts.env {
         env.retain(|e, _| !e.eq_ignore_ascii_case(k));
@@ -140,11 +165,19 @@ pub fn run_turn(
     let echo = opts.echo;
     let started = Instant::now();
     let kill_after = opts.kill_after;
+    let cancel_flag = opts.cancel.clone();
+    let cancel: Option<Box<dyn Fn() -> bool + Send>> = if kill_after.is_some() || cancel_flag.is_some() {
+        Some(Box::new(move || {
+            kill_after.is_some_and(|d| started.elapsed() >= d)
+                || cancel_flag.as_ref().is_some_and(|c| c.load(Ordering::SeqCst))
+        }))
+    } else {
+        None
+    };
     let wait = WaitOptions {
         max: Some(opts.max),
         stall: Some(opts.stall),
-        cancel: kill_after
-            .map(|d| Box::new(move || started.elapsed() >= d) as Box<dyn Fn() -> bool + Send>),
+        cancel,
     };
     let exit = running.wait(wait, |c| match c {
         Chunk::Stdout(b) => {
@@ -153,6 +186,7 @@ pub fn run_turn(
                 if echo {
                     echo_line(kind, &line);
                 }
+                on_line(&line);
                 match kind {
                     ProfileKind::Claude => claude.feed_line(&line),
                     ProfileKind::Codex => codex.feed_line(&line),
@@ -164,6 +198,7 @@ pub fn run_turn(
         }
     })?;
     if let Some(rest) = splitter.finish() {
+        on_line(&rest);
         match kind {
             ProfileKind::Claude => claude.feed_line(&rest),
             ProfileKind::Codex => codex.feed_line(&rest),

@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is the product platform; Linux runs the sh-script fakes (tests/spike_e2e.rs).
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Git identity for the test repositories
+        run: |
+          git config --global user.name "toryo-ci"
+          git config --global user.email "toryo-ci@users.noreply.github.com"
+          git config --global init.defaultBranch main
+      - name: Tests (M1 core + M0 kit)
+        run: cargo test --locked
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Core without the M0 kit
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+
+  release-build:
+    name: toryo.exe (release)
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: toryo-windows-x64
+          path: target/release/toryo.exe
+          retention-days: 14

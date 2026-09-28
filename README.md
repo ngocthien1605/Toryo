@@ -1,13 +1,24 @@
-# toryo — M0 spike kit
+# toryo
 
 > **Toryo** (棟梁, *tōryō*) is the master carpenter who leads a building crew: he does not cut the wood himself,
 > he hands out the work, checks every joint and signs off each stage. That is this tool's job — Claude Code and
 > Codex are the craftsmen; `toryo` plans the order of work, enforces the rules, checkpoints and verifies.
 > (Renamed from `thien` on 2026-09-28, plan v0.7 R55.)
 
-Rust implementation of **milestone M0** of the Toryo plan (v0.6, §17): the pieces needed
-to answer the twelve `M0-VERIFY` questions on the real Windows machine, before any pipeline code
-(M1–M8) is written — the plan's stop rule.
+Rust implementation of the Toryo plan (**v0.7**). **M0 is done** (the spike kit and its evidence);
+**M1** adds the vendor-neutral core the engine (M2–M8) will build on:
+
+| M1 module | Plan | What it does |
+|---|---|---|
+| `domain` | §5.1, §6.1 | `Role`, `AgentEvent`, `OpenSession`/`TurnInput`/`TurnLimits`, `StageOutcome`, `TokenUsage`, `UsageCapabilities` |
+| `agents::adapter` | §6.1 | `AgentAdapter` / `AgentSession` traits; `run_to_completion` (stall/max limit → interrupt → `Timeout`) |
+| `agents::cli` | §6.2, §6.3, R48, R49 | Claude one-shot and Codex exec adapters on the kit's launch lines; live events per stream line; usage capabilities (Claude per-run, Codex cumulative) |
+| `agents::fake` | §6.4 | `FakeAgentAdapter`: scripted turns per `role` / `role@profile` (text, tools, file writes, usage, denials, failures, hang, crash) and replay of recorded real streams (`fixtures/captured/`) through the real parsers |
+| `agents::hub` | — | sync facade (owns the tokio runtime) that picks the real or fake adapter per profile |
+| `runner` | §8 | `CommandRunner` / `LocalRunner` for verify commands (ANSI stripped) |
+| `evidence` | R51 | evidence records carry `cli_versions`; a profile whose CLI version differs from its last canary pass is *unverified* |
+
+M0 kit modules (ported to the core where M1 needs them, R52):
 
 | Module | Plan | What it does |
 |---|---|---|
@@ -20,12 +31,12 @@ to answer the twelve `M0-VERIFY` questions on the real Windows machine, before a
 | `usage` | R21, R41 | disjoint token buckets, cumulative deltas with reset |
 | `git` | R33, R37 | `GitCmd` hardening prefix, `<CANON_DIFF>`, trusted/neutralised filter plan, canaries, pkt-line filter |
 | `config` | §14, R35 | `toryo.yaml` + machine config, canonical hash, Credential Manager secrets |
-| `doctor` | §15 | environment / profile / repo checks + recorded M0 evidence |
-| `spike::*` | §17 | the M0 commands (see `docs/M0-RUNBOOK.md`) |
+| `doctor` | §15, R51 | environment / profile / repo checks + version-bound evidence; `--canaries` re-runs them |
+| `spike::*` | §17 | the M0 commands (see `docs/M0-RUNBOOK.md`) — cargo feature `m0-kit`, on by default |
 | `spike::pipeline` | §5.2, R28, R40 | prototype workflow on a real repo: plan gate, guards, checkpoints, verify, exact-AC review, fix cycles |
 
 ```
-toryo doctor
+toryo doctor [--canaries [--profile P …] [--claude-mode restricted]]   # R51: re-verify after a CLI upgrade
 toryo spike job-test | git-canary | lowil-canary
 toryo spike claude-isolation --profile claude-max [--mode restricted|setting-sources|cwd-run-store]
 toryo spike codex-canary --profile codex-foundry
@@ -33,7 +44,9 @@ toryo spike codex-project-config --profile codex-foundry
 toryo spike killed-resume --profile <claude-max|codex-foundry>
 toryo spike smoke                 # end-to-end: plan → implement → checkpoint → verify → review
 toryo spike pipeline --repo R --task T.md   # one real task: plan → HUMAN GATE → implement → verify → review → fix cycles
-                                            # (implementer out of quota → fallback, e.g. codex-openai → claude-max)
+                                            # (implementer out of quota → fallback, e.g. codex-openai → claude-max;
+                                            #  the reviewer stays roles.reviewer; unverified profiles refused
+                                            #  unless --accept-unverified)
 toryo spike claude|codex …        # single turns for the manual dry-run
 toryo spike init-fixture | render | diff | report
 ```
@@ -62,13 +75,20 @@ cargo build --release
 cargo test --release
 ```
 
-On Linux the tests run the whole spike harness against fake `claude`/`codex` scripts
-(`tests/spike_e2e.rs`) and the Git canaries against the real `git` (`tests/git_canary.rs`). The
-Windows-only paths (Job Object, Low integrity) compile on Linux via
-`cargo check --target x86_64-pc-windows-gnu` but only *run* on Windows — `cargo test` and
-`toryo spike job-test` / `lowil-canary` there are part of M0.
+| Test | Runs on | What it covers |
+|---|---|---|
+| `tests/pipeline_fake.rs` | Windows + Linux | the pipeline scenarios on `FakeAgentAdapter`: gate reject → planner resumed, fix cycle, sticky fallback with the configured reviewer kept, rate-limit retry, verify failure → fix, review correction, all implementers out of quota, quit at the gate |
+| `tests/adapters.rs` | Windows + Linux | recorded real Claude/Codex streams through the adapters; fake failure classes, stall timeout, crash |
+| `tests/spike_e2e.rs` | Linux | the kit against fake `claude`/`codex` sh scripts, incl. `version_bound_evidence` (R51) |
+| `tests/redaction.rs` | Windows + Linux | `redaction_split_boundaries` (C9/R42) |
+| `tests/architecture.rs` | Windows + Linux | no vendor types outside the adapters |
+| `tests/git_canary.rs` | Windows + Linux | Git hook/filter/textconv canaries on the real `git` |
+
+CI (`.github/workflows/ci.yml`) runs `cargo test`, `clippy -D warnings` and the core without the kit
+(`--no-default-features`) on `windows-latest` and `ubuntu-latest`, then builds a release `toryo.exe`.
 
 ## Status
 
-M0 kit — not the orchestrator. No `toryo task`, `run`, `approve` yet: they start in M1 once M0's
-evidence is in plan v0.7.
+M0 done; M1 (adapter layer) done. No `toryo task`, `run`, `approve` yet: the engine with SQLite state
+starts in M2. `spike pipeline` stays the behavioural reference (R52); since M1 it runs on the adapter
+layer (`AgentHub`, `LocalRunner`), so what it proves is the M1 code.

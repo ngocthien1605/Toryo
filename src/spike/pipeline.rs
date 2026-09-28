@@ -20,18 +20,16 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use super::agents::{claude_implement_turn, claude_turn, codex_turn, ClaudeArgs, CodexArgs};
 use super::fixture;
 use super::render;
-use super::results::{append, stamp, Record};
-use super::turn::{print_summary, TurnOpts, TurnRun};
-use crate::agents::claude::LaunchMode;
-use crate::agents::ErrorClass;
+use crate::agents::hub::AgentHub;
 use crate::config::{data_dir, expand_vars, CommandSpec, Effective, ProfileKind};
+use crate::domain::{ErrorClass, OpenSession, Role, StageOutcome, TurnInput, TurnLimits};
+use crate::evidence::{append, stamp, Record};
 use crate::git::{parse_status_z, GitCmd, Loc};
 use crate::process::env::build_env;
-use crate::process::redact::Redactions;
-use crate::process::{spawn, Boundary, Chunk, SpawnSpec, WaitOptions};
+use crate::process::Boundary;
+use crate::runner::{CommandResult, CommandRunner, LocalRunner, RunSpec};
 use crate::usage::Buckets;
 
 fn fwd(p: &Path) -> String {
@@ -51,7 +49,11 @@ pub struct PipelineArgs {
     pub simulate_quota: bool,
     pub claude_model: Option<String>,
     pub codex_model: Option<String>,
-    pub mode: LaunchMode,
+    /// Reviewer profile (`roles.reviewer`): an implementer fallback never changes it
+    /// (owner decision 15).
+    pub reviewer_profile: String,
+    /// R51: CLI versions in use (bound into the pipeline record).
+    pub cli_versions: BTreeMap<String, String>,
     pub max_fix_cycles: u32,
     /// Skip the human plan gate (demo / CI only).
     pub yes: bool,
@@ -229,38 +231,23 @@ fn resolve_program(p: &str) -> PathBuf {
     super::smoke::which(p).unwrap_or(pb)
 }
 
-fn run_command(spec: &CommandSpec, cwd: &Path) -> Result<(Option<i32>, String, u128)> {
+fn run_command(hub: &AgentHub, spec: &CommandSpec, cwd: &Path) -> Result<CommandResult> {
     let program = resolve_program(&expand_vars(&spec.program)?);
-    let s = SpawnSpec {
-        program,
-        args: spec.args.clone(),
-        cwd: cwd.to_path_buf(),
-        env: {
-            let mut e = build_env(std::env::vars(), &Default::default(), &Default::default());
-            e.insert("NO_COLOR".into(), "1".into());
-            e
+    let mut env = build_env(std::env::vars(), &Default::default(), &Default::default());
+    env.insert("NO_COLOR".into(), "1".into());
+    hub.block_on(LocalRunner.run(
+        RunSpec {
+            name: spec.name.clone(),
+            program,
+            args: spec.args.clone(),
+            cwd: cwd.to_path_buf(),
+            env,
+            // Prototype: the verify boundary (R36) is wired in M6 — see HUONG-DAN.md.
+            boundary: Boundary::None,
+            timeout: Duration::from_secs(60 * spec.timeout_min.unwrap_or(30)),
+            cancel: None,
         },
-        stdin: None,
-        // Prototype: the verify boundary (R36) is not applied yet — see HUONG-DAN.md.
-        boundary: Boundary::None,
-    };
-    let r = spawn(&s, &Redactions::empty())
-        .with_context(|| format!("starting verify command `{}`", spec.name))?;
-    let mut out = Vec::new();
-    let info = r.wait(
-        WaitOptions {
-            max: Some(Duration::from_secs(60 * spec.timeout_min.unwrap_or(30))),
-            ..Default::default()
-        },
-        |c| {
-            let (Chunk::Stdout(b) | Chunk::Stderr(b)) = c;
-            out.extend(b)
-        },
-    )?;
-    Ok((
-        if info.timed_out { None } else { info.code },
-        crate::process::strip_ansi(&String::from_utf8_lossy(&out)),
-        info.duration_ms,
+        None,
     ))
 }
 
@@ -315,20 +302,20 @@ struct Totals {
 }
 
 impl Totals {
-    fn add(&mut self, r: &TurnRun, label: &str) {
-        if let Some(u) = r.outcome.usage {
-            self.tokens.add(&u);
+    fn add(&mut self, r: &StageOutcome, label: &str) {
+        if let Some(b) = r.usage.and_then(|u| u.buckets) {
+            self.tokens.add(&b);
         }
         eprintln!(
             "   ↳ {label}: {:?} usage {} tokens, {:.0}s",
-            r.outcome.accounting,
-            r.outcome.usage.map(|u| u.total()).unwrap_or(0),
-            r.exit.duration_ms as f64 / 1000.0
+            r.usage.map(|u| u.accounting),
+            r.usage.map(|u| u.total()).unwrap_or(0),
+            r.duration_ms as f64 / 1000.0
         );
     }
 }
 
-pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
+pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool> {
     let repo = std::path::absolute(&a.repo)?;
     if !repo.join(".git").exists() {
         bail!(
@@ -453,15 +440,16 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
         repo: repo.clone(),
         base_ref: base_ref.clone(),
         wt: wt.clone(),
+        cli_versions: a.cli_versions.clone(),
     };
     let mut totals = Totals {
         tokens: Buckets::default(),
     };
     let mut log: Vec<Value> = Vec::new();
     let res = (|| -> Result<(bool, String)> {
-        let turn_opts = |mins: u64| TurnOpts {
+        let limits = |mins: u64| TurnLimits {
             max: Duration::from_secs(mins * 60),
-            ..Default::default()
+            stall: Duration::from_secs(10 * 60),
         };
 
         // ── 1. PLAN (+ human gate) ───────────────────────────────────────────────────────
@@ -482,32 +470,33 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
         let mut approved = false;
         for attempt in 1..=3 {
             eprintln!("\n── PLAN (Claude, attempt {attempt}) ──");
-            let r = claude_turn(
-                cfg,
-                ClaudeArgs {
+            let r = hub.turn(
+                OpenSession {
                     profile: a.claude_profile.clone(),
-                    worktree: wt.clone(),
-                    run_store: rs.clone(),
-                    prompt: plan_prompt.clone(),
+                    role: Role::Planner,
+                    cwd: wt.clone(),
+                    run_store: Some(rs.clone()),
+                    capture_dir: run.clone(),
                     schema: Some(fixture::schema("plan.schema.json")?.into()),
                     context_file: Some(planner_ctx.clone()),
                     model: a.claude_model.clone(),
-                    mode: a.mode,
                     resume: resume.clone(),
-                    drop_flags: vec![],
-                    extra_args: vec![],
-                    label: format!("plan-{attempt}"),
-                    opts: turn_opts(20),
                 },
-                &run,
+                TurnInput {
+                    prompt: plan_prompt.clone(),
+                    label: format!("plan-{attempt}"),
+                    echo: true,
+                    ..Default::default()
+                },
+                limits(20),
             )?;
             totals.add(&r, "planner");
-            let Some(p) = r.outcome.structured.clone() else {
-                print_summary(&r);
+            let Some(p) = r.structured.clone() else {
+                r.print_summary();
                 bail!(
                     "planner returned no structured plan: {:?} {}",
-                    r.outcome.error_class,
-                    r.outcome.error_detail.unwrap_or_default()
+                    r.error_class,
+                    r.error_detail.clone().unwrap_or_default()
                 );
             };
             let plan_json = p;
@@ -528,7 +517,7 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
             if !bad.is_empty() {
                 eprintln!("!! plan wants to touch protected paths {bad:?} — rejected automatically (plan-time policy)");
                 plan_prompt = format!("Your plan lists protected paths {bad:?}, which may not change. Create the plan again without touching them.");
-                resume = r.outcome.session_id.clone();
+                resume = r.session_id.clone();
                 continue;
             }
             if a.yes {
@@ -555,7 +544,7 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
                         json!({"step": "plan-gate", "decision": "rejected", "reason": reason}),
                     );
                     plan_prompt = format!("The human reviewer rejected the plan. Reason: {reason}\nCreate the plan again, revised to address this.");
-                    resume = r.outcome.session_id.clone();
+                    resume = r.session_id.clone();
                 }
             }
         }
@@ -564,10 +553,9 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
         }
 
         // ── 2. IMPLEMENT → CHECKPOINT → VERIFY → REVIEW, with fix cycles ───────────────────
-        let impl_schema = contracts.join("schemas").join("implementation.schema.json");
         let mut feedback: Option<String> = None;
         let mut last_reviewed: Option<String> = None;
-        let mut claude_impl_noted = false;
+        let mut same_vendor_noted = false;
         let mut imps = Implementers {
             chain: a.implementers.clone(),
             cur: 0,
@@ -603,10 +591,11 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
                 wt: &wt,
                 rs: &rs,
                 run: &run,
-                schema_path: &impl_schema,
+                schema: fixture::schema("implementation.schema.json")?,
             };
             let Some((imp, implementer)) = implement_turn(
                 cfg,
+                hub,
                 &a,
                 &mut imps,
                 &ctx,
@@ -624,13 +613,14 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
                     ),
                 ));
             };
-            if cfg.profile(&implementer)?.kind == ProfileKind::Claude && !claude_impl_noted {
-                claude_impl_noted = true;
-                eprintln!("note: {implementer} (Claude) implemented this checkpoint and Claude also reviews it — the review runs in a fresh session, but it is less independent than a Codex/Claude pair.");
-                log.push(json!({"step": stage, "note": "implementer and reviewer are both Claude (fresh sessions)"}));
+            if cfg.profile(&implementer)?.kind == cfg.profile(&a.reviewer_profile)?.kind && !same_vendor_noted {
+                same_vendor_noted = true;
+                // Owner decision 15: the configured reviewer stays; this is information only.
+                eprintln!("note: implementer {implementer} and reviewer {} are the same vendor (information only; the configured reviewer is kept, in a fresh session).", a.reviewer_profile);
+                log.push(json!({"step": stage, "note": "implementer and reviewer: same vendor"}));
             }
             log.push(json!({"step": stage, "implemented_by": implementer}));
-            if let Some(v) = &imp.outcome.structured {
+            if let Some(v) = &imp.structured {
                 std::fs::write(
                     rs.join(format!("implementation-{cycle}.json")),
                     serde_json::to_vec_pretty(v)?,
@@ -676,14 +666,14 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
                 log.push(json!({"step": stage, "protected_changed": prot}));
                 continue;
             }
-            if !imp.outcome.success && changed.is_empty() {
-                print_summary(&imp);
+            if !imp.success && changed.is_empty() {
+                imp.print_summary();
                 return Ok((
                     false,
                     format!(
                         "implementer failed: {:?} {}",
-                        imp.outcome.error_class,
-                        imp.outcome.error_detail.clone().unwrap_or_default()
+                        imp.error_class,
+                        imp.error_detail.clone().unwrap_or_default()
                     ),
                 ));
             }
@@ -724,7 +714,8 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
             let mut results = Vec::new();
             let mut pass = true;
             for cmd in &cmds {
-                let (code, out, ms) = run_command(cmd, &wt)?;
+                let res = run_command(hub, cmd, &wt)?;
+                let (code, out, ms) = (res.exit, res.output.clone(), res.duration_ms);
                 let ok = code == Some(0);
                 pass &= ok;
                 eprintln!(
@@ -784,27 +775,28 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
             let mut rresume = None;
             let mut review = Value::Null;
             for corr in 0..=2 {
-                let r = claude_turn(
-                    cfg,
-                    ClaudeArgs {
-                        profile: a.claude_profile.clone(),
-                        worktree: wt.clone(),
-                        run_store: rs.clone(),
-                        prompt: rprompt.clone(),
+                let r = hub.turn(
+                    OpenSession {
+                        profile: a.reviewer_profile.clone(),
+                        role: Role::Reviewer,
+                        cwd: wt.clone(),
+                        run_store: Some(rs.clone()),
+                        capture_dir: run.clone(),
                         schema: Some(fixture::schema("review.schema.json")?.into()),
                         context_file: Some(reviewer_ctx.clone()),
                         model: a.claude_model.clone(),
-                        mode: a.mode,
                         resume: rresume.clone(),
-                        drop_flags: vec![],
-                        extra_args: vec![],
-                        label: format!("review-{cycle}-{corr}"),
-                        opts: turn_opts(20),
                     },
-                    &run,
+                    TurnInput {
+                        prompt: rprompt.clone(),
+                        label: format!("review-{cycle}-{corr}"),
+                        echo: true,
+                        ..Default::default()
+                    },
+                    limits(20),
                 )?;
                 totals.add(&r, "reviewer");
-                review = r.outcome.structured.clone().unwrap_or(Value::Null);
+                review = r.structured.clone().unwrap_or(Value::Null);
                 let viol = review_violations(&review, &ac_ids);
                 if viol.is_empty() {
                     break;
@@ -817,7 +809,7 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
                     ));
                 }
                 rprompt = format!("Your previous final response was rejected and was not used. Validation error: {}. Return only a corrected JSON object matching the schema.", viol.join("; "));
-                rresume = r.outcome.session_id.clone();
+                rresume = r.session_id.clone();
             }
             std::fs::write(rs.join("review.json"), serde_json::to_vec_pretty(&review)?)?;
             let review_md = render::render("review", &review)?;
@@ -923,6 +915,10 @@ pub fn pipeline(cfg: &Effective, a: PipelineArgs) -> Result<bool> {
             ),
         ))
     })();
+    if hub.is_fake() {
+        // scripted agents: what each role was asked, for the FakeAgent e2e tests
+        std::fs::write(run.join("fake-calls.json"), serde_json::to_vec_pretty(&hub.fake_calls())?)?;
+    }
     match res {
         Ok((ok, why)) => finish(&fin, ok, &why, &totals, log),
         Err(e) => {
@@ -952,7 +948,7 @@ struct ImplCtx<'a> {
     wt: &'a Path,
     rs: &'a Path,
     run: &'a Path,
-    schema_path: &'a Path,
+    schema: &'static str,
 }
 
 /// Extra instructions when Claude is the Implementer: it has file tools but no shell, and
@@ -976,6 +972,7 @@ fn claude_implementer_prompt(base: &str, rs: &Path) -> Result<String> {
 #[allow(clippy::too_many_arguments)]
 fn implement_turn(
     cfg: &Effective,
+    hub: &AgentHub,
     a: &PipelineArgs,
     imps: &mut Implementers,
     c: &ImplCtx,
@@ -983,7 +980,7 @@ fn implement_turn(
     stage: &str,
     totals: &mut Totals,
     log: &mut Vec<Value>,
-) -> Result<Option<(TurnRun, String)>> {
+) -> Result<Option<(StageOutcome, String)>> {
     let retry_base: u64 = std::env::var("TORYO_RETRY_BASE_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1013,64 +1010,55 @@ fn implement_turn(
             if let Some(h) = &imps.handoff {
                 prompt.push_str(h);
             }
-            let r = match kind {
-                ProfileKind::Codex => codex_turn(
-                    cfg,
-                    CodexArgs {
-                        profile: profile.clone(),
-                        worktree: c.wt.to_path_buf(),
-                        prompt,
-                        schema_path: Some(c.schema_path.to_path_buf()),
-                        model: a.codex_model.clone(),
-                        resume: None,
-                        extra_args: vec![],
-                        label: label.clone(),
-                        opts: TurnOpts {
-                            max: Duration::from_secs(30 * 60),
-                            env: c.task_env.clone(),
-                            ..Default::default()
-                        },
-                    },
-                    c.run,
-                )?,
-                ProfileKind::Claude => claude_implement_turn(
-                    cfg,
-                    &profile,
-                    c.wt,
-                    &claude_implementer_prompt(&prompt, c.rs)?,
-                    Some(fixture::schema("implementation.schema.json")?),
-                    a.claude_model.clone(),
-                    a.mode,
-                    &label,
-                    TurnOpts {
-                        max: Duration::from_secs(30 * 60),
-                        env: c.task_env.clone(),
-                        ..Default::default()
-                    },
-                    c.run,
-                )?,
+            let (prompt, model) = match kind {
+                ProfileKind::Codex => (prompt, a.codex_model.clone()),
+                // R49: no shell, no run store — the task pack is inlined
+                ProfileKind::Claude => (claude_implementer_prompt(&prompt, c.rs)?, a.claude_model.clone()),
             };
+            let r = hub.turn(
+                OpenSession {
+                    profile: profile.clone(),
+                    role: Role::Implementer,
+                    cwd: c.wt.to_path_buf(),
+                    run_store: None,
+                    capture_dir: c.run.to_path_buf(),
+                    schema: Some(c.schema.to_string()),
+                    context_file: None,
+                    model,
+                    resume: None,
+                },
+                TurnInput {
+                    prompt,
+                    label: label.clone(),
+                    env: c.task_env.clone(),
+                    echo: true,
+                },
+                TurnLimits {
+                    max: Duration::from_secs(30 * 60),
+                    stall: Duration::from_secs(10 * 60),
+                },
+            )?;
             attempt += 1;
             totals.add(&r, "implementer");
-            match r.outcome.error_class {
+            match r.error_class {
                 Some(ErrorClass::QuotaExceeded) => Some(format!(
                     "quota exhausted: {}",
-                    r.outcome.error_detail.clone().unwrap_or_default()
+                    r.error_detail.clone().unwrap_or_default()
                 )),
                 Some(ErrorClass::RateLimited | ErrorClass::Overloaded) if imps.retries < 2 => {
                     imps.retries += 1;
                     let wait = retry_base * u64::from(imps.retries);
                     eprintln!(
                         "!! {profile}: {:?} — retry {}/2 in {wait}s",
-                        r.outcome.error_class, imps.retries
+                        r.error_class, imps.retries
                     );
-                    log.push(json!({"step": stage, "implementer": profile, "retry": imps.retries, "error": r.outcome.error_class}));
+                    log.push(json!({"step": stage, "implementer": profile, "retry": imps.retries, "error": r.error_class}));
                     std::thread::sleep(Duration::from_secs(wait));
                     continue;
                 }
                 Some(ErrorClass::RateLimited | ErrorClass::Overloaded) => Some(format!(
                     "{:?} after 2 retries",
-                    r.outcome.error_class.unwrap()
+                    r.error_class.unwrap()
                 )),
                 _ => {
                     imps.retries = 0;
@@ -1117,6 +1105,7 @@ struct Fin {
     repo: PathBuf,
     base_ref: String,
     wt: PathBuf,
+    cli_versions: BTreeMap<String, String>,
 }
 
 fn finish(f: &Fin, ok: bool, why: &str, totals: &Totals, log: Vec<Value>) -> Result<bool> {
@@ -1183,6 +1172,7 @@ fn finish(f: &Fin, ok: bool, why: &str, totals: &Totals, log: Vec<Value>) -> Res
     rec.details =
         json!({"id": id, "branch": branch, "base": base, "repo": repo, "steps": log, "tokens": t});
     rec.run_dir = Some(run.display().to_string());
+    rec.cli_versions = f.cli_versions.clone();
     append(&rec)?;
     eprintln!(
         "\n══════════ {id}: {} ══════════\n{why}",

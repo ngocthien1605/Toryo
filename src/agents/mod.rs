@@ -4,31 +4,21 @@
 //! wrap; in M0 they are driven by `toryo spike …` so the real CLIs can be
 //! exercised and their output captured as fixtures.
 
+pub mod adapter;
 pub mod claude;
+pub mod cli;
 pub mod codex;
+pub mod events;
+pub mod exec;
+pub mod fake;
+pub mod hub;
 
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::usage::{Accounting, Buckets};
 
-/// Plan §6.1 error classes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub enum ErrorClass {
-    RateLimited,
-    Overloaded,
-    QuotaExceeded,
-    ContextWindowExceeded,
-    Auth,
-    BadRequest,
-    Network,
-    ProcessCrashed,
-    Timeout,
-    PolicyRefusal,
-    PermissionDenied,
-    InvalidOutput,
-    Unknown,
-}
+pub use crate::domain::ErrorClass;
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct CommandExec {

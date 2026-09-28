@@ -3,13 +3,18 @@ name = "toryo"
 version = "0.0.1"
 edition = "2021"
 rust-version = "1.80"
-description = "Toryo (棟梁) — orchestrates Claude Code and Codex through a bounded, verified workflow (M0 spike kit, plan v0.7)"
+description = "Toryo (棟梁) — orchestrates Claude Code and Codex through a bounded, verified workflow (M1 adapter layer + M0 kit, plan v0.7)"
 license = "UNLICENSED"
 publish = false
 
 [[bin]]
 name = "toryo"
 path = "src/main.rs"
+
+[features]
+default = ["m0-kit"]
+# The M0 spike kit (`toryo spike …`, `doctor --canaries`): the behavioural reference for M2–M8 (R52).
+m0-kit = []
 
 [dependencies]
 anyhow = "1"
@@ -24,6 +29,8 @@ regex = "1"
 aho-corasick = "1"
 time = { version = "0.3", features = ["formatting", "macros"] }
 toml = "0.8"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+async-trait = "0.1.92"
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }

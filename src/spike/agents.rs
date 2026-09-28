@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::fixture;
-use super::results::{append, new_run_dir, Record};
-use super::turn::{print_summary, run_turn, TurnOpts, TurnRun};
+use crate::evidence::{append, new_run_dir, Record};
+use crate::agents::exec::{print_summary, run_turn, TurnOpts, TurnRun};
 use crate::agents::claude::{ClaudeLaunch, LaunchMode};
 use crate::agents::codex::CodexLaunch;
 use crate::config::{expand_vars, Billing, Effective, Profile, ProfileKind};
@@ -333,6 +333,7 @@ pub fn claude_isolation(
         &[auth_item, "M0-VERIFY 2", "M0-VERIFY 7", "R44b"],
     );
     rec.pass = Some(pass);
+    rec.bind_versions(Some(cfg), &[profile]); // R51
     rec.summary = format!(
         "mode={mode:?}: {}",
         checks
@@ -513,6 +514,7 @@ pub fn codex_canary(cfg: &Effective, profile: &str, model: Option<String>) -> Re
         &["M0-VERIFY 3", "R18", "R27"],
     );
     rec.pass = Some(pass);
+    rec.bind_versions(Some(cfg), &[profile]); // R51
     rec.summary = format!(
         "windows.sandbox={}: {}",
         ws.as_deref().unwrap_or("<unset>"),

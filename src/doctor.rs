@@ -3,7 +3,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::Result;
 use serde::Serialize;
@@ -14,9 +13,7 @@ use crate::config::{
 };
 use crate::git::{GitCmd, Loc};
 use crate::process::env::{build_env, validate_provider_selection};
-use crate::process::redact::Redactions;
-use crate::process::{spawn, Boundary, Chunk, SpawnSpec, WaitOptions};
-use crate::spike::results;
+use crate::evidence::{self as results, evidence_status, run_version, EvidenceStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, PartialOrd, Ord)]
 pub enum Level {
@@ -61,38 +58,6 @@ fn version_matches(pattern: &str, actual: &str) -> bool {
     actual.contains(p)
 }
 
-fn run_version(exe: &Path, env: BTreeMap<String, String>) -> Result<String> {
-    let spec = SpawnSpec {
-        program: exe.to_path_buf(),
-        args: vec!["--version".into()],
-        cwd: std::env::temp_dir(),
-        env,
-        stdin: None,
-        boundary: Boundary::None,
-    };
-    let r = spawn(&spec, &Redactions::empty())?;
-    let mut out = Vec::new();
-    let info = r.wait(
-        WaitOptions {
-            max: Some(Duration::from_secs(60)),
-            ..Default::default()
-        },
-        |c| {
-            let (Chunk::Stdout(b) | Chunk::Stderr(b)) = c;
-            out.extend(b)
-        },
-    )?;
-    if info.timed_out {
-        anyhow::bail!("--version timed out");
-    }
-    Ok(String::from_utf8_lossy(&out)
-        .trim()
-        .lines()
-        .next()
-        .unwrap_or("")
-        .to_string())
-}
-
 pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Result<i32> {
     let mut r = Report::default();
     r.add(
@@ -115,7 +80,7 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
     }
 
     // Git + GitCmd prerequisites (R33)
-    let git = crate::spike::fixture::git_exe();
+    let git = crate::git::git_exe();
     match std::process::Command::new(&git).arg("--version").output() {
         Ok(o) => r.add(
             Level::Ok,
@@ -211,7 +176,9 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
             ),
             Err(e) => r.add(Level::Fail, &area, format!("{e}")),
         }
-        match run_version(&exe, build_env(std::env::vars(), &p.env, &BTreeMap::new())) {
+        let ver = run_version(&exe, build_env(std::env::vars(), &p.env, &BTreeMap::new()));
+        let current = ver.as_ref().ok().and_then(|v| results::parse_version(v));
+        match ver {
             Ok(v) => {
                 let lvl = match &p.version {
                     Some(pat) if !version_matches(pat, &v) => Level::Warn,
@@ -275,13 +242,14 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
                         "subscription auth from the interactive /login of this Windows user",
                     );
                 }
-                evidence(
+                profile_evidence(
                     &mut r,
                     &records,
                     "claude-isolation",
                     name,
+                    current.as_deref(),
                     &area,
-                    "launch-mode isolation (R44b); run `toryo spike claude-isolation`",
+                    "launch-mode isolation (R44b); run `toryo doctor --canaries`",
                 );
             }
             ProfileKind::Codex => {
@@ -309,7 +277,15 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
                         "foundry billing but no codex.provider block",
                     );
                 }
-                evidence(&mut r, &records, "codex-canary", name, &area, "sandbox canary (R18/R27); run `toryo spike codex-canary` — profile is UNUSABLE until it passes");
+                profile_evidence(
+                    &mut r,
+                    &records,
+                    "codex-canary",
+                    name,
+                    current.as_deref(),
+                    &area,
+                    "sandbox canary (R18/R27); run `toryo doctor --canaries` — profile is UNUSABLE until it passes",
+                );
             }
         }
     }
@@ -351,14 +327,21 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
         "verify boundary",
         "Low-IL boundary (R36, M0-VERIFY 9); run `toryo spike lowil-canary`",
     );
-    evidence(
-        &mut r,
-        &records,
-        "git-canary",
-        "",
-        "git",
-        "hook/filter/textconv canary (R33/R37, M0-VERIFY 10); run `toryo spike git-canary`",
-    );
+    match evidence_status(&records, "git-canary", "", "git", results::git_version().as_deref()) {
+        st @ EvidenceStatus::Stale { .. } => r.add(
+            Level::Warn,
+            "git",
+            format!("{} — run `toryo doctor --canaries`", st.describe("git-canary")),
+        ),
+        _ => evidence(
+            &mut r,
+            &records,
+            "git-canary",
+            "",
+            "git",
+            "hook/filter/textconv canary (R33/R37, M0-VERIFY 10); run `toryo doctor --canaries`",
+        ),
+    }
     finish(r, json)
 }
 
@@ -394,6 +377,33 @@ fn verify_root_check(r: &mut Report, cfg: &Effective) {
             },
             area,
             format!("{e:#}"),
+        ),
+    }
+}
+
+/// R51: a profile's isolation canary must have passed for the CLI version installed now.
+#[allow(clippy::too_many_arguments)]
+fn profile_evidence(
+    r: &mut Report,
+    records: &[Value],
+    spike: &str,
+    profile: &str,
+    current: Option<&str>,
+    area: &str,
+    hint: &str,
+) {
+    let st = evidence_status(records, spike, profile, profile, current);
+    match &st {
+        EvidenceStatus::Verified { .. } => r.add(
+            Level::Ok,
+            area,
+            format!("{} for {} (R51)", st.describe(spike), current.unwrap_or("?")),
+        ),
+        EvidenceStatus::Missing => r.add(Level::Fail, area, format!("no M0 record: {hint}")),
+        _ => r.add(
+            Level::Fail,
+            area,
+            format!("{} — run `toryo doctor --canaries`", st.describe(spike)),
         ),
     }
 }

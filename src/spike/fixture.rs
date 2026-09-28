@@ -1,11 +1,10 @@
 //! Calculator fixture repository (embedded) and helpers to materialise it.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{bail, Result};
 
-use crate::config::data_dir;
-use crate::git::{GitCmd, Loc};
+use crate::git::Loc;
 
 pub const FILES: &[(&str, &str)] = &[
     (
@@ -109,15 +108,7 @@ pub const ROLES: &[(&str, &str)] = &[
     ),
 ];
 
-pub fn git_exe() -> PathBuf {
-    std::env::var_os("TORYO_GIT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("git"))
-}
-
-pub fn gitcmd() -> Result<GitCmd> {
-    GitCmd::new(git_exe(), data_dir().join("empty-hooks"))
-}
+pub use crate::git::{default_gitcmd as gitcmd, git_exe};
 
 /// Write the calculator fixture into `dir` (must not exist or be empty) and commit it on `main`.
 pub fn init_repo(dir: &Path) -> Result<String> {

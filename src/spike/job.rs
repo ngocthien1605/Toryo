@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde_json::json;
 
-use super::results::{append, new_run_dir, Record};
+use crate::evidence::{append, new_run_dir, Record};
 use crate::process::env::build_env;
 use crate::process::redact::Redactions;
 use crate::process::{is_alive, kill_pid, spawn, Boundary, ProcId, SpawnSpec};
@@ -214,6 +214,7 @@ pub fn job_test() -> Result<bool> {
     }
     let mut rec = Record::new("job-test", None, &["R23", "§13 Job Object test"]);
     rec.pass = Some(pass);
+    rec.bind_versions(None, &[]); // R51
     rec.summary = results
         .iter()
         .map(|r| {
