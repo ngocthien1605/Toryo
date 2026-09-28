@@ -1,7 +1,8 @@
-//! The engine (plan §4): the pipeline state machine (M2). SQLite state, recovery and the
-//! task lock follow in M3; the stage runners in M4–M6.
+//! The engine (plan §4): the pipeline state machine (M2), SQLite state, recovery and the
+//! task lock (M3), the ProjectContextLoader (M4) and the stage runners.
 
 pub mod checks;
+pub mod context;
 pub mod contracts;
 pub mod state;
 pub mod lock;

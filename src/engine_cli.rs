@@ -84,6 +84,24 @@ pub enum TaskCmd {
 }
 
 #[derive(Subcommand)]
+pub enum ContextCmd {
+    /// Print exactly what the agent of a stage receives: the source list on stderr, the
+    /// context itself on stdout. Without --attempt: the next attempt (assembled now, nothing
+    /// written); with --attempt: the stored context of that attempt (hash-checked).
+    Show {
+        id: String,
+        /// plan, implement, fix-N or review (default for implement in a fix cycle: fix-N)
+        #[arg(long)]
+        stage: String,
+        #[arg(long)]
+        attempt: Option<u32>,
+        /// Preview for another profile (default: the stage's current profile)
+        #[arg(long)]
+        profile: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum PartialCmd {
     /// Re-create an interrupted attempt's files from its recovery snapshot (R39).
     Export {
@@ -415,6 +433,50 @@ fn show(id: &str) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+pub fn context(cmd: &ContextCmd) -> Result<i32> {
+    use toryo::engine::context as cx;
+    let ContextCmd::Show { id, stage, attempt, profile } = cmd;
+    let st = store()?;
+    let t = get(&st, id)?;
+    let stage = if stage == "implement" { toryo::engine::runner::writing_stage(t.fix_cycle) } else { stage.clone() };
+    cx::stage_role(&stage)?;
+    match attempt {
+        Some(n) => {
+            let (i, s2) = (id.clone(), stage.clone());
+            let atts = st.call(move |tx| store::attempts(tx, &i))?;
+            let a = atts
+                .into_iter()
+                .find(|a| a.stage == s2 && a.attempt == *n)
+                .with_context(|| format!("{id}: no attempt {stage}/{n}"))?;
+            let p = cx::artifact_path(&t, &stage, *n);
+            let text = std::fs::read_to_string(&p).with_context(|| format!("{id}/{stage}/{n}: no stored context ({})", p.display()))?;
+            let sha = toryo::engine::task::sha256_hex(text.as_bytes());
+            let ok = a.context_sha256.as_deref() == Some(sha.as_str());
+            eprintln!(
+                "{}: context of {} ({}), sha256 {} — {}",
+                id,
+                a.id,
+                a.profile.unwrap_or_default(),
+                &sha[..12],
+                if ok { "matches stage_attempts.context_sha256" } else { "DOES NOT MATCH stage_attempts.context_sha256 (artifact_tampered)" }
+            );
+            print!("{text}");
+            Ok(if ok { 0 } else { 1 })
+        }
+        None => {
+            let cfg = frozen_config(&t)?;
+            let profile = match profile {
+                Some(p) => p.clone(),
+                None => cx::stage_profile(&t, &stage)?,
+            };
+            let c = cx::assemble(&cx::request(&t, &cfg, &stage, &profile)?)?;
+            eprint!("{id}: next `{stage}` attempt with `{profile}` — {}", cx::describe(&c));
+            print!("{}", c.text);
+            Ok(0)
+        }
+    }
 }
 
 pub fn partial(cmd: &PartialCmd) -> Result<i32> {

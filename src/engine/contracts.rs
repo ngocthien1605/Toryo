@@ -20,6 +20,10 @@ pub const SCHEMAS: &[(&str, &str)] = &[
         "probe.schema.json",
         include_str!("../../schemas/probe.schema.json"),
     ),
+    (
+        "implementer-probe.schema.json",
+        include_str!("../../schemas/implementer-probe.schema.json"),
+    ),
 ];
 
 pub const ROLES: &[(&str, &str)] = &[

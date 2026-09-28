@@ -15,7 +15,7 @@ mod engine_cli;
 #[cfg(feature = "m0-kit")]
 mod spike_cli;
 
-use engine_cli::{DriveArgs, Gate, PartialCmd, ResumeArgs, TaskCmd};
+use engine_cli::{ContextCmd, DriveArgs, Gate, PartialCmd, ResumeArgs, TaskCmd};
 #[cfg(feature = "m0-kit")]
 use spike_cli::{run_canaries, spike, SpikeCmd};
 
@@ -114,6 +114,11 @@ enum Cmd {
     },
     /// Tasks, their state and the next human action.
     Status { id: Option<String> },
+    /// What an agent receives: the assembled project context (plan §7).
+    Context {
+        #[command(subcommand)]
+        cmd: ContextCmd,
+    },
     /// Recovery snapshots (R39).
     Partial {
         #[command(subcommand)]
@@ -215,6 +220,7 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Stop { id, wait_secs } => engine_cli::stop(id, *wait_secs),
         Cmd::Status { id } => engine_cli::status(id.as_deref()),
         Cmd::Partial { cmd } => engine_cli::partial(cmd),
+        Cmd::Context { cmd } => engine_cli::context(cmd),
     }
 }
 

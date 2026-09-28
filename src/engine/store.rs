@@ -631,9 +631,10 @@ pub struct AttemptRow {
     pub correction_turns: u32,
     pub started_at: String,
     pub ended_at: Option<String>,
+    pub context_sha256: Option<String>,
 }
 
-const ATTEMPT_COLS: &str = "id, task_id, stage, attempt, kind, fallback_from, profile, external_session_id, pid, pid_created_at, status, error_class, error_detail, git_head_before, git_head_after, subject_commit, partial_commit, checkpoint_kind, partial_snapshot_id, correction_turns, started_at, ended_at";
+const ATTEMPT_COLS: &str = "id, task_id, stage, attempt, kind, fallback_from, profile, external_session_id, pid, pid_created_at, status, error_class, error_detail, git_head_before, git_head_after, subject_commit, partial_commit, checkpoint_kind, partial_snapshot_id, correction_turns, started_at, ended_at, context_sha256";
 
 fn attempt_from_row(r: &rusqlite::Row) -> rusqlite::Result<AttemptRow> {
     Ok(AttemptRow {
@@ -659,6 +660,7 @@ fn attempt_from_row(r: &rusqlite::Row) -> rusqlite::Result<AttemptRow> {
         correction_turns: r.get::<_, i64>(19)? as u32,
         started_at: r.get(20)?,
         ended_at: r.get(21)?,
+        context_sha256: r.get(22)?,
     })
 }
 
@@ -767,6 +769,12 @@ pub fn finish_attempt(tx: &Transaction, id: &str, status: AttemptStatus, end: &A
 }
 
 /// Update the external session id as soon as it is known (so a crash can still resume it).
+/// The SHA-256 of the context an attempt received (§7).
+pub fn set_attempt_context(tx: &Transaction, id: &str, sha256: &str) -> Result<()> {
+    tx.execute("UPDATE stage_attempts SET context_sha256 = ?2 WHERE id = ?1", params![id, sha256])?;
+    Ok(())
+}
+
 pub fn set_attempt_session(tx: &Transaction, id: &str, session: &str) -> Result<()> {
     tx.execute("UPDATE stage_attempts SET external_session_id = ?2 WHERE id = ?1", params![id, session])?;
     Ok(())

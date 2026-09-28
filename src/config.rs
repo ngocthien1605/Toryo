@@ -196,6 +196,21 @@ pub struct Commands {
     pub verify: Vec<CommandSpec>,
 }
 
+/// ProjectContextLoader settings (plan §7).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ContextCfg {
+    /// Size budget per role in KB (`planner`, `implementer`, `reviewer`); default 40.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub budget_kb: BTreeMap<String, u64>,
+}
+
+impl ContextCfg {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Timeouts {
@@ -225,6 +240,8 @@ pub struct RepoConfig {
     pub commands: Commands,
     #[serde(default)]
     pub timeouts: Timeouts,
+    #[serde(default, skip_serializing_if = "ContextCfg::is_default")]
+    pub context: ContextCfg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]

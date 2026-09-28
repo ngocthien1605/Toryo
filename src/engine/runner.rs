@@ -6,12 +6,12 @@
 //! The stage bodies port the `spike pipeline` behaviour (R52): Planner (read-only, gate),
 //! Implementer (fallback chain, HEAD guard, path policy), checkpoint (trailers, no-change
 //! R40), Verify (stop at first failure; never to Review), Reviewer (exact AC set, correction
-//! turns, consistency downgrade), final gate. Not yet here: ProjectContextLoader (M4), the
-//! protected snapshot (M5), immutable artifacts and the Low-IL verify boundary (M6), budget
-//! admission (M7).
+//! turns, consistency downgrade), final gate. Every agent attempt gets its context from the
+//! ProjectContextLoader (§7, M4). Not yet here: the protected snapshot (M5), immutable
+//! artifacts and the Low-IL verify boundary (M6), budget admission (M7).
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +19,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use super::checks::{resolve_program, review_violations, verify_commands, verify_files, Protected};
+use super::context;
 use super::contracts;
 use super::lock::TaskLock;
 use super::state::{GateKind, PipelineEvent as Ev, PipelineState as St};
@@ -211,11 +212,6 @@ impl<'a> Engine<'a> {
     fn plan(&mut self, t: &TaskRow) -> Result<Flow> {
         let art = t.artifacts();
         let prev = { let i = self.id.clone(); self.store.call(move |tx| store::last_attempt(tx, &i, "plan"))? };
-        let ctx = art.join("context-plan.md");
-        std::fs::write(
-            &ctx,
-            format!("{}\n\n## Task pack\n- TASK.md: {}\n", contracts::role("planner.md"), art.join("TASK.md").display()),
-        )?;
         // R48: the Planner (Claude) resumes its session for a revision or after an interruption
         let resume = prev.as_ref().and_then(|p| p.external_session_id.clone());
         let prompt = match (&t.feedback, prev.as_ref().map(|p| p.status)) {
@@ -230,6 +226,7 @@ impl<'a> Engine<'a> {
         let a = self.begin(NewAttempt { stage: "plan", kind: "agent", profile: Some(&t.planner), fallback_from: None, head_before: Some(&head), subject_commit: None })?;
         eprintln!("\n── PLAN (attempt {}, {}) ──", a.attempt, t.planner);
         crash_point("plan:after_begin");
+        let ctx = self.context(t, &a, &t.planner)?;
         let stop = self.lock.watch_stop();
         let r = self.hub.turn_with(
             OpenSession {
@@ -296,12 +293,7 @@ impl<'a> Engine<'a> {
         };
         let kind = self.cfg.profile(&profile)?.kind;
         let prev = { let (i, s) = (self.id.clone(), stage.clone()); self.store.call(move |tx| store::last_attempt(tx, &i, &s))? };
-        let mut prompt = format!(
-            "{}\n\n## Task pack (read-only)\n- TASK.md: {}\n- PLAN.md: {}\n",
-            contracts::role("implementer.md"),
-            art.join("TASK.md").display(),
-            art.join("PLAN.md").display()
-        );
+        let mut prompt = "Implement the approved plan (PLAN.md) for the task (TASK.md) in this worktree, following your role and the project rules in the context.\n".to_string();
         if t.fix_cycle > 0 {
             if let Some(f) = &t.feedback {
                 prompt.push_str(&format!("\n## Fix cycle {}\nThe previous checkpoint was not accepted. Address the following, then report the issue ids you fixed in `resolved`:\n\n{f}\n", t.fix_cycle));
@@ -323,7 +315,7 @@ impl<'a> Engine<'a> {
         };
         let (prompt, model) = match kind {
             ProfileKind::Codex => (prompt, self.role_model("implementer").or_else(|| self.cfg.profile(&profile).ok().and_then(|p| p.model.clone()))),
-            ProfileKind::Claude => (claude_implementer_prompt(&prompt, &art)?, None),
+            ProfileKind::Claude => (claude_implementer_prompt(&prompt), None),
         };
         let head_before = wt.head()?;
         let tmp = t.worktree.join(".toryo-tmp");
@@ -333,6 +325,7 @@ impl<'a> Engine<'a> {
         let a = self.begin(NewAttempt { stage: &stage, kind: "agent", profile: Some(&profile), fallback_from: fallback_from.as_deref(), head_before: Some(&head_before), subject_commit: None })?;
         eprintln!("\n── {} (attempt {}, {profile}) ──", stage.to_uppercase(), a.attempt);
         crash_point("implement:after_begin");
+        let ctx = self.context(t, &a, &profile)?;
         let stop = self.lock.watch_stop();
         let r = self.hub.turn_with(
             OpenSession {
@@ -342,7 +335,7 @@ impl<'a> Engine<'a> {
                 run_store: None,
                 capture_dir: t.captures(),
                 schema: Some(contracts::schema("implementation.schema.json")?.into()),
-                context_file: None,
+                context_file: Some(ctx),
                 model,
                 resume,
             },
@@ -550,19 +543,6 @@ impl<'a> Engine<'a> {
     fn review(&mut self, t: &TaskRow) -> Result<Flow> {
         let head = t.machine.checkpoint().context("no checkpoint to review")?.to_string();
         let art = t.artifacts();
-        let ctx = art.join("context-review.md");
-        std::fs::write(
-            &ctx,
-            format!(
-                "{}\n\n## Task pack\n- TASK.md: {}\n- PLAN.md: {}\n- DIFF.patch (base → checkpoint): {}\n- DIFF-incremental.patch (since your last review): {}\n- VERIFY_RESULT.json: {}\n",
-                contracts::role("reviewer.md"),
-                art.join("TASK.md").display(),
-                art.join("PLAN.md").display(),
-                art.join("DIFF.patch").display(),
-                art.join("DIFF-incremental.patch").display(),
-                art.join("VERIFY_RESULT.json").display()
-            ),
-        )?;
         // R48: a review of the same checkpoint that was interrupted (crash, stop) resumes the
         // Reviewer's session
         let prev = { let i = self.id.clone(); self.store.call(move |tx| store::last_attempt(tx, &i, "review"))? };
@@ -572,8 +552,13 @@ impl<'a> Engine<'a> {
         let a = self.begin(NewAttempt { stage: "review", kind: "agent", profile: Some(&t.reviewer), fallback_from: None, head_before: Some(&head), subject_commit: Some(&head) })?;
         eprintln!("\n── REVIEW (attempt {}, {}{}) ──", a.attempt, t.reviewer, if resume.is_some() { ", resuming the interrupted session" } else { "" });
         crash_point("review:after_begin");
+        let ctx = self.context(t, &a, &t.reviewer)?;
         let stop = self.lock.watch_stop();
-        let mut prompt = format!("Review the checkpoint {} in this worktree against TASK.md. Acceptance criteria ids: {:?}.", &head[..12], t.acceptance_ids);
+        let mut prompt = format!(
+            "Review the checkpoint {} in this worktree against TASK.md. DIFF.patch is base → checkpoint; DIFF-incremental.patch is the change since your last review (empty on the first). Acceptance criteria ids: {:?}.",
+            &head[..12],
+            t.acceptance_ids
+        );
         if resume.is_some() {
             prompt = format!("Your previous review turn was interrupted before it finished. {prompt} Return the complete review.");
         }
@@ -643,6 +628,30 @@ impl<'a> Engine<'a> {
     }
 
     // ── attempt helpers ──────────────────────────────────────────────────────────────
+
+    /// Assemble the attempt's context (§7), store it as `context/<stage>-<attempt>` and
+    /// record its hash on the attempt.
+    fn context(&self, t: &TaskRow, a: &AttemptRow, profile: &str) -> Result<PathBuf> {
+        let req = context::request(t, &self.cfg, &a.stage, profile)?;
+        let c = context::assemble(&req)?;
+        let p = context::artifact_path(t, &a.stage, a.attempt);
+        std::fs::create_dir_all(p.parent().expect("parent"))?;
+        std::fs::write(&p, &c.text)?;
+        for w in &c.warnings {
+            eprintln!("!! {w}");
+        }
+        eprintln!("   context: {} bytes, {} sources, sha256 {}", c.text.len(), c.sources.len(), &c.sha256[..12]);
+        let rel = p.strip_prefix(&t.run_store).map(|x| x.display().to_string()).unwrap_or_else(|_| p.display().to_string());
+        let (tid, aid, logical, sha, size) = (t.id.clone(), a.id.clone(), format!("context/{}-{}", a.stage, a.attempt), c.sha256.clone(), c.text.len() as u64);
+        let payload = json!({"sha256": c.sha256, "sources": c.sources, "skipped": c.skipped, "warnings": c.warnings, "budget": c.budget});
+        self.store.call(move |tx| {
+            store::register_artifact(tx, &tid, Some(&aid), &logical, "context", &rel, &sha, size)?;
+            store::set_attempt_context(tx, &aid, &sha)?;
+            store::event(tx, Some(&tid), Some(&aid), "context_assembled", &payload)?;
+            Ok(())
+        })?;
+        Ok(p)
+    }
 
     fn begin(&self, a: NewAttempt) -> Result<AttemptRow> {
         let i = self.id.clone();
@@ -727,19 +736,15 @@ fn review_feedback(review: &Value) -> String {
 }
 
 /// Extra instructions when Claude is the Implementer (R49): file tools only, no shell, no
-/// run store — the task pack is inlined.
-fn claude_implementer_prompt(base: &str, art: &Path) -> Result<String> {
-    let task = std::fs::read_to_string(art.join("TASK.md"))?;
-    let plan = std::fs::read_to_string(art.join("PLAN.md")).unwrap_or_default();
-    Ok(format!(
+/// run store — the context inlines the task pack.
+fn claude_implementer_prompt(base: &str) -> String {
+    format!(
         "{base}\n## Session notes (Claude implementer)\n\
          - Your working directory is the task worktree. You can Read, Grep, Glob, Edit and Write files there only.\n\
          - You have NO shell in this session: do not try to run commands. The orchestrator runs build/test after you \
          and sends failures back. Put what you checked by reading code in `validation_performed`.\n\
-         - Read `AGENTS.md` in the worktree first if it exists and follow it.\n\
-         - The paths above are not accessible to you; their content follows.\n\n\
-         ## TASK.md\n\n{task}\n\n## PLAN.md\n\n{plan}\n"
-    ))
+         - TASK.md and PLAN.md are inlined in your system prompt (the run store is not accessible to you).\n"
+    )
 }
 
 // ── gate decisions (used by `toryo approve` / `reject` and `--yes`) ──────────────────

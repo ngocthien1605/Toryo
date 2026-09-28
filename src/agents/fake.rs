@@ -90,6 +90,8 @@ pub struct FakeCall {
     pub label: String,
     pub prompt: String,
     pub resume: Option<String>,
+    /// The context file's content at call time (§7), if the session had one.
+    pub context: Option<String>,
 }
 
 #[derive(Default)]
@@ -199,6 +201,7 @@ impl AgentSession for FakeSession {
                 label: input.label.clone(),
                 prompt: input.prompt.clone(),
                 resume: if self.turns > 0 || self.req.resume.is_some() { self.external.clone() } else { None },
+                context: self.req.context_file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()),
             });
             s.queues.get_mut(&key).and_then(VecDeque::pop_front)
         };

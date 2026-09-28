@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["context_codeword", "run_store_content", "notes"],
+  "properties": {
+    "context_codeword":  { "type": "string" },
+    "run_store_content": { "type": "string" },
+    "notes":             { "type": "string" }
+  }
+}

@@ -85,6 +85,15 @@ pub enum SpikeCmd {
         #[arg(long)]
         model: Option<String>,
     },
+    /// claude_implementer_isolation (R49, V07-VERIFY 4): Claude in the fallback Implementer mode.
+    ClaudeImplementerIsolation {
+        #[arg(long)]
+        profile: String,
+        #[arg(long, value_enum, default_value = "restricted")]
+        mode: LaunchMode,
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Codex sandbox canary (M0-VERIFY 3, R18/R27).
     CodexCanary {
         #[arg(long)]
@@ -156,8 +165,8 @@ pub enum SpikeCmd {
         )]
         modes: Vec<LaunchMode>,
     },
-    /// Run one task through the whole workflow on a real repo: Claude plans → you approve
-    /// → Codex implements → toryo checkpoints + verifies → Claude reviews → fix cycles.
+    /// Reference prototype (R52) — use `toryo run`. Runs one task through the whole workflow:
+    /// Claude plans → you approve → Codex implements → checkpoint + verify → review → fix cycles.
     Pipeline {
         /// The Git repository (its current branch is the base unless --base is given)
         #[arg(long)]
@@ -453,6 +462,12 @@ pub fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
             *mode,
             model.clone(),
         )?),
+        SpikeCmd::ClaudeImplementerIsolation { profile, mode, model } => ok(sa::claude_implementer_isolation(
+            &load_config(cli)?,
+            profile,
+            *mode,
+            model.clone(),
+        )?),
         SpikeCmd::CodexCanary { profile, model } => ok(sa::codex_canary(
             &load_config(cli)?,
             profile,
@@ -538,6 +553,10 @@ pub fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
             accept_unverified,
             fake_agents,
         } => {
+            eprintln!(
+                "WARNING: `toryo spike pipeline` is the M0 reference prototype (R52) and gets no new features \
+                 (no project context, no protected snapshot, no Low-IL verify, no budget). Use `toryo task create` + `toryo run`."
+            );
             let cfg = load_config(cli)?;
             let fake = fake_agents.is_some();
             let preflight = |cfg: &Effective, p: &[&str]| -> Result<()> {
