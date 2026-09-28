@@ -17,6 +17,7 @@
 //!   run. A moved HEAD, a modified tracked file or a rewritten pointer is
 //!   `verify_mutated_tree`.
 
+use crate::git::short;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -227,7 +228,7 @@ pub fn prepare(
     if head.trim() != sha || !status.is_empty() {
         bail!(
             "{MUTATED}: the verify checkout is not a clean checkout of {} before the run (HEAD {})",
-            &sha[..12],
+            short(sha),
             head.trim()
         );
     }

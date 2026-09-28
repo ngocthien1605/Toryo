@@ -13,6 +13,7 @@
 //! in a detached checkout of the checkpoint under `verify_root`, inside the Low-IL boundary
 //! (R29/R36/R45, M6). Not yet here: budget admission (M7).
 
+use crate::git::short;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -693,7 +694,7 @@ impl<'a> Engine<'a> {
         if wt.head()? != head_before {
             eprintln!(
                 "!! policy_violation: the agent moved HEAD — soft reset to {}",
-                &head_before[..12]
+                short(&head_before)
             );
             wt.soft_reset(&head_before)?;
             let (i, aid) = (self.id.clone(), a.id.clone());
@@ -793,7 +794,7 @@ impl<'a> Engine<'a> {
             Some(c) if !c.partial => {
                 eprintln!(
                     "✔ checkpoint {} already committed (trailer match)",
-                    &c.sha[..12]
+                    short(&c.sha)
                 );
                 (c.sha, if c.no_change { "no_change" } else { "normal" })
             }
@@ -842,7 +843,7 @@ impl<'a> Engine<'a> {
             &inc,
             "DIFF-incremental.patch",
         )?;
-        eprintln!("✔ checkpoint {} ({kind})", &head[..12]);
+        eprintln!("✔ checkpoint {} ({kind})", short(&head));
         // R35: a committed tracked protected change allowed by TASK.md becomes the new baseline
         let c = protect::check(self.store, t, &self.g, &self.protect)?;
         let allowed: Vec<String> = c
@@ -859,7 +860,7 @@ impl<'a> Engine<'a> {
                 &self.protect,
                 &format!(
                     "checkpoint {}: allowed protected change {allowed:?} (TASK.md)",
-                    &head[..12]
+                    short(&head)
                 ),
             )?;
             eprintln!("   protected baseline renewed: {allowed:?} (## Allow protected)");
@@ -1140,7 +1141,7 @@ impl<'a> Engine<'a> {
         let stop = self.lock.watch_stop();
         let mut prompt = format!(
             "Review the checkpoint {} in this worktree against TASK.md. DIFF.patch is base → checkpoint; DIFF-incremental.patch is the change since your last review (empty on the first). Acceptance criteria ids: {:?}.",
-            &head[..12],
+            short(&head),
             t.acceptance_ids
         );
         if resume.is_some() {
@@ -1276,7 +1277,7 @@ impl<'a> Engine<'a> {
                     "follow-ups: non-blocking review issues (R53)",
                     &format!(
                         "Review of checkpoint {} approved with these open issues:\n{}",
-                        &head[..12],
+                        short(&head),
                         nb.join("\n")
                     ),
                 )?;
@@ -1432,7 +1433,7 @@ impl<'a> Engine<'a> {
             "   context: {} bytes, {} sources, sha256 {}",
             c.text.len(),
             c.sources.len(),
-            &c.sha256[..12]
+            short(&c.sha256)
         );
         let logical = format!("context/{}-{}", a.stage, a.attempt);
         let v = super::artifacts::put(
@@ -1707,7 +1708,7 @@ pub fn approve_now(store: &Store, t: &TaskRow, kind: GateKind, expect: Option<&s
     if let Some(e) = expect {
         let digest = gate_digest(store, &t.id, kind, gate.occurrence)?;
         if !digest.starts_with(e) {
-            bail!("subject_changed: the gate subject digest is {} — it does not start with --expect {e} (R32)", &digest[..12]);
+            bail!("subject_changed: the gate subject digest is {} — it does not start with --expect {e} (R32)", short(&digest));
         }
     }
     let e = match kind {

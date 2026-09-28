@@ -12,6 +12,7 @@
 //! derived **views** for humans, rewritten after each commit; they are never evidence.
 //! Agents get the version paths (§7), and every hand-off re-hashes what it hands over.
 
+use crate::git::short;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -92,7 +93,7 @@ pub fn put(
     let tmp = staging(t).join(format!(
         "{}-{version}-{}.{ext}",
         logical.replace('/', "_"),
-        &sha[..12]
+        short(&sha)
     ));
     {
         let mut f =
@@ -104,7 +105,7 @@ pub fn put(
     // 2. publish (never overwrite)
     let dir = root(t).join(logical);
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{version}-{}.{ext}", &sha[..12]));
+    let path = dir.join(format!("{version}-{}.{ext}", short(&sha)));
     if path.exists() {
         // a leftover of a crash between publish and commit that reconciliation has not seen
         if sha256_hex(&std::fs::read(&path)?) != sha {

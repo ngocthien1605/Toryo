@@ -7,6 +7,7 @@
 //! artifact reconciliation — staging leftovers removed, orphans moved to `orphans/`, every
 //! registered version re-hashed (`artifact_missing` / `artifact_tampered` → Escalated).
 
+use crate::git::short;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -31,10 +32,6 @@ pub struct Recovery<'a> {
     pub protect: &'a Protected,
     /// The task's frozen configuration (billing kind of a killed turn's usage row).
     pub cfg: &'a Effective,
-}
-
-fn short(s: &str) -> &str {
-    &s[..12.min(s.len())]
 }
 
 impl<'a> Recovery<'a> {

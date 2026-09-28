@@ -1,6 +1,7 @@
 //! `toryo doctor` (plan §15): environment, profiles, repository configuration and the
 //! M0 evidence recorded so far. Exit code 1 when any check FAILs.
 
+use crate::git::short;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -116,7 +117,7 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
         format!(
             "{} (effective sha256 {})",
             cfg.repo_path.display(),
-            &cfg.sha256()[..12]
+            short(&cfg.sha256())
         ),
     );
     match &cfg.machine_path {

@@ -329,6 +329,11 @@ pub fn referenced_filter_names(g: &GitCmd, loc: &Loc) -> Result<BTreeSet<String>
     Ok(names)
 }
 
+/// The first 12 characters of a SHA or digest, for display. Never panics on short input.
+pub fn short(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
 /// Parse `git status --porcelain=v1 -z` into (XY, path) pairs.
 pub fn parse_status_z(out: &[u8]) -> Vec<(String, String)> {
     let mut v = Vec::new();
@@ -352,6 +357,13 @@ pub mod filter_process;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn short_never_panics() {
+        assert_eq!(super::short("0123456789abcdef"), "0123456789ab");
+        assert_eq!(super::short("abc"), "abc");
+        assert_eq!(super::short(""), "");
+    }
+
     use super::*;
 
     #[test]

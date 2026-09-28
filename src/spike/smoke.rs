@@ -6,6 +6,7 @@
 //! For the Claude steps it tries the plan's launch mode first and then the two §6.2
 //! fallbacks, recording which one worked — the first answer to M0-VERIFY 1.
 
+use crate::git::short;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -203,7 +204,7 @@ pub fn smoke(cfg: &Effective, a: SmokeArgs) -> Result<bool> {
         &mut steps,
         "setup",
         true,
-        format!("fixture main={}, worktree toryo/CALC-001", &base[..12]),
+        format!("fixture main={}, worktree toryo/CALC-001", short(&base)),
     );
 
     // 1. plan (Claude, read-only)
@@ -320,7 +321,7 @@ pub fn smoke(cfg: &Effective, a: SmokeArgs) -> Result<bool> {
         &mut steps,
         "agent did not commit (HEAD guard)",
         head_before == head_after,
-        format!("HEAD {}", &head_after[..12]),
+        format!("HEAD {}", short(&head_after)),
     );
     let protected: Vec<&String> = changed
         .iter()
@@ -374,7 +375,7 @@ pub fn smoke(cfg: &Effective, a: SmokeArgs) -> Result<bool> {
         true,
         format!(
             "{} ({} bytes diff{})",
-            &checkpoint[..12],
+            short(&checkpoint),
             diff.len(),
             if no_change { ", no-change" } else { "" }
         ),

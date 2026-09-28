@@ -12,6 +12,7 @@
 //! immutable run-store versions, the Low-IL verify boundary, budget pause. Every turn's
 //! stream, prompt and outcome is still captured under the run directory.
 
+use crate::git::short;
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -240,7 +241,7 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
     eprintln!(
         "\n■ {id}: repo {} · base {base_ref} ({}) · worktree {} · branch {branch}",
         repo.display(),
-        &base[..12],
+        short(&base),
         wt.display()
     );
     eprintln!(
@@ -496,7 +497,7 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
             if head_after != head_before {
                 eprintln!(
                     "!! policy_violation: the agent moved HEAD — soft reset to {}",
-                    &head_before[..12]
+                    short(&head_before)
                 );
                 g.run(&wtl, false, &["reset", "-q", "--soft", &head_before])?;
                 log.push(json!({"step": stage, "policy_violation": "agent commit, soft-reset"}));
@@ -581,7 +582,7 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
             std::fs::write(rs.join("DIFF-incremental.patch"), &inc)?;
             eprintln!(
                 "✔ checkpoint {} ({} file(s), {} bytes diff{})",
-                &checkpoint[..12],
+                short(&checkpoint),
                 changed.len(),
                 diff.len(),
                 if no_change { ", no change" } else { "" }
@@ -667,7 +668,7 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
                 rs.join("VERIFY_RESULT.json").display()
             ),
         )?;
-            let mut rprompt = format!("Review the checkpoint {} in this worktree against TASK.md. Acceptance criteria ids: {ac_ids:?}.", &checkpoint[..12]);
+            let mut rprompt = format!("Review the checkpoint {} in this worktree against TASK.md. Acceptance criteria ids: {ac_ids:?}.", short(&checkpoint));
             let mut rresume = None;
             let mut review = Value::Null;
             for corr in 0..=2 {
@@ -769,7 +770,7 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
                     } else {
                         ask(&format!(
                             "\n▶ Accept the result of {id} at checkpoint {}? [y]es / [n]o (you will give a reason) / [q]uit: ",
-                            &checkpoint[..12]
+                            short(&checkpoint)
                         ))?
                     };
                     match ans.to_ascii_lowercase().as_str() {
@@ -783,7 +784,7 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
                                     subject,
                                 },
                             )?;
-                            return Ok(format!("approved at checkpoint {}", &checkpoint[..12]));
+                            return Ok(format!("approved at checkpoint {}", short(&checkpoint)));
                         }
                         "q" | "quit" => {
                             log.push(json!({"step": "final-gate", "decision": "cancelled"}));

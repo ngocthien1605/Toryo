@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 use std::time::Duration;
+use toryo::git::short;
 
 use anyhow::{bail, Context, Result};
 use clap::{Subcommand, ValueEnum};
@@ -293,7 +294,7 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
                 t.acceptance_ids,
                 t.worktree.display(),
                 t.branch,
-                &t.base_commit[..12],
+                short(&t.base_commit),
                 t.planner,
                 t.implementers.join(" → (fallback) "),
                 t.reviewer,
@@ -353,7 +354,7 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
         let text = std::fs::read_to_string(t.artifacts().join("config.json"))?;
         eprintln!(
             "{id}: frozen configuration, digest {}",
-            &t.config_sha256[..12]
+            short(&t.config_sha256)
         );
         let v: serde_json::Value = serde_json::from_str(&text)?;
         println!("{}", serde_json::to_string_pretty(&v)?);
@@ -371,7 +372,7 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     if new_sha == t.config_sha256 {
         eprintln!(
             "{id}: the effective configuration is unchanged ({})",
-            &new_sha[..12]
+            short(&new_sha)
         );
         lock.release();
         return Ok(0);
@@ -384,8 +385,8 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
         Ok(serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(s)?)? + "\n")
     };
     let (a, b) = (
-        dir.join(format!("{n}-old-{}.json", &t.config_sha256[..12])),
-        dir.join(format!("{n}-new-{}.json", &new_sha[..12])),
+        dir.join(format!("{n}-old-{}.json", short(&t.config_sha256))),
+        dir.join(format!("{n}-new-{}.json", short(&new_sha))),
     );
     std::fs::write(&a, pretty(&old.canonical_json())?)?;
     std::fs::write(&b, pretty(&new_text)?)?;
@@ -407,12 +408,12 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     eprintln!("{}", String::from_utf8_lossy(&out.stdout));
     eprintln!(
         "{id}: new configuration digest {} (was {})",
-        &new_sha[..12],
-        &t.config_sha256[..12]
+        short(&new_sha),
+        short(&t.config_sha256)
     );
     if let Some(e) = expect {
         if !new_sha.starts_with(e) {
-            bail!("subject_changed: the new configuration digest is {} — it does not start with --expect {e}; nothing was changed", &new_sha[..12]);
+            bail!("subject_changed: the new configuration digest is {} — it does not start with --expect {e}; nothing was changed", short(&new_sha));
         }
     }
     let (planner, implementers, reviewer) = task::roles(&new)?;
@@ -435,8 +436,8 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     )?;
     let mut notes = vec![format!(
         "configuration {} → {} (diff: {})",
-        &t.config_sha256[..12],
-        &new_sha[..12],
+        short(&t.config_sha256),
+        short(&new_sha),
         b.display()
     )];
     let reverify =
@@ -876,10 +877,10 @@ fn show(id: &str) -> Result<i32> {
             a.profile.unwrap_or_default(),
             a.error_class.unwrap_or_default(),
             a.git_head_after
-                .map(|h| format!(" → {}", &h[..12]))
+                .map(|h| format!(" → {}", short(&h)))
                 .unwrap_or_default(),
             a.partial_commit
-                .map(|h| format!(" partial {}", &h[..12]))
+                .map(|h| format!(" partial {}", short(&h)))
                 .unwrap_or_default()
         );
     }
@@ -915,7 +916,7 @@ fn show(id: &str) -> Result<i32> {
                 a.gate,
                 a.occurrence,
                 a.status,
-                &a.subject_digest[..12],
+                short(&a.subject_digest),
                 a.reason.unwrap_or_default()
             );
         }
@@ -1011,7 +1012,7 @@ pub fn context(cmd: &ContextCmd) -> Result<i32> {
                 id,
                 a.id,
                 a.profile.unwrap_or_default(),
-                &sha[..12],
+                short(&sha),
                 if ok {
                     "matches stage_attempts.context_sha256"
                 } else {
@@ -1072,7 +1073,7 @@ pub fn partial(cmd: &PartialCmd) -> Result<i32> {
                 m.entries.len(),
                 a.id,
                 into.display(),
-                &m.head[..12]
+                short(&m.head)
             );
             Ok(0)
         }

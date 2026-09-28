@@ -14,6 +14,7 @@
 //! [`completion_check`] must pass before anything destructive; [`export`] re-creates the
 //! state in a fresh detached checkout so nothing discarded is lost.
 
+use crate::git::short;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -197,7 +198,7 @@ pub fn take(
     };
     let bytes = serde_json::to_vec_pretty(&m)?;
     std::fs::write(staging.join("manifest.json"), &bytes)?; // last
-    let dir = root.join(format!("{version}-{}", &sha256_hex(&bytes)[..12]));
+    let dir = root.join(format!("{version}-{}", short(&sha256_hex(&bytes))));
     std::fs::rename(&staging, &dir)?; // a new path: never overwrites an earlier version (R34)
     Ok((dir, m))
 }

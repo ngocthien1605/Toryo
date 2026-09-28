@@ -22,6 +22,7 @@
 //! them), then truncates global.md, CLAUDE.md and AGENTS.md, and — only when the task pack
 //! must be inlined — the task pack, largest last. Every trim is reported.
 
+use crate::git::short;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
@@ -467,7 +468,7 @@ pub fn describe(a: &Assembled) -> String {
         a.kind,
         a.text.len(),
         a.budget / 1024,
-        &a.sha256[..12]
+        short(&a.sha256)
     );
     for x in &a.sources {
         s.push_str(&format!(
