@@ -486,6 +486,66 @@ pub fn claude_implementer_isolation(
     Ok(pass)
 }
 
+/// V07-VERIFY 2 (R46): the per-task TEMP (`<worktree>\\.toryo-tmp`) reaches the commands
+/// Codex runs in its sandbox — `GetTempPath()` points there and a temporary file lands there.
+pub fn codex_temp_probe(cfg: &Effective, profile: &str, model: Option<String>) -> Result<bool> {
+    let root = new_run_dir("codex-temp", profile)?;
+    let wt = root.join("repo");
+    fixture::init_repo(&wt)?;
+    let tmp = wt.join(".toryo-tmp");
+    std::fs::create_dir_all(&tmp)?;
+    let cmd = if cfg!(windows) {
+        "pwsh -NoProfile -Command \"[IO.Path]::GetTempPath() | Set-Content -Path temp-path.txt; (New-TemporaryFile).FullName | Add-Content -Path temp-path.txt\""
+    } else {
+        "sh -c 'printf \"%s\\n\" \"$TEMP\" > temp-path.txt; mktemp -p \"$TEMP\" >> temp-path.txt'"
+    };
+    let prompt = format!(
+        "This is an automated environment probe. Run exactly this one shell command in the current directory, do not change it, and do not set TEMP/TMP yourself:\n\n{cmd}\n\nThen reply with the file content of temp-path.txt."
+    );
+    let env: std::collections::BTreeMap<String, String> =
+        [("TEMP", &tmp), ("TMP", &tmp)].into_iter().map(|(k, v)| (k.to_string(), v.display().to_string())).collect();
+    let r = codex_turn(
+        cfg,
+        CodexArgs {
+            profile: profile.into(),
+            worktree: wt.clone(),
+            prompt,
+            schema_path: None,
+            model,
+            resume: None,
+            extra_args: vec![],
+            label: "temp-probe".into(),
+            opts: TurnOpts { max: Duration::from_secs(15 * 60), env, ..Default::default() },
+        },
+        &root,
+    )?;
+    print_summary(&r);
+    let out = std::fs::read_to_string(wt.join("temp-path.txt")).unwrap_or_default();
+    let norm = |x: &str| x.trim().replace('\\', "/").trim_end_matches('/').to_ascii_lowercase();
+    let want = norm(&tmp.display().to_string());
+    let lines: Vec<String> = out.lines().map(norm).filter(|l| !l.is_empty()).collect();
+    let created: Vec<String> = std::fs::read_dir(&tmp)?.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+    let checks = vec![
+        ("the command ran (temp-path.txt written)", !lines.is_empty()),
+        ("GetTempPath()/TEMP points into <worktree>/.toryo-tmp", lines.first().is_some_and(|l| *l == want)),
+        ("a temporary file was created in .toryo-tmp", lines.get(1).is_some_and(|l| l.starts_with(&want)) && !created.is_empty()),
+    ];
+    let pass = checks.iter().all(|(_, ok)| *ok);
+    eprintln!("── codex_temp_probe (V07-VERIFY 2) ──");
+    for (name, ok) in &checks {
+        eprintln!("[{}] {name}", if *ok { "PASS" } else { "FAIL" });
+    }
+    eprintln!("temp-path.txt: {:?}\n.toryo-tmp: {created:?}", out.trim());
+    let mut rec = Record::new("codex-temp", Some(profile), &["V07-VERIFY 2", "R46"]);
+    rec.pass = Some(pass);
+    rec.bind_versions(Some(cfg), &[profile]);
+    rec.summary = if pass { "TEMP reaches sandboxed commands".into() } else { format!("FAIL: temp-path.txt = {:?}", out.trim()) };
+    rec.details = json!({"checks": checks.iter().map(|(n, ok)| json!({"check": n, "ok": ok})).collect::<Vec<_>>(), "temp_path": out, "created": created, "argv": r.argv});
+    rec.run_dir = Some(root.display().to_string());
+    append(&rec)?;
+    Ok(pass)
+}
+
 /// Run a marker command through the shell Claude would use (Windows: the profile's Git Bash,
 /// else cmd; Unix: sh) with the profile's environment; true if the marker appeared (then removed).
 fn marker_control(p: &Profile, cmd: &str, marker: &Path) -> Result<bool> {

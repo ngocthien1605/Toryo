@@ -266,6 +266,25 @@ pub fn unverified_profiles(cfg: &Effective, profiles: &[&str]) -> Result<Vec<(St
     Ok(out)
 }
 
+/// R49 (V07-VERIFY 4): Claude profiles used as a fallback Implementer also need a passing
+/// `claude-implementer-isolation` record for the version installed now.
+pub fn unverified_implementers(cfg: &Effective, profiles: &[&str]) -> Result<Vec<(String, String)>> {
+    let records = load();
+    let mut out = Vec::new();
+    for name in profiles {
+        let p = cfg.profile(name)?;
+        if p.kind != ProfileKind::Claude {
+            continue;
+        }
+        let spike = "claude-implementer-isolation";
+        let st = evidence_status(&records, spike, name, name, profile_version(p).as_deref());
+        if !st.is_verified() {
+            out.push(((*name).to_string(), st.describe(spike)));
+        }
+    }
+    Ok(out)
+}
+
 pub fn append(rec: &Record) -> Result<PathBuf> {
     let dir = m0_dir();
     std::fs::create_dir_all(&dir)?;

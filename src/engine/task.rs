@@ -156,7 +156,11 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     if res.is_err() {
         let _ = g.output(&Loc::Discover(wt.clone()), false, &["worktree", "remove", "--force", &fwd(&wt)]);
     }
-    res
+    let t = res?;
+    // R35: protected baseline v1 — after the info/exclude line (R46), before any agent runs
+    let (_, protect, _) = super::runner::task_policy(&t, cfg)?;
+    super::protect::take_baseline(store, &t, &g, &protect, "v1 (task created)")?;
+    Ok(t)
 }
 
 /// The frozen configuration of a task (R35).

@@ -20,6 +20,11 @@ pub struct Env {
 }
 
 pub fn setup(implementer: &str) -> Env {
+    setup_with(implementer, "")
+}
+
+/// `setup` with extra top-level YAML appended to toryo.yaml (e.g. a `policy:` block).
+pub fn setup_with(implementer: &str, extra: &str) -> Env {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let repo = root.join("calc");
@@ -42,7 +47,7 @@ roles:
 commands:
   verify:
     - {{ name: divide-present, program: git, args: ["grep", "-q", "Divide-Numbers", "--", "src"] }}
-"#,
+{extra}"#,
             repo = fwd(&repo),
             wts = fwd(&root.join("wts")),
         ),
@@ -173,4 +178,20 @@ pub fn calls(env: &Env, id: &str) -> Vec<Value> {
     let t = task(env, id);
     let v: Value = serde_json::from_slice(&std::fs::read(t.captures().join(format!("fake-calls-{}.json", t.lock_generation))).unwrap()).unwrap();
     v.as_array().cloned().unwrap_or_default()
+}
+
+pub fn fail(class: &str, detail: &str) -> Value {
+    json!({"kind":"fail","class":class,"detail":detail})
+}
+
+/// Commit files into the fixture repo (on main), before a task is created.
+pub fn commit_repo(env: &Env, files: &[(&str, &str)], msg: &str) {
+    for (p, c) in files {
+        let f = env.repo.join(p);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, c).unwrap();
+    }
+    let run = |a: &[&str]| assert!(Command::new("git").arg("-C").arg(&env.repo).args(a).status().unwrap().success());
+    run(&["add", "-A"]);
+    run(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", msg]);
 }

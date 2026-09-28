@@ -116,6 +116,32 @@ pub fn review_violations(v: &Value, ac_ids: &[String]) -> Vec<String> {
 pub struct Protected {
     exact: Vec<String>,
     globs: Vec<regex::Regex>,
+    /// `## Allow protected` in TASK.md (R28): tracked protected paths this task may change.
+    allowed: Vec<regex::Regex>,
+    /// `policy.deny_paths` (§8): never changed, never planned (e.g. `**/ZZZ/**`).
+    deny: Vec<regex::Regex>,
+}
+
+/// Paths/globs listed under `## Allow protected` in TASK.md (R28).
+pub fn parse_allow_protected(task: &str) -> Vec<String> {
+    let mut in_section = false;
+    let mut out = Vec::new();
+    for line in task.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            in_section = t.trim_start_matches('#').trim().eq_ignore_ascii_case("allow protected");
+            continue;
+        }
+        if in_section {
+            if let Some(item) = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")) {
+                let p = item.trim().trim_matches('`').trim();
+                if !p.is_empty() {
+                    out.push(p.replace('\\', "/"));
+                }
+            }
+        }
+    }
+    out
 }
 
 pub fn glob_to_regex(g: &str) -> regex::Regex {
@@ -147,10 +173,46 @@ impl Protected {
         Self {
             exact: exact.into_iter().map(|e| e.replace('\\', "/")).collect(),
             globs: globs.iter().map(|g| glob_to_regex(g)).collect(),
+            allowed: Vec::new(),
+            deny: Vec::new(),
         }
     }
 
+    /// Add the task's `## Allow protected` list and `policy.deny_paths`.
+    pub fn with_policy(mut self, allowed: &[String], deny: &[String]) -> Self {
+        self.allowed = allowed.iter().map(|g| glob_to_regex(g)).collect();
+        self.deny = deny
+            .iter()
+            .map(|g| regex::Regex::new(&format!("(?i){}", glob_to_regex(g).as_str())).unwrap_or_else(|_| glob_to_regex(g)))
+            .collect();
+        self
+    }
+
+    /// Protected and not allowed for this task: changing it is a path-policy violation.
     pub fn is_protected(&self, path: &str) -> bool {
+        self.matches(path) && !self.is_allowed(path)
+    }
+
+    /// A change here breaks the path policy: protected (and not allowed) or denied.
+    pub fn violates(&self, path: &str) -> bool {
+        self.is_protected(path) || self.is_denied(path)
+    }
+
+    /// Listed under `## Allow protected` in TASK.md.
+    pub fn is_allowed(&self, path: &str) -> bool {
+        let p = path.replace('\\', "/");
+        self.allowed.iter().any(|g| g.is_match(&p))
+    }
+
+    /// Matches `policy.deny_paths` (case-insensitive).
+    pub fn is_denied(&self, path: &str) -> bool {
+        let p = path.replace('\\', "/");
+        self.deny.iter().any(|g| g.is_match(&p))
+    }
+
+    /// Protected by the policy, whether or not this task may change it (the R35 snapshot
+    /// covers every match).
+    pub fn matches(&self, path: &str) -> bool {
         let p = path.replace('\\', "/");
         let name = p.rsplit('/').next().unwrap_or(&p);
         self.exact.contains(&p)
@@ -285,5 +347,11 @@ mod tests {
         assert!(!p.is_protected("src/BatchRename.psm1"));
         assert!(!p.is_protected("scripts/other.ps1"));
         assert!(!p.is_protected("tasks/BR-002.md"));
+        let p = p.with_policy(&["AGENTS.md".into()], &["**/ZZZ/**".into()]);
+        assert!(!p.is_protected("AGENTS.md") && p.matches("AGENTS.md"), "allowed, still snapshotted");
+        assert!(p.is_denied("Metadata/zzz/Foo.xml") && p.is_denied("ZZZ/a") && p.violates("x/ZZZ/y"));
+        assert!(!p.is_denied("src/ZZZa/b"));
+        let t = "# T\n## Allow protected\n- `scripts\\test.ps1`\n- AGENTS.md\n\n## Notes\n- not this\n";
+        assert_eq!(parse_allow_protected(t), vec!["scripts/test.ps1".to_string(), "AGENTS.md".to_string()]);
     }
 }

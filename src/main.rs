@@ -103,6 +103,10 @@ enum Cmd {
         /// After fixing the worktree by hand: snapshot, re-check, recovery checkpoint (R31)
         #[arg(long, conflicts_with = "note")]
         keep_partial: bool,
+        /// After `protected_config_changed`: accept this changed protected path (repeat for
+        /// each); a new protected baseline is taken and the decision goes to DECISIONS.md (R35)
+        #[arg(long = "accept-protected-change", value_name = "PATH", conflicts_with_all = ["note", "discard_partial", "keep_partial"])]
+        accept_protected: Vec<String>,
         #[command(flatten)]
         drive: DriveArgs,
     },
@@ -212,9 +216,9 @@ fn run(cli: Cli) -> Result<i32> {
             engine_cli::approve(id, *gate, expect.as_deref(), *force, *cont, drive)
         }
         Cmd::Reject { id, gate, reason } => engine_cli::reject(id, *gate, reason),
-        Cmd::Resume { id, note, discard_partial, keep_partial, drive } => engine_cli::resume(
+        Cmd::Resume { id, note, discard_partial, keep_partial, accept_protected, drive } => engine_cli::resume(
             id.as_deref(),
-            &ResumeArgs { note: note.clone(), discard_partial: *discard_partial, keep_partial: *keep_partial },
+            &ResumeArgs { note: note.clone(), discard_partial: *discard_partial, keep_partial: *keep_partial, accept_protected: accept_protected.clone() },
             drive,
         ),
         Cmd::Stop { id, wait_secs } => engine_cli::stop(id, *wait_secs),

@@ -94,6 +94,13 @@ pub enum SpikeCmd {
         #[arg(long)]
         model: Option<String>,
     },
+    /// V07-VERIFY 2 (R46): does the per-task TEMP reach Codex's sandboxed commands?
+    CodexTempProbe {
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Codex sandbox canary (M0-VERIFY 3, R18/R27).
     CodexCanary {
         #[arg(long)]
@@ -326,6 +333,12 @@ pub fn run_canaries(cli: &Cli, only: &[String], mode: LaunchMode) -> Result<Vec<
             toryo::config::ProfileKind::Codex => s(&["spike", "codex-canary", "--profile", name]),
         };
         steps.push((format!("{} {name}", args[1]), args));
+        // R49: a Claude profile in the implementer chain also runs the implementer mode
+        let in_chain = toryo::engine::task::roles(&cfg).map(|(_, chain, _)| chain.contains(name)).unwrap_or(false);
+        if p.kind == toryo::config::ProfileKind::Claude && in_chain {
+            let a2 = s(&["spike", "claude-implementer-isolation", "--profile", name, "--mode", &mode_arg]);
+            steps.push((format!("claude-implementer-isolation {name}"), a2));
+        }
     }
     for o in only {
         if !cfg.repo.profiles.contains_key(o) {
@@ -468,6 +481,7 @@ pub fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
             *mode,
             model.clone(),
         )?),
+        SpikeCmd::CodexTempProbe { profile, model } => ok(sa::codex_temp_probe(&load_config(cli)?, profile, model.clone())?),
         SpikeCmd::CodexCanary { profile, model } => ok(sa::codex_canary(
             &load_config(cli)?,
             profile,

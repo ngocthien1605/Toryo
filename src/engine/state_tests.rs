@@ -50,7 +50,9 @@ fn samples() -> Vec<E> {
         E::ForceFinal,
         E::ResumeStage,
         E::BudgetExceeded,
-        E::BudgetResumed,
+        E::Pause { reason: s("quota") },
+        E::Unpause,
+        E::Reverify,
         E::Escalate { reason: s("x") },
         E::Cancel,
         E::Fail { error: s("x") },
@@ -61,15 +63,15 @@ fn samples() -> Vec<E> {
 fn allowed(s: S) -> &'static [&'static str] {
     match s {
         S::New => &["start", "escalate", "cancel", "fail"],
-        S::Planning => &["plan_policy_violation", "plan_ready", "budget_exceeded", "escalate", "cancel", "fail"],
+        S::Planning => &["plan_policy_violation", "plan_ready", "budget_exceeded", "pause", "escalate", "cancel", "fail"],
         S::WaitingPlanApproval => &["plan_approved", "plan_rejected", "escalate", "cancel", "fail"],
-        S::Implementing | S::Fixing => &["implementation_done", "path_policy_violation", "budget_exceeded", "escalate", "cancel", "fail"],
-        S::Checkpointing => &["checkpointed", "budget_exceeded", "escalate", "cancel", "fail"],
-        S::Verifying => &["verify_passed", "verify_failed", "budget_exceeded", "escalate", "cancel", "fail"],
-        S::Reviewing => &["review_approved", "changes_requested", "review_blocked", "budget_exceeded", "escalate", "cancel", "fail"],
-        S::WaitingFinalApproval => &["final_approved", "final_rejected", "escalate", "cancel", "fail"],
-        S::Escalated => &["resume_with_note", "force_final", "resume_stage", "cancel", "fail"],
-        S::Paused => &["budget_resumed", "escalate", "cancel", "fail"],
+        S::Implementing | S::Fixing => &["implementation_done", "path_policy_violation", "budget_exceeded", "pause", "escalate", "cancel", "fail"],
+        S::Checkpointing => &["checkpointed", "budget_exceeded", "pause", "escalate", "cancel", "fail"],
+        S::Verifying => &["verify_passed", "verify_failed", "budget_exceeded", "pause", "escalate", "cancel", "fail"],
+        S::Reviewing => &["review_approved", "changes_requested", "review_blocked", "budget_exceeded", "pause", "escalate", "cancel", "fail"],
+        S::WaitingFinalApproval => &["final_approved", "final_rejected", "reverify", "escalate", "cancel", "fail"],
+        S::Escalated => &["resume_with_note", "force_final", "resume_stage", "reverify", "cancel", "fail"],
+        S::Paused => &["unpause", "escalate", "cancel", "fail"],
         S::Completed | S::Cancelled | S::Failed => &[],
     }
 }
@@ -88,7 +90,7 @@ fn transition_table_is_exhaustive() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 14 * 23);
+    assert_eq!(checked, 14 * 25);
 }
 
 #[test]
@@ -252,7 +254,7 @@ fn paused_returns_to_the_previous_state() {
         let mut m = at(s);
         assert_eq!(m.apply(E::BudgetExceeded), Ok(S::Paused));
         assert_eq!(m.paused_from(), Some(s));
-        assert_eq!(m.apply(E::BudgetResumed), Ok(s));
+        assert_eq!(m.apply(E::Unpause), Ok(s));
         assert_eq!(m.paused_from(), None);
     }
     // waiting states are not paused by a budget
@@ -340,4 +342,25 @@ fn resume_stage_returns_to_the_escalated_stage_without_a_cycle() {
     let mut m = at(S::WaitingPlanApproval);
     m.apply(E::Escalate { reason: "x".into() }).unwrap();
     assert!(m.apply(E::ResumeStage).is_err());
+}
+
+#[test]
+fn pause_keeps_the_stage_and_reverify_clears_the_verified_head() {
+    // R49 (M5): quota / --no-fallback pause the running stage; resume returns to it
+    let mut m = at(S::Reviewing);
+    assert_eq!(m.apply(E::Pause { reason: "reviewer out of quota".into() }), Ok(S::Paused));
+    assert_eq!(m.reason(), Some("reviewer out of quota"));
+    assert_eq!(m.apply(E::Unpause), Ok(S::Reviewing));
+    // R35: a reloaded verify config sends the checkpoint back to Verify
+    let mut m = at(S::WaitingFinalApproval);
+    assert_eq!(m.apply(E::Reverify), Ok(S::Verifying));
+    assert!(m.gate().is_none() && m.verified_head().is_none());
+    assert!(m.apply(E::ReviewApproved { head: C1.into() }).is_err());
+    let mut m = at(S::Escalated);
+    assert_eq!(m.apply(E::Reverify), Ok(S::Verifying));
+    assert_eq!(m.apply(E::ForceFinal).map_err(|_| ()), Err(()));
+    // never before a checkpoint exists
+    let mut m = at(S::Escalated);
+    m.checkpoint = None;
+    assert!(m.apply(E::Reverify).is_err());
 }

@@ -2,7 +2,8 @@
 //! (step 0, lock-first): holding it proves the previous owner is gone, so its stage
 //! processes died with its Job (`KILL_ON_JOB_CLOSE`, R23).
 //!
-//! Not yet here: the protected-state comparison (step 3, R35 → M5) and artifact
+//! Step 3 (R35, M5): the protected state is compared first; a change to untracked/ignored
+//! protected files or Git metadata escalates before anything else. Not yet here: artifact
 //! reconciliation (step 4, R34 → M6).
 
 use std::path::PathBuf;
@@ -11,11 +12,12 @@ use anyhow::{bail, Context, Result};
 use serde_json::json;
 
 use super::checks::Protected;
+use super::protect;
 use super::runner::writing_stage;
 use super::snapshot;
 use super::state::{PipelineEvent as Ev, PipelineState as St};
 use super::store::{self, AttemptEnd, AttemptRow, AttemptStatus, Store, TaskRow};
-use super::worktree::{Worktree, T_ATTEMPT, T_IMPLEMENTER, T_PARTIAL, T_STAGE, T_TASK};
+use super::worktree::{Worktree, T_ATTEMPT, T_AGENT, T_PARTIAL, T_STAGE, T_TASK};
 use crate::config::{Billing, Effective};
 use crate::git::GitCmd;
 
@@ -82,6 +84,23 @@ impl<'a> Recovery<'a> {
         let i = id.to_string();
         let atts = self.store.call(move |tx| store::attempts(tx, &i))?;
         let wt = Worktree::new(self.g, &t.worktree);
+        // §10 step 3 (R35): protected state first
+        if t.state.is_running() {
+            let c = protect::check(self.store, &t, self.g, self.protect)?;
+            let hard = c.hard();
+            if !hard.is_empty() {
+                let reason = protect::escalation_reason(&t.id, &hard, c.diff_path.as_deref());
+                for a in atts.iter().filter(|a| a.status == AttemptStatus::Running) {
+                    self.finish(a, AttemptStatus::Interrupted, AttemptEnd { error_class: Some(protect::REASON.into()), error_detail: Some("owner process ended".into()), ..Default::default() }, None, None)?;
+                }
+                let (i, r) = (id.to_string(), reason.clone());
+                self.store.call(move |tx| store::transition(tx, &i, Ev::Escalate { reason: r }).map(|_| ()))?;
+                notes.push(format!("escalated before anything else: {reason}"));
+                let (i, n) = (id.to_string(), notes.clone());
+                self.store.call(move |tx| store::event(tx, Some(&i), None, "recovered", &json!({"notes": n})))?;
+                return Ok(notes);
+            }
+        }
         match t.state {
             St::Implementing | St::Fixing => {
                 let stage = writing_stage(t.fix_cycle);
@@ -166,7 +185,7 @@ impl<'a> Recovery<'a> {
         // iii. dirty: snapshot first (R39), then the unfinished-operation check and the path policy
         let (snap_id, dir) = self.snapshot(t, a, wt)?;
         let changed: Vec<String> = wt.changed()?.into_iter().map(|c| c.1).collect();
-        let prot: Vec<String> = changed.iter().filter(|p| self.protect.is_protected(p)).cloned().collect();
+        let prot: Vec<String> = changed.iter().filter(|p| self.protect.violates(p)).cloned().collect();
         let unfinished = wt.unfinished_operation()?;
         if !prot.is_empty() || unfinished.is_some() {
             let what = match (&unfinished, prot.is_empty()) {
@@ -215,7 +234,7 @@ impl<'a> Recovery<'a> {
                 (T_TASK, t.id.clone()),
                 (T_STAGE, a.stage.clone()),
                 (T_ATTEMPT, a.attempt.to_string()),
-                (T_IMPLEMENTER, a.profile.clone().unwrap_or_default()),
+                (T_AGENT, a.profile.clone().unwrap_or_default()),
                 (T_PARTIAL, "true".into()),
             ],
             false,
@@ -270,7 +289,7 @@ impl<'a> Recovery<'a> {
         let t = self.task(id)?;
         let a = self.escalated_writing_attempt(&t)?;
         let wt = Worktree::new(self.g, &t.worktree);
-        let prot: Vec<String> = wt.changed()?.into_iter().map(|c| c.1).filter(|p| self.protect.is_protected(p)).collect();
+        let prot: Vec<String> = wt.changed()?.into_iter().map(|c| c.1).filter(|p| self.protect.violates(p)).collect();
         if let Some(op) = wt.unfinished_operation()? {
             bail!("an unfinished Git operation ({op}) is still in the worktree — finish or abort it first");
         }

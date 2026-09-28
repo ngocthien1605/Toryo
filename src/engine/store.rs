@@ -422,6 +422,15 @@ pub fn set_handoff(tx: &Transaction, id: &str, handoff: Option<&str>) -> Result<
     Ok(())
 }
 
+/// `toryo task config --reload` (R35): the new frozen configuration and the roles it resolves.
+pub fn set_config(tx: &Transaction, id: &str, config_sha256: &str, planner: &str, implementers: &[String], reviewer: &str, idx: usize) -> Result<()> {
+    tx.execute(
+        "UPDATE tasks SET config_sha256 = ?2, planner = ?3, implementers = ?4, reviewer = ?5, implementer_index = ?6, updated_at = ?7 WHERE id = ?1",
+        params![id, config_sha256, planner, serde_json::to_string(implementers)?, reviewer, idx as i64, now()],
+    )?;
+    Ok(())
+}
+
 pub fn set_implementer_index(tx: &Transaction, id: &str, idx: usize) -> Result<()> {
     tx.execute("UPDATE tasks SET implementer_index = ?2, updated_at = ?3 WHERE id = ?1", params![id, idx as i64, now()])?;
     Ok(())

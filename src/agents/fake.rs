@@ -157,6 +157,7 @@ impl AgentAdapter for FakeAgentAdapter {
             hang: false,
             turns: 0,
             announced: false,
+            env: Default::default(),
         }))
     }
 
@@ -181,6 +182,8 @@ struct FakeSession {
     hang: bool,
     turns: u32,
     announced: bool,
+    /// The current turn's environment (`$TEMP/…` in `write_file` paths, R46).
+    env: std::collections::BTreeMap<String, String>,
 }
 
 #[async_trait]
@@ -225,6 +228,7 @@ impl AgentSession for FakeSession {
         self.done = false;
         self.hang = false;
         self.turns += 1;
+        self.env = input.env.clone();
         Ok(self.turns)
     }
 
@@ -245,7 +249,11 @@ impl AgentSession for FakeSession {
                 FakeStep::Text { text } => return Some(AgentEvent::TextDelta(text)),
                 FakeStep::Tool { name, summary } => return Some(AgentEvent::ToolActivity { name, summary }),
                 FakeStep::WriteFile { path, content, append } => {
-                    let p = self.req.cwd.join(&path);
+                    // `$TEMP/x` writes into the turn's TEMP (R46), like a test runner would
+                    let p = match (path.strip_prefix("$TEMP/"), self.env.get("TEMP")) {
+                        (Some(r), Some(t)) => PathBuf::from(t).join(r),
+                        _ => self.req.cwd.join(&path),
+                    };
                     if let Some(d) = p.parent() {
                         let _ = std::fs::create_dir_all(d);
                     }

@@ -7,8 +7,10 @@
 //! Implementer (fallback chain, HEAD guard, path policy), checkpoint (trailers, no-change
 //! R40), Verify (stop at first failure; never to Review), Reviewer (exact AC set, correction
 //! turns, consistency downgrade), final gate. Every agent attempt gets its context from the
-//! ProjectContextLoader (§7, M4). Not yet here: the protected snapshot (M5), immutable
-//! artifacts and the Low-IL verify boundary (M6), budget admission (M7).
+//! ProjectContextLoader (§7, M4). The protected-state snapshot (R35, M5) is compared before
+//! every running stage and after every agent turn and verify run. Quota exhaustion and
+//! `--no-fallback` pause the task (M5). Not yet here: immutable artifacts and the Low-IL
+//! verify boundary (M6), budget admission (M7).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -18,14 +20,15 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use super::checks::{resolve_program, review_violations, verify_commands, verify_files, Protected};
+use super::checks::{parse_allow_protected, resolve_program, review_violations, verify_commands, verify_files, Protected};
 use super::context;
 use super::contracts;
 use super::lock::TaskLock;
+use super::protect;
 use super::state::{GateKind, PipelineEvent as Ev, PipelineState as St};
 use super::store::{self, AttemptEnd, AttemptRow, AttemptStatus, NewAttempt, Store, TaskRow};
 use super::task::{frozen_config, sha256_hex, task_git};
-use super::worktree::{rel, Worktree, T_ATTEMPT, T_IMPLEMENTER, T_NO_CHANGE, T_STAGE, T_TASK};
+use super::worktree::{rel, Worktree, T_AGENT, T_ATTEMPT, T_NO_CHANGE, T_STAGE, T_TASK};
 use crate::agents::adapter::TurnHooks;
 use crate::agents::hub::AgentHub;
 use crate::config::{expand_vars, Billing, CommandSpec, Effective, ProfileKind};
@@ -39,7 +42,7 @@ use crate::runner::{CommandRunner, LocalRunner, RunSpec};
 pub struct RunOptions {
     /// Approve both gates automatically (demos / CI only).
     pub yes: bool,
-    /// R49: do not switch implementers; escalate when the implementer is out of quota.
+    /// R49: do not switch implementers; pause when the implementer is out of quota.
     pub no_fallback: bool,
 }
 
@@ -77,7 +80,10 @@ pub fn task_policy(t: &TaskRow, cfg: &Effective) -> Result<(GitCmd, Protected, V
     if let Ok(r) = rel(&t.repo, &t.task_file) {
         exact.push(r); // the task is the contract: agents may not edit it
     }
-    Ok((g, Protected::new(exact, &cfg.repo.policy.protected_paths), cmds))
+    // the allow list comes from the TASK.md snapshot (hashed at create, R28), not the repo
+    let task_md = std::fs::read_to_string(t.artifacts().join("TASK.md")).unwrap_or_default();
+    let p = Protected::new(exact, &cfg.repo.policy.protected_paths).with_policy(&parse_allow_protected(&task_md), &cfg.repo.policy.deny_paths);
+    Ok((g, p, cmds))
 }
 
 /// The writing stage label for a fix cycle: `implement`, `fix-1`, `fix-2`, …
@@ -175,6 +181,14 @@ impl<'a> Engine<'a> {
                 return Ok(RunEnd::Stopped);
             }
             let t = self.task()?;
+            // R35: nothing runs while protected state differs from the baseline in force
+            if t.state.is_running() {
+                if let Some(reason) = self.protected_violation(&t, false)? {
+                    eprintln!("!! {reason}");
+                    self.apply(Ev::Escalate { reason })?;
+                    continue;
+                }
+            }
             let flow = match t.state {
                 St::New => {
                     self.apply(Ev::Start)?;
@@ -249,6 +263,9 @@ impl<'a> Engine<'a> {
             self.end(&a, AttemptStatus::Interrupted, &r, AttemptEnd::default())?;
             return self.stopped();
         }
+        if let Some(flow) = self.after_read_only_turn(t, &a, &r, "planner")? {
+            return Ok(flow);
+        }
         let Some(plan) = r.structured.clone() else {
             let reason = format!("planner returned no structured plan: {:?} {}", r.error_class, r.error_detail.clone().unwrap_or_default());
             self.end_and(&a, AttemptStatus::Failed, &r, AttemptEnd::default(), Some(Ev::Escalate { reason }), None)?;
@@ -260,10 +277,10 @@ impl<'a> Engine<'a> {
         std::fs::write(art.join("PLAN.md"), &md)?;
         eprintln!("\n{md}");
         let files: Vec<String> = plan["files_likely_involved"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect();
-        let bad: Vec<String> = files.iter().filter(|f| self.protect.is_protected(f)).cloned().collect();
+        let bad: Vec<String> = files.iter().filter(|f| self.protect.violates(f)).cloned().collect();
         if !bad.is_empty() {
-            eprintln!("!! the plan lists protected paths {bad:?} — rejected automatically (plan-time policy)");
-            let fb = format!("Your plan lists protected paths {bad:?}, which may not change. Create the plan again without touching them.");
+            eprintln!("!! the plan lists protected or denied paths {bad:?} — rejected automatically (plan-time policy)");
+            let fb = format!("Your plan lists protected or denied paths {bad:?} (toryo.yaml policy), which may not change. Create the plan again without touching them.");
             self.end_and(&a, AttemptStatus::Succeeded, &r, AttemptEnd::default(), Some(Ev::PlanPolicyViolation { paths: bad }), Some(Some(fb)))?;
             return Ok(Flow::Next);
         }
@@ -285,10 +302,11 @@ impl<'a> Engine<'a> {
         let limit = if self.opts.no_fallback { 1 } else { t.implementers.len() };
         let Some(profile) = t.implementers.get(t.implementer_index).filter(|_| t.implementer_index < limit).cloned() else {
             let reason = format!(
-                "all implementers are out of quota ({}); the worktree keeps any partial changes",
-                t.implementers.join(" → ")
+                "implementer_quota: no implementer left ({}{}); the worktree keeps any partial changes — `toryo resume` when the quota is back",
+                t.implementers.join(" → "),
+                if self.opts.no_fallback { ", --no-fallback" } else { "" }
             );
-            self.apply(Ev::Escalate { reason })?;
+            self.apply(Ev::Pause { reason })?;
             return Ok(Flow::Next);
         };
         let kind = self.cfg.profile(&profile)?.kind;
@@ -381,15 +399,15 @@ impl<'a> Engine<'a> {
                 )
             };
             let (i, aid, idx, st2) = (self.id.clone(), a.id.clone(), t.implementer_index + 1, r.session_id.clone());
-            let escalate = next.is_none();
+            let pause = next.is_none();
             let payload = json!({"from": profile, "to": next, "reason": reason, "partial_changes": changed});
             self.store.call(move |tx| {
                 store::finish_attempt(tx, &aid, AttemptStatus::Failed, &AttemptEnd { error_class: Some("QuotaExceeded".into()), external_session_id: st2, ..Default::default() })?;
                 store::set_implementer_index(tx, &i, idx)?;
                 store::set_handoff(tx, &i, Some(&note))?;
                 store::event(tx, Some(&i), Some(&aid), "implementer_switch", &payload)?;
-                if escalate {
-                    store::transition(tx, &i, Ev::Escalate { reason: format!("all implementers are out of quota ({reason}); the worktree keeps any partial changes") })?;
+                if pause {
+                    store::transition(tx, &i, Ev::Pause { reason: format!("implementer_quota: no implementer left ({reason}); the worktree keeps any partial changes — `toryo resume` when the quota is back") })?;
                 }
                 Ok(())
             })?;
@@ -403,12 +421,18 @@ impl<'a> Engine<'a> {
             let (i, aid) = (self.id.clone(), a.id.clone());
             self.store.call(move |tx| store::event(tx, Some(&i), Some(&aid), "policy_violation", &json!({"kind": "agent commit", "action": "soft reset"})))?;
         }
+        // R35: untracked/ignored protected files or Git metadata → Escalated, nothing else runs
+        if let Some(reason) = self.protected_violation(t, true)? {
+            eprintln!("!! {reason}");
+            self.end_and(&a, AttemptStatus::Failed, &r, AttemptEnd { error_class: Some(protect::REASON.into()), ..Default::default() }, Some(Ev::Escalate { reason }), None)?;
+            return Ok(Flow::Next);
+        }
         let changed = wt.changed()?;
-        let prot: Vec<String> = changed.iter().map(|c| c.1.clone()).filter(|p| self.protect.is_protected(p)).collect();
+        let prot: Vec<String> = changed.iter().map(|c| c.1.clone()).filter(|p| self.protect.violates(p)).collect();
         if !prot.is_empty() {
-            eprintln!("!! protected paths changed: {prot:?} — restored, nothing committed; sent back to the implementer");
+            eprintln!("!! protected or denied paths changed: {prot:?} — restored, nothing committed; sent back to the implementer");
             wt.restore(&prot)?;
-            let fb = format!("- POLICY: you changed protected paths {prot:?}. They were restored. Do not modify them; achieve the task another way.");
+            let fb = format!("- POLICY: you changed protected or denied paths {prot:?}. They were restored. Do not modify them; achieve the task another way.");
             self.end_and(&a, AttemptStatus::Failed, &r, AttemptEnd { error_class: Some("policy_violation".into()), error_detail: Some(format!("{prot:?}")), ..Default::default() }, Some(Ev::PathPolicyViolation { paths: prot }), Some(Some(fb)))?;
             return Ok(Flow::Next);
         }
@@ -438,12 +462,20 @@ impl<'a> Engine<'a> {
                 (c.sha, if c.no_change { "no_change" } else { "normal" })
             }
             _ => {
+                // §8: deny paths are checked again right before the commit
+                let denied: Vec<String> = wt.changed()?.into_iter().map(|c| c.1).filter(|p| self.protect.is_denied(p)).collect();
+                if !denied.is_empty() {
+                    let reason = format!("policy_violation: denied paths {denied:?} would be committed (policy.deny_paths); nothing was committed");
+                    eprintln!("!! {reason}");
+                    self.apply(Ev::Escalate { reason })?;
+                    return Ok(Flow::Next);
+                }
                 let no_change = wt.nothing_to_commit()?;
                 let mut tr = vec![
                     (T_TASK, t.id.clone()),
                     (T_STAGE, stage.clone()),
                     (T_ATTEMPT, a.attempt.to_string()),
-                    (T_IMPLEMENTER, implementer.clone()),
+                    (T_AGENT, implementer.clone()),
                 ];
                 if no_change {
                     tr.push((T_NO_CHANGE, "true".into()));
@@ -461,6 +493,13 @@ impl<'a> Engine<'a> {
         };
         std::fs::write(art.join("DIFF-incremental.patch"), inc)?;
         eprintln!("✔ checkpoint {} ({kind})", &head[..12]);
+        // R35: a committed tracked protected change allowed by TASK.md becomes the new baseline
+        let c = protect::check(self.store, t, &self.g, &self.protect)?;
+        let allowed: Vec<String> = c.changes.iter().filter(|x| !x.is_hard() && self.protect.is_allowed(&x.path)).map(|x| x.path.clone()).collect();
+        if !allowed.is_empty() && c.hard().is_empty() {
+            protect::take_baseline(self.store, t, &self.g, &self.protect, &format!("checkpoint {}: allowed protected change {allowed:?} (TASK.md)", &head[..12]))?;
+            eprintln!("   protected baseline renewed: {allowed:?} (## Allow protected)");
+        }
         let (i, aid, h, k) = (self.id.clone(), a.id.clone(), head.clone(), kind.to_string());
         self.store.call(move |tx| {
             store::finish_attempt(tx, &aid, AttemptStatus::Succeeded, &AttemptEnd { head_after: Some(h.clone()), checkpoint_kind: Some(k), ..Default::default() })?;
@@ -510,6 +549,18 @@ impl<'a> Engine<'a> {
             if !ok {
                 break; // stop at the first failure (§5.2)
             }
+        }
+        // R35: the verify run must not have touched protected state
+        if let Some(reason) = self.protected_violation(t, false)? {
+            eprintln!("!! {reason}");
+            let aid = a.id.clone();
+            let i = self.id.clone();
+            self.store.call(move |tx| {
+                store::finish_attempt(tx, &aid, AttemptStatus::Failed, &AttemptEnd { error_class: Some(protect::REASON.into()), ..Default::default() })?;
+                store::transition(tx, &i, Ev::Escalate { reason })?;
+                Ok(())
+            })?;
+            return Ok(Flow::Next);
         }
         let vr = json!({"head": head, "pass": pass, "boundary": "none (M6)", "commands": results});
         std::fs::write(t.artifacts().join("VERIFY_RESULT.json"), serde_json::to_vec_pretty(&vr)?)?;
@@ -588,6 +639,9 @@ impl<'a> Engine<'a> {
                 self.end(&a, AttemptStatus::Interrupted, &r, AttemptEnd::default())?;
                 return self.stopped();
             }
+            if let Some(flow) = self.after_read_only_turn(t, &a, &r, "reviewer")? {
+                return Ok(flow);
+            }
             review = r.structured.clone().unwrap_or(Value::Null);
             let viol = review_violations(&review, &t.acceptance_ids);
             last = r;
@@ -627,6 +681,40 @@ impl<'a> Engine<'a> {
         Ok(Flow::Next)
     }
 
+    // ── protected state (R35) and pauses (R49) ───────────────────────────────────────
+
+    /// Compare the protected state with the baseline in force. `only_hard`: right after an
+    /// Implementer turn, where tracked protected changes go to the path policy instead.
+    /// Changes the task may make (`## Allow protected`, tracked) never count. Returns the
+    /// escalation reason.
+    fn protected_violation(&self, t: &TaskRow, only_hard: bool) -> Result<Option<String>> {
+        let c = protect::check(self.store, t, &self.g, &self.protect)?;
+        let bad: Vec<&protect::Change> = c.changes.iter().filter(|x| x.is_hard() || (!only_hard && !self.protect.is_allowed(&x.path))).collect();
+        if bad.is_empty() {
+            return Ok(None);
+        }
+        let (i, payload) = (self.id.clone(), json!({"changes": bad, "baseline": c.baseline_id, "diff": c.diff_path}));
+        self.store.call(move |tx| store::event(tx, Some(&i), None, "protected_changed", &payload))?;
+        Ok(Some(protect::escalation_reason(&t.id, &bad, c.diff_path.as_deref())))
+    }
+
+    /// After a Planner/Reviewer turn: quota → `Paused` (no Planner/Reviewer fallback in
+    /// v0.1, R49); a changed protected state → `Escalated`.
+    fn after_read_only_turn(&self, t: &TaskRow, a: &AttemptRow, r: &StageOutcome, role: &str) -> Result<Option<Flow>> {
+        if let Some(c @ (ErrorClass::QuotaExceeded | ErrorClass::RateLimited | ErrorClass::Overloaded)) = r.error_class {
+            let reason = format!("{role}_quota: {c:?} {} — `toryo resume {}` when the quota is back (no {role} fallback in v0.1)", r.error_detail.clone().unwrap_or_default(), t.id);
+            eprintln!("!! {reason}");
+            self.end_and(a, AttemptStatus::Failed, r, AttemptEnd::default(), Some(Ev::Pause { reason }), None)?;
+            return Ok(Some(Flow::Next));
+        }
+        if let Some(reason) = self.protected_violation(t, false)? {
+            eprintln!("!! {reason}");
+            self.end_and(a, AttemptStatus::Failed, r, AttemptEnd { error_class: Some(protect::REASON.into()), ..Default::default() }, Some(Ev::Escalate { reason }), None)?;
+            return Ok(Some(Flow::Next));
+        }
+        Ok(None)
+    }
+
     // ── attempt helpers ──────────────────────────────────────────────────────────────
 
     /// Assemble the attempt's context (§7), store it as `context/<stage>-<attempt>` and
@@ -664,7 +752,7 @@ impl<'a> Engine<'a> {
             a.subject_commit.map(str::to_string),
         );
         self.store.call(move |tx| {
-            store::begin_attempt(
+            let a = store::begin_attempt(
                 tx,
                 &i,
                 &NewAttempt {
@@ -675,7 +763,13 @@ impl<'a> Engine<'a> {
                     head_before: hb.as_deref(),
                     subject_commit: sc.as_deref(),
                 },
-            )
+            )?;
+            // R35: the baseline version in force when the attempt started
+            tx.execute(
+                "UPDATE stage_attempts SET protected_manifest_id = (SELECT artifact_id FROM artifact_heads WHERE task_id = ?2 AND logical_name = 'protected') WHERE id = ?1",
+                rusqlite::params![a.id, i],
+            )?;
+            Ok(a)
         })
     }
 
@@ -812,13 +906,15 @@ pub fn next_action(t: &TaskRow) -> String {
         St::WaitingFinalApproval => format!("review the branch {} (REVIEW.md in the run store), then `toryo approve {id} --gate final` or `toryo reject {id} --gate final --reason \"…\"`", t.branch),
         St::Escalated => {
             let why = t.machine.reason().unwrap_or("");
-            if why.starts_with("recovery_policy_violation") {
+            if why.starts_with(protect::REASON) {
+                format!("{why}\n  → restore the file(s) and `toryo resume {id}`, or `toryo resume {id} --accept-protected-change <path>` (recorded in DECISIONS.md)")
+            } else if why.starts_with("recovery_policy_violation") {
                 format!("{why}\n  → `toryo resume {id} --discard-partial` (after a snapshot check) or fix the worktree by hand and `toryo resume {id} --keep-partial`")
             } else {
                 format!("{why}\n  → `toryo resume {id} --note \"…\"` (another fix cycle), `toryo approve {id} --gate final --force`, or give up: `toryo task cleanup {id}`")
             }
         }
-        St::Paused => format!("paused (budget): `toryo resume {id}`"),
+        St::Paused => format!("paused — {}\n  → `toryo resume {id}`", t.machine.reason().unwrap_or("")),
         St::Completed => format!("done — merge `{}` yourself (toryo never merges); `toryo task cleanup {id}` afterwards", t.branch),
         St::Cancelled => format!("cancelled — `toryo task cleanup {id}`"),
         St::Failed => format!("failed: {} — `toryo task cleanup {id}`", t.machine.reason().unwrap_or("")),

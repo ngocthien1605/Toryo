@@ -153,8 +153,14 @@ pub enum PipelineEvent {
     /// the human resolved a recovery stop (`resume --discard-partial | --keep-partial`, §10).
     ResumeStage,
     BudgetExceeded,
-    /// `toryo budget set` + `resume` from `Paused`.
-    BudgetResumed,
+    /// A running stage cannot go on without a human, but nothing is wrong with the work:
+    /// the implementer chain or the Planner/Reviewer is out of quota, `--no-fallback` (R49).
+    Pause { reason: String },
+    /// `toryo resume` from `Paused` (after `budget set`, or once the quota is back).
+    Unpause,
+    /// The verify configuration changed (`task config --reload`, R35): the current
+    /// checkpoint must be verified again — from the final gate or `Escalated`.
+    Reverify,
     /// A stop that needs a human (max cycles, InvalidOutput, quota, tampering, …).
     Escalate { reason: String },
     Cancel,
@@ -185,7 +191,9 @@ impl PipelineEvent {
             E::ForceFinal => "force_final",
             E::ResumeStage => "resume_stage",
             E::BudgetExceeded => "budget_exceeded",
-            E::BudgetResumed => "budget_resumed",
+            E::Pause { .. } => "pause",
+            E::Unpause => "unpause",
+            E::Reverify => "reverify",
             E::Escalate { .. } => "escalate",
             E::Cancel => "cancel",
             E::Fail { .. } => "fail",
@@ -346,9 +354,15 @@ impl Machine {
             (s, E::Escalate { reason }) if s != S::Escalated => m.escalate(s, reason.clone()),
             (s, E::BudgetExceeded) if s.is_running() => {
                 m.paused_from = Some(s);
+                m.reason = Some("budget".into());
                 m.state = S::Paused;
             }
-            (S::Paused, E::BudgetResumed) => {
+            (s, E::Pause { reason }) if s.is_running() => {
+                m.paused_from = Some(s);
+                m.reason = Some(reason.clone());
+                m.state = S::Paused;
+            }
+            (S::Paused, E::Unpause) => {
                 m.state = m.paused_from.take().ok_or(invalid)?;
             }
 
@@ -459,6 +473,15 @@ impl Machine {
                 }
                 m.escalated_from = None;
                 m.state = back;
+            }
+            (S::WaitingFinalApproval | S::Escalated, E::Reverify) => {
+                if !m.plan_approved || m.checkpoint.is_none() {
+                    return Err(invalid);
+                }
+                m.gate = None;
+                m.verified_head = None;
+                m.escalated_from = None;
+                m.state = S::Verifying;
             }
             (S::Escalated, E::ForceFinal) => {
                 if !m.plan_approved {

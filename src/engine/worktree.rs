@@ -11,7 +11,8 @@ use crate::git::{parse_status_z, GitCmd, Loc};
 pub const T_TASK: &str = "Toryo-Task";
 pub const T_STAGE: &str = "Toryo-Stage";
 pub const T_ATTEMPT: &str = "Toryo-Attempt";
-pub const T_IMPLEMENTER: &str = "Toryo-Implementer";
+/// The agent profile that wrote a checkpoint (R49; M3 wrote `Toryo-Implementer`).
+pub const T_AGENT: &str = "Toryo-Agent";
 pub const T_NO_CHANGE: &str = "Toryo-No-Change";
 pub const T_PARTIAL: &str = "Toryo-Partial";
 

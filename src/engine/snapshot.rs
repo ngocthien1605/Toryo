@@ -122,7 +122,7 @@ pub fn take(wt: &Worktree, protect: &Protected, root: &Path, task: &str, attempt
         entries.push(file_entry(&wt.path, &p, "untracked")?);
     }
     for p in split_z(&g.run(&wt.loc, true, &["ls-files", "-z", "--others", "--ignored", "--exclude-standard"])?) {
-        if p.starts_with(".toryo-tmp/") || !protect.is_protected(&p) {
+        if p.starts_with(".toryo-tmp/") || !protect.matches(&p) {
             continue;
         }
         copy_into(&wt.path, &p, &staging.join("protected"))?;
