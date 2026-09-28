@@ -168,6 +168,8 @@ pub struct StageOutcome {
     pub duration_ms: u128,
     /// The turn was interrupted because of the stall or max limit.
     pub timed_out: bool,
+    /// The turn was interrupted by a stop request (R38).
+    pub cancelled: bool,
     pub label: String,
     pub capture_dir: Option<PathBuf>,
 }

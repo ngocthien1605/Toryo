@@ -8,8 +8,8 @@ pub mod init_config;
 pub mod job;
 pub mod lowil;
 pub mod pipeline;
-pub mod render;
 pub mod smoke;
 // Moved to the core in M1 (R52); kept as aliases for the spike code.
 pub use crate::agents::exec as turn;
 pub use crate::evidence as results;
+pub use crate::engine::render;

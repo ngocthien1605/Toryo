@@ -74,40 +74,7 @@ pub const BATCH_RENAME: &[(&str, &str)] = &[
     ),
 ];
 
-pub const SCHEMAS: &[(&str, &str)] = &[
-    (
-        "plan.schema.json",
-        include_str!("../../schemas/plan.schema.json"),
-    ),
-    (
-        "review.schema.json",
-        include_str!("../../schemas/review.schema.json"),
-    ),
-    (
-        "implementation.schema.json",
-        include_str!("../../schemas/implementation.schema.json"),
-    ),
-    (
-        "probe.schema.json",
-        include_str!("../../schemas/probe.schema.json"),
-    ),
-];
-
-pub const ROLES: &[(&str, &str)] = &[
-    (
-        "planner.md",
-        include_str!("../../templates/roles/planner.md"),
-    ),
-    (
-        "implementer.md",
-        include_str!("../../templates/roles/implementer.md"),
-    ),
-    (
-        "reviewer.md",
-        include_str!("../../templates/roles/reviewer.md"),
-    ),
-];
-
+pub use crate::engine::contracts::{schema, ROLES, SCHEMAS};
 pub use crate::git::{default_gitcmd as gitcmd, git_exe};
 
 /// Write the calculator fixture into `dir` (must not exist or be empty) and commit it on `main`.
@@ -158,14 +125,6 @@ pub fn write_contracts(dir: &Path) -> Result<()> {
         std::fs::write(dir.join("roles").join(n), c)?;
     }
     Ok(())
-}
-
-pub fn schema(name: &str) -> Result<&'static str> {
-    SCHEMAS
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, c)| *c)
-        .ok_or_else(|| anyhow::anyhow!("no schema {name}"))
 }
 
 #[cfg(test)]

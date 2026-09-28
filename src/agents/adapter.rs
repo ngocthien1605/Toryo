@@ -1,6 +1,8 @@
 //! The adapter contract (plan §6.1): one streaming session per stage, events only.
 
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -47,6 +49,30 @@ pub async fn run_to_completion(
     input: TurnInput,
     limits: TurnLimits,
 ) -> Result<StageOutcome> {
+    run_to_completion_with(session, input, limits, TurnHooks::default()).await
+}
+
+/// Called with the external session id as soon as it is known.
+pub type SessionHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Optional hooks for one turn.
+#[derive(Clone, Default)]
+pub struct TurnHooks {
+    /// A stop request (R38): interrupts the turn, reported as `cancelled`.
+    pub cancel: Option<Arc<AtomicBool>>,
+    /// Called as soon as the external session id is known, so a crash mid-turn can still
+    /// resume the session (R48).
+    pub on_session: Option<SessionHook>,
+}
+
+/// Like [`run_to_completion`], with [`TurnHooks`].
+pub async fn run_to_completion_with(
+    session: &mut dyn AgentSession,
+    input: TurnInput,
+    limits: TurnLimits,
+    hooks: TurnHooks,
+) -> Result<StageOutcome> {
+    let cancel = hooks.cancel.clone();
     let started = Instant::now();
     let label = input.label.clone();
     session.start_turn(input).await?;
@@ -55,17 +81,26 @@ pub async fn run_to_completion(
         ..Default::default()
     };
     let deadline = tokio::time::Instant::now() + limits.max;
-    let mut interrupted = false;
+    let mut last_event = tokio::time::Instant::now();
+    let mut interrupted_at: Option<tokio::time::Instant> = None;
     loop {
         let now = tokio::time::Instant::now();
-        let wait = if interrupted {
+        let mut wait = match interrupted_at {
             // after an interrupt, give the session a moment to deliver its terminal event
-            std::time::Duration::from_secs(10)
-        } else {
-            limits.stall.min(deadline.saturating_duration_since(now))
+            Some(t) => (t + Duration::from_secs(10)).saturating_duration_since(now),
+            None => (last_event + limits.stall)
+                .min(deadline)
+                .saturating_duration_since(now),
         };
+        if cancel.is_some() && interrupted_at.is_none() {
+            wait = wait.min(Duration::from_millis(200));
+        }
         match tokio::time::timeout(wait, session.next_event()).await {
             Ok(Some(e)) => {
+                last_event = tokio::time::Instant::now();
+                if let (AgentEvent::SessionIdentified(id), Some(f)) = (&e, &hooks.on_session) {
+                    f(id);
+                }
                 let terminal = e.is_terminal();
                 out.apply(&e);
                 if terminal {
@@ -79,22 +114,34 @@ pub async fn run_to_completion(
                 }
                 break;
             }
-            Err(_) if !interrupted => {
-                out.timed_out = true;
-                interrupted = true;
+            Err(_) if interrupted_at.is_none() => {
+                let now = tokio::time::Instant::now();
+                if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+                    out.cancelled = true;
+                } else if now >= deadline || now >= last_event + limits.stall {
+                    out.timed_out = true;
+                } else {
+                    continue;
+                }
+                interrupted_at = Some(now);
                 let _ = session.interrupt().await;
             }
             Err(_) => break,
         }
     }
-    if out.timed_out {
+    if out.timed_out || out.cancelled {
         out.success = false;
-        out.error_class = Some(ErrorClass::Timeout);
-        out.error_detail = Some(format!(
-            "no terminal event within the limits (stall {}s, max {}s)",
-            limits.stall.as_secs(),
-            limits.max.as_secs()
-        ));
+        if out.cancelled {
+            out.error_class = Some(ErrorClass::ProcessCrashed);
+            out.error_detail = Some("interrupted by `toryo stop`".into());
+        } else {
+            out.error_class = Some(ErrorClass::Timeout);
+            out.error_detail = Some(format!(
+                "no terminal event within the limits (stall {}s, max {}s)",
+                limits.stall.as_secs(),
+                limits.max.as_secs()
+            ));
+        }
     }
     out.duration_ms = started.elapsed().as_millis();
     if let Some(id) = session.external_id() {

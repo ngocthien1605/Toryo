@@ -168,18 +168,7 @@ pub(crate) fn run_verify(script: &Path, cwd: &Path) -> Result<(Option<i32>, Stri
     ))
 }
 
-pub(crate) fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        for ext in ["", ".exe", ".cmd"] {
-            let p = dir.join(format!("{name}{ext}"));
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    None
-}
+pub(crate) use crate::engine::checks::which;
 
 pub fn smoke(cfg: &Effective, a: SmokeArgs) -> Result<bool> {
     let root = new_run_dir("smoke", "calc")?;

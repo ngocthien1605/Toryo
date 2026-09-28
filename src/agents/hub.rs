@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use super::adapter::{run_to_completion, AgentAdapter};
+use super::adapter::{run_to_completion_with, AgentAdapter, TurnHooks};
 use super::claude::LaunchMode;
 use super::cli::CliAdapter;
 use super::fake::{FakeAgentAdapter, FakeCall, FakeScript};
@@ -63,11 +63,16 @@ impl AgentHub {
 
     /// Open a session, run one turn to completion, close.
     pub fn turn(&self, open: OpenSession, input: TurnInput, limits: TurnLimits) -> Result<StageOutcome> {
+        self.turn_with(open, input, limits, TurnHooks::default())
+    }
+
+    /// [`AgentHub::turn`] with hooks (stop request, session id as soon as known).
+    pub fn turn_with(&self, open: OpenSession, input: TurnInput, limits: TurnLimits, hooks: TurnHooks) -> Result<StageOutcome> {
         let adapter = self.adapter(&open.profile)?;
         let capture = open.capture_dir.clone();
         self.rt.block_on(async move {
             let mut session = adapter.open(open).await?;
-            let mut out = run_to_completion(session.as_mut(), input, limits).await?;
+            let mut out = run_to_completion_with(session.as_mut(), input, limits, hooks).await?;
             session.close().await?;
             out.capture_dir = Some(capture);
             Ok(out)

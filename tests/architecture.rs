@@ -45,6 +45,9 @@ fn no_vendor_types_outside_adapters() {
     check("src/runner.rs", modules);
     check("src/engine/mod.rs", modules);
     check("src/engine/state.rs", modules);
+    for f in ["checks", "contracts", "lock", "recovery", "render", "runner", "snapshot", "store", "task", "worktree"] {
+        check(&format!("src/engine/{f}.rs"), modules);
+    }
     check("src/spike/pipeline.rs", modules);
     // the hub picks an adapter (and passes the Claude launch mode through), nothing more
     check("src/agents/hub.rs", &["exec::", "events::"]);

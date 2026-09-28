@@ -150,6 +150,18 @@ impl GitCmd {
             .with_context(|| format!("running git {}", args.join(" ")))
     }
 
+    /// Like [`GitCmd::output`] with extra environment (e.g. `GIT_INDEX_FILE` for a scratch
+    /// index) and optional stdin.
+    pub fn output_env(&self, loc: &Loc, read_only: bool, args: &[&str], env: &[(&str, &Path)]) -> Result<Output> {
+        let mut cmd = self.command(loc, read_only);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        cmd.args(args);
+        cmd.output()
+            .with_context(|| format!("running git {}", args.join(" ")))
+    }
+
     /// Run, require exit 0, return stdout bytes.
     pub fn run(&self, loc: &Loc, read_only: bool, args: &[&str]) -> Result<Vec<u8>> {
         let out = self.output(loc, read_only, args)?;

@@ -1,4 +1,4 @@
-//! Render structured outputs to the Markdown artifacts (plan §9) for the manual dry-run.
+//! Render structured outputs to the Markdown artifacts (plan §9).
 
 use anyhow::{bail, Result};
 use serde_json::Value;

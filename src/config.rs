@@ -311,6 +311,24 @@ impl Effective {
         })
     }
 
+    /// Rebuild the configuration frozen by `toryo task create` (R35): a task never re-reads
+    /// `toryo.yaml`; the frozen copy hashes to the same `config_sha256`.
+    pub fn from_frozen(canonical_json: &str, origin: &Path) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct Frozen {
+            repo: RepoConfig,
+            #[serde(default)]
+            trusted_filters: BTreeMap<String, TrustedFilter>,
+        }
+        let f: Frozen = serde_json::from_str(canonical_json).context("parsing the frozen config.json")?;
+        Ok(Self {
+            repo: f.repo,
+            trusted_filters: f.trusted_filters,
+            repo_path: origin.to_path_buf(),
+            machine_path: None,
+        })
+    }
+
     /// Canonical JSON (sorted keys, no whitespace) — what gets frozen and hashed.
     pub fn canonical_json(&self) -> String {
         let v = serde_json::to_value(self).expect("config serialises");
@@ -477,6 +495,9 @@ policy:
         let b = Effective::load(&p, None).unwrap();
         assert_eq!(a.sha256(), b.sha256());
         assert_eq!(a.repo.verify.boundary, "low_integrity");
+        // the frozen copy (R35) round-trips to the same digest
+        let f = Effective::from_frozen(&a.canonical_json(), &p).unwrap();
+        assert_eq!(f.sha256(), a.sha256());
     }
 
     #[test]

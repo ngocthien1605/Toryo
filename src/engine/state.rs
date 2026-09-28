@@ -149,6 +149,9 @@ pub enum PipelineEvent {
     ResumeWithNote { note: String },
     /// `toryo approve --gate final --force` from `Escalated`.
     ForceFinal,
+    /// Back from `Escalated` into the stage that escalated, without a new fix cycle — after
+    /// the human resolved a recovery stop (`resume --discard-partial | --keep-partial`, §10).
+    ResumeStage,
     BudgetExceeded,
     /// `toryo budget set` + `resume` from `Paused`.
     BudgetResumed,
@@ -180,6 +183,7 @@ impl PipelineEvent {
             E::FinalRejected { .. } => "final_rejected",
             E::ResumeWithNote { .. } => "resume_with_note",
             E::ForceFinal => "force_final",
+            E::ResumeStage => "resume_stage",
             E::BudgetExceeded => "budget_exceeded",
             E::BudgetResumed => "budget_resumed",
             E::Escalate { .. } => "escalate",
@@ -292,6 +296,9 @@ impl Machine {
     }
     pub fn reason(&self) -> Option<&str> {
         self.reason.as_deref()
+    }
+    pub fn escalated_from(&self) -> Option<PipelineState> {
+        self.escalated_from
     }
 
     /// Guard for a stage runner: the task must be in `s` (e.g. no Implementer turn before
@@ -444,6 +451,14 @@ impl Machine {
                     m.plan_auto_rejections = 0;
                     m.state = S::Planning;
                 }
+            }
+            (S::Escalated, E::ResumeStage) => {
+                let back = m.escalated_from.filter(|s| s.is_running()).ok_or(invalid.clone())?;
+                if back != S::Planning && !m.plan_approved {
+                    return Err(invalid);
+                }
+                m.escalated_from = None;
+                m.state = back;
             }
             (S::Escalated, E::ForceFinal) => {
                 if !m.plan_approved {

@@ -1,4 +1,6 @@
-//! `toryo` CLI (plan v0.7 §15): `doctor`, `secrets`, and the M0 kit (`spike`, feature `m0-kit`).
+//! `toryo` CLI (plan v0.7 §15): the engine commands (`task`, `run`, `approve`, `reject`,
+//! `resume`, `stop`, `status`, `partial`), `doctor`, `secrets`, and the M0 kit (`spike`,
+//! feature `m0-kit`).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -9,8 +11,11 @@ use clap::{Parser, Subcommand};
 use toryo::agents::claude::LaunchMode;
 use toryo::config::{default_machine_config_path, Effective};
 
+mod engine_cli;
 #[cfg(feature = "m0-kit")]
 mod spike_cli;
+
+use engine_cli::{DriveArgs, Gate, PartialCmd, ResumeArgs, TaskCmd};
 #[cfg(feature = "m0-kit")]
 use spike_cli::{run_canaries, spike, SpikeCmd};
 
@@ -18,7 +23,7 @@ use spike_cli::{run_canaries, spike, SpikeCmd};
 #[command(
     name = "toryo",
     version,
-    about = "Toryo — M0 spike kit (plan v0.6)"
+    about = "Toryo (棟梁) — orchestrates Claude Code and Codex through a gated, verified workflow"
 )]
 pub(crate) struct Cli {
     /// Repository config (default: ./toryo.yaml, then $TORYO_CONFIG)
@@ -48,6 +53,71 @@ enum Cmd {
         /// With --canaries: the Claude launch mode to verify (the pipeline's `--mode`)
         #[arg(long, value_enum, default_value = "restricted", requires = "canaries")]
         claude_mode: LaunchMode,
+    },
+    /// Create, list, show or clean up tasks.
+    Task {
+        #[command(subcommand)]
+        cmd: TaskCmd,
+    },
+    /// 🔒 Run a task until a gate, an escalation, a stop or completion (recovers first).
+    Run {
+        id: String,
+        #[command(flatten)]
+        drive: DriveArgs,
+    },
+    /// 🔒 Approve the open gate (R32: refuses if its subject changed).
+    Approve {
+        id: String,
+        #[arg(long, value_enum)]
+        gate: Gate,
+        /// Refuse unless the gate's subject digest starts with this
+        #[arg(long)]
+        expect: Option<String>,
+        /// From Escalated: skip the reviewer and open the final gate (needs a verified checkpoint)
+        #[arg(long)]
+        force: bool,
+        /// Approve, then run on
+        #[arg(long = "continue")]
+        cont: bool,
+        #[command(flatten)]
+        drive: DriveArgs,
+    },
+    /// 🔒 Reject the open gate with a reason (the revision opens a new occurrence, R44a).
+    Reject {
+        id: String,
+        #[arg(long, value_enum)]
+        gate: Gate,
+        #[arg(long)]
+        reason: String,
+    },
+    /// 🔒 Recover after a crash or stop and continue; without an id, every task whose lock is
+    /// free (active tasks are reported and skipped, R38).
+    Resume {
+        id: Option<String>,
+        /// Leave Escalated → Fixing with this note for the Implementer
+        #[arg(long)]
+        note: Option<String>,
+        /// After a recovery policy violation: reset to the attempt's start (snapshot kept, R39)
+        #[arg(long, conflicts_with_all = ["note", "keep_partial"])]
+        discard_partial: bool,
+        /// After fixing the worktree by hand: snapshot, re-check, recovery checkpoint (R31)
+        #[arg(long, conflicts_with = "note")]
+        keep_partial: bool,
+        #[command(flatten)]
+        drive: DriveArgs,
+    },
+    /// Ask the task's current owner to stop (R38); waits for the answer.
+    Stop {
+        id: String,
+        #[arg(long, default_value_t = 15)]
+        wait_secs: u64,
+    },
+    /// Tasks, their state and the next human action.
+    Status { id: Option<String> },
+    /// Recovery snapshots (R39).
+    Partial {
+        #[command(subcommand)]
+        cmd: PartialCmd,
     },
     /// Windows Credential Manager secrets.
     Secrets {
@@ -131,6 +201,20 @@ fn run(cli: Cli) -> Result<i32> {
         }
         #[cfg(feature = "m0-kit")]
         Cmd::Spike { cmd } => spike(&cli, cmd),
+        Cmd::Task { cmd } => engine_cli::task(&cli, cmd),
+        Cmd::Run { id, drive } => engine_cli::run(id, drive),
+        Cmd::Approve { id, gate, expect, force, cont, drive } => {
+            engine_cli::approve(id, *gate, expect.as_deref(), *force, *cont, drive)
+        }
+        Cmd::Reject { id, gate, reason } => engine_cli::reject(id, *gate, reason),
+        Cmd::Resume { id, note, discard_partial, keep_partial, drive } => engine_cli::resume(
+            id.as_deref(),
+            &ResumeArgs { note: note.clone(), discard_partial: *discard_partial, keep_partial: *keep_partial },
+            drive,
+        ),
+        Cmd::Stop { id, wait_secs } => engine_cli::stop(id, *wait_secs),
+        Cmd::Status { id } => engine_cli::status(id.as_deref()),
+        Cmd::Partial { cmd } => engine_cli::partial(cmd),
     }
 }
 
@@ -140,6 +224,10 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
+            if let Some(a) = e.downcast_ref::<toryo::engine::lock::TaskActive>() {
+                eprintln!("task_active: {a}");
+                return ExitCode::from(toryo::engine::lock::EXIT_TASK_ACTIVE as u8);
+            }
             eprintln!("error: {e:#}");
             ExitCode::from(2)
         }

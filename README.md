@@ -18,6 +18,10 @@ Rust implementation of the Toryo plan (**v0.7**). **M0 is done** (the spike kit 
 | `runner` | §8 | `CommandRunner` / `LocalRunner` for verify commands (ANSI stripped) |
 | `evidence` | R51 | evidence records carry `cli_versions`; a profile whose CLI version differs from its last canary pass is *unverified* |
 | `engine::state` (M2) | §5.2, R5, R29, R32, R40, R44a, R56 | the pipeline state machine: one `transition(state, event)`, gate occurrences, fix-cycle bound, `Escalated`/`Paused` as waiting states; serializable for M3 |
+| `engine::store` (M3) | §5.3, R24 | SQLite (WAL) store actor: every state change and its event in one transaction; tasks, stage attempts, gate occurrences, usage, control requests |
+| `engine::lock` (M3) | R24, R38 | per-task OS file lock (lock-first), lock generation, `toryo stop` protocol |
+| `engine::runner` (M3) | §5.2, R48, R49 | the engine: stages as persisted attempts, gates as approvals, fallback chain, stop polling |
+| `engine::recovery`, `engine::snapshot` (M3) | §10, R31, R39, R40 | crash recovery: trailer-matched checkpoints, recovery snapshots + completion check, partial checkpoints, `--discard-partial` / `--keep-partial`, `partial export` |
 
 M0 kit modules (ported to the core where M1 needs them, R52):
 
@@ -37,6 +41,13 @@ M0 kit modules (ported to the core where M1 needs them, R52):
 | `spike::pipeline` | §5.2, R28, R40 | prototype workflow on a real repo: plan gate, guards, checkpoints, verify, exact-AC review, fix cycles |
 
 ```
+toryo task create --file TASK.md [--id ID] [--repo R] [--base B]   # snapshot + frozen config + worktree toryo/<ID>
+toryo run ID                                   # 🔒 runs until a gate / escalation / stop / completion
+toryo approve ID --gate plan|final [--expect DIGEST] [--continue]   # 🔒
+toryo reject  ID --gate plan|final --reason "…"                     # 🔒
+toryo resume [ID] [--note "…" | --discard-partial | --keep-partial]  # 🔒 recover after a crash/stop, continue
+toryo stop ID                                  # ask the running owner to stop (R38)
+toryo status [ID] · toryo task list|show ID|cleanup ID · toryo partial export ID --attempt N --into DIR
 toryo doctor [--canaries [--profile P …] [--claude-mode restricted]]   # R51: re-verify after a CLI upgrade
 toryo spike job-test | git-canary | lowil-canary
 toryo spike claude-isolation --profile claude-max [--mode restricted|setting-sources|cwd-run-store]
@@ -81,6 +92,7 @@ cargo test --release
 | `tests/pipeline_fake.rs` | Windows + Linux | the pipeline scenarios on `FakeAgentAdapter`, with the state trail checked: gate reject → planner resumed, fix cycle, final-gate rejection, max cycles → `Escalated`, path-policy cycle, bounded automatic plan rejections, unlimited human ones, blocked review, sticky fallback with the configured reviewer kept, rate-limit retry, verify failure → fix, review correction, all implementers out of quota, quit at the gate |
 | `tests/adapters.rs` | Windows + Linux | recorded real Claude/Codex streams through the adapters; fake failure classes, stall timeout, crash |
 | `tests/spike_e2e.rs` | Linux | the kit against fake `claude`/`codex` sh scripts, incl. `version_bound_evidence` (R51) |
+| `tests/engine_e2e.rs` | Windows + Linux | M3: gates persisted (occurrences, `--expect`), a crash at every stage → `resume` → clean tree, trailer-matched normal / partial / no-change checkpoints, R48 resume policy (Claude resumes, Codex fresh + hand-over), policy-violating partial → `--discard-partial` / `--keep-partial`, `partial_snapshot_roundtrip`, `lock_first_recovery` |
 | `tests/redaction.rs` | Windows + Linux | `redaction_split_boundaries` (C9/R42) |
 | `tests/architecture.rs` | Windows + Linux | no vendor types outside the adapters |
 | `tests/git_canary.rs` | Windows + Linux | Git hook/filter/textconv canaries on the real `git` |
@@ -90,7 +102,9 @@ CI (`.github/workflows/ci.yml`) runs `cargo test`, `clippy -D warnings` and the 
 
 ## Status
 
-M0 done; M1 (adapter layer) and M2 (state machine) done. No `toryo task`, `run`, `approve` yet: SQLite
-state, recovery and the task lock are M3. `spike pipeline` stays the behavioural reference (R52); it runs
-on the adapter layer (`AgentHub`, `LocalRunner`) and every step goes through `engine::state::Machine`, so
-what it proves is the M1/M2 code. It now has the final gate too (`--yes` skips both gates).
+M0, M1 (adapters), M2 (state machine) and M3 (SQLite store, task lock, crash recovery) are done. The
+engine commands (`task create`, `run`, `approve`, `reject`, `resume`, `stop`, `status`) run a task with its
+state in `%LOCALAPPDATA%\toryo\toryo.db`; a killed `toryo` loses nothing — `toryo resume` continues from
+the last committed step. Still to come: ProjectContextLoader (M4), the protected-state snapshot (M5),
+immutable run-store artifacts and the Low-IL verify boundary in the engine (M6), budget admission (M7).
+`spike pipeline` stays the behavioural reference (R52).

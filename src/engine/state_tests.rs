@@ -22,6 +22,7 @@ fn at(s: S) -> Machine {
         S::WaitingPlanApproval => m.open_gate(GateKind::Plan, "p".into()),
         S::WaitingFinalApproval => m.open_gate(GateKind::Final, C1.into()),
         S::Paused => m.paused_from = Some(S::Implementing),
+        S::Escalated => m.escalated_from = Some(S::Implementing),
         _ => {}
     }
     m
@@ -47,6 +48,7 @@ fn samples() -> Vec<E> {
         E::FinalRejected { occurrence: 1, reason: s("r") },
         E::ResumeWithNote { note: s("n") },
         E::ForceFinal,
+        E::ResumeStage,
         E::BudgetExceeded,
         E::BudgetResumed,
         E::Escalate { reason: s("x") },
@@ -66,7 +68,7 @@ fn allowed(s: S) -> &'static [&'static str] {
         S::Verifying => &["verify_passed", "verify_failed", "budget_exceeded", "escalate", "cancel", "fail"],
         S::Reviewing => &["review_approved", "changes_requested", "review_blocked", "budget_exceeded", "escalate", "cancel", "fail"],
         S::WaitingFinalApproval => &["final_approved", "final_rejected", "escalate", "cancel", "fail"],
-        S::Escalated => &["resume_with_note", "force_final", "cancel", "fail"],
+        S::Escalated => &["resume_with_note", "force_final", "resume_stage", "cancel", "fail"],
         S::Paused => &["budget_resumed", "escalate", "cancel", "fail"],
         S::Completed | S::Cancelled | S::Failed => &[],
     }
@@ -86,7 +88,7 @@ fn transition_table_is_exhaustive() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 14 * 22);
+    assert_eq!(checked, 14 * 23);
 }
 
 #[test]
@@ -325,4 +327,17 @@ fn machine_roundtrips_through_json() {
     assert_eq!(back, m);
     let e: E = serde_json::from_str(r#"{"event":"plan_rejected","occurrence":2,"reason":"x"}"#).unwrap();
     assert_eq!(e.name(), "plan_rejected");
+}
+
+#[test]
+fn resume_stage_returns_to_the_escalated_stage_without_a_cycle() {
+    let mut m = at(S::Implementing);
+    m.apply(E::Escalate { reason: "recovery_policy_violation".into() }).unwrap();
+    assert_eq!(m.escalated_from(), Some(S::Implementing));
+    assert_eq!(m.apply(E::ResumeStage), Ok(S::Implementing));
+    assert_eq!(m.fix_cycle(), 0);
+    // an escalation from a waiting state has no stage to go back to
+    let mut m = at(S::WaitingPlanApproval);
+    m.apply(E::Escalate { reason: "x".into() }).unwrap();
+    assert!(m.apply(E::ResumeStage).is_err());
 }

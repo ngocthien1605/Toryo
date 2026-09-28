@@ -1,4 +1,4 @@
-# Hướng dẫn sử dụng Toryo (prototype M0 + adapter M1 + state machine M2)
+# Hướng dẫn sử dụng Toryo (M0 kit · M1 adapter · M2 state machine · M3 engine + recovery)
 
 > **Toryo (棟梁 — tōryō)** = "thợ cả": người chỉ huy đội thợ, không tự đục đẽo mà giao việc, kiểm tra từng mối nối
 > và nghiệm thu từng giai đoạn. Tên cũ của tool là `thien` (đổi ngày 2026-09-28, plan v0.7 R55).
@@ -291,6 +291,37 @@ không gọi Claude/Codex thật. Ví dụ một script:
 } }
 ```
 
+### 5.4 Engine (M3): task có trạng thái lưu bền, chạy lại được sau crash
+
+Ví dụ D365FO: `spike pipeline` giống chạy một job **interactive** — tắt cửa sổ là mất. Engine M3 giống
+**batch job có trạng thái trong database**: mỗi bước (plan, implement, verify, review) là một *stage attempt*
+ghi vào SQLite (`%LOCALAPPDATA%\toryo\toryo.db`), mỗi lần đổi trạng thái được ghi cùng event trong **một
+transaction**. Máy tắt, Toryo bị kill, anh Ctrl+C… chạy `toryo resume` là tiếp tục đúng chỗ.
+
+```powershell
+toryo task create --file tasks\BR-003.md --repo C:\.thien\AgentOrchestrator\demo\batch-rename
+toryo run BR-003                                   # chạy tới plan gate rồi dừng (exit 0)
+toryo status BR-003                                # trạng thái + việc anh cần làm tiếp
+toryo approve BR-003 --gate plan --continue        # duyệt plan và chạy tiếp tới final gate
+toryo reject  BR-003 --gate plan --reason "..."    # hoặc từ chối (plan làm lại, gate mới)
+toryo approve BR-003 --gate final                  # nhận kết quả → Completed
+toryo task show BR-003                             # stage attempts, các lần duyệt (gate occurrences)
+```
+
+| Tình huống | Toryo làm gì | Anh làm gì |
+|---|---|---|
+| Toryo bị kill / máy tắt giữa chừng | attempt đang chạy ở trạng thái `running` trong DB | `toryo resume BR-003` |
+| Kill lúc Implementer đang sửa file | chụp **snapshot** (patch + bản copy file) rồi commit **recovery checkpoint** (`Toryo-Partial: true`); attempt mới nhận ghi chú hand-over. Claude **resume** đúng session cũ; Codex mở session **mới** (R48) | không cần làm gì |
+| Kill ngay sau commit checkpoint | tìm commit theo trailer `(task, stage, attempt)` → không commit lần hai | không |
+| Phần sửa dở có đụng file protected (TASK.md, AGENTS.md…) | **Escalated** `recovery_policy_violation`, không commit gì | `toryo resume ID --discard-partial` (bỏ phần dở, snapshot vẫn giữ) hoặc tự sửa worktree rồi `toryo resume ID --keep-partial` |
+| Muốn lấy lại phần đã bỏ | — | `toryo partial export ID --attempt 1 --into C:\temp\x` |
+| Muốn dừng task đang chạy | — | `toryo stop BR-003` (ở cửa sổ khác; dừng trong vài giây, attempt thành `interrupted`) |
+| Chạy lệnh trên task đang chạy ở cửa sổ khác | **từ chối**, exit code 3 `task_active` (lock-first, R38) | chờ, hoặc `toryo stop` |
+
+Ghi chú: `run`/`resume` vẫn kiểm tra R51 (canary theo version CLI). Recovery không gọi agent nên không cần.
+Chưa có trong engine (các milestone sau): ProjectContextLoader (M4), so sánh protected snapshot (M5),
+artifact bất biến + verify ở Low-IL (M6), budget (M7). Prototype `toryo spike pipeline` vẫn dùng được như cũ.
+
 ---
 
 ## 6. Thực hành: dự án mẫu **BatchRename** (PowerShell module)
@@ -427,7 +458,7 @@ Khi có lệnh build/test X++ chạy không tương tác trên dev VM, chỉ c�
 | Giới hạn | Hệ quả / cách xử lý |
 |---|---|
 | Verify chạy **với quyền user của anh** trong worktree (chưa có Low-IL boundary) | Chỉ dùng cho repo và task anh tin tưởng. Script test do AI viết sẽ được chạy thật! |
-| Chưa có resume sau crash / Ctrl+C | Chạy lại với `--id` khác, hoặc xoá worktree + branch cũ (lệnh in ra cuối mỗi lần chạy) |
+| `spike pipeline` chưa có resume sau crash / Ctrl+C | Dùng engine (mục 5.4): `toryo task create` + `toryo run` + `toryo resume` |
 | Fallback mới áp dụng cho Implementer (planner/reviewer Claude hết quota thì dừng) | Chờ reset quota rồi chạy lại |
 | Canary chỉ kiểm tra launch mode `restricted` (mặc định) | Nếu dùng `--mode` khác cho pipeline: `toryo doctor --canaries --claude-mode <mode>` |
 | Chưa có budget cap theo token | Xem token ở cuối mỗi lượt và trong `SUMMARY.md`; giữ `--max-fix-cycles` nhỏ |
