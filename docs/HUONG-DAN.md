@@ -550,6 +550,7 @@ Khi có lệnh build/test X++ chạy không tương tác trên dev VM, chỉ c�
 | Test tạo thư mục tạm bị lỗi quyền khi Codex chạy | Toryo đã cấp TEMP riêng `<worktree>\.toryo-tmp` (git bỏ qua). Nếu vẫn lỗi, xem `implement.meta.json` có biến `TEMP` không |
 | `unverified profiles (R51)` khi chạy pipeline | Vừa nâng cấp Claude Code/Codex, hoặc chưa có record có version → `toryo doctor --canaries` (shell thường, không Admin) |
 | Muốn xem AI "nghĩ" gì | `runs\<ID>\captures\*.stdout.jsonl` (stream đầy đủ), `*.prompt.md`, và `toryo context show` |
+| Ký tự lạ kiểu `ΓòÉΓòÉ`, `ΓåÆ` khi **pipe** output của toryo (`toryo … \| Tee-Object`, `\| Select-String`) | toryo in UTF-8, còn PowerShell giải mã output qua pipe bằng code page OEM 437. Thêm vào `$PROFILE`: `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)` (các script trong `scripts\` đã tự đặt). Chạy trực tiếp không pipe thì luôn hiển thị đúng |
 | `protected_config_changed` | Mở file diff được nêu trong lý do; khôi phục rồi `toryo resume ID`, hoặc `--accept-protected-change <path>` |
 | `verify_boundary_unavailable` | `verify_root` không gán được Low label (thiếu WRITE_OWNER) → để mặc định `%LOCALAPPDATA%\toryo-verify`; `toryo doctor` nêu nguyên nhân |
 | `verify_mutated_tree` | Script verify đã sửa file đã track / `.git` của bản checkout → sửa script (hoặc code agent viết), rồi `toryo resume ID --note "…"` |

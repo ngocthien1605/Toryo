@@ -39,6 +39,11 @@ param(
     [string]$FakeAgents
 )
 $ErrorActionPreference = 'Stop'
+# toryo writes UTF-8. When its output goes through a pipe (as here, for the log), PowerShell
+# decodes it with [Console]::OutputEncoding, which is the OEM code page (437) on Windows:
+# '═' (E2 95 90) would show as 'ΓòÉ' and '→' as 'ΓåÆ'.
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $toryo = (Resolve-Path (Join-Path $PSScriptRoot '..\bin\toryo.exe')).Path
 $env:TORYO_CONFIG = $Config
 $dataDir = if ($env:TORYO_DATA_DIR) { $env:TORYO_DATA_DIR } else { Join-Path $env:LOCALAPPDATA 'toryo' }

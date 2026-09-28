@@ -22,6 +22,8 @@ param(
     [string]$Reason = 'Undo-Rename should output one object per restored file (OldName, NewName), like Rename-ByPattern does, and a test should check it'
 )
 $ErrorActionPreference = 'Stop'
+# toryo writes UTF-8; decode piped output as UTF-8, not the OEM code page
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $toryo = (Resolve-Path (Join-Path $PSScriptRoot '..\bin\toryo.exe')).Path
 $env:TORYO_CONFIG = $Config
 
