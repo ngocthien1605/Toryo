@@ -237,8 +237,9 @@ fn verify_root_label_probe() {
 #[cfg(windows)]
 #[test]
 fn verify_boundary_writes() {
-    const PROBE: &str = r#"param([string[]]$Targets)
-foreach ($t in $Targets) {
+    // targets come as separate arguments: `-File probe.ps1 a b c` binds them to $args (a
+    // `param([string[]]$Targets)` would only receive the first one)
+    const PROBE: &str = r#"foreach ($t in $args) {
   try { Set-Content -Path (Join-Path $t 'lowil-marker.txt') -Value hit -ErrorAction Stop; "WROTE $t" } catch { "DENIED $t" }
 }
 try { Set-Content -Path (Join-Path $env:TORYO_VERIFY_BUILD 'out.txt') -Value ok -ErrorAction Stop; 'BUILD ok' } catch { 'BUILD denied' }
@@ -265,6 +266,7 @@ exit 0
         let t = task(&env, id);
         let vr: Value = serde_json::from_slice(&std::fs::read(t.artifacts().join("VERIFY_RESULT.json")).unwrap()).unwrap();
         let out = vr["commands"][0]["output_tail"].as_str().unwrap_or("").to_string();
+        assert_eq!(out.matches("WROTE ").count() + out.matches("DENIED ").count(), 5, "the probe tried every target: {out}");
         let markers: Vec<bool> = targets.iter().map(|d| d.join("lowil-marker.txt").exists()).collect();
         if boundary == "low_integrity" {
             assert_eq!(markers, vec![false; 5], "Low IL wrote toryo state: {out}\n{err}");

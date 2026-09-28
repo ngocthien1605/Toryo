@@ -39,6 +39,11 @@ fn staging(t: &TaskRow) -> PathBuf {
     root(t).join(".staging")
 }
 
+/// A registered path (run-store relative, `/`-separated) as a native absolute path.
+fn abs(t: &TaskRow, rel: &str) -> PathBuf {
+    rel.split(['/', '\\']).filter(|c| !c.is_empty()).fold(t.run_store.clone(), |p, c| p.join(c))
+}
+
 fn rel(t: &TaskRow, p: &Path) -> String {
     p.strip_prefix(&t.run_store).map(|r| r.display().to_string().replace('\\', "/")).unwrap_or_else(|_| p.display().to_string())
 }
@@ -122,7 +127,7 @@ pub fn head(store: &Store, t: &TaskRow, logical: &str) -> Result<Option<Version>
             )
             .optional()?)
     })?;
-    Ok(row.map(|(id, v, p, sha)| Version { id, logical: logical.to_string(), version: v as u32, path: t.run_store.join(p), sha256: sha }))
+    Ok(row.map(|(id, v, p, sha)| Version { id, logical: logical.to_string(), version: v as u32, path: abs(t, &p), sha256: sha }))
 }
 
 /// Read a version and check its hash: `artifact_missing` / `artifact_tampered` otherwise.
@@ -207,7 +212,7 @@ pub fn reconcile(store: &Store, t: &TaskRow) -> Result<Reconciled> {
         if kind == "partial_snapshot" {
             continue; // a directory; its manifest is checked by `snapshot::completion_check`
         }
-        let v = Version { id: id.clone(), logical: String::new(), version: 0, path: t.run_store.join(&path), sha256: sha };
+        let v = Version { id: id.clone(), logical: String::new(), version: 0, path: abs(t, &path), sha256: sha };
         if let Err(e) = read_version(&v) {
             r.problem.get_or_insert_with(|| format!("{e:#}"));
         }

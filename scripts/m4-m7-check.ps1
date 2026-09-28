@@ -41,7 +41,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $toryo = (Resolve-Path (Join-Path $PSScriptRoot '..\bin\toryo.exe')).Path
 $env:TORYO_CONFIG = $Config
-$scratch = Join-Path ([System.IO.Path]::GetTempPath()) "toryo-m4m7-$Task"
+$dataDir = if ($env:TORYO_DATA_DIR) { $env:TORYO_DATA_DIR } else { Join-Path $env:LOCALAPPDATA 'toryo' }
+# scratch files and the log live in the toryo data dir, next to the run store
+$scratch = Join-Path $dataDir "m4-m7-check/$Task"
 New-Item -ItemType Directory -Force $scratch | Out-Null
 $log = Join-Path $scratch 'm4-m7-check.log'
 $checks = [System.Collections.Generic.List[object]]::new()
@@ -67,13 +69,17 @@ function Check([string]$name, [bool]$ok, [string]$detail = '') {
 $drive = @()
 if ($AcceptUnverified) { $drive += '--accept-unverified' }
 if ($FakeAgents) { $drive += @('--fake-agents', $FakeAgents); $SkipCanaries = $true }
-$dataDir = if ($env:TORYO_DATA_DIR) { $env:TORYO_DATA_DIR } else { Join-Path $env:LOCALAPPDATA 'toryo' }
 
 # ── 1. canaries ─────────────────────────────────────────────────────────────────────
 if (-not $SkipCanaries) {
     Show-Step "1a. claude-implementer-isolation --profile $ClaudeProfile (R49, V07-VERIFY 4)"
     $c = T spike claude-implementer-isolation --profile $ClaudeProfile
     Check 'claude_implementer_isolation' ($c -eq 0)
+    if ($c -ne 0 -and -not $AcceptUnverified) {
+        Write-Warning ("$ClaudeProfile is in the implementer fallback chain, so ``toryo run`` refuses to start without a passing " +
+            "claude-implementer-isolation for this Claude version (R51). Send the log to Claude, or rerun with -AcceptUnverified. log: $log")
+        exit 1
+    }
     Show-Step "1b. codex-temp-probe --profile $CodexProfile (R46, V07-VERIFY 2)"
     $c = T spike codex-temp-probe --profile $CodexProfile
     Check 'codex TEMP reaches sandboxed commands' ($c -eq 0)
@@ -113,8 +119,13 @@ $marker = "GLOBAL-RULE-$([guid]::NewGuid().ToString('N').Substring(0,8))"
 $global = Join-Path $scratch 'global.md'
 "# Personal rules`n`n- $marker`: write comment-based help (.SYNOPSIS) for every new public function." | Set-Content $global -Encoding utf8NoBOM
 $env:TORYO_GLOBAL_CONTEXT = $global
-$c = T task create --file $taskFile --repo $Repo --id $Task
-if ($c -ne 0) { throw "task create failed ($c) — an old $Task? use -Task <other id>, or toryo task cleanup $Task" }
+$existing = TOut status $Task
+if ($existing -match "(?m)^$([regex]::Escape($Task))\s+New\b") {
+    Write-Host "$Task already exists and has not started (New) - reusing it"
+} else {
+    $c = T task create --file $taskFile --repo $Repo --id $Task
+    if ($c -ne 0) { throw "task create failed ($c) - $Task exists already? use -Task <other id>, or 'toryo task cleanup $Task --force' + 'git branch -D toryo/$Task' in the repo" }
+}
 $ctxPlan = TOut context show $Task --stage plan
 $ctxPlan | Set-Content (Join-Path $scratch 'context-plan.txt')
 Check 'planner context: global.md + AGENTS.md (Claude)' (($ctxPlan -match $marker) -and ($ctxPlan -match 'AGENTS\.md'))
@@ -126,7 +137,10 @@ Show-Step '3. run -> plan gate'
 $c = T run $Task @drive
 $st = TOut status $Task
 Check 'stops at the plan gate' ($st -match 'WaitingPlanApproval') $st.Split("`n")[0]
-if ($st -notmatch 'WaitingPlanApproval') { throw "unexpected state; see $log" }
+if ($st -notmatch 'WaitingPlanApproval') {
+    if ((Get-Content $log -Raw) -match 'unverified profiles') { Write-Warning 'toryo run refused: unverified profiles (R51) - see the log; rerun the canaries or use -AcceptUnverified' }
+    throw "unexpected state; see $log"
+}
 Show-Step '3b. approve plan --continue -> implement -> verify (Low IL) -> review'
 $c = T approve $Task --gate plan --continue @drive
 $st = TOut status $Task
