@@ -534,3 +534,33 @@ fn lock_first_recovery() {
     assert_eq!(row.outcome.as_deref(), Some("expired"), "a request never acts on a later owner");
     assert!(clean(&wt(&env, "A-1")));
 }
+
+#[test]
+fn stopped_review_resumes_the_reviewer_session() {
+    let env = setup("codex-openai");
+    create(&env, "R-1");
+    let s = script(&env, "r.json", json!({
+        "planner": [turn(vec![plan()])],
+        "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+        "reviewer": [turn(vec![hang()])],
+    }));
+    let mut child = spawn(&env, &["run", "R-1", "--yes", "--fake-agents", &s], "r.log");
+    wait_until("the reviewer to run", 60, || {
+        attempts(&env, "R-1").iter().any(|a| a.stage == "review" && a.status == AttemptStatus::Running && a.external_session_id.is_some())
+    });
+    let (code, err) = toryo(&env, &["stop", "R-1"], &[]);
+    assert_eq!(code, 0, "{err}");
+    child.wait().unwrap();
+    let a = attempts(&env, "R-1").into_iter().find(|a| a.id == "R-1/review/1").unwrap();
+    assert_eq!(a.status, AttemptStatus::Interrupted);
+    let sid = a.external_session_id.unwrap();
+    assert_eq!(task(&env, "R-1").state, St::Reviewing, "a stop leaves the state (R38)");
+    let s2 = script(&env, "r2.json", json!({ "reviewer": [turn(vec![approved()])] }));
+    let (code, err) = toryo(&env, &["resume", "R-1", "--yes", "--fake-agents", &s2], &[]);
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R-1");
+    assert_eq!(t.state, St::Completed);
+    let calls: Value = serde_json::from_slice(&std::fs::read(t.captures().join(format!("fake-calls-{}.json", t.lock_generation))).unwrap()).unwrap();
+    assert_eq!(calls[0]["resume"].as_str(), Some(sid.as_str()), "R48: the Reviewer resumes its interrupted session");
+    assert!(calls[0]["prompt"].as_str().unwrap().contains("interrupted"));
+}

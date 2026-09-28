@@ -563,12 +563,20 @@ impl<'a> Engine<'a> {
                 art.join("VERIFY_RESULT.json").display()
             ),
         )?;
+        // R48: a review of the same checkpoint that was interrupted (crash, stop) resumes the
+        // Reviewer's session
+        let prev = { let i = self.id.clone(); self.store.call(move |tx| store::last_attempt(tx, &i, "review"))? };
+        let mut resume: Option<String> = prev
+            .filter(|p| p.status == AttemptStatus::Interrupted && p.subject_commit.as_deref() == Some(head.as_str()) && p.profile.as_deref() == Some(t.reviewer.as_str()))
+            .and_then(|p| p.external_session_id);
         let a = self.begin(NewAttempt { stage: "review", kind: "agent", profile: Some(&t.reviewer), fallback_from: None, head_before: Some(&head), subject_commit: Some(&head) })?;
-        eprintln!("\n── REVIEW (attempt {}, {}) ──", a.attempt, t.reviewer);
+        eprintln!("\n── REVIEW (attempt {}, {}{}) ──", a.attempt, t.reviewer, if resume.is_some() { ", resuming the interrupted session" } else { "" });
         crash_point("review:after_begin");
         let stop = self.lock.watch_stop();
         let mut prompt = format!("Review the checkpoint {} in this worktree against TASK.md. Acceptance criteria ids: {:?}.", &head[..12], t.acceptance_ids);
-        let mut resume: Option<String> = None;
+        if resume.is_some() {
+            prompt = format!("Your previous review turn was interrupted before it finished. {prompt} Return the complete review.");
+        }
         let mut review = Value::Null;
         let mut valid = false;
         let mut last = StageOutcome::default();
