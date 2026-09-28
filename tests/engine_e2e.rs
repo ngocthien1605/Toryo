@@ -353,6 +353,10 @@ fn killed_codex_implementer_restarts_fresh_with_a_handover() {
     let imp = calls.as_array().unwrap().iter().find(|c| c["key"] == "implementer").unwrap();
     assert!(imp["resume"].is_null(), "Codex starts a fresh session (R48)");
     assert!(imp["prompt"].as_str().unwrap().contains(&partial[..12]), "the hand-over names the partial commit");
+    // R41: the killed turn is an `unknown` usage row with a reservation, never zero
+    assert!(db(&env).call(|tx| store::has_usage(tx, "K-1/implement/1")).unwrap(), "the killed turn has a usage row");
+    // plan, the killed implement turn, implement 2 and the review: fakes report no usage
+    assert_eq!(t.reserved_tokens, 4 * store::DEFAULT_UNKNOWN_RESERVATION);
     assert!(clean(&t.worktree));
 }
 

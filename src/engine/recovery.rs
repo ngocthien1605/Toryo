@@ -16,6 +16,7 @@ use super::snapshot;
 use super::state::{PipelineEvent as Ev, PipelineState as St};
 use super::store::{self, AttemptEnd, AttemptRow, AttemptStatus, Store, TaskRow};
 use super::worktree::{Worktree, T_ATTEMPT, T_IMPLEMENTER, T_PARTIAL, T_STAGE, T_TASK};
+use crate::config::{Billing, Effective};
 use crate::git::GitCmd;
 
 /// `recovery_policy_violation` prefix of the escalation reason (§11).
@@ -25,6 +26,8 @@ pub struct Recovery<'a> {
     pub store: &'a Store,
     pub g: &'a GitCmd,
     pub protect: &'a Protected,
+    /// The task's frozen configuration (billing kind of a killed turn's usage row).
+    pub cfg: &'a Effective,
 }
 
 fn short(s: &str) -> &str {
@@ -39,7 +42,23 @@ impl<'a> Recovery<'a> {
 
     fn finish(&self, a: &AttemptRow, status: AttemptStatus, end: AttemptEnd, e: Option<Ev>, handoff: Option<String>) -> Result<()> {
         let (aid, tid) = (a.id.clone(), a.task_id.clone());
+        // R41: an agent turn killed with its owner reported no usage: record it as `unknown`
+        // with a reservation — never as zero
+        let killed = (a.status == AttemptStatus::Running && a.kind == "agent").then(|| {
+            let p = a.profile.clone().unwrap_or_default();
+            let billing = match self.cfg.profile(&p).map(|x| x.billing) {
+                Ok(Billing::Foundry) => "foundry",
+                Ok(Billing::Api) => "api",
+                _ => "subscription",
+            };
+            (p, billing)
+        });
         self.store.call(move |tx| {
+            if let Some((p, b)) = killed {
+                if !store::has_usage(tx, &aid)? {
+                    store::record_usage(tx, &tid, &aid, &p, b, None)?;
+                }
+            }
             store::finish_attempt(tx, &aid, status, &end)?;
             if let Some(h) = handoff {
                 store::set_handoff(tx, &tid, Some(&h))?;

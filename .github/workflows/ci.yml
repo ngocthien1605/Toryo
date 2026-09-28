@@ -31,8 +31,29 @@ jobs:
           git config --global user.name "toryo-ci"
           git config --global user.email "toryo-ci@users.noreply.github.com"
           git config --global init.defaultBranch main
-      - name: Tests (M1 core + M0 kit)
-        run: cargo test --locked
+      - name: Tests (core + M0 kit)
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --no-fail-fast 2>&1 | tee test-output.txt
+      - name: Failed tests → summary + annotations
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "### Failed tests (${{ matrix.os }})"
+            echo '```'
+            grep -n -E "^test .* FAILED$|panicked at|^  left:|^ right:|assertion|^error(\[|:)" test-output.txt | head -120
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -E "panicked at" -A3 test-output.txt | head -40 | while IFS= read -r line; do echo "::error title=test failure::$line"; done
+      - name: Upload the test output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-${{ matrix.os }}
+          path: test-output.txt
+          retention-days: 14
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Core without the M0 kit

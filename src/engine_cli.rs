@@ -132,8 +132,9 @@ fn hub_for(t: &TaskRow, d: &DriveArgs) -> Result<AgentHub> {
 fn drive(store: &Store, lock: &TaskLock, d: &DriveArgs) -> Result<i32> {
     // recovery launches no agent: it needs neither the hub nor the R51 check
     let t = get(store, &lock.task)?;
-    let (g, protect, _) = task_policy(&t, &frozen_config(&t)?)?;
-    let rec = Recovery { store, g: &g, protect: &protect };
+    let cfg = frozen_config(&t)?;
+    let (g, protect, _) = task_policy(&t, &cfg)?;
+    let rec = Recovery { store, g: &g, protect: &protect, cfg: &cfg };
     for n in rec.recover(&lock.task)? {
         eprintln!("↺ recovery: {n}");
     }
@@ -288,8 +289,9 @@ pub struct ResumeArgs {
 fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
     let t = get(st, &lock.task)?;
     if r.discard_partial || r.keep_partial {
-        let (g, protect, _) = task_policy(&t, &frozen_config(&t)?)?;
-        let rec = Recovery { store: st, g: &g, protect: &protect };
+        let cfg = frozen_config(&t)?;
+        let (g, protect, _) = task_policy(&t, &cfg)?;
+        let rec = Recovery { store: st, g: &g, protect: &protect, cfg: &cfg };
         let msg = if r.discard_partial { rec.discard_partial(&t.id)? } else { rec.keep_partial(&t.id)? };
         eprintln!("↺ {msg}");
     } else if let Some(note) = &r.note {

@@ -774,6 +774,10 @@ pub fn set_attempt_session(tx: &Transaction, id: &str, session: &str) -> Result<
 
 // ── usage (R41, minimal until M7) ────────────────────────────────────────────────────
 
+pub fn has_usage(tx: &Transaction, attempt: &str) -> Result<bool> {
+    Ok(tx.query_row("SELECT COUNT(*) FROM usage WHERE stage_attempt_id = ?1", [attempt], |r| r.get::<_, i64>(0))? > 0)
+}
+
 pub fn record_usage(tx: &Transaction, task: &str, attempt: &str, profile: &str, billing: &str, u: Option<TokenUsage>) -> Result<()> {
     let (b, acc) = match u {
         Some(u) => (u.buckets, u.accounting),
