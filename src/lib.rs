@@ -13,6 +13,7 @@ pub mod agents;
 pub mod config;
 pub mod doctor;
 pub mod domain;
+pub mod engine;
 pub mod evidence;
 pub mod git;
 pub mod process;

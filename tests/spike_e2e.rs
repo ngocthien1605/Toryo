@@ -521,7 +521,7 @@ fn pipeline_plan_gate_fix_cycle_and_approval() {
             "--id",
             "CALC-001",
         ],
-        "n\nplease also cover negative numbers\ny\n",
+        "n\nplease also cover negative numbers\ny\ny\n",
     );
     let r = records(&env);
     if std::env::var("SHOW").is_ok() {

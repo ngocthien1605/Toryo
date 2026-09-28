@@ -1,0 +1,328 @@
+//! M2 acceptance (plan §17): invalid transitions rejected; implement blocked before plan
+//! approval; verify failure → Fixing, never Review; max cycles → Escalated; Escalated →
+//! Fixing with a note; Paused → previous state; a rejected gate occurrence never passes.
+
+use super::*;
+use PipelineEvent as E;
+use PipelineState as S;
+
+const C1: &str = "c1";
+
+/// A machine forced into `s`, with a context in which every guard can pass.
+fn at(s: S) -> Machine {
+    let mut m = Machine::new(2);
+    m.state = s;
+    m.plan_attempt = 1;
+    if !matches!(s, S::New | S::Planning | S::WaitingPlanApproval) {
+        m.plan_approved = true;
+        m.checkpoint = Some(C1.into());
+        m.verified_head = Some(C1.into());
+    }
+    match s {
+        S::WaitingPlanApproval => m.open_gate(GateKind::Plan, "p".into()),
+        S::WaitingFinalApproval => m.open_gate(GateKind::Final, C1.into()),
+        S::Paused => m.paused_from = Some(S::Implementing),
+        _ => {}
+    }
+    m
+}
+
+fn samples() -> Vec<E> {
+    let s = |x: &str| x.to_string();
+    vec![
+        E::Start,
+        E::PlanPolicyViolation { paths: vec![s("toryo.yaml")] },
+        E::PlanReady { subject: s("p") },
+        E::PlanApproved { occurrence: 1, subject: s("p") },
+        E::PlanRejected { occurrence: 1, reason: s("r") },
+        E::ImplementationDone,
+        E::PathPolicyViolation { paths: vec![s("AGENTS.md")] },
+        E::Checkpointed { head: s(C1) },
+        E::VerifyPassed { head: s(C1) },
+        E::VerifyFailed { head: s(C1) },
+        E::ReviewApproved { head: s(C1) },
+        E::ChangesRequested { head: s(C1) },
+        E::ReviewBlocked { head: s(C1) },
+        E::FinalApproved { occurrence: 1, subject: s(C1) },
+        E::FinalRejected { occurrence: 1, reason: s("r") },
+        E::ResumeWithNote { note: s("n") },
+        E::ForceFinal,
+        E::BudgetExceeded,
+        E::BudgetResumed,
+        E::Escalate { reason: s("x") },
+        E::Cancel,
+        E::Fail { error: s("x") },
+    ]
+}
+
+/// The transition table: every (state, event) pair not listed here must be rejected.
+fn allowed(s: S) -> &'static [&'static str] {
+    match s {
+        S::New => &["start", "escalate", "cancel", "fail"],
+        S::Planning => &["plan_policy_violation", "plan_ready", "budget_exceeded", "escalate", "cancel", "fail"],
+        S::WaitingPlanApproval => &["plan_approved", "plan_rejected", "escalate", "cancel", "fail"],
+        S::Implementing | S::Fixing => &["implementation_done", "path_policy_violation", "budget_exceeded", "escalate", "cancel", "fail"],
+        S::Checkpointing => &["checkpointed", "budget_exceeded", "escalate", "cancel", "fail"],
+        S::Verifying => &["verify_passed", "verify_failed", "budget_exceeded", "escalate", "cancel", "fail"],
+        S::Reviewing => &["review_approved", "changes_requested", "review_blocked", "budget_exceeded", "escalate", "cancel", "fail"],
+        S::WaitingFinalApproval => &["final_approved", "final_rejected", "escalate", "cancel", "fail"],
+        S::Escalated => &["resume_with_note", "force_final", "cancel", "fail"],
+        S::Paused => &["budget_resumed", "escalate", "cancel", "fail"],
+        S::Completed | S::Cancelled | S::Failed => &[],
+    }
+}
+
+#[test]
+fn transition_table_is_exhaustive() {
+    let mut checked = 0;
+    for s in S::ALL {
+        for e in samples() {
+            let ok = allowed(s).contains(&e.name());
+            let r = at(s).transition(&e);
+            assert_eq!(r.is_ok(), ok, "{s:?} + {} → {r:?}", e.name());
+            if s.is_terminal() {
+                assert_eq!(r, Err(PipelineError::Terminal(s)));
+            }
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 14 * 22);
+}
+
+#[test]
+fn a_rejected_transition_changes_nothing() {
+    let mut m = at(S::Verifying);
+    let before = m.clone();
+    assert!(m.apply(E::ReviewApproved { head: C1.into() }).is_err());
+    assert_eq!(m, before);
+}
+
+fn walk(m: &mut Machine, events: Vec<E>) -> Vec<S> {
+    events
+        .into_iter()
+        .map(|e| {
+            let n = e.name();
+            m.apply(e).unwrap_or_else(|err| panic!("{n}: {err}"))
+        })
+        .collect()
+}
+
+fn occ(m: &Machine) -> u32 {
+    m.gate().unwrap().occurrence
+}
+
+/// Plan → approve → implement → verify → review → final approve.
+fn happy(m: &mut Machine) {
+    m.apply(E::Start).unwrap();
+    m.apply(E::PlanReady { subject: "p1".into() }).unwrap();
+    m.apply(E::PlanApproved { occurrence: occ(m), subject: "p1".into() }).unwrap();
+    walk(
+        m,
+        vec![
+            E::ImplementationDone,
+            E::Checkpointed { head: C1.into() },
+            E::VerifyPassed { head: C1.into() },
+            E::ReviewApproved { head: C1.into() },
+        ],
+    );
+    let o = occ(m);
+    assert_eq!(m.apply(E::FinalApproved { occurrence: o, subject: C1.into() }), Ok(S::Completed));
+}
+
+#[test]
+fn happy_path_completes() {
+    let mut m = Machine::new(2);
+    happy(&mut m);
+    assert_eq!(m.fix_cycle(), 0);
+    assert!(m.gate().is_none());
+    assert!(m.apply(E::Cancel).is_err(), "terminal");
+}
+
+#[test]
+fn implement_is_blocked_before_plan_approval() {
+    let mut m = Machine::new(2);
+    m.apply(E::Start).unwrap();
+    assert!(m.expect(S::Implementing).is_err());
+    assert!(m.apply(E::ImplementationDone).is_err());
+    m.apply(E::PlanReady { subject: "p".into() }).unwrap();
+    assert!(m.apply(E::ImplementationDone).is_err(), "gate open, not approved");
+    assert!(!m.plan_approved());
+}
+
+#[test]
+fn verify_failure_goes_to_fixing_never_to_review() {
+    let mut m = at(S::Verifying);
+    assert_eq!(m.apply(E::VerifyFailed { head: C1.into() }), Ok(S::Fixing));
+    assert_eq!(m.fix_cycle(), 1);
+    // a stale verify result (another head) is rejected
+    let mut m = at(S::Verifying);
+    assert!(matches!(
+        m.apply(E::VerifyPassed { head: "old".into() }),
+        Err(PipelineError::StaleHead { .. })
+    ));
+}
+
+#[test]
+fn review_needs_a_verified_current_checkpoint() {
+    // R29: the verify pass was for an older checkpoint
+    let mut m = at(S::Reviewing);
+    m.verified_head = Some("c0".into());
+    assert!(matches!(
+        m.apply(E::ReviewApproved { head: C1.into() }),
+        Err(PipelineError::NotVerified { .. })
+    ));
+    // a review of a stale head is ignored
+    let mut m = at(S::Reviewing);
+    assert!(matches!(
+        m.apply(E::ChangesRequested { head: "c0".into() }),
+        Err(PipelineError::StaleHead { .. })
+    ));
+}
+
+#[test]
+fn every_entry_into_fixing_counts_and_max_cycles_escalates() {
+    let mut m = Machine::new(2);
+    m.apply(E::Start).unwrap();
+    m.apply(E::PlanReady { subject: "p".into() }).unwrap();
+    m.apply(E::PlanApproved { occurrence: occ(&m), subject: "p".into() }).unwrap();
+    // cycle 1: path policy (owner decision: counts as a fix cycle)
+    assert_eq!(m.apply(E::PathPolicyViolation { paths: vec!["AGENTS.md".into()] }), Ok(S::Fixing));
+    assert_eq!(m.fix_cycle(), 1);
+    // cycle 2: verify failure
+    walk(&mut m, vec![E::ImplementationDone, E::Checkpointed { head: "c2".into() }]);
+    assert_eq!(m.apply(E::VerifyFailed { head: "c2".into() }), Ok(S::Fixing));
+    assert_eq!(m.fix_cycle(), 2);
+    // no cycle left: changes requested → Escalated
+    walk(
+        &mut m,
+        vec![
+            E::ImplementationDone,
+            E::Checkpointed { head: "c3".into() },
+            E::VerifyPassed { head: "c3".into() },
+        ],
+    );
+    assert_eq!(m.apply(E::ChangesRequested { head: "c3".into() }), Ok(S::Escalated));
+    assert_eq!(m.fix_cycle(), 2);
+    assert!(m.reason().unwrap().contains("after 2 fix cycle(s)"), "{:?}", m.reason());
+}
+
+#[test]
+fn final_rejection_is_a_fix_cycle() {
+    let mut m = at(S::WaitingFinalApproval);
+    let o = occ(&m);
+    assert_eq!(m.apply(E::FinalRejected { occurrence: o, reason: "rename the flag".into() }), Ok(S::Fixing));
+    assert_eq!(m.fix_cycle(), 1);
+    assert!(m.reason().unwrap().contains("rename the flag"));
+}
+
+#[test]
+fn escalated_to_fixing_needs_a_note() {
+    let mut m = at(S::Reviewing);
+    m.apply(E::ReviewBlocked { head: C1.into() }).unwrap();
+    assert_eq!(m.state(), S::Escalated);
+    assert_eq!(m.apply(E::ResumeWithNote { note: "  ".into() }), Err(PipelineError::EmptyNote));
+    assert_eq!(m.apply(E::ResumeWithNote { note: "use the v2 API".into() }), Ok(S::Fixing));
+    assert_eq!(m.reason(), Some("use the v2 API"));
+}
+
+#[test]
+fn escalated_before_plan_approval_resumes_planning_not_fixing() {
+    let mut m = Machine::new(2);
+    m.apply(E::Start).unwrap();
+    m.apply(E::Escalate { reason: "planner InvalidOutput".into() }).unwrap();
+    assert_eq!(m.apply(E::ResumeWithNote { note: "keep it small".into() }), Ok(S::Planning));
+    assert!(m.clone().apply(E::ForceFinal).is_err());
+}
+
+#[test]
+fn force_final_from_escalated_needs_a_verified_checkpoint() {
+    let mut m = at(S::Escalated);
+    assert_eq!(m.apply(E::ForceFinal), Ok(S::WaitingFinalApproval));
+    assert_eq!(m.gate().unwrap().subject, C1);
+    let mut m = at(S::Escalated);
+    m.verified_head = None;
+    assert!(matches!(m.apply(E::ForceFinal), Err(PipelineError::NotVerified { .. })));
+}
+
+#[test]
+fn paused_returns_to_the_previous_state() {
+    for s in [S::Planning, S::Implementing, S::Checkpointing, S::Verifying, S::Fixing, S::Reviewing] {
+        let mut m = at(s);
+        assert_eq!(m.apply(E::BudgetExceeded), Ok(S::Paused));
+        assert_eq!(m.paused_from(), Some(s));
+        assert_eq!(m.apply(E::BudgetResumed), Ok(s));
+        assert_eq!(m.paused_from(), None);
+    }
+    // waiting states are not paused by a budget
+    assert!(at(S::WaitingPlanApproval).apply(E::BudgetExceeded).is_err());
+}
+
+#[test]
+fn a_rejected_gate_occurrence_never_passes() {
+    let mut m = Machine::new(2);
+    m.apply(E::Start).unwrap();
+    m.apply(E::PlanReady { subject: "p1".into() }).unwrap();
+    let first = occ(&m);
+    m.apply(E::PlanRejected { occurrence: first, reason: "no".into() }).unwrap();
+    m.apply(E::PlanReady { subject: "p2".into() }).unwrap();
+    let second = occ(&m);
+    assert_ne!(first, second);
+    // an approval of the resolved (rejected) occurrence is refused, whatever the subject
+    for subject in ["p1", "p2"] {
+        assert!(matches!(
+            m.clone().apply(E::PlanApproved { occurrence: first, subject: subject.into() }),
+            Err(PipelineError::StaleOccurrence { .. })
+        ));
+    }
+    // R32: approving the open occurrence with the old plan's digest is refused too
+    assert!(matches!(
+        m.clone().apply(E::PlanApproved { occurrence: second, subject: "p1".into() }),
+        Err(PipelineError::SubjectMismatch { .. })
+    ));
+    assert_eq!(m.apply(E::PlanApproved { occurrence: second, subject: "p2".into() }), Ok(S::Implementing));
+    // the gate is closed: deciding it again fails
+    assert!(m.apply(E::PlanApproved { occurrence: second, subject: "p2".into() }).is_err());
+}
+
+#[test]
+fn human_plan_rejections_are_unlimited() {
+    let mut m = Machine::new(2);
+    m.apply(E::Start).unwrap();
+    for i in 0..10 {
+        m.apply(E::PlanReady { subject: format!("p{i}") }).unwrap();
+        let o = occ(&m);
+        assert_eq!(m.apply(E::PlanRejected { occurrence: o, reason: "again".into() }), Ok(S::Planning));
+    }
+    assert_eq!(m.plan_attempt(), 11);
+}
+
+#[test]
+fn automatic_plan_rejections_are_bounded() {
+    let mut m = Machine::new(2);
+    m.apply(E::Start).unwrap();
+    let v = || E::PlanPolicyViolation { paths: vec!["toryo.yaml".into()] };
+    for _ in 0..MAX_PLAN_AUTO_REJECTIONS {
+        assert_eq!(m.apply(v()), Ok(S::Planning));
+    }
+    assert_eq!(m.apply(v()), Ok(S::Escalated));
+    assert!(m.reason().unwrap().contains("protected paths"));
+}
+
+#[test]
+fn no_change_checkpoint_is_the_only_way_on() {
+    // R40: there is no "nothing to commit" event; an empty checkpoint is Checkpointed
+    let mut m = at(S::Implementing);
+    walk(&mut m, vec![E::ImplementationDone, E::Checkpointed { head: C1.into() }]);
+    assert_eq!(m.state(), S::Verifying);
+}
+
+#[test]
+fn machine_roundtrips_through_json() {
+    let mut m = Machine::new(3);
+    happy(&mut m);
+    let text = serde_json::to_string(&m).unwrap();
+    let back: Machine = serde_json::from_str(&text).unwrap();
+    assert_eq!(back, m);
+    let e: E = serde_json::from_str(r#"{"event":"plan_rejected","occurrence":2,"reason":"x"}"#).unwrap();
+    assert_eq!(e.name(), "plan_rejected");
+}

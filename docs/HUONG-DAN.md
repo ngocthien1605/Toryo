@@ -1,4 +1,4 @@
-# Hướng dẫn sử dụng Toryo (prototype M0 + lớp adapter M1)
+# Hướng dẫn sử dụng Toryo (prototype M0 + adapter M1 + state machine M2)
 
 > **Toryo (棟梁 — tōryō)** = "thợ cả": người chỉ huy đội thợ, không tự đục đẽo mà giao việc, kiểm tra từng mối nối
 > và nghiệm thu từng giai đoạn. Tên cũ của tool là `thien` (đổi ngày 2026-09-28, plan v0.7 R55).
@@ -49,9 +49,9 @@ và Codex (implementer) là hai "người" độc lập, nên review khách quan
         ▼
  1. PLAN — Claude (read-only: Read/Grep/Glob, --restricted, JSON schema)
         │  → plan.json + PLAN.md
-        │  • plan muốn đụng file protected? → tự động bắt làm lại
+        │  • plan muốn đụng file protected? → tự động bắt làm lại (tối đa 2 lần, rồi ESCALATED)
         ▼
- 2. PLAN GATE — anh:  y = duyệt · n = từ chối + lý do (Claude sửa plan, tối đa 3 lần) · q = dừng
+ 2. PLAN GATE — anh:  y = duyệt · n = từ chối + lý do (Claude sửa plan, không giới hạn số lần) · q = dừng
         │
         ▼
  ┌─► 3. IMPLEMENT / FIX — Codex (sandbox workspace-write, chỉ trong worktree)
@@ -60,23 +60,39 @@ và Codex (implementer) là hai "người" độc lập, nên review khách quan
  │   4. GUARDS — Toryo
  │      • HEAD guard: agent tự commit? → soft reset
  │      • protected paths (AGENTS.md, scripts verify, TASK.md, .claude/, .codex/…)
- │        bị sửa? → khôi phục, bắt Codex làm lại
+ │        bị sửa? → khôi phục, không commit, sang vòng fix (tính 1 vòng)
  │      ▼
  │   5. CHECKPOINT — Toryo commit:  "toryo(<ID>): implement"  + trailers
  │      → DIFF.patch (base→HEAD), DIFF-incremental.patch (từ lần review trước)
  │      ▼
  │   6. VERIFY — build → test (dừng ở lệnh fail đầu tiên)
- │      • fail → quay lại 3 với log lỗi (KHÔNG sang review)
+ │      • fail → quay lại 3 với log lỗi, tính 1 vòng fix (KHÔNG sang review)
  │      ▼
  │   7. REVIEW — Claude (read-only) → review.json + REVIEW.md
  │      • Toryo kiểm tra: đúng tập AC ids, có evidence thật, decision hợp lệ
  │        (sai → bắt Claude sửa, tối đa 2 lần)
  │      • "approved" nhưng còn AC chưa đạt / issue blocking → coi như changes_requested
  │      ▼
- │   approved ──────────────► DONE: in lệnh merge cho anh
- │   blocked  ──────────────► STOP (cần người)
+ │   approved ──► 8. FINAL GATE — anh: y = nhận kết quả (COMPLETED, in lệnh merge)
+ │                                    n = từ chối + lý do → vòng fix · q = dừng (CANCELLED)
+ │   blocked  ──────────────► ESCALATED (cần người)
  └── changes_requested ───── (nếu còn vòng fix) · hết vòng → ESCALATED
 ```
+
+**Từ M2, mọi bước đi qua state machine** (plan §5.2). Giống trạng thái của Purchase order trong D365FO:
+luật chuyển trạng thái nằm ở một chỗ, không bước nào đi tắt được. Trên console anh sẽ thấy các dòng
+`[state] Verifying --verify_failed--> Fixing`. `SUMMARY.md` ghi trạng thái cuối (`Completed`, `Escalated`,
+`Cancelled`, `Failed`), còn `results.jsonl` ghi toàn bộ chuỗi trạng thái (`details.states`).
+
+| Trạng thái cuối | Nghĩa | Anh làm gì |
+|---|---|---|
+| `Completed` | anh đã nhận ở final gate | review diff, merge branch `toryo/<ID>` |
+| `Escalated` | hết vòng fix, reviewer blocked, JSON sai 3 lần, hết quota mọi Implementer… (lý do trong `SUMMARY.md`) | đọc lý do; prototype chưa có `resume` (M3) → sửa task/config rồi chạy lại với `--id` khác |
+| `Cancelled` | anh chọn `q` ở một gate | — |
+| `Failed` | lỗi không cứu được (Git, file system…) | xem `error:` trong `SUMMARY.md` |
+
+Mỗi lần vào vòng fix (verify fail, changes requested, sửa protected path, anh từ chối ở final gate) đều tính 1 vòng;
+`--max-fix-cycles` là giới hạn duy nhất (R56).
 
 **Nguyên tắc an toàn quan trọng** (đã được kiểm chứng bằng M0 trên máy anh):
 
@@ -206,7 +222,7 @@ Tuỳ chọn của `pipeline`:
 | `--max-fix-cycles` | 2 | số vòng sửa tối đa |
 | `--mode` | `restricted` | launch mode của Claude (M0 đã xác nhận `restricted` chạy được) |
 | `--accept-unverified` | tắt | vẫn chạy dù profile chưa được canary xác nhận cho version CLI hiện tại (R51) — nên chạy `doctor --canaries` thay vì dùng cờ này |
-| `--yes` | tắt | bỏ qua plan gate (chỉ dùng cho demo) |
+| `--yes` | tắt | bỏ qua plan gate **và** final gate (chỉ dùng cho demo) |
 
 Exit code: `0` = approved, khác `0` = dừng (xem `SUMMARY.md`).
 

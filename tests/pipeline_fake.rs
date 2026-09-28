@@ -194,7 +194,7 @@ fn gate_reject_resumes_planner_then_fix_cycle_and_approval() {
             "reviewer": [turn(vec![review_changes()]), turn(vec![review_approved()])],
         }),
     );
-    let (code, err) = pipeline(&env, &s, "CALC-001", &[], "n\nplease also cover negative numbers\ny\n", &[]);
+    let (code, err) = pipeline(&env, &s, "CALC-001", &[], "n\nplease also cover negative numbers\ny\ny\n", &[]);
     assert_eq!(code, 0, "{err}");
     let (rec, steps, calls) = outcome(&env);
     assert_eq!(rec["pass"], true, "{err}");
@@ -204,6 +204,18 @@ fn gate_reject_resumes_planner_then_fix_cycle_and_approval() {
     assert!(has(&|s| s["step"] == "review-0" && s["decision"] == "changes_requested"));
     assert!(has(&|s| s["step"] == "fix-1" && s["verify"] == true));
     assert!(has(&|s| s["step"] == "review-1" && s["decision"] == "approved"));
+    assert!(has(&|s| s["step"] == "final-gate" && s["decision"] == "approved"));
+    // M2: the whole run went through the state machine
+    assert_eq!(
+        states(&rec),
+        [
+            "Planning", "WaitingPlanApproval", "Planning", "WaitingPlanApproval",
+            "Implementing", "Checkpointing", "Verifying", "Reviewing",
+            "Fixing", "Checkpointing", "Verifying", "Reviewing",
+            "WaitingFinalApproval", "Completed",
+        ]
+    );
+    assert_eq!(rec["details"]["state"], "Completed");
 
     // the rejected plan is revised in the same planner session, with the reason
     let planner = calls_for(&calls, "planner");
@@ -342,4 +354,164 @@ fn all_implementers_out_of_quota_stops_and_keeps_partial_work() {
     assert!(rec["summary"].as_str().unwrap().contains("out of quota"), "{err}");
     assert_eq!(calls.iter().filter(|c| c["key"].as_str().unwrap().starts_with("implementer")).count(), 2);
     assert!(env.root.join("wts").join("CALC-X").join("src").join("Partial.ps1").exists());
+}
+
+/// The states the run went through (`to` of every transition).
+fn states(rec: &Value) -> Vec<String> {
+    rec["details"]["states"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["to"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn events(rec: &Value) -> Vec<String> {
+    rec["details"]["states"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["event"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn plan_touching(path: &str) -> Value {
+    json!({"kind":"complete","structured":{"understanding":"u","files_likely_involved":[path],"steps":["x"],"validation":[],"plan_markdown":"md"}})
+}
+
+fn review_blocked() -> Value {
+    json!({"kind":"complete","structured":{"decision":"blocked","summary":"the task contradicts AGENTS.md","acceptance_criteria":[
+        {"id":"AC-1","met":false,"evidence":"e"},{"id":"AC-2","met":false,"evidence":"e"},{"id":"AC-3","met":false,"evidence":"e"}],
+        "issues":[{"id":"R-1","severity":"major","blocking":true,"description":"contradiction"}]}})
+}
+
+#[test]
+fn final_gate_rejection_is_a_fix_cycle() {
+    let env = setup(None, &[]);
+    let s = script(
+        &env,
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write("src/Calculator.psm1", DIVIDE), implementation(&[])]),
+                turn(vec![write("src/Calculator.psm1", "# renamed\n"), implementation(&[])]),
+            ],
+            "reviewer": [turn(vec![review_approved()]), turn(vec![review_approved()])],
+        }),
+    );
+    // plan: y · final: n + reason · final: y
+    let (code, err) = pipeline(&env, &s, "CALC-F", &[], "y\nn\nrename the parameters to -Dividend/-Divisor\ny\n", &[]);
+    assert_eq!(code, 0, "{err}");
+    let (rec, steps, _) = outcome(&env);
+    assert_eq!(rec["details"]["state"], "Completed");
+    assert_eq!(rec["details"]["fix_cycle"], 1);
+    assert!(steps.iter().any(|s| s["step"] == "final-gate" && s["decision"] == "rejected"));
+    assert!(events(&rec).contains(&"final_rejected".to_string()));
+    let run = PathBuf::from(rec["run_dir"].as_str().unwrap());
+    let fix = std::fs::read_to_string(run.join("fix-1.prompt.md")).unwrap();
+    assert!(fix.contains("HUMAN (final gate): rename the parameters"), "{fix}");
+}
+
+#[test]
+fn max_fix_cycles_escalates() {
+    let env = setup(None, &[]);
+    let s = script(
+        &env,
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write("src/Calculator.psm1", DIVIDE), implementation(&[])]),
+                turn(vec![write("tests/Divide.Tests.ps1", "# t\n"), implementation(&[])]),
+            ],
+            "reviewer": [turn(vec![review_changes()]), turn(vec![review_changes()])],
+        }),
+    );
+    let (code, err) = pipeline(&env, &s, "CALC-M", &["--yes", "--max-fix-cycles", "1"], "", &[]);
+    assert_ne!(code, 0);
+    let (rec, _, calls) = outcome(&env);
+    assert_eq!(rec["details"]["state"], "Escalated", "{err}");
+    assert!(rec["summary"].as_str().unwrap().contains("not accepted after 1 fix cycle(s)"), "{}", rec["summary"]);
+    assert_eq!(calls_for(&calls, "implementer").len(), 2, "implement + 1 fix, then stop");
+    assert_eq!(states(&rec).last().unwrap(), "Escalated");
+}
+
+#[test]
+fn path_policy_violation_is_a_fix_cycle() {
+    let env = setup(None, &[]);
+    let s = script(
+        &env,
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                // edits the task file (protected: the task is the contract)
+                turn(vec![write("TASK.md", "- AC-4: nothing\n"), write("src/Calculator.psm1", DIVIDE), implementation(&[])]),
+                turn(vec![write("src/Calculator.psm1", DIVIDE), implementation(&[])]),
+            ],
+            "reviewer": [turn(vec![review_approved()])],
+        }),
+    );
+    let (code, err) = pipeline(&env, &s, "CALC-P", &["--yes"], "", &[]);
+    assert_eq!(code, 0, "{err}");
+    let (rec, steps, _) = outcome(&env);
+    assert_eq!(rec["details"]["fix_cycle"], 1);
+    assert!(events(&rec).contains(&"path_policy_violation".to_string()));
+    assert!(steps.iter().any(|s| s["protected_changed"].to_string().contains("TASK.md")));
+    let run = PathBuf::from(rec["run_dir"].as_str().unwrap());
+    assert!(std::fs::read_to_string(run.join("fix-1.prompt.md")).unwrap().contains("POLICY"));
+    // nothing of the violating turn was committed
+    let files = git(&env.repo, &["log", "--name-only", "--format=", "main..toryo/CALC-P"]);
+    assert!(!files.contains("TASK.md"), "{files}");
+}
+
+#[test]
+fn automatic_plan_rejections_are_bounded() {
+    let env = setup(None, &[]);
+    let s = script(
+        &env,
+        json!({ "planner": [turn(vec![plan_touching("TASK.md")]), turn(vec![plan_touching("TASK.md")]), turn(vec![plan_touching("TASK.md")])] }),
+    );
+    let (code, err) = pipeline(&env, &s, "CALC-A", &[], "", &[]);
+    assert_ne!(code, 0);
+    let (rec, _, calls) = outcome(&env);
+    assert_eq!(rec["details"]["state"], "Escalated", "{err}");
+    assert_eq!(calls.len(), 3, "3 planner turns, no gate, no implementer");
+    assert!(rec["summary"].as_str().unwrap().contains("protected paths"));
+}
+
+#[test]
+fn human_plan_rejections_are_unlimited() {
+    let env = setup(None, &[]);
+    let s = script(
+        &env,
+        json!({
+            "planner": (0..5).map(|_| turn(vec![plan()])).collect::<Vec<_>>(),
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation(&[])])],
+            "reviewer": [turn(vec![review_approved()])],
+        }),
+    );
+    // four rejections (the prototype used to stop at three), then approve, then accept
+    let (code, err) = pipeline(&env, &s, "CALC-H", &[], "n\na\nn\nb\nn\nc\nn\nd\ny\ny\n", &[]);
+    assert_eq!(code, 0, "{err}");
+    let (rec, _, calls) = outcome(&env);
+    assert_eq!(calls_for(&calls, "planner").len(), 5);
+    assert_eq!(rec["details"]["state"], "Completed");
+    assert_eq!(calls_for(&calls, "planner")[4]["label"], "plan-5");
+}
+
+#[test]
+fn blocked_review_escalates() {
+    let env = setup(None, &[]);
+    let s = script(
+        &env,
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation(&[])])],
+            "reviewer": [turn(vec![review_blocked()])],
+        }),
+    );
+    let (code, _) = pipeline(&env, &s, "CALC-B", &["--yes"], "", &[]);
+    assert_ne!(code, 0);
+    let (rec, _, _) = outcome(&env);
+    assert_eq!(rec["details"]["state"], "Escalated");
+    assert!(rec["summary"].as_str().unwrap().contains("reviewer blocked"));
 }

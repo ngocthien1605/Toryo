@@ -17,6 +17,7 @@ Rust implementation of the Toryo plan (**v0.7**). **M0 is done** (the spike kit 
 | `agents::hub` | — | sync facade (owns the tokio runtime) that picks the real or fake adapter per profile |
 | `runner` | §8 | `CommandRunner` / `LocalRunner` for verify commands (ANSI stripped) |
 | `evidence` | R51 | evidence records carry `cli_versions`; a profile whose CLI version differs from its last canary pass is *unverified* |
+| `engine::state` (M2) | §5.2, R5, R29, R32, R40, R44a, R56 | the pipeline state machine: one `transition(state, event)`, gate occurrences, fix-cycle bound, `Escalated`/`Paused` as waiting states; serializable for M3 |
 
 M0 kit modules (ported to the core where M1 needs them, R52):
 
@@ -77,7 +78,7 @@ cargo test --release
 
 | Test | Runs on | What it covers |
 |---|---|---|
-| `tests/pipeline_fake.rs` | Windows + Linux | the pipeline scenarios on `FakeAgentAdapter`: gate reject → planner resumed, fix cycle, sticky fallback with the configured reviewer kept, rate-limit retry, verify failure → fix, review correction, all implementers out of quota, quit at the gate |
+| `tests/pipeline_fake.rs` | Windows + Linux | the pipeline scenarios on `FakeAgentAdapter`, with the state trail checked: gate reject → planner resumed, fix cycle, final-gate rejection, max cycles → `Escalated`, path-policy cycle, bounded automatic plan rejections, unlimited human ones, blocked review, sticky fallback with the configured reviewer kept, rate-limit retry, verify failure → fix, review correction, all implementers out of quota, quit at the gate |
 | `tests/adapters.rs` | Windows + Linux | recorded real Claude/Codex streams through the adapters; fake failure classes, stall timeout, crash |
 | `tests/spike_e2e.rs` | Linux | the kit against fake `claude`/`codex` sh scripts, incl. `version_bound_evidence` (R51) |
 | `tests/redaction.rs` | Windows + Linux | `redaction_split_boundaries` (C9/R42) |
@@ -89,6 +90,7 @@ CI (`.github/workflows/ci.yml`) runs `cargo test`, `clippy -D warnings` and the 
 
 ## Status
 
-M0 done; M1 (adapter layer) done. No `toryo task`, `run`, `approve` yet: the engine with SQLite state
-starts in M2. `spike pipeline` stays the behavioural reference (R52); since M1 it runs on the adapter
-layer (`AgentHub`, `LocalRunner`), so what it proves is the M1 code.
+M0 done; M1 (adapter layer) and M2 (state machine) done. No `toryo task`, `run`, `approve` yet: SQLite
+state, recovery and the task lock are M3. `spike pipeline` stays the behavioural reference (R52); it runs
+on the adapter layer (`AgentHub`, `LocalRunner`) and every step goes through `engine::state::Machine`, so
+what it proves is the M1/M2 code. It now has the final gate too (`--yes` skips both gates).

@@ -25,6 +25,7 @@ use super::render;
 use crate::agents::hub::AgentHub;
 use crate::config::{data_dir, expand_vars, CommandSpec, Effective, ProfileKind};
 use crate::domain::{ErrorClass, OpenSession, Role, StageOutcome, TurnInput, TurnLimits};
+use crate::engine::{Machine, PipelineEvent as Ev, PipelineState as St};
 use crate::evidence::{append, stamp, Record};
 use crate::git::{parse_status_z, GitCmd, Loc};
 use crate::process::env::build_env;
@@ -297,6 +298,28 @@ fn ask(question: &str) -> Result<String> {
     Ok(line.trim().to_string())
 }
 
+/// M2: every step of the prototype goes through the state machine (plan §5.2). A step the
+/// machine refuses is a bug in the prototype, not a user error.
+fn step(sm: &mut Machine, trail: &mut Vec<Value>, e: Ev) -> Result<St> {
+    let from = sm.state();
+    let name = e.name();
+    let to = sm
+        .apply(e)
+        .map_err(|err| anyhow::anyhow!("state machine refused `{name}` in {from:?}: {err}"))?;
+    eprintln!("   [state] {from:?} --{name}--> {to:?}");
+    trail.push(json!({"from": from, "event": name, "to": to, "fix_cycle": sm.fix_cycle()}));
+    Ok(to)
+}
+
+fn escalated(sm: &Machine) -> String {
+    format!("escalated: {}", sm.reason().unwrap_or(""))
+}
+
+fn digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
 struct Totals {
     tokens: Buckets,
 }
@@ -446,7 +469,9 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
         tokens: Buckets::default(),
     };
     let mut log: Vec<Value> = Vec::new();
-    let res = (|| -> Result<(bool, String)> {
+    let mut sm = Machine::new(a.max_fix_cycles);
+    let mut trail: Vec<Value> = Vec::new();
+    let res = (|| -> Result<String> {
         let limits = |mins: u64| TurnLimits {
             max: Duration::from_secs(mins * 60),
             stall: Duration::from_secs(10 * 60),
@@ -467,8 +492,10 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
             rs.join("TASK.md").display()
         );
         let mut resume: Option<String> = None;
-        let mut approved = false;
-        for attempt in 1..=3 {
+        step(&mut sm, &mut trail, Ev::Start)?;
+        loop {
+            // human rejections are unlimited; automatic ones are bounded by the machine
+            let attempt = sm.plan_attempt();
             eprintln!("\n── PLAN (Claude, attempt {attempt}) ──");
             let r = hub.turn(
                 OpenSession {
@@ -493,11 +520,13 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
             totals.add(&r, "planner");
             let Some(p) = r.structured.clone() else {
                 r.print_summary();
-                bail!(
+                let reason = format!(
                     "planner returned no structured plan: {:?} {}",
                     r.error_class,
                     r.error_detail.clone().unwrap_or_default()
                 );
+                step(&mut sm, &mut trail, Ev::Escalate { reason })?;
+                return Ok(escalated(&sm));
             };
             let plan_json = p;
             std::fs::write(rs.join("plan.json"), serde_json::to_vec_pretty(&plan_json)?)?;
@@ -516,13 +545,20 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
             eprintln!("\n{plan_md}");
             if !bad.is_empty() {
                 eprintln!("!! plan wants to touch protected paths {bad:?} — rejected automatically (plan-time policy)");
+                let paths = bad.iter().map(|x| x.to_string()).collect();
+                if step(&mut sm, &mut trail, Ev::PlanPolicyViolation { paths })? == St::Escalated {
+                    return Ok(escalated(&sm));
+                }
                 plan_prompt = format!("Your plan lists protected paths {bad:?}, which may not change. Create the plan again without touching them.");
                 resume = r.session_id.clone();
                 continue;
             }
+            let subject = digest(&std::fs::read(rs.join("plan.json"))?);
+            step(&mut sm, &mut trail, Ev::PlanReady { subject: subject.clone() })?;
+            let occurrence = sm.gate().map(|g| g.occurrence).unwrap_or_default();
             if a.yes {
                 eprintln!("(plan gate skipped: --yes)");
-                approved = true;
+                step(&mut sm, &mut trail, Ev::PlanApproved { occurrence, subject })?;
                 break;
             }
             let ans = ask(&format!(
@@ -531,25 +567,24 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
             match ans.to_ascii_lowercase().as_str() {
                 "y" | "yes" => {
                     log.push(json!({"step": "plan-gate", "decision": "approved"}));
-                    approved = true;
+                    step(&mut sm, &mut trail, Ev::PlanApproved { occurrence, subject })?;
                     break;
                 }
                 "q" | "quit" => {
                     log.push(json!({"step": "plan-gate", "decision": "cancelled"}));
-                    return Ok((false, "cancelled at the plan gate".to_string()));
+                    step(&mut sm, &mut trail, Ev::Cancel)?;
+                    return Ok("cancelled at the plan gate".to_string());
                 }
                 _ => {
                     let reason = ask("   Reason / what to change: ")?;
                     log.push(
                         json!({"step": "plan-gate", "decision": "rejected", "reason": reason}),
                     );
+                    step(&mut sm, &mut trail, Ev::PlanRejected { occurrence, reason: reason.clone() })?;
                     plan_prompt = format!("The human reviewer rejected the plan. Reason: {reason}\nCreate the plan again, revised to address this.");
                     resume = r.session_id.clone();
                 }
             }
-        }
-        if !approved {
-            return Ok((false, "plan not approved after 3 attempts".to_string()));
         }
 
         // ── 2. IMPLEMENT → CHECKPOINT → VERIFY → REVIEW, with fix cycles ───────────────────
@@ -562,7 +597,12 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
             retries: 0,
             handoff: None,
         };
-        for cycle in 0..=a.max_fix_cycles {
+        loop {
+            // the machine owns the cycle count and its bound (Implementing → 0, Fixing → n)
+            if !sm.state().is_writing() {
+                bail!("internal: implementer turn in state {:?}", sm.state());
+            }
+            let cycle = sm.fix_cycle();
             let stage = if cycle == 0 {
                 "implement".to_string()
             } else {
@@ -605,13 +645,12 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
                 &mut log,
             )?
             else {
-                return Ok((
-                    false,
-                    format!(
-                        "all implementers are out of quota ({}); the worktree keeps any partial changes — rerun later with another --id, or add a fallback profile",
-                        imps.chain.join(" → ")
-                    ),
-                ));
+                let reason = format!(
+                    "all implementers are out of quota ({}); the worktree keeps any partial changes — rerun later with another --id, or add a fallback profile",
+                    imps.chain.join(" → ")
+                );
+                step(&mut sm, &mut trail, Ev::Escalate { reason })?;
+                return Ok(escalated(&sm));
             };
             if cfg.profile(&implementer)?.kind == cfg.profile(&a.reviewer_profile)?.kind && !same_vendor_noted {
                 same_vendor_noted = true;
@@ -664,20 +703,24 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
                 }
                 feedback = Some(format!("- POLICY: you changed protected paths {prot:?}. They were restored. Do not modify them; achieve the task another way."));
                 log.push(json!({"step": stage, "protected_changed": prot}));
+                // owner decision (M2): a path-policy violation is a fix cycle
+                if step(&mut sm, &mut trail, Ev::PathPolicyViolation { paths: prot })? == St::Escalated {
+                    return Ok(escalated(&sm));
+                }
                 continue;
             }
             if !imp.success && changed.is_empty() {
                 imp.print_summary();
-                return Ok((
-                    false,
-                    format!(
-                        "implementer failed: {:?} {}",
-                        imp.error_class,
-                        imp.error_detail.clone().unwrap_or_default()
-                    ),
-                ));
+                let reason = format!(
+                    "implementer failed: {:?} {}",
+                    imp.error_class,
+                    imp.error_detail.clone().unwrap_or_default()
+                );
+                step(&mut sm, &mut trail, Ev::Escalate { reason })?;
+                return Ok(escalated(&sm));
             }
             // checkpoint (toryo owns commits; no-change → empty checkpoint, R40)
+            step(&mut sm, &mut trail, Ev::ImplementationDone)?;
             g.run(&wtl, false, &["add", "-A"])?;
             let no_change = g
                 .output(&wtl, true, &["diff", "--cached", "--quiet"])?
@@ -694,6 +737,7 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
             }
             g.run(&wtl, false, &c)?;
             let checkpoint = g.run_str(&wtl, true, &["rev-parse", "HEAD"])?;
+            step(&mut sm, &mut trail, Ev::Checkpointed { head: checkpoint.clone() })?;
             let diff = g.canonical_diff(&wtl, &base, Some("HEAD"))?;
             std::fs::write(rs.join("DIFF.patch"), &diff)?;
             let inc = match &last_reviewed {
@@ -753,8 +797,13 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
                     failed["exit"],
                     failed["output_tail"].as_str().unwrap_or("")
                 ));
-                continue; // → Fixing (never to Review, §5.2)
+                // → Fixing (never to Review, §5.2), or Escalated when no cycle is left
+                if step(&mut sm, &mut trail, Ev::VerifyFailed { head: checkpoint.clone() })? == St::Escalated {
+                    return Ok(escalated(&sm));
+                }
+                continue;
             }
+            step(&mut sm, &mut trail, Ev::VerifyPassed { head: checkpoint.clone() })?;
 
             // review
             eprintln!("\n── REVIEW (Claude) ──");
@@ -803,10 +852,9 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
                 }
                 eprintln!("!! invalid review (correction {}/2): {viol:?}", corr + 1);
                 if corr == 2 {
-                    return Ok((
-                        false,
-                        format!("InvalidOutput: review rejected 3 times: {viol:?}"),
-                    ));
+                    let reason = format!("InvalidOutput: review rejected 3 times: {viol:?}");
+                    step(&mut sm, &mut trail, Ev::Escalate { reason })?;
+                    return Ok(escalated(&sm));
                 }
                 rprompt = format!("Your previous final response was rejected and was not used. Validation error: {}. Return only a corrected JSON object matching the schema.", viol.join("; "));
                 rresume = r.session_id.clone();
@@ -858,18 +906,46 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
             log.push(json!({"step": format!("review-{cycle}"), "decision": decision, "unmet": unmet, "issues": issues}));
             match decision.as_str() {
                 "approved" => {
-                    return Ok((
-                        true,
-                        format!("approved at checkpoint {}", &checkpoint[..12]),
-                    ));
+                    step(&mut sm, &mut trail, Ev::ReviewApproved { head: checkpoint.clone() })?;
+                    // ── final gate (§5.2; R53: open review issues were printed above) ──
+                    let occurrence = sm.gate().map(|g| g.occurrence).unwrap_or_default();
+                    let subject = checkpoint.clone();
+                    let ans = if a.yes {
+                        eprintln!("(final gate skipped: --yes)");
+                        "y".to_string()
+                    } else {
+                        ask(&format!(
+                            "\n▶ Accept the result of {id} at checkpoint {}? [y]es / [n]o (you will give a reason) / [q]uit: ",
+                            &checkpoint[..12]
+                        ))?
+                    };
+                    match ans.to_ascii_lowercase().as_str() {
+                        "y" | "yes" => {
+                            log.push(json!({"step": "final-gate", "decision": "approved"}));
+                            step(&mut sm, &mut trail, Ev::FinalApproved { occurrence, subject })?;
+                            return Ok(format!("approved at checkpoint {}", &checkpoint[..12]));
+                        }
+                        "q" | "quit" => {
+                            log.push(json!({"step": "final-gate", "decision": "cancelled"}));
+                            step(&mut sm, &mut trail, Ev::Cancel)?;
+                            return Ok("cancelled at the final gate".to_string());
+                        }
+                        _ => {
+                            let reason = ask("   Reason / what to change: ")?;
+                            log.push(json!({"step": "final-gate", "decision": "rejected", "reason": reason}));
+                            // a final rejection is a fix cycle (§5.2)
+                            if step(&mut sm, &mut trail, Ev::FinalRejected { occurrence, reason: reason.clone() })? == St::Escalated {
+                                return Ok(escalated(&sm));
+                            }
+                            feedback = Some(format!("- HUMAN (final gate): {reason}\n"));
+                        }
+                    }
                 }
                 "blocked" => {
-                    return Ok((
-                        false,
-                        format!(
-                            "reviewer blocked: {}",
-                            review["summary"].as_str().unwrap_or("")
-                        ),
+                    step(&mut sm, &mut trail, Ev::ReviewBlocked { head: checkpoint.clone() })?;
+                    return Ok(format!(
+                        "escalated: reviewer blocked: {}",
+                        review["summary"].as_str().unwrap_or("")
                     ));
                 }
                 _ => {
@@ -904,29 +980,29 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
                         ));
                     }
                     feedback = Some(f);
+                    if step(&mut sm, &mut trail, Ev::ChangesRequested { head: checkpoint.clone() })? == St::Escalated {
+                        return Ok(escalated(&sm));
+                    }
                 }
             }
         }
-        Ok((
-            false,
-            format!(
-                "escalated: not approved after {} fix cycle(s)",
-                a.max_fix_cycles
-            ),
-        ))
     })();
     if hub.is_fake() {
         // scripted agents: what each role was asked, for the FakeAgent e2e tests
         std::fs::write(run.join("fake-calls.json"), serde_json::to_vec_pretty(&hub.fake_calls())?)?;
     }
-    match res {
-        Ok((ok, why)) => finish(&fin, ok, &why, &totals, log),
+    let why = match res {
+        Ok(why) => why,
         Err(e) => {
             eprintln!("error: {e:#}");
-            finish(&fin, false, &format!("error: {e:#}"), &totals, log)?;
-            Ok(false)
+            let why = format!("error: {e:#}");
+            if !sm.state().is_terminal() {
+                let _ = step(&mut sm, &mut trail, Ev::Fail { error: why.clone() });
+            }
+            why
         }
-    }
+    };
+    finish(&fin, &sm, &why, &totals, log, trail)
 }
 
 /// The implementer chain (primary + fallbacks). The position is sticky for the whole run:
@@ -1108,11 +1184,20 @@ struct Fin {
     cli_versions: BTreeMap<String, String>,
 }
 
-fn finish(f: &Fin, ok: bool, why: &str, totals: &Totals, log: Vec<Value>) -> Result<bool> {
+fn finish(
+    f: &Fin,
+    sm: &Machine,
+    why: &str,
+    totals: &Totals,
+    log: Vec<Value>,
+    trail: Vec<Value>,
+) -> Result<bool> {
+    let state = sm.state();
+    let ok = state == St::Completed;
     let (run, id, branch, repo, base) = (&f.run, &f.id, &f.branch, &f.repo, &f.base_ref);
     let t = &totals.tokens;
     let summary = format!(
-        "# {id} — {}\n\n{why}\n\n- branch: `{branch}` in `{}` (base `{base}`)\n- tokens: {} total (uncached in {}, cache read {}, cache write {}, out {})\n- artifacts: `{}`\n",
+        "# {id} — {} ({state:?})\n\n{why}\n\n- branch: `{branch}` in `{}` (base `{base}`)\n- tokens: {} total (uncached in {}, cache read {}, cache write {}, out {})\n- artifacts: `{}`\n",
         if ok { "APPROVED" } else { "STOPPED" },
         repo.display(),
         t.total(),
@@ -1169,8 +1254,10 @@ fn finish(f: &Fin, ok: bool, why: &str, totals: &Totals, log: Vec<Value>) -> Res
     let mut rec = Record::new("pipeline", None, &["pipeline prototype"]);
     rec.pass = Some(ok);
     rec.summary = format!("{id}: {why}");
-    rec.details =
-        json!({"id": id, "branch": branch, "base": base, "repo": repo, "steps": log, "tokens": t});
+    rec.details = json!({
+        "id": id, "branch": branch, "base": base, "repo": repo, "steps": log, "tokens": t,
+        "state": state, "fix_cycle": sm.fix_cycle(), "states": trail,
+    });
     rec.run_dir = Some(run.display().to_string());
     rec.cli_versions = f.cli_versions.clone();
     append(&rec)?;
