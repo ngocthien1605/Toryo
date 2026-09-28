@@ -6,6 +6,7 @@
 //! |---|---|
 //! | `tracked-index.patch` | staged changes (`git diff --cached <CANON_DIFF> HEAD`), incl. binary |
 //! | `index-worktree.patch` | unstaged changes to tracked files (`git diff <CANON_DIFF>`) |
+//! | `worktree/…` | byte copies of every staged / unstaged file as it was in the worktree |
 //! | `files/…` | byte copies of untracked, non-ignored files |
 //! | `protected/…` | byte copies of ignored protected files (for inspection) |
 //! | `manifest.json` | head + every entry with size and SHA-256; written **last** |
@@ -102,11 +103,19 @@ pub fn take(wt: &Worktree, protect: &Protected, root: &Path, task: &str, attempt
     std::fs::write(staging.join(TRACKED), &tracked)?;
     std::fs::write(staging.join(UNSTAGED), &unstaged)?;
     let mut entries = Vec::new();
-    for p in split_z(&g.run(&wt.loc, true, &["diff", "--cached", "--name-only", "-z", "--no-renames", "HEAD"])?) {
-        entries.push(file_entry(&wt.path, &p, "staged")?);
-    }
-    for p in split_z(&g.run(&wt.loc, true, &["diff", "--name-only", "-z", "--no-renames"])?) {
-        entries.push(file_entry(&wt.path, &p, "unstaged")?);
+    // Byte copies of the tracked changes too: with `core.autocrlf` (the Git for Windows
+    // default) a patch round trip does not restore the exact bytes; the copies do.
+    for (kind, args) in [
+        ("staged", vec!["diff", "--cached", "--name-only", "-z", "--no-renames", "HEAD"]),
+        ("unstaged", vec!["diff", "--name-only", "-z", "--no-renames"]),
+    ] {
+        for p in split_z(&g.run(&wt.loc, true, &args)?) {
+            let e = file_entry(&wt.path, &p, kind)?;
+            if !e.sha256.is_empty() {
+                copy_into(&wt.path, &p, &staging.join("worktree"))?;
+            }
+            entries.push(e);
+        }
     }
     for p in split_z(&g.run(&wt.loc, true, &["ls-files", "-z", "--others", "--exclude-standard"])?) {
         copy_into(&wt.path, &p, &staging.join("files"))?;
@@ -162,7 +171,8 @@ pub fn completion_check(wt: &Worktree, dir: &Path) -> Result<Manifest> {
         let sub = match e.kind.as_str() {
             "untracked" => "files",
             "ignored_protected" => "protected",
-            _ => continue,
+            _ if e.sha256.is_empty() => continue, // deleted in the worktree
+            _ => "worktree",
         };
         match std::fs::read(dir.join(sub).join(&e.path)) {
             Ok(b) if sha256_hex(&b) == e.sha256 => {}
@@ -204,7 +214,8 @@ pub fn completion_check(wt: &Worktree, dir: &Path) -> Result<Manifest> {
 }
 
 /// `toryo partial export` (R39): re-create the snapshot's state in a fresh detached checkout
-/// of its head at `into` (which must not exist or be empty).
+/// of its head at `into` (which must not exist or be empty): the staged changes go into its
+/// index, and every file gets its recorded bytes.
 pub fn export(wt: &Worktree, dir: &Path, into: &Path) -> Result<Manifest> {
     let m = completion_check(wt, dir)?;
     if into.exists() && std::fs::read_dir(into)?.next().is_some() {
@@ -213,23 +224,22 @@ pub fn export(wt: &Worktree, dir: &Path, into: &Path) -> Result<Manifest> {
     let into_s = into.display().to_string().replace('\\', "/");
     wt.g.run(&wt.loc, false, &["worktree", "add", "--detach", "-q", &into_s, &m.head])?;
     let dst = Worktree { g: wt.g, path: into.to_path_buf(), loc: Loc::Discover(into.to_path_buf()) };
-    for (name, index) in [(TRACKED, true), (UNSTAGED, false)] {
-        let p = dir.join(name);
-        if std::fs::metadata(&p)?.len() == 0 {
-            continue;
-        }
-        let ps = p.display().to_string();
-        let mut args = vec!["apply", "--binary"];
-        if index {
-            args.push("--index");
-        }
-        args.push(&ps);
-        dst.g.run(&dst.loc, false, &args)?;
+    let tracked = dir.join(TRACKED);
+    if std::fs::metadata(&tracked)?.len() > 0 {
+        let ps = tracked.display().to_string();
+        dst.g.run(&dst.loc, false, &["apply", "--cached", "--binary", &ps])?;
     }
-    for (sub, kind) in [("files", "untracked"), ("protected", "ignored_protected")] {
-        for e in m.entries.iter().filter(|e| e.kind == kind) {
-            copy_into(&dir.join(sub), &e.path, into)?;
-        }
+    for e in &m.entries {
+        let sub = match e.kind.as_str() {
+            "untracked" => "files",
+            "ignored_protected" => "protected",
+            _ if e.sha256.is_empty() => {
+                let _ = std::fs::remove_file(into.join(&e.path));
+                continue;
+            }
+            _ => "worktree",
+        };
+        copy_into(&dir.join(sub), &e.path, into)?;
     }
     Ok(m)
 }

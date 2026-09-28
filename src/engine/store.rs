@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   reserved_tokens INTEGER NOT NULL DEFAULT 0,
   budget_usd_est REAL, spent_usd_est REAL NOT NULL DEFAULT 0,
   run_lock_owner TEXT, run_lock_at TEXT,
+  run_lock_pid INTEGER, run_lock_created TEXT,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   -- engine columns (M3)
   repo TEXT NOT NULL,
@@ -190,6 +191,17 @@ impl Store {
                 }
                 Some(v) if v == SCHEMA_VERSION.to_string() => {}
                 Some(v) => bail!("database {} has schema version {v}; this toryo expects {SCHEMA_VERSION}", path.display()),
+            }
+            // additive migrations within schema version 1
+            let cols: Vec<String> = {
+                let mut st = tx.prepare("PRAGMA table_info(tasks)")?;
+                let rows = st.query_map([], |r| r.get::<_, String>(1))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (c, ty) in [("run_lock_pid", "INTEGER"), ("run_lock_created", "TEXT")] {
+                if !cols.iter().any(|x| x == c) {
+                    tx.execute_batch(&format!("ALTER TABLE tasks ADD COLUMN {c} {ty}"))?;
+                }
             }
             tx.commit()?;
         }
@@ -660,14 +672,19 @@ pub struct NewAttempt<'a> {
     pub subject_commit: Option<&'a str>,
 }
 
-/// This process's identity for `stage_attempts.pid` / `pid_created_at` (§10 step 2).
+/// This process's identity for `stage_attempts.pid` / `pid_created_at` (§10 step 2):
+/// PID + OS creation time, so a reused PID is never mistaken for it.
 pub fn process_identity() -> (i64, String) {
-    use std::sync::OnceLock;
-    static STARTED: OnceLock<String> = OnceLock::new();
-    (
-        std::process::id() as i64,
-        STARTED.get_or_init(now).clone(),
-    )
+    let p = crate::process::current_proc_id();
+    (p.pid as i64, p.created.to_string())
+}
+
+/// Is the process recorded as (pid, created) still running?
+pub fn identity_alive(pid: i64, created: &str) -> bool {
+    match created.parse::<u64>() {
+        Ok(c) => crate::process::is_alive(crate::process::ProcId { pid: pid as u32, created: c }),
+        Err(_) => false,
+    }
 }
 
 pub fn begin_attempt(tx: &Transaction, task: &str, a: &NewAttempt) -> Result<AttemptRow> {
@@ -801,9 +818,10 @@ pub fn record_usage(tx: &Transaction, task: &str, attempt: &str, profile: &str, 
 /// request addressed to an older owner expires. Returns the new generation.
 pub fn claim_lock(tx: &Transaction, task: &str, owner: &str) -> Result<i64> {
     let at = now();
+    let (pid, created) = process_identity();
     let n = tx.execute(
-        "UPDATE tasks SET lock_generation = lock_generation + 1, run_lock_owner = ?2, run_lock_at = ?3 WHERE id = ?1",
-        params![task, owner, at],
+        "UPDATE tasks SET lock_generation = lock_generation + 1, run_lock_owner = ?2, run_lock_at = ?3, run_lock_pid = ?4, run_lock_created = ?5 WHERE id = ?1",
+        params![task, owner, at, pid, created],
     )?;
     if n == 0 {
         bail!("no task `{task}`");
@@ -819,10 +837,23 @@ pub fn claim_lock(tx: &Transaction, task: &str, owner: &str) -> Result<i64> {
 
 pub fn release_lock(tx: &Transaction, task: &str, generation: i64) -> Result<()> {
     tx.execute(
-        "UPDATE tasks SET run_lock_owner = NULL, run_lock_at = NULL WHERE id = ?1 AND lock_generation = ?2",
+        "UPDATE tasks SET run_lock_owner = NULL, run_lock_at = NULL, run_lock_pid = NULL, run_lock_created = NULL WHERE id = ?1 AND lock_generation = ?2",
         params![task, generation],
     )?;
     Ok(())
+}
+
+/// The recorded lock owner: (label, since, pid, created).
+pub type LockOwner = (String, String, Option<i64>, Option<String>);
+
+pub fn lock_owner(tx: &Transaction, task: &str) -> Result<Option<LockOwner>> {
+    Ok(tx
+        .query_row(
+            "SELECT run_lock_owner, run_lock_at, run_lock_pid, run_lock_created FROM tasks WHERE id = ?1 AND run_lock_owner IS NOT NULL",
+            [task],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?)
 }
 
 pub fn insert_stop(tx: &Transaction, task: &str, generation: i64, by: &str) -> Result<i64> {

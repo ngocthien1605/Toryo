@@ -62,24 +62,31 @@ impl TaskLock {
     /// generation, record the owner and expire requests addressed to older owners.
     pub fn acquire(store: &Store, task: &str) -> Result<TaskLock> {
         let file = open_lock_file(task)?;
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                let t = task.to_string();
-                let (owner, since) = store
-                    .call(move |tx| {
-                        let r = store::get_task(tx, &t)?;
-                        Ok((r.run_lock_owner.unwrap_or_else(|| "?".into()), r.run_lock_at.unwrap_or_else(|| "?".into())))
-                    })
-                    .unwrap_or_else(|_| ("?".into(), "?".into()));
-                return Err(TaskActive {
-                    task: task.to_string(),
-                    owner,
-                    since,
+        // Windows may release the lock of a killed owner a moment after the process is gone
+        // ("depends upon available system resources"): while the recorded owner is dead,
+        // retry briefly; a live owner is refused at once.
+        let t = task.to_string();
+        let owner_now = move |st: &Store| {
+            let t = t.clone();
+            st.call(move |tx| store::lock_owner(tx, &t)).ok().flatten()
+        };
+        let mut tries = 0;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) => {
+                    let o = owner_now(store);
+                    let dead = matches!(&o, Some((_, _, Some(pid), Some(c))) if !store::identity_alive(*pid, c));
+                    if dead && tries < 15 {
+                        tries += 1;
+                        std::thread::sleep(Duration::from_millis(200));
+                        continue;
+                    }
+                    let (owner, since) = o.map(|(l, s, _, _)| (l, s)).unwrap_or_else(|| ("?".into(), "?".into()));
+                    return Err(TaskActive { task: task.to_string(), owner, since }.into());
                 }
-                .into());
+                Err(TryLockError::Error(e)) => return Err(e).context("locking the task"),
             }
-            Err(TryLockError::Error(e)) => return Err(e).context("locking the task"),
         }
         let owner = owner_label();
         let t = task.to_string();
