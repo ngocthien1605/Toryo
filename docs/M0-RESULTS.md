@@ -17,13 +17,13 @@ Medium integrity. That fact explains F7.
 | 6 | Foundry credentials under `--restricted --safe-mode` | `claude-isolation --profile claude-foundry` | **Not run** | No Foundry profile on this machine | Leave open. Run it before a Foundry profile is used. |
 | 7 | `--add-dir` run store readable; outside Read denied; no settings from `--add-dir` | `claude-isolation` | **PASS** | Same record: run store read, outside Read in `permission_denials`, repo settings env and hooks not applied | — |
 | 8 | Repo `.codex/config.toml` loaded with `--ignore-user-config`? | `codex-project-config` | **Not loaded** (good) | 04:23:20Z: the probe variable was absent | A repo cannot loosen the sandbox through `.codex/config.toml`. `allow_codex_project_config` can stay off by default. |
-| 9 | Low-IL verify boundary works as designed; fixture builds at Low IL | `lowil-canary` | **PASS** with `verify_root` under `%LOCALAPPDATA%` | 04:58:32Z: 6/6 deny, 3/3 allow, negative control, build + tests at Low. It failed at 04:24:37Z with the data dir under `C:\.thien` (F7). | `verify_root` must be under the user profile (default `%LOCALAPPDATA%\thien-verify`). `doctor` now checks this. |
+| 9 | Low-IL verify boundary works as designed; fixture builds at Low IL | `lowil-canary` | **PASS** with `verify_root` under `%LOCALAPPDATA%` | 04:58:32Z: 6/6 deny, 3/3 allow, negative control, build + tests at Low. It failed at 04:24:37Z with the data dir under `C:\.thien` (F7). 05:30:52Z: PASS with the data dir still under `C:\.thien` and the new default `verify_root` (`C:\Users\…\AppData\Local\thien-verify`). | `verify_root` must be under the user profile (default `%LOCALAPPDATA%\thien-verify`). `doctor` now checks this. |
 | 10 | Empty/trusted `-c filter.<d>.*` overrides stop repo filter commands | `git-canary` | **PASS** | 2026-09-27 and 2026-09-28, Git 2.55.0.windows.5, 4/4 variants | F1 still holds: a trusted filter must define `process`. |
 | 11 | Codex usage subsets (`cached ⊂ input`, `reasoning ⊂ output`) | Codex raw usage | **cached ⊂ input: consistent**; reasoning: not observable | Resumed turn: input 47 125, cached 31 616. Reasoning was 0 in every turn. | Keep `cached_in_input=true`. Re-check reasoning on a model that reports it. |
 | 12 | Codex resumed total includes the killed turn | `killed-resume --profile codex-openai` | **Resumed turn re-reads the killed context** | 04:24:37Z: fresh 14 922 vs resumed 47 125 (31 616 cached). The killed turn has no live usage (`unknown`). | The killed Codex turn stays `unknown` (R41). A resume costs about 3× a fresh probe (F9). |
 | — | Job Object tests (stop / crash / assign failure) | `job-test` | **PASS** | Both days, 3/3 | — |
 | — | Launch-mode isolation for every mode a profile uses (R44b) | `claude-isolation --mode …` | **PASS** for `restricted` | Only mode used | Run the fallback modes only if they are ever needed. |
-| — | Manual dry-run: artifacts good enough to automate? | `smoke` + `spike pipeline` (BR-001) | **Yes** | Smoke 9/9 (09-27). BR-001 and BR-001-fb were both approved on the first review with concrete evidence (F12, F13). | R11 (second stop rule) satisfied. |
+| — | Manual dry-run: artifacts good enough to automate? | `smoke` + `spike pipeline` (BR-001, BR-002) | **Yes** | Smoke 9/9 (09-27). BR-001 and BR-001-fb were approved on the first review. In BR-002 the reviewer caught a real sort bug that the tests agreed with; it was fixed in one cycle (F13). | R11 (second stop rule) satisfied. |
 
 **Stop rule:** every M0-VERIFY item except #6 (Foundry, not applicable here) has a Windows answer,
 so M0 is complete. Next steps: re-estimate for v0.7 (R43), then M1.
@@ -38,7 +38,7 @@ Wall-clock times of the runs, from the records. The human hours are Thien's to f
 | Host checks (job-test, git-canary, lowil ×2) | ~3 min | |
 | Claude spikes (isolation, killed-resume) | ~2 min | |
 | Codex spikes (probe, canary, project-config, killed-resume) | ~3 min | |
-| Smoke + pipeline runs (smoke, BR-001, BR-001-fb) | ~15 min | |
+| Smoke + pipeline runs (smoke, BR-001, BR-001-fb, BR-002) | ~23 min | |
 | Kit development (plan v0.6 → M0 kit → pipeline prototype) | — | |
 | **Total M0** | | |
 

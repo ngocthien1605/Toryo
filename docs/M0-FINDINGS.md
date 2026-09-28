@@ -97,6 +97,12 @@ folders (`New-TestFolder` uses `GetTempPath()`). `workspace-write` only allows t
 `info/exclude`, so it never reaches a checkpoint. `TurnOpts.env` carries per-turn environment.
 Plan §13 (Codex env) should list it.
 
+**BR-002 (after the change):** the turn's env had `TEMP=<worktree>\.thien-tmp`, yet Codex still ran
+`$env:TEMP = (Get-Location).Path` before the tests, in both implement and fix-1. There are two possible
+reasons. Either Codex's sandbox or shell environment policy does not forward `TEMP` to its commands,
+or the model redirects TEMP by habit. **To do:** add an `echo $env:TEMP` probe to `codex-canary`, and add
+one line to the implementer prompt: "TEMP/TMP already point to a writable folder in the worktree".
+
 ## F9 — Resume is not free
 
 | | fresh probe | resumed after kill |
@@ -141,9 +147,17 @@ is then also Claude (fresh session). The pipeline logs this and prints a warning
 |---|---|---|---|---|
 | BR-001 (Codex implements, plan rejected once) | plan ×2 (56 s, 41 s), implement 119 s, review 26 s | ~10 min incl. human gate | 193 k (62 % cache read); Codex implement 102 k | approved, 0 fix cycles |
 | BR-001-fb (Claude implements) | plan 53 s, implement 47 s, review 24 s | ~2 min | 143 k | approved, 0 fix cycles |
+| BR-002 (Codex, one real fix cycle) | plan 65 s, implement 141 s, review 78 s, fix-1 96 s, review 21 s | ~8 min | 477 k (75 % cache read); the fix cycle cost ≈ 218 k (46 %) | approved after fix-1 |
 
 - Plan gate: the rejection reason reached Claude through `--resume` of the planner session, and the
   revised plan added the requested test.
 - Review quality: the evidence cites diff lines and test names. The review also raised one non-blocking
   low issue (I-1). Such issues are now listed in `SUMMARY.md` as follow-ups.
-- Not yet exercised with real agents: a fix cycle (both runs passed first time). BR-002 is the next run.
+- **Fix cycle with real agents (BR-002):** the implementation and its own tests passed verify, yet the
+  reviewer requested changes. It had worked out that the expected order in the test contradicted
+  `OrdinalIgnoreCase` ('_' sorts after 'Z'), so the test could only pass if the sort did not run. Codex
+  reproduced the bug in fix-1. PowerShell had bound `[Array]::Sort($keys, $files, …)` to an overload that
+  sorted a copy, so `$files` stayed unsorted. Codex fixed it with explicit casts, corrected the test,
+  added a culture-vs-ordinal case and reported `resolved: AC-2, AC-4, I-1, I-2`. Review 2 approved it.
+  This is exactly the defect class the verify step alone cannot catch (a test agreeing with a bug), and
+  it justifies the independent reviewer.
