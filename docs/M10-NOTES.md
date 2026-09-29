@@ -12,7 +12,7 @@ Branch `m10/flight-recorder` (from `main` @ `5adf204`). One commit per task.
 - [x] B1 — `status --json`, `task show --json`
 - [x] B2 — `toryo watch <ID>`
 - [x] C1 — `prices.toml` + `toryo usage <ID>`
-- [ ] C2 — scripted turns in mixed runs report zero usage
+- [x] C2 — scripted turns in mixed runs report zero usage
 - [ ] D1 — Windows toast
 - [ ] E1 — docs, morning summary
 
@@ -195,3 +195,21 @@ Branch `m10/flight-recorder` (from `main` @ `5adf204`). One commit per task.
   `~est.` with reservations, reconciled rows not counted twice, the vendor cost, the parser's key names,
   no file); `tests/m10_usage.rs` (a fake run with `usage` steps and a Foundry-billed fake profile: text and
   `--json` numbers, `no price`, the model on new rows, the NULL fallback, a bad table, no table).
+
+### C2 — scripted turns in mixed runs report zero usage
+
+- **Rule.** When the fake script lists `only_profiles` (a mixed fake/real run, like the E7 canary), a
+  scripted turn that ends — `complete`, `fail` (also the "no turn left" failure and an interrupt), or a
+  replayed stream's terminal event — without having reported usage first reports **exact zero** usage
+  (all four buckets 0) just before its end: the row is `exact`, 0 tokens, no reservation. A scripted
+  turn with a `usage` step keeps its numbers. A pure fake run (no `only_profiles`) is unchanged: a turn
+  without usage is `unknown` and R41 reserves (the R41 tests rely on that and pass unchanged).
+- **Where.** `agents::fake` — `Shared.zero_usage` (from the script), `FakeSession.usage_seen` (per
+  turn), `FakeSession::zero_usage_before(step)`. A turn that ends without a terminal step (`crash`, the
+  steps running out) still reports nothing: it models a crash, and a crash's usage is unknown.
+- **Why exact zero, not "no row".** The engine records a row for every turn (R41: never silently zero);
+  an exact zero row keeps that invariant and says what is true — a scripted turn costs nothing.
+- Tests: `tests/m10_usage.rs::scripted_turns_of_a_mixed_run_report_exact_zero` (both profiles listed, so
+  nothing real runs; exact zero rows, `status` without `reserved`; the same script without the list
+  reserves), `tests/regress_agents.rs::fake_turns_of_a_mixed_run_report_zero_usage` (complete, fail,
+  with a usage step, pure fake).

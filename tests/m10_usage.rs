@@ -233,3 +233,67 @@ fn a_bad_price_table_names_the_key_and_none_means_no_costs() {
     assert!(!text.contains("est. $"), "{text}");
     assert!(line_of(&text, "implement").contains("3100000"), "{text}");
 }
+
+// ── C2: scripted turns in a mixed run report zero usage ──────────────────────────────
+
+/// AC-1: when the fake script lists `only_profiles`, a scripted turn that ends without a
+/// `usage` step is an `exact` zero row — no reservation — and `status` shows none. Both profiles
+/// are listed here, so nothing real runs. The same turns without `only_profiles` keep R41's
+/// reservation (AC-2 is the R41 tests, unchanged).
+#[test]
+fn scripted_turns_of_a_mixed_run_report_exact_zero() {
+    let env = setup("codex-openai");
+    let turns = json!({
+        "planner": [turn(vec![plan()])],
+        "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+        "reviewer": [turn(vec![fail("Unknown", "a scripted failure without usage")])],
+    });
+    let mixed = env.root.join("mixed.json");
+    std::fs::write(
+        &mixed,
+        serde_json::to_vec(
+            &json!({"turns": turns, "only_profiles": ["claude-max", "codex-openai"]}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    create(&env, "U-3");
+    let (_, err) = toryo(
+        &env,
+        &[
+            "run",
+            "U-3",
+            "--yes",
+            "--fake-agents",
+            mixed.to_str().unwrap(),
+        ],
+        &[],
+    );
+    let t = task(&env, "U-3");
+    assert_eq!(t.state, St::Escalated, "the failed review escalates: {err}");
+    assert_eq!((t.spent_tokens, t.reserved_tokens), (0, 0), "{err}");
+    let i = "U-3".to_string();
+    let rows: Vec<(String, Option<i64>, Option<i64>)> = db(&env)
+        .call(move |tx| {
+            let mut q = tx.prepare(
+                "SELECT accounting, budget_tokens, reservation_tokens FROM usage WHERE task_id = ?1 ORDER BY id",
+            )?;
+            let v = q
+                .query_map([i], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(v)
+        })
+        .unwrap();
+    assert!(rows.len() >= 3, "{rows:?}");
+    for r in &rows {
+        assert_eq!(r, &("exact".to_string(), Some(0), None), "{rows:?}");
+    }
+    assert!(!status_out(&env, "U-3").contains("reserved"));
+
+    // the same script without `only_profiles`: turns with no usage are reserved (R41)
+    let pure = script(&env, "pure.json", turns);
+    create(&env, "U-4");
+    let _ = toryo(&env, &["run", "U-4", "--yes", "--fake-agents", &pure], &[]);
+    assert!(task(&env, "U-4").reserved_tokens > 0);
+    assert!(status_out(&env, "U-4").contains("reserved"));
+}

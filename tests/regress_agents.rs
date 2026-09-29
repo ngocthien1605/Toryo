@@ -1371,3 +1371,35 @@ mod linux {
         assert_eq!((u.accounting, u.total()), (Accounting::Exact, 900_050));
     }
 }
+
+/// M10-C2: in a mixed run (the script lists `only_profiles`) a scripted turn that ends without a
+/// `usage` step reports exact zero usage, complete or failed; one with a `usage` step keeps it;
+/// in a pure fake run nothing changes (no usage: R41 reserves).
+#[tokio::test]
+async fn fake_turns_of_a_mixed_run_report_zero_usage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let complete = json!({"kind": "complete", "text": "ok"});
+    let failed = json!({"kind": "fail", "class": "Unknown", "detail": "x"});
+    let used = json!({"kind": "usage", "input": 7, "output": 3});
+    for (only, steps, want) in [
+        (json!(["codex-openai"]), json!([complete]), Some(0)),
+        (json!(["codex-openai"]), json!([failed]), Some(0)),
+        (json!(["codex-openai"]), json!([used, complete]), Some(10)),
+        (json!([]), json!([complete]), None),
+    ] {
+        let script = json!({"turns": {"implementer": [{"steps": steps}]}, "only_profiles": only});
+        let f = FakeAgentAdapter::new(serde_json::from_value::<FakeScript>(script).unwrap());
+        let a = f.for_profile("codex-openai", ProfileKind::Codex);
+        let mut s = a
+            .open(open(tmp.path(), "codex-openai", Role::Implementer))
+            .await
+            .unwrap();
+        let o = run_to_completion(s.as_mut(), input("i"), TurnLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(o.usage.map(|u| u.total()), want, "{only} {steps}");
+        if let Some(u) = o.usage {
+            assert_eq!(u.accounting, Accounting::Exact);
+        }
+    }
+}
