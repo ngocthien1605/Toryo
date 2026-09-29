@@ -208,6 +208,7 @@ impl AgentAdapter for FakeAgentAdapter {
             announced: false,
             env: Default::default(),
             denials: 0,
+            delay_until: None,
         }))
     }
 
@@ -240,6 +241,9 @@ struct FakeSession {
     env: std::collections::BTreeMap<String, String>,
     /// Permission denials in the current turn: any fails it (TS-01).
     denials: usize,
+    /// End of a running `delay` step. Kept in the session so the delay survives the turn
+    /// loop dropping `next_event` at each limits poll (a plain sleep was cut to ~200 ms).
+    delay_until: Option<tokio::time::Instant>,
 }
 
 #[async_trait]
@@ -302,6 +306,7 @@ impl AgentSession for FakeSession {
         self.done = false;
         self.hang = false;
         self.denials = 0;
+        self.delay_until = None;
         self.turns += 1;
         self.env = input.env.clone();
         Ok(self.turns)
@@ -315,12 +320,19 @@ impl AgentSession for FakeSession {
             if self.hang {
                 std::future::pending::<()>().await;
             }
+            if let Some(until) = self.delay_until {
+                tokio::time::sleep_until(until).await;
+                self.delay_until = None;
+            }
             let Some(step) = self.pending.pop_front() else {
                 self.done = true;
                 return None; // no terminal step: like a crash without a result
             };
             match step {
-                FakeStep::Delay { ms } => tokio::time::sleep(Duration::from_millis(ms)).await,
+                FakeStep::Delay { ms } => {
+                    self.delay_until =
+                        Some(tokio::time::Instant::now() + Duration::from_millis(ms));
+                }
                 FakeStep::Text { text } => return Some(AgentEvent::TextDelta(text)),
                 FakeStep::Tool { name, summary } => {
                     return Some(AgentEvent::ToolActivity { name, summary })
@@ -450,6 +462,7 @@ impl AgentSession for FakeSession {
     async fn interrupt(&mut self) -> Result<()> {
         self.pending.clear();
         self.hang = false;
+        self.delay_until = None;
         self.pending.push_back(FakeStep::Fail {
             class: ErrorClass::ProcessCrashed,
             detail: "interrupted".into(),

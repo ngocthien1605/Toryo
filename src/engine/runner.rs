@@ -666,6 +666,18 @@ impl<'a> Engine<'a> {
                 &serde_json::to_vec_pretty(v)?,
                 &format!("implementation-{}.json", t.fix_cycle),
             )?;
+            // EC-25: the report is informational, so a schema mismatch is recorded, not fatal
+            if let Err(errors) = contracts::validate("implementation.schema.json", v) {
+                eprintln!(
+                    "!! implementation.json does not match implementation.schema.json: {}",
+                    errors.join("; ")
+                );
+                let (i, aid) = (self.id.clone(), run.attempt.id.clone());
+                let payload = json!({"schema": "implementation.schema.json", "errors": errors});
+                self.store.call(move |tx| {
+                    store::event(tx, Some(&i), Some(&aid), "schema_violation", &payload)
+                })?;
+            }
         }
         // quota / rate limits: retry, then the next implementer (sticky, R49)
         if let Some(o) = ImplementOutcome::quota(r, self.retries, retry_base_secs()) {

@@ -604,6 +604,41 @@ async fn fake_unreadable_replay_file_fails_loudly() {
     );
 }
 
+/// A `delay` step lasts its full time even though the turn loop drops `next_event` at every
+/// limits poll (200 ms) while a stop flag is installed, as it is in every engine turn.
+#[tokio::test]
+async fn fake_delay_survives_the_limits_poll() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use toryo::agents::adapter::{run_to_completion_with, TurnHooks};
+    let tmp = tempfile::tempdir().unwrap();
+    let script = json!({"turns":{"implementer":[{"steps":[{"kind":"delay","ms":700},{"kind":"complete"}]}]}});
+    let f = FakeAgentAdapter::new(serde_json::from_value::<FakeScript>(script).unwrap());
+    let a = f.for_profile("codex-openai", ProfileKind::Codex);
+    let mut s = a
+        .open(open(tmp.path(), "codex-openai", Role::Implementer))
+        .await
+        .unwrap();
+    let hooks = TurnHooks {
+        cancel: Some(Arc::new(AtomicBool::new(false))),
+        ..Default::default()
+    };
+    let limits = TurnLimits {
+        max: Duration::from_secs(10),
+        stall: Duration::from_secs(5),
+    };
+    let t0 = std::time::Instant::now();
+    let o = run_to_completion_with(s.as_mut(), input("d"), limits, hooks)
+        .await
+        .unwrap();
+    assert!(o.success, "{o:?}");
+    assert!(
+        t0.elapsed() >= Duration::from_millis(650),
+        "the delay was cut short: {:?}",
+        t0.elapsed()
+    );
+}
+
 // ── ARCH-05: an unusable Codex profile never runs ────────────────────────────────────
 
 #[test]

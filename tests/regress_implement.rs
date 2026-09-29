@@ -935,3 +935,37 @@ fn code03_a_switch_after_rate_limit_retries_records_the_real_class_and_detail() 
         )
     );
 }
+
+// ── EC-25 (implementation.json): the report is validated, a mismatch is recorded ──────────
+
+#[test]
+fn ec25_an_invalid_implementation_report_is_recorded_not_fatal() {
+    let env = setup("codex-openai");
+    create(&env, "V-1");
+    // missing `deviations`/`validation_performed`/…, and an extra key the schema forbids
+    let report = json!({"kind":"complete","structured":{"summary":"s","ok":true}});
+    let s = script(
+        &env,
+        "v1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), report])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(&env, &["run", "V-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "V-1").state, St::Completed, "{err}");
+    assert!(
+        err.contains("implementation.json does not match implementation.schema.json"),
+        "{err}"
+    );
+    let v = events(&env, "V-1", "schema_violation");
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert_eq!(v[0]["schema"], json!("implementation.schema.json"));
+    let errors = v[0]["errors"].to_string();
+    assert!(
+        errors.contains("deviations") && errors.contains("ok"),
+        "{errors}"
+    );
+}
