@@ -11,11 +11,16 @@
 //! every running stage and after every agent turn and verify run. Quota exhaustion and
 //! `--no-fallback` pause the task (M5). Artifacts are immutable versions (R34) and Verify runs
 //! in a detached checkout of the checkpoint under `verify_root`, inside the Low-IL boundary
-//! (R29/R36/R45, M6). Not yet here: budget admission (M7).
+//! (R29/R36/R45, M6). Every turn is admitted against the token budget, and a live adapter's
+//! turn is interrupted when it reaches the budget (R41, M7).
+//!
+//! The Implementer and Reviewer stages run in steps: prepare the turn, run it, interpret the
+//! result into an outcome (`ImplementOutcome`, `ReviewTurns`, `ReviewVerdict`), then record
+//! that outcome. The decisions are pure functions near the end of this file, with unit tests.
 
 use crate::git::short;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +34,7 @@ use super::checks::{
 };
 use super::context;
 use super::contracts;
-use super::lock::TaskLock;
+use super::lock::{StopWatch, TaskLock};
 use super::protect;
 use super::state::{GateKind, PipelineEvent as Ev, PipelineState as St};
 use super::store::{self, AttemptEnd, AttemptRow, AttemptStatus, NewAttempt, Store, TaskRow};
@@ -41,7 +46,8 @@ use crate::agents::hub::AgentHub;
 use crate::config::{expand_vars, Billing, CommandSpec, Effective, ProfileKind};
 use crate::domain::{ErrorClass, OpenSession, Role, StageOutcome, Tri, TurnInput, TurnLimits};
 use crate::git::GitCmd;
-use crate::runner::{CommandRunner, LocalRunner, RunSpec};
+use crate::process::Boundary;
+use crate::runner::{CommandResult, CommandRunner, LocalRunner, RunSpec};
 use crate::usage::{Accounting, Weights};
 
 #[derive(Debug, Clone, Default)]
@@ -66,6 +72,12 @@ enum Flow {
     Next,
     Stopped,
 }
+
+/// R49: rate-limit retries of one implementer before the switch to the next one.
+const RATE_LIMIT_RETRIES: u32 = 2;
+
+/// R22: correction turns for an invalid review before `InvalidOutput`.
+const MAX_CORRECTIONS: u32 = 2;
 
 /// Test hook: `TORYO_TEST_CRASH_AT=<point>[,<point>…]` exits the process abruptly at that
 /// point, like a kill — no cleanup, the OS releases the lock (§10 recovery tests).
@@ -196,7 +208,7 @@ impl<'a> Engine<'a> {
     fn hooks(
         &self,
         attempt: &str,
-        stop: &super::lock::StopWatch,
+        stop: &StopWatch,
         profile: &str,
     ) -> Result<(TurnHooks, Arc<AtomicBool>)> {
         let (st, a) = (self.store.clone(), attempt.to_string());
@@ -292,6 +304,29 @@ impl<'a> Engine<'a> {
         Ok(Flow::Stopped)
     }
 
+    /// A stop request cancelled the turn (R38): the attempt is `interrupted`.
+    fn stopped_turn(&self, a: &AttemptRow, r: &StageOutcome) -> Result<Flow> {
+        self.end(a, AttemptStatus::Interrupted, r, AttemptEnd::default())?;
+        self.stopped()
+    }
+
+    /// A Planner/Reviewer turn cut short by the live budget interrupt (R41) or a stop
+    /// request (R38) ends its attempt here.
+    fn cut_short(
+        &self,
+        a: &AttemptRow,
+        r: &StageOutcome,
+        budget_hit: bool,
+    ) -> Result<Option<Flow>> {
+        if budget_hit {
+            return self.budget_interrupted(a, r).map(Some);
+        }
+        if r.cancelled {
+            return self.stopped_turn(a, r).map(Some);
+        }
+        Ok(None)
+    }
+
     /// Run until a gate, an escalation, a pause, a stop or a terminal state.
     pub fn run(&mut self) -> Result<RunEnd> {
         loop {
@@ -355,15 +390,12 @@ impl<'a> Engine<'a> {
                 .call(move |tx| store::last_attempt(tx, &i, "plan"))?
         };
         // R48: the Planner (Claude) resumes its session for a revision or after an interruption
-        let resume = prev.as_ref().and_then(|p| p.external_session_id.clone());
-        let prompt = match (&t.feedback, prev.as_ref().map(|p| p.status)) {
-            (Some(f), _) => f.clone(),
-            (None, Some(AttemptStatus::Interrupted)) => format!(
-                "Your previous turn was interrupted before it finished. Create the plan for the task in {} again and return it.",
-                art.join("TASK.md").display()
-            ),
-            _ => format!("Create the plan for the task in {}.", art.join("TASK.md").display()),
-        };
+        let resume = plan_resume(prev.as_ref());
+        let prompt = plan_prompt(
+            t.feedback.as_deref(),
+            prev.as_ref().map(|p| p.status),
+            &art.join("TASK.md"),
+        );
         if !self.admitted()? {
             return Ok(Flow::Next);
         }
@@ -405,12 +437,8 @@ impl<'a> Engine<'a> {
             hooks,
         )?;
         self.usage(&a, &t.planner, &r)?;
-        if budget_hit.load(Ordering::SeqCst) {
-            return self.budget_interrupted(&a, &r);
-        }
-        if r.cancelled {
-            self.end(&a, AttemptStatus::Interrupted, &r, AttemptEnd::default())?;
-            return self.stopped();
+        if let Some(flow) = self.cut_short(&a, &r, budget_hit.load(Ordering::SeqCst))? {
+            return Ok(flow);
         }
         if let Some(flow) = self.after_read_only_turn(t, &a, &r, "planner")? {
             return Ok(flow);
@@ -436,16 +464,9 @@ impl<'a> Engine<'a> {
         self.put(t, &a, "plan", "json", &bytes, "plan.json")?;
         self.put(t, &a, "plan-md", "md", md.as_bytes(), "PLAN.md")?;
         eprintln!("\n{md}");
-        let files: Vec<String> = plan["files_likely_involved"]
-            .as_array()
+        let bad: Vec<String> = plan_files(&plan)
             .into_iter()
-            .flatten()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
-        let bad: Vec<String> = files
-            .iter()
             .filter(|f| self.protect.violates(f))
-            .cloned()
             .collect();
         if !bad.is_empty() {
             eprintln!("!! the plan lists protected or denied paths {bad:?} — rejected automatically (plan-time policy)");
@@ -477,63 +498,48 @@ impl<'a> Engine<'a> {
     }
 
     // ── Implementing / Fixing ────────────────────────────────────────────────────────
+    //
+    // The implementer of the chain (R49) → prepare the turn → admission (R41) → run it →
+    // interpret the result (`ImplementOutcome`) → record the outcome.
 
     fn implement(&mut self, t: &TaskRow) -> Result<Flow> {
-        let stage = writing_stage(t.fix_cycle);
         let wt = Worktree::new(&self.g, &t.worktree);
-        let limit = if self.opts.no_fallback {
-            1
-        } else {
-            t.implementers.len()
-        };
-        let Some(profile) = t
-            .implementers
-            .get(t.implementer_index)
-            .filter(|_| t.implementer_index < limit)
-            .cloned()
-        else {
-            let reason = format!(
-                "implementer_quota: no implementer left ({}{}); the worktree keeps any partial changes — `toryo resume` when the quota is back",
+        let Some(profile) = implementer_at(t, t.implementer_index, self.opts.no_fallback) else {
+            let reason = implementer_quota_reason(&format!(
+                "{}{}",
                 t.implementers.join(" → "),
-                if self.opts.no_fallback { ", --no-fallback" } else { "" }
-            );
+                if self.opts.no_fallback {
+                    ", --no-fallback"
+                } else {
+                    ""
+                }
+            ));
             self.apply(Ev::Pause { reason })?;
             return Ok(Flow::Next);
         };
+        let turn = self.prepare_implement(t, profile)?;
+        if !self.admitted()? {
+            return Ok(Flow::Next);
+        }
+        let Some(run) = self.run_implement_turn(t, &turn, &wt)? else {
+            return Ok(Flow::Next); // the task pack failed its hash check: escalated (R34)
+        };
+        let outcome = self.interpret_implement(t, &run, &wt)?;
+        self.retries = outcome.retries_after(self.retries);
+        self.decide_implement(t, &turn, &run, &wt, outcome)
+    }
+
+    /// The turn's stage, prompt, model, resume and fallback (R48, R49), before admission.
+    fn prepare_implement(&self, t: &TaskRow, profile: String) -> Result<ImplementTurn> {
+        let stage = writing_stage(t.fix_cycle);
         let kind = self.cfg.profile(&profile)?.kind;
         let prev = {
             let (i, s) = (self.id.clone(), stage.clone());
             self.store.call(move |tx| store::last_attempt(tx, &i, &s))?
         };
-        let mut prompt = "Implement the approved plan (PLAN.md) for the task (TASK.md) in this worktree, following your role and the project rules in the context.\n".to_string();
-        if t.fix_cycle > 0 {
-            if let Some(f) = &t.feedback {
-                prompt.push_str(&format!("\n## Fix cycle {}\nThe previous checkpoint was not accepted. Address the following, then report the issue ids you fixed in `resolved`:\n\n{f}\n", t.fix_cycle));
-            }
-        }
-        if let Some(h) = &t.handoff {
-            prompt.push_str(h);
-        }
-        // R48 recovery policy: Claude resumes the interrupted session, Codex starts fresh
-        // (the hand-over note written by recovery names the partial commit)
-        let resume = match (&prev, kind) {
-            (Some(p), ProfileKind::Claude)
-                if p.status == AttemptStatus::Interrupted
-                    && p.profile.as_deref() == Some(profile.as_str()) =>
-            {
-                p.external_session_id.clone()
-            }
-            _ => None,
-        };
-        let fallback_from = if t.implementer_index > 0
-            && prev
-                .as_ref()
-                .is_none_or(|p| p.profile.as_deref() != Some(profile.as_str()))
-        {
-            t.implementers.get(t.implementer_index - 1).cloned()
-        } else {
-            None
-        };
+        let prompt = implementer_prompt(t.fix_cycle, t.feedback.as_deref(), t.handoff.as_deref());
+        let resume = implementer_resume(prev.as_ref(), kind, &profile);
+        let fallback_from = fallback_from(t, prev.as_ref(), &profile);
         let (prompt, model) = match kind {
             ProfileKind::Codex => (
                 prompt,
@@ -546,9 +552,25 @@ impl<'a> Engine<'a> {
             ),
             ProfileKind::Claude => (claude_implementer_prompt(&prompt), None),
         };
-        if !self.admitted()? {
-            return Ok(Flow::Next);
-        }
+        Ok(ImplementTurn {
+            stage,
+            profile,
+            prompt,
+            model,
+            resume,
+            fallback_from,
+        })
+    }
+
+    /// Begin the attempt at the current HEAD with an empty TEMP (R46), assemble its context
+    /// (§7), run the turn and record its usage (R41). `None`: the context could not be
+    /// assembled and the task escalated.
+    fn run_implement_turn(
+        &self,
+        t: &TaskRow,
+        turn: &ImplementTurn,
+        wt: &Worktree,
+    ) -> Result<Option<ImplementRun>> {
         let head_before = wt.head()?;
         let tmp = t.worktree.join(".toryo-tmp");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -558,39 +580,40 @@ impl<'a> Engine<'a> {
             .map(|(k, v)| (k.to_string(), v.display().to_string()))
             .collect();
         let a = self.begin(NewAttempt {
-            stage: &stage,
+            stage: &turn.stage,
             kind: "agent",
-            profile: Some(&profile),
-            fallback_from: fallback_from.as_deref(),
+            profile: Some(&turn.profile),
+            fallback_from: turn.fallback_from.as_deref(),
             head_before: Some(&head_before),
             subject_commit: None,
         })?;
         eprintln!(
-            "\n── {} (attempt {}, {profile}) ──",
-            stage.to_uppercase(),
-            a.attempt
+            "\n── {} (attempt {}, {}) ──",
+            turn.stage.to_uppercase(),
+            a.attempt,
+            turn.profile
         );
         crash_point("implement:after_begin");
-        let Some(ctx) = self.context(t, &a, &profile)? else {
-            return Ok(Flow::Next);
+        let Some(ctx) = self.context(t, &a, &turn.profile)? else {
+            return Ok(None);
         };
         let stop = self.lock.watch_stop();
-        let (hooks, budget_hit) = self.hooks(&a.id, &stop, &profile)?;
+        let (hooks, budget_hit) = self.hooks(&a.id, &stop, &turn.profile)?;
         let r = self.hub.turn_with(
             OpenSession {
-                profile: profile.clone(),
+                profile: turn.profile.clone(),
                 role: Role::Implementer,
                 cwd: t.worktree.clone(),
                 run_store: None,
                 capture_dir: t.captures(),
                 schema: Some(contracts::schema("implementation.schema.json")?.into()),
                 context_file: Some(ctx),
-                model,
-                resume,
+                model: turn.model.clone(),
+                resume: turn.resume.clone(),
             },
             TurnInput {
-                prompt,
-                label: format!("{stage}-{}", a.attempt),
+                prompt: turn.prompt.clone(),
+                label: format!("{}-{}", turn.stage, a.attempt),
                 env,
                 echo: true,
             },
@@ -598,18 +621,34 @@ impl<'a> Engine<'a> {
             hooks,
         )?;
         crash_point("implement:after_turn");
-        self.usage(&a, &profile, &r)?;
-        if budget_hit.load(Ordering::SeqCst) {
-            return self.budget_interrupted(&a, &r);
-        }
-        if r.cancelled {
-            self.end(&a, AttemptStatus::Interrupted, &r, AttemptEnd::default())?;
-            return self.stopped();
+        self.usage(&a, &turn.profile, &r)?;
+        Ok(Some(ImplementRun {
+            budget_hit: budget_hit.load(Ordering::SeqCst),
+            attempt: a,
+            result: r,
+            head_before,
+            _stop: stop,
+        }))
+    }
+
+    /// What the finished turn leads to, in this order: the live budget interrupt or a stop;
+    /// then the implementation report is stored; quota and rate limits (retry, then switch);
+    /// then the HEAD guard, protected state (R35) and the path policy (§8). The HEAD guard
+    /// and the protected-state check do not run when an earlier outcome returns (EC-18).
+    fn interpret_implement(
+        &self,
+        t: &TaskRow,
+        run: &ImplementRun,
+        wt: &Worktree,
+    ) -> Result<ImplementOutcome> {
+        let r = &run.result;
+        if let Some(o) = ImplementOutcome::interrupted(r, run.budget_hit) {
+            return Ok(o);
         }
         if let Some(v) = &r.structured {
             self.put(
                 t,
-                &a,
+                &run.attempt,
                 "implementation",
                 "json",
                 &serde_json::to_vec_pretty(v)?,
@@ -617,86 +656,121 @@ impl<'a> Engine<'a> {
             )?;
         }
         // quota / rate limits: retry, then the next implementer (sticky, R49)
-        let switch = match r.error_class {
-            Some(ErrorClass::QuotaExceeded) => Some(format!(
-                "quota exhausted: {}",
-                r.error_detail.clone().unwrap_or_default()
-            )),
-            Some(ErrorClass::RateLimited | ErrorClass::Overloaded) if self.retries < 2 => {
-                self.retries += 1;
-                let base: u64 = std::env::var("TORYO_RETRY_BASE_SECS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(30);
-                let wait = base * u64::from(self.retries);
-                eprintln!(
-                    "!! {profile}: {:?} — retry {}/2 in {wait}s",
-                    r.error_class, self.retries
-                );
-                self.end(&a, AttemptStatus::Failed, &r, AttemptEnd::default())?;
-                std::thread::sleep(Duration::from_secs(wait));
-                return Ok(Flow::Next);
-            }
-            Some(c @ (ErrorClass::RateLimited | ErrorClass::Overloaded)) => {
-                Some(format!("{c:?} after 2 retries"))
-            }
-            _ => None,
-        };
-        if let Some(reason) = switch {
-            self.retries = 0;
-            let changed: Vec<String> = wt
-                .changed()?
-                .into_iter()
-                .map(|(s, p)| format!("{s} {p}"))
-                .collect();
-            let next = t
-                .implementers
-                .get(t.implementer_index + 1)
-                .filter(|_| t.implementer_index + 1 < limit)
-                .cloned();
-            eprintln!(
-                "!! implementer {profile}: {reason} → {}",
-                next.as_deref()
-                    .map(|n| format!("switching to {n}"))
-                    .unwrap_or_else(|| "no fallback left".into())
-            );
-            let note = if changed.is_empty() {
-                format!("\n## Hand-over\nThe previous implementer (`{profile}`) stopped before producing any change ({reason}). Start the task from the plan.\n")
-            } else {
-                format!(
-                    "\n## Hand-over\nThe previous implementer (`{profile}`) stopped before finishing ({reason}). The worktree contains its UNCOMMITTED partial changes:\n{}\nInspect them, keep what is correct, fix or complete the rest, and finish the task.\n",
-                    changed.iter().map(|x| format!("- `{x}`")).collect::<Vec<_>>().join("\n")
-                )
-            };
-            let (i, aid, idx, st2) = (
-                self.id.clone(),
-                a.id.clone(),
-                t.implementer_index + 1,
-                r.session_id.clone(),
-            );
-            let pause = next.is_none();
-            let payload =
-                json!({"from": profile, "to": next, "reason": reason, "partial_changes": changed});
-            self.store.call(move |tx| {
-                store::finish_attempt(tx, &aid, AttemptStatus::Failed, &AttemptEnd { error_class: Some("QuotaExceeded".into()), external_session_id: st2, ..Default::default() })?;
-                store::set_implementer_index(tx, &i, idx)?;
-                store::set_handoff(tx, &i, Some(&note))?;
-                store::event(tx, Some(&i), Some(&aid), "implementer_switch", &payload)?;
-                if pause {
-                    store::transition(tx, &i, Ev::Pause { reason: format!("implementer_quota: no implementer left ({reason}); the worktree keeps any partial changes — `toryo resume` when the quota is back") })?;
-                }
-                Ok(())
-            })?;
-            return Ok(Flow::Next);
+        if let Some(o) = ImplementOutcome::quota(r, self.retries, retry_base_secs()) {
+            return Ok(o);
         }
-        self.retries = 0;
-        // HEAD guard (§8): agents must not commit
+        self.head_guard(wt, &run.head_before, &run.attempt)?;
+        // R35: untracked/ignored protected files or Git metadata → Escalated, nothing else runs
+        if let Some(reason) = self.protected_violation(t, true)? {
+            return Ok(ImplementOutcome::ProtectedChanged { reason });
+        }
+        Ok(ImplementOutcome::after_checks(
+            r,
+            &wt.changed()?,
+            &self.protect,
+        ))
+    }
+
+    /// Record the outcome: end the attempt, apply the event, set the feedback — with the
+    /// same transactions and output as before the split into steps.
+    fn decide_implement(
+        &self,
+        t: &TaskRow,
+        turn: &ImplementTurn,
+        run: &ImplementRun,
+        wt: &Worktree,
+        outcome: ImplementOutcome,
+    ) -> Result<Flow> {
+        let (a, r) = (&run.attempt, &run.result);
+        match outcome {
+            ImplementOutcome::BudgetHit => self.budget_interrupted(a, r),
+            ImplementOutcome::Stopped => self.stopped_turn(a, r),
+            ImplementOutcome::Retry { retry, wait } => {
+                eprintln!(
+                    "!! {}: {:?} — retry {retry}/{RATE_LIMIT_RETRIES} in {}s",
+                    turn.profile,
+                    r.error_class,
+                    wait.as_secs()
+                );
+                self.end(a, AttemptStatus::Failed, r, AttemptEnd::default())?;
+                // a stop request waits for the backoff to end (EC-17)
+                std::thread::sleep(wait);
+                Ok(Flow::Next)
+            }
+            ImplementOutcome::Switch { reason } => {
+                self.switch_implementer(t, &turn.profile, run, wt, reason)
+            }
+            ImplementOutcome::ProtectedChanged { reason } => {
+                eprintln!("!! {reason}");
+                self.end_and(
+                    a,
+                    AttemptStatus::Failed,
+                    r,
+                    AttemptEnd {
+                        error_class: Some(protect::REASON.into()),
+                        ..Default::default()
+                    },
+                    Some(Ev::Escalate { reason }),
+                    None,
+                )?;
+                Ok(Flow::Next)
+            }
+            ImplementOutcome::PathPolicy { paths } => {
+                eprintln!("!! protected or denied paths changed: {paths:?} — restored, nothing committed; sent back to the implementer");
+                wt.restore(&paths)?;
+                let fb = format!("- POLICY: you changed protected or denied paths {paths:?}. They were restored. Do not modify them; achieve the task another way.");
+                self.end_and(
+                    a,
+                    AttemptStatus::Failed,
+                    r,
+                    AttemptEnd {
+                        error_class: Some("policy_violation".into()),
+                        error_detail: Some(format!("{paths:?}")),
+                        ..Default::default()
+                    },
+                    Some(Ev::PathPolicyViolation { paths }),
+                    Some(Some(fb)),
+                )?;
+                Ok(Flow::Next)
+            }
+            ImplementOutcome::Failed { reason } => {
+                r.print_summary();
+                self.end_and(
+                    a,
+                    AttemptStatus::Failed,
+                    r,
+                    AttemptEnd::default(),
+                    Some(Ev::Escalate { reason }),
+                    None,
+                )?;
+                Ok(Flow::Next)
+            }
+            ImplementOutcome::Done => {
+                let i = self.id.clone();
+                self.end_and(
+                    a,
+                    AttemptStatus::Succeeded,
+                    r,
+                    AttemptEnd::default(),
+                    Some(Ev::ImplementationDone),
+                    None,
+                )?;
+                self.store
+                    .call(move |tx| store::set_handoff(tx, &i, None))?;
+                Ok(Flow::Next)
+            }
+        }
+    }
+
+    /// HEAD guard (§8): agents must not commit. A moved HEAD is soft-reset to where the turn
+    /// began and recorded as a policy violation. Compares the SHA only (EC-18).
+    fn head_guard(&self, wt: &Worktree, head_before: &str, a: &AttemptRow) -> Result<()> {
         if wt.head()? != head_before {
             eprintln!(
                 "!! policy_violation: the agent moved HEAD — soft reset to {}",
-                short(&head_before)
+                short(head_before)
             );
-            wt.soft_reset(&head_before)?;
+            wt.soft_reset(head_before)?;
             let (i, aid) = (self.id.clone(), a.id.clone());
             self.store.call(move |tx| {
                 store::event(
@@ -708,74 +782,67 @@ impl<'a> Engine<'a> {
                 )
             })?;
         }
-        // R35: untracked/ignored protected files or Git metadata → Escalated, nothing else runs
-        if let Some(reason) = self.protected_violation(t, true)? {
-            eprintln!("!! {reason}");
-            self.end_and(
-                &a,
-                AttemptStatus::Failed,
-                &r,
-                AttemptEnd {
-                    error_class: Some(protect::REASON.into()),
-                    ..Default::default()
-                },
-                Some(Ev::Escalate { reason }),
-                None,
-            )?;
-            return Ok(Flow::Next);
-        }
-        let changed = wt.changed()?;
-        let prot: Vec<String> = changed
-            .iter()
-            .map(|c| c.1.clone())
-            .filter(|p| self.protect.violates(p))
+        Ok(())
+    }
+
+    /// R49: the next implementer of the chain takes over (sticky), with a hand-over note that
+    /// lists the uncommitted partial changes; with none left, the task pauses. One
+    /// transaction.
+    fn switch_implementer(
+        &self,
+        t: &TaskRow,
+        profile: &str,
+        run: &ImplementRun,
+        wt: &Worktree,
+        reason: String,
+    ) -> Result<Flow> {
+        let changed: Vec<String> = wt
+            .changed()?
+            .into_iter()
+            .map(|(s, p)| format!("{s} {p}"))
             .collect();
-        if !prot.is_empty() {
-            eprintln!("!! protected or denied paths changed: {prot:?} — restored, nothing committed; sent back to the implementer");
-            wt.restore(&prot)?;
-            let fb = format!("- POLICY: you changed protected or denied paths {prot:?}. They were restored. Do not modify them; achieve the task another way.");
-            self.end_and(
-                &a,
+        let next = implementer_at(t, t.implementer_index + 1, self.opts.no_fallback);
+        eprintln!(
+            "!! implementer {profile}: {reason} → {}",
+            next.as_deref()
+                .map(|n| format!("switching to {n}"))
+                .unwrap_or_else(|| "no fallback left".into())
+        );
+        let note = handover_note(profile, &reason, &changed);
+        let (i, aid, idx, session) = (
+            self.id.clone(),
+            run.attempt.id.clone(),
+            t.implementer_index + 1,
+            run.result.session_id.clone(),
+        );
+        let pause = next.is_none();
+        let payload =
+            json!({"from": profile, "to": next, "reason": reason, "partial_changes": changed});
+        self.store.call(move |tx| {
+            store::finish_attempt(
+                tx,
+                &aid,
                 AttemptStatus::Failed,
-                &r,
-                AttemptEnd {
-                    error_class: Some("policy_violation".into()),
-                    error_detail: Some(format!("{prot:?}")),
+                &AttemptEnd {
+                    error_class: Some("QuotaExceeded".into()),
+                    external_session_id: session,
                     ..Default::default()
                 },
-                Some(Ev::PathPolicyViolation { paths: prot }),
-                Some(Some(fb)),
             )?;
-            return Ok(Flow::Next);
-        }
-        if !r.success && changed.is_empty() {
-            r.print_summary();
-            let reason = format!(
-                "implementer failed: {:?} {}",
-                r.error_class,
-                r.error_detail.clone().unwrap_or_default()
-            );
-            self.end_and(
-                &a,
-                AttemptStatus::Failed,
-                &r,
-                AttemptEnd::default(),
-                Some(Ev::Escalate { reason }),
-                None,
-            )?;
-            return Ok(Flow::Next);
-        }
-        let i = self.id.clone();
-        self.end_and(
-            &a,
-            AttemptStatus::Succeeded,
-            &r,
-            AttemptEnd::default(),
-            Some(Ev::ImplementationDone),
-            None,
-        )?;
-        self.store
-            .call(move |tx| store::set_handoff(tx, &i, None))?;
+            store::set_implementer_index(tx, &i, idx)?;
+            store::set_handoff(tx, &i, Some(&note))?;
+            store::event(tx, Some(&i), Some(&aid), "implementer_switch", &payload)?;
+            if pause {
+                store::transition(
+                    tx,
+                    &i,
+                    Ev::Pause {
+                        reason: implementer_quota_reason(&reason),
+                    },
+                )?;
+            }
+            Ok(())
+        })?;
         Ok(Flow::Next)
     }
 
@@ -865,26 +932,17 @@ impl<'a> Engine<'a> {
             )?;
             eprintln!("   protected baseline renewed: {allowed:?} (## Allow protected)");
         }
-        let (i, aid, h, k) = (
-            self.id.clone(),
-            a.id.clone(),
-            head.clone(),
-            kind.to_string(),
-        );
-        self.store.call(move |tx| {
-            store::finish_attempt(
-                tx,
-                &aid,
-                AttemptStatus::Succeeded,
-                &AttemptEnd {
-                    head_after: Some(h.clone()),
-                    checkpoint_kind: Some(k),
-                    ..Default::default()
-                },
-            )?;
-            store::transition(tx, &i, Ev::Checkpointed { head: h })?;
-            Ok(())
-        })?;
+        self.finish_and(
+            &a,
+            AttemptStatus::Succeeded,
+            AttemptEnd {
+                head_after: Some(head.clone()),
+                checkpoint_kind: Some(kind.to_string()),
+                ..Default::default()
+            },
+            None,
+            Some(Ev::Checkpointed { head }),
+        )?;
         Ok(Flow::Next)
     }
 
@@ -905,39 +963,8 @@ impl<'a> Engine<'a> {
             subject_commit: Some(&head),
         })?;
         crash_point("verify:after_begin");
-        // R36/R45: the boundary is established or the stage stops — never a silent downgrade
-        let prepared = verify::boundary(&self.cfg)
-            .and_then(|b| verify::prepare(&self.g, t, &self.cfg, &head, b).map(|c| (b, c)));
-        let (b, co) = match prepared {
-            Ok(x) => x,
-            Err(e)
-                if format!("{e:#}").starts_with(verify::UNAVAILABLE)
-                    || format!("{e:#}").starts_with(verify::MUTATED) =>
-            {
-                let reason = format!("{e:#}");
-                eprintln!("!! {reason}");
-                let class = reason
-                    .split(':')
-                    .next()
-                    .unwrap_or(verify::UNAVAILABLE)
-                    .to_string();
-                let (i, aid) = (self.id.clone(), a.id.clone());
-                self.store.call(move |tx| {
-                    store::finish_attempt(
-                        tx,
-                        &aid,
-                        AttemptStatus::Failed,
-                        &AttemptEnd {
-                            error_class: Some(class),
-                            ..Default::default()
-                        },
-                    )?;
-                    store::transition(tx, &i, Ev::Escalate { reason })?;
-                    Ok(())
-                })?;
-                return Ok(Flow::Next);
-            }
-            Err(e) => return Err(e),
+        let Some((b, co)) = self.verify_checkout(t, &a, &head)? else {
+            return Ok(Flow::Next);
         };
         eprintln!(
             "\n── VERIFY (attempt {}, {} in {}) ──",
@@ -946,51 +973,16 @@ impl<'a> Engine<'a> {
             co.dir.display()
         );
         let stop = self.lock.watch_stop();
-        let env = verify::env(&co);
-        let mut results = Vec::new();
-        let mut pass = true;
-        for c in &self.cmds {
-            let program = resolve_program(&expand_vars(&c.program)?);
-            let res = self.hub.block_on(LocalRunner.run(
-                RunSpec {
-                    name: c.name.clone(),
-                    program,
-                    args: c.args.clone(),
-                    cwd: co.dir.clone(),
-                    env: env.clone(),
-                    boundary: b,
-                    timeout: Duration::from_secs(60 * c.timeout_min.unwrap_or(30)),
-                    cancel: Some(stop.flag.clone()),
-                },
+        let Some((results, pass)) = self.run_verify_commands(b, &co, &stop)? else {
+            self.finish_and(
+                &a,
+                AttemptStatus::Interrupted,
+                AttemptEnd::default(),
                 None,
-            ))?;
-            if res.cancelled || stop.stopped() {
-                let (aid,) = (a.id.clone(),);
-                self.store.call(move |tx| {
-                    store::finish_attempt(
-                        tx,
-                        &aid,
-                        AttemptStatus::Interrupted,
-                        &AttemptEnd::default(),
-                    )
-                })?;
-                return self.stopped();
-            }
-            let ok = res.ok();
-            pass &= ok;
-            eprintln!(
-                "  {} {} (exit {:?}, {:.1}s)",
-                if ok { "✔" } else { "✘" },
-                c.name,
-                res.exit,
-                res.duration_ms as f64 / 1000.0
-            );
-            // R50: LocalRunner strips ANSI (CSI/OSC) from everything it captures
-            results.push(json!({"name": c.name, "argv": std::iter::once(c.program.clone()).chain(c.args.clone()).collect::<Vec<_>>(), "exit": res.exit, "ms": res.duration_ms, "output_tail": res.tail(40)}));
-            if !ok {
-                break; // stop at the first failure (§5.2)
-            }
-        }
+                None,
+            )?;
+            return self.stopped();
+        };
         // R29/R47: the checkout must be exactly the checkpoint after the run
         let mutated = verify::mutated(&self.g, &co, &head)?;
         let tree = self.g.run_str(
@@ -1020,77 +1012,106 @@ impl<'a> Engine<'a> {
         )?;
         if let Some(reason) = mutated {
             eprintln!("!! {reason}");
-            let (i, aid) = (self.id.clone(), a.id.clone());
-            self.store.call(move |tx| {
-                store::finish_attempt(
-                    tx,
-                    &aid,
-                    AttemptStatus::Failed,
-                    &AttemptEnd {
-                        error_class: Some(verify::MUTATED.into()),
-                        ..Default::default()
-                    },
-                )?;
-                store::transition(tx, &i, Ev::Escalate { reason })?;
-                Ok(())
-            })?;
+            self.escalate_attempt(&a, verify::MUTATED.into(), reason)?;
             return Ok(Flow::Next);
         }
         // R35: the verify run must not have touched protected state
         if let Some(reason) = self.protected_violation(t, false)? {
             eprintln!("!! {reason}");
-            let aid = a.id.clone();
-            let i = self.id.clone();
-            self.store.call(move |tx| {
-                store::finish_attempt(
-                    tx,
-                    &aid,
-                    AttemptStatus::Failed,
-                    &AttemptEnd {
-                        error_class: Some(protect::REASON.into()),
-                        ..Default::default()
-                    },
-                )?;
-                store::transition(tx, &i, Ev::Escalate { reason })?;
-                Ok(())
-            })?;
+            self.escalate_attempt(&a, protect::REASON.into(), reason)?;
             return Ok(Flow::Next);
         }
-        let (i, aid, h) = (self.id.clone(), a.id.clone(), head.clone());
-        let fb = if pass {
-            None
+        let (status, feedback, event) = if pass {
+            (AttemptStatus::Succeeded, None, Ev::VerifyPassed { head })
         } else {
-            let f = results.last().cloned().unwrap_or(Value::Null);
-            Some(format!(
-                "- VERIFY FAILED: `{}` exited {:?}. Last output:\n```\n{}\n```",
-                f["name"].as_str().unwrap_or(""),
-                f["exit"],
-                f["output_tail"].as_str().unwrap_or("")
-            ))
+            (
+                AttemptStatus::Failed,
+                Some(Some(verify_feedback(&results))),
+                Ev::VerifyFailed { head },
+            )
         };
-        self.store.call(move |tx| {
-            store::finish_attempt(
-                tx,
-                &aid,
-                if pass {
-                    AttemptStatus::Succeeded
-                } else {
-                    AttemptStatus::Failed
-                },
-                &AttemptEnd::default(),
-            )?;
-            if pass {
-                store::transition(tx, &i, Ev::VerifyPassed { head: h })?;
-            } else {
-                store::set_feedback(tx, &i, fb.as_deref())?;
-                store::transition(tx, &i, Ev::VerifyFailed { head: h })?;
-            }
-            Ok(())
-        })?;
+        self.finish_and(&a, status, AttemptEnd::default(), feedback, Some(event))?;
         Ok(Flow::Next)
     }
 
+    /// R36/R45: the execution boundary and the detached checkout of `head` are established,
+    /// or the stage stops — never a silent downgrade. `None`: the boundary is unavailable or
+    /// the checkout was mutated, and the task escalated.
+    fn verify_checkout(
+        &self,
+        t: &TaskRow,
+        a: &AttemptRow,
+        head: &str,
+    ) -> Result<Option<(Boundary, verify::Checkout)>> {
+        let prepared = verify::boundary(&self.cfg)
+            .and_then(|b| verify::prepare(&self.g, t, &self.cfg, head, b).map(|c| (b, c)));
+        match prepared {
+            Ok(x) => Ok(Some(x)),
+            Err(e)
+                if format!("{e:#}").starts_with(verify::UNAVAILABLE)
+                    || format!("{e:#}").starts_with(verify::MUTATED) =>
+            {
+                let reason = format!("{e:#}");
+                eprintln!("!! {reason}");
+                self.escalate_attempt(a, reason_class(&reason, verify::UNAVAILABLE), reason)?;
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Run the verify commands in the checkout, inside the boundary, and stop at the first
+    /// failure (§5.2). Returns each command's result and whether all passed; `None` when a
+    /// stop request ended a command (R38).
+    fn run_verify_commands(
+        &self,
+        b: Boundary,
+        co: &verify::Checkout,
+        stop: &StopWatch,
+    ) -> Result<Option<(Vec<Value>, bool)>> {
+        let env = verify::env(co);
+        let mut results = Vec::new();
+        let mut pass = true;
+        for c in &self.cmds {
+            let program = resolve_program(&expand_vars(&c.program)?);
+            let res = self.hub.block_on(LocalRunner.run(
+                RunSpec {
+                    name: c.name.clone(),
+                    program,
+                    args: c.args.clone(),
+                    cwd: co.dir.clone(),
+                    env: env.clone(),
+                    boundary: b,
+                    timeout: Duration::from_secs(60 * c.timeout_min.unwrap_or(30)),
+                    cancel: Some(stop.flag.clone()),
+                },
+                None,
+            ))?;
+            if res.cancelled || stop.stopped() {
+                return Ok(None);
+            }
+            let ok = res.ok();
+            pass &= ok;
+            eprintln!(
+                "  {} {} (exit {:?}, {:.1}s)",
+                if ok { "✔" } else { "✘" },
+                c.name,
+                res.exit,
+                res.duration_ms as f64 / 1000.0
+            );
+            // R50: LocalRunner strips ANSI (CSI/OSC) from everything it captures
+            results.push(command_result(c, &res));
+            if !ok {
+                break; // stop at the first failure (§5.2)
+            }
+        }
+        Ok(Some((results, pass)))
+    }
+
     // ── Reviewing ────────────────────────────────────────────────────────────────────
+    //
+    // The review turn and its correction turns (`ReviewTurns`) → the decision of a valid
+    // review (`ReviewVerdict`) → record it.
 
     fn review(&mut self, t: &TaskRow) -> Result<Flow> {
         let head = t
@@ -1098,7 +1119,6 @@ impl<'a> Engine<'a> {
             .checkpoint()
             .context("no checkpoint to review")?
             .to_string();
-        let art = t.artifacts();
         // R48: a review of the same checkpoint that was interrupted (crash, stop) resumes the
         // Reviewer's session
         let prev = {
@@ -1106,13 +1126,7 @@ impl<'a> Engine<'a> {
             self.store
                 .call(move |tx| store::last_attempt(tx, &i, "review"))?
         };
-        let mut resume: Option<String> = prev
-            .filter(|p| {
-                p.status == AttemptStatus::Interrupted
-                    && p.subject_commit.as_deref() == Some(head.as_str())
-                    && p.profile.as_deref() == Some(t.reviewer.as_str())
-            })
-            .and_then(|p| p.external_session_id);
+        let resume = review_resume(prev.as_ref(), &head, &t.reviewer);
         if !self.admitted()? {
             return Ok(Flow::Next);
         }
@@ -1139,23 +1153,52 @@ impl<'a> Engine<'a> {
             return Ok(Flow::Next);
         };
         let stop = self.lock.watch_stop();
-        let mut prompt = format!(
-            "Review the checkpoint {} in this worktree against TASK.md. DIFF.patch is base → checkpoint; DIFF-incremental.patch is the change since your last review (empty on the first). Acceptance criteria ids: {:?}.",
-            short(&head),
-            t.acceptance_ids
-        );
-        if resume.is_some() {
-            prompt = format!("Your previous review turn was interrupted before it finished. {prompt} Return the complete review.");
-        }
-        let mut review = Value::Null;
-        let mut valid = false;
-        let mut last = StageOutcome::default();
-        let mut corrections = 0u32;
-        for corr in 0..=2u32 {
-            // R41: every turn is admitted, correction turns too
-            if corr > 0 && !self.admitted()? {
+        let prompt = review_prompt(&head, &t.acceptance_ids, resume.is_some());
+        match self.review_turns(t, &a, &ctx, &stop, prompt, resume)? {
+            ReviewTurns::Valid(valid) => self.decide_review(t, &a, &head, valid),
+            ReviewTurns::Rejected { last } => {
+                let reason = format!(
+                    "InvalidOutput: the review was rejected {} times (R22)",
+                    MAX_CORRECTIONS + 1
+                );
                 self.end_and(
                     &a,
+                    AttemptStatus::Failed,
+                    &last,
+                    AttemptEnd {
+                        error_class: Some("InvalidOutput".into()),
+                        correction_turns: Some(MAX_CORRECTIONS),
+                        ..Default::default()
+                    },
+                    Some(Ev::Escalate { reason }),
+                    None,
+                )?;
+                Ok(Flow::Next)
+            }
+            ReviewTurns::Ended(flow) => Ok(flow),
+        }
+    }
+
+    /// The review turn and up to two correction turns in the same session (R22): a review
+    /// that fails the checks (R28) is sent back with the violations. Every turn is admitted
+    /// (R41) and checked like any read-only turn. A turn that failed is checked like any
+    /// other (EC-01), and a crash or timeout also gets a correction turn (EC-14).
+    fn review_turns(
+        &self,
+        t: &TaskRow,
+        a: &AttemptRow,
+        ctx: &Path,
+        stop: &StopWatch,
+        mut prompt: String,
+        mut resume: Option<String>,
+    ) -> Result<ReviewTurns> {
+        let mut last = StageOutcome::default();
+        for corr in 0..=MAX_CORRECTIONS {
+            // R41: every turn is admitted, correction turns too (EC-13: a refusal has already
+            // applied `BudgetExceeded`, so the transition below is refused)
+            if corr > 0 && !self.admitted()? {
+                self.end_and(
+                    a,
                     AttemptStatus::Failed,
                     &last,
                     AttemptEnd {
@@ -1165,18 +1208,18 @@ impl<'a> Engine<'a> {
                     Some(Ev::BudgetExceeded),
                     None,
                 )?;
-                return Ok(Flow::Next);
+                return Ok(ReviewTurns::Ended(Flow::Next));
             }
-            let (hooks, budget_hit) = self.hooks(&a.id, &stop, &t.reviewer)?;
+            let (hooks, budget_hit) = self.hooks(&a.id, stop, &t.reviewer)?;
             let r = self.hub.turn_with(
                 OpenSession {
                     profile: t.reviewer.clone(),
                     role: Role::Reviewer,
                     cwd: t.worktree.clone(),
-                    run_store: Some(art.clone()),
+                    run_store: Some(t.artifacts()),
                     capture_dir: t.captures(),
                     schema: Some(contracts::schema("review.schema.json")?.into()),
-                    context_file: Some(ctx.clone()),
+                    context_file: Some(ctx.to_path_buf()),
                     model: self.role_model("reviewer"),
                     resume: resume.clone(),
                 },
@@ -1189,85 +1232,67 @@ impl<'a> Engine<'a> {
                 self.limits(),
                 hooks,
             )?;
-            self.usage(&a, &t.reviewer, &r)?;
-            if budget_hit.load(Ordering::SeqCst) {
-                return self.budget_interrupted(&a, &r);
+            self.usage(a, &t.reviewer, &r)?;
+            if let Some(flow) = self.cut_short(a, &r, budget_hit.load(Ordering::SeqCst))? {
+                return Ok(ReviewTurns::Ended(flow));
             }
-            if r.cancelled {
-                self.end(&a, AttemptStatus::Interrupted, &r, AttemptEnd::default())?;
-                return self.stopped();
+            if let Some(flow) = self.after_read_only_turn(t, a, &r, "reviewer")? {
+                return Ok(ReviewTurns::Ended(flow));
             }
-            if let Some(flow) = self.after_read_only_turn(t, &a, &r, "reviewer")? {
-                return Ok(flow);
-            }
-            review = r.structured.clone().unwrap_or(Value::Null);
+            let review = r.structured.clone().unwrap_or(Value::Null);
             let viol = review_violations(&review, &t.acceptance_ids);
             last = r;
             if viol.is_empty() {
-                valid = true;
-                break;
+                return Ok(ReviewTurns::Valid(ValidReview {
+                    review,
+                    last,
+                    corrections: corr,
+                }));
             }
-            eprintln!("!! invalid review (correction {}/2): {viol:?}", corr + 1);
-            corrections = corr + 1;
-            prompt = format!("Your previous final response was rejected and was not used. Validation error: {}. Return only a corrected JSON object matching the schema.", viol.join("; "));
+            eprintln!(
+                "!! invalid review (correction {}/{MAX_CORRECTIONS}): {viol:?}",
+                corr + 1
+            );
+            prompt = correction_prompt(&viol);
             resume = last.session_id.clone();
         }
-        if !valid {
-            let reason = "InvalidOutput: the review was rejected 3 times (R22)".to_string();
-            self.end_and(
-                &a,
-                AttemptStatus::Failed,
-                &last,
-                AttemptEnd {
-                    error_class: Some("InvalidOutput".into()),
-                    correction_turns: Some(2),
-                    ..Default::default()
-                },
-                Some(Ev::Escalate { reason }),
-                None,
-            )?;
-            return Ok(Flow::Next);
-        }
+        Ok(ReviewTurns::Rejected { last })
+    }
+
+    /// Publish a valid review (review.json, REVIEW.md) and apply its decision: an
+    /// inconsistent approval is downgraded to `changes_requested`, and an approval's
+    /// non-blocking issues become follow-ups (R53).
+    fn decide_review(
+        &self,
+        t: &TaskRow,
+        a: &AttemptRow,
+        head: &str,
+        valid: ValidReview,
+    ) -> Result<Flow> {
+        let ValidReview {
+            review,
+            last,
+            corrections,
+        } = valid;
         let md = super::render::render("review", &review)?;
         self.put(
             t,
-            &a,
+            a,
             "review",
             "json",
             &serde_json::to_vec_pretty(&review)?,
             "review.json",
         )?;
-        self.put(t, &a, "review-md", "md", md.as_bytes(), "REVIEW.md")?;
+        self.put(t, a, "review-md", "md", md.as_bytes(), "REVIEW.md")?;
         eprintln!("\n{md}");
-        let mut decision = review["decision"].as_str().unwrap_or("").to_string();
-        let unmet: Vec<String> = review["acceptance_criteria"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|x| x["met"].as_bool() != Some(true))
-            .filter_map(|x| x["id"].as_str().map(str::to_string))
-            .collect();
-        let blocking = review["issues"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|i| i["blocking"].as_bool() == Some(true));
-        if decision == "approved" && (!unmet.is_empty() || blocking) {
+        let verdict = ReviewVerdict::of(&review);
+        if let Some(unmet) = &verdict.downgraded {
             eprintln!("!! review_inconsistent: `approved` with unmet {unmet:?} / blocking issues → changes_requested");
-            decision = "changes_requested".into();
         }
-        let (event, feedback) = match decision.as_str() {
-            "approved" => (Ev::ReviewApproved { head: head.clone() }, None),
-            "blocked" => (Ev::ReviewBlocked { head: head.clone() }, None),
-            _ => (
-                Ev::ChangesRequested { head: head.clone() },
-                Some(review_feedback(&review)),
-            ),
-        };
-        let (i, h) = (self.id.clone(), head.clone());
+        let (i, h) = (self.id.clone(), head.to_string());
         self.store
             .call(move |tx| store::set_last_reviewed(tx, &i, &h))?;
-        if decision == "approved" {
+        if verdict.decision == ReviewDecision::Approved {
             // R53: non-blocking issues survive an approval as follow-ups
             let nb = non_blocking(&review);
             if !nb.is_empty() {
@@ -1277,21 +1302,23 @@ impl<'a> Engine<'a> {
                     "follow-ups: non-blocking review issues (R53)",
                     &format!(
                         "Review of checkpoint {} approved with these open issues:\n{}",
-                        short(&head),
+                        short(head),
                         nb.join("\n")
                     ),
                 )?;
             }
         }
+        let feedback = (verdict.decision == ReviewDecision::ChangesRequested)
+            .then(|| review_feedback(&review));
         self.end_and(
-            &a,
+            a,
             AttemptStatus::Succeeded,
             &last,
             AttemptEnd {
                 correction_turns: Some(corrections),
                 ..Default::default()
             },
-            Some(event),
+            Some(verdict.decision.event(head)),
             feedback.map(Some),
         )?;
         Ok(Flow::Next)
@@ -1402,25 +1429,7 @@ impl<'a> Engine<'a> {
             Err(e) if format!("{e:#}").starts_with("artifact_") => {
                 let reason = format!("{e:#}");
                 eprintln!("!! {reason}");
-                let class = reason
-                    .split(':')
-                    .next()
-                    .unwrap_or("artifact_tampered")
-                    .to_string();
-                let (i, aid) = (self.id.clone(), a.id.clone());
-                self.store.call(move |tx| {
-                    store::finish_attempt(
-                        tx,
-                        &aid,
-                        AttemptStatus::Failed,
-                        &AttemptEnd {
-                            error_class: Some(class),
-                            ..Default::default()
-                        },
-                    )?;
-                    store::transition(tx, &i, Ev::Escalate { reason })?;
-                    Ok(())
-                })?;
+                self.escalate_attempt(a, reason_class(&reason, "artifact_tampered"), reason)?;
                 return Ok(None);
             }
             Err(e) => return Err(e),
@@ -1581,6 +1590,399 @@ impl<'a> Engine<'a> {
         }
         Ok(())
     }
+
+    /// Finish the attempt with `end` as given, optionally set the feedback and apply a
+    /// transition — one transaction. Unlike `end_and` there is no turn outcome to take the
+    /// error or the session from, and no `[state]` line is printed.
+    fn finish_and(
+        &self,
+        a: &AttemptRow,
+        status: AttemptStatus,
+        end: AttemptEnd,
+        feedback: Option<Option<String>>,
+        e: Option<Ev>,
+    ) -> Result<()> {
+        let (i, aid) = (self.id.clone(), a.id.clone());
+        self.store.call(move |tx| {
+            store::finish_attempt(tx, &aid, status, &end)?;
+            if let Some(f) = feedback {
+                store::set_feedback(tx, &i, f.as_deref())?;
+            }
+            if let Some(e) = e {
+                store::transition(tx, &i, e)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Fail the attempt with `class` and escalate the task with `reason` (one transaction;
+    /// the caller prints the reason).
+    fn escalate_attempt(&self, a: &AttemptRow, class: String, reason: String) -> Result<()> {
+        self.finish_and(
+            a,
+            AttemptStatus::Failed,
+            AttemptEnd {
+                error_class: Some(class),
+                ..Default::default()
+            },
+            None,
+            Some(Ev::Escalate { reason }),
+        )
+    }
+}
+
+// ── stage decisions: pure, unit-tested ───────────────────────────────────────────────
+
+/// R48: the Planner resumes the session of its previous attempt, whatever its profile
+/// (EC-30).
+fn plan_resume(prev: Option<&AttemptRow>) -> Option<String> {
+    prev.and_then(|p| p.external_session_id.clone())
+}
+
+/// The Planner's prompt: the feedback on a revision, else the task (again, after an
+/// interrupted turn).
+fn plan_prompt(feedback: Option<&str>, prev: Option<AttemptStatus>, task_md: &Path) -> String {
+    match (feedback, prev) {
+        (Some(f), _) => f.to_string(),
+        (None, Some(AttemptStatus::Interrupted)) => format!(
+            "Your previous turn was interrupted before it finished. Create the plan for the task in {} again and return it.",
+            task_md.display()
+        ),
+        _ => format!("Create the plan for the task in {}.", task_md.display()),
+    }
+}
+
+/// The plan's `files_likely_involved` (checked against the path policy at plan time).
+fn plan_files(plan: &Value) -> Vec<String> {
+    plan["files_likely_involved"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
+/// An Implementer turn as prepared before admission (R48, R49).
+struct ImplementTurn {
+    /// `implement` or `fix-N`.
+    stage: String,
+    profile: String,
+    prompt: String,
+    model: Option<String>,
+    /// R48: the interrupted Claude session to resume.
+    resume: Option<String>,
+    /// R49: the implementer this attempt replaces.
+    fallback_from: Option<String>,
+}
+
+/// A finished Implementer turn and its attempt.
+struct ImplementRun {
+    attempt: AttemptRow,
+    result: StageOutcome,
+    /// HEAD when the attempt began: the HEAD guard's reference.
+    head_before: String,
+    /// The R41 live interrupt fired during the turn.
+    budget_hit: bool,
+    /// The stage's stop poller (R38), kept until the stage ends.
+    _stop: StopWatch,
+}
+
+/// What an Implementer turn leads to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImplementOutcome {
+    /// The live budget interrupt fired (R41): the attempt is interrupted, the task pauses.
+    BudgetHit,
+    /// A stop request cancelled the turn (R38).
+    Stopped,
+    /// Rate limited or overloaded: the same implementer again after `wait` (R49).
+    Retry { retry: u32, wait: Duration },
+    /// Out of quota, or still rate limited after the retries: the next implementer (R49).
+    Switch { reason: String },
+    /// Untracked/ignored protected files or Git metadata changed (R35): escalate.
+    ProtectedChanged { reason: String },
+    /// Protected or denied paths changed (§8): restore them, back to the implementer.
+    PathPolicy { paths: Vec<String> },
+    /// The turn failed and changed nothing: escalate.
+    Failed { reason: String },
+    /// On to the checkpoint.
+    Done,
+}
+
+impl ImplementOutcome {
+    /// The turn was cut short: by the live budget interrupt (which also cancels the turn),
+    /// else by a stop request.
+    fn interrupted(r: &StageOutcome, budget_hit: bool) -> Option<Self> {
+        if budget_hit {
+            Some(Self::BudgetHit)
+        } else if r.cancelled {
+            Some(Self::Stopped)
+        } else {
+            None
+        }
+    }
+
+    /// Quota and rate limits (R49): out of quota → the next implementer; rate limited or
+    /// overloaded → retry after `base × n` seconds, and after the retries → the next
+    /// implementer. `retries` is the number of retries so far.
+    fn quota(r: &StageOutcome, retries: u32, retry_base_secs: u64) -> Option<Self> {
+        match r.error_class {
+            Some(ErrorClass::QuotaExceeded) => Some(Self::Switch {
+                reason: format!(
+                    "quota exhausted: {}",
+                    r.error_detail.clone().unwrap_or_default()
+                ),
+            }),
+            Some(ErrorClass::RateLimited | ErrorClass::Overloaded)
+                if retries < RATE_LIMIT_RETRIES =>
+            {
+                let retry = retries + 1;
+                Some(Self::Retry {
+                    retry,
+                    wait: Duration::from_secs(retry_base_secs * u64::from(retry)),
+                })
+            }
+            Some(c @ (ErrorClass::RateLimited | ErrorClass::Overloaded)) => Some(Self::Switch {
+                reason: format!("{c:?} after {RATE_LIMIT_RETRIES} retries"),
+            }),
+            _ => None,
+        }
+    }
+
+    /// After the HEAD guard and the protected-state check: changed protected or denied
+    /// paths → the path policy; a failed turn that changed nothing → escalate; else on to
+    /// the checkpoint — a failed turn that left changes too (EC-15).
+    fn after_checks(r: &StageOutcome, changed: &[(String, String)], protect: &Protected) -> Self {
+        let paths: Vec<String> = changed
+            .iter()
+            .map(|c| c.1.clone())
+            .filter(|p| protect.violates(p))
+            .collect();
+        if !paths.is_empty() {
+            return Self::PathPolicy { paths };
+        }
+        if !r.success && changed.is_empty() {
+            return Self::Failed {
+                reason: format!(
+                    "implementer failed: {:?} {}",
+                    r.error_class,
+                    r.error_detail.clone().unwrap_or_default()
+                ),
+            };
+        }
+        Self::Done
+    }
+
+    /// Consecutive rate-limit retries after this outcome: a retry counts, a turn cut short
+    /// leaves the count, anything else resets it.
+    fn retries_after(&self, retries: u32) -> u32 {
+        match self {
+            Self::Retry { retry, .. } => *retry,
+            Self::BudgetHit | Self::Stopped => retries,
+            _ => 0,
+        }
+    }
+}
+
+/// The implementer at `index` of the task's chain (R49); with `--no-fallback`, only the
+/// first one — even after a sticky switch (EC-16).
+fn implementer_at(t: &TaskRow, index: usize, no_fallback: bool) -> Option<String> {
+    let limit = if no_fallback { 1 } else { t.implementers.len() };
+    t.implementers.get(index).filter(|_| index < limit).cloned()
+}
+
+/// Why the task pauses when no implementer is left (R49).
+fn implementer_quota_reason(detail: &str) -> String {
+    format!("implementer_quota: no implementer left ({detail}); the worktree keeps any partial changes — `toryo resume` when the quota is back")
+}
+
+/// The Implementer's prompt: the plan, the feedback of a fix cycle, the hand-over note.
+fn implementer_prompt(fix_cycle: u32, feedback: Option<&str>, handoff: Option<&str>) -> String {
+    let mut prompt = "Implement the approved plan (PLAN.md) for the task (TASK.md) in this worktree, following your role and the project rules in the context.\n".to_string();
+    if fix_cycle > 0 {
+        if let Some(f) = feedback {
+            prompt.push_str(&format!("\n## Fix cycle {fix_cycle}\nThe previous checkpoint was not accepted. Address the following, then report the issue ids you fixed in `resolved`:\n\n{f}\n"));
+        }
+    }
+    if let Some(h) = handoff {
+        prompt.push_str(h);
+    }
+    prompt
+}
+
+/// R48 recovery policy: Claude resumes its interrupted session; Codex starts fresh (the
+/// hand-over note written by recovery names the partial commit).
+fn implementer_resume(
+    prev: Option<&AttemptRow>,
+    kind: ProfileKind,
+    profile: &str,
+) -> Option<String> {
+    match (prev, kind) {
+        (Some(p), ProfileKind::Claude)
+            if p.status == AttemptStatus::Interrupted && p.profile.as_deref() == Some(profile) =>
+        {
+            p.external_session_id.clone()
+        }
+        _ => None,
+    }
+}
+
+/// R49: the implementer this attempt replaces — on the first attempt of a fallback profile.
+fn fallback_from(t: &TaskRow, prev: Option<&AttemptRow>, profile: &str) -> Option<String> {
+    if t.implementer_index > 0 && prev.is_none_or(|p| p.profile.as_deref() != Some(profile)) {
+        t.implementers.get(t.implementer_index - 1).cloned()
+    } else {
+        None
+    }
+}
+
+/// R49: the hand-over note for the next implementer, with the uncommitted partial changes
+/// (`<status> <path>`).
+fn handover_note(profile: &str, reason: &str, changed: &[String]) -> String {
+    if changed.is_empty() {
+        format!("\n## Hand-over\nThe previous implementer (`{profile}`) stopped before producing any change ({reason}). Start the task from the plan.\n")
+    } else {
+        format!(
+            "\n## Hand-over\nThe previous implementer (`{profile}`) stopped before finishing ({reason}). The worktree contains its UNCOMMITTED partial changes:\n{}\nInspect them, keep what is correct, fix or complete the rest, and finish the task.\n",
+            changed.iter().map(|x| format!("- `{x}`")).collect::<Vec<_>>().join("\n")
+        )
+    }
+}
+
+/// The first rate-limit backoff in seconds: `TORYO_RETRY_BASE_SECS`, default 30.
+fn retry_base_secs() -> u64 {
+    std::env::var("TORYO_RETRY_BASE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
+}
+
+/// A review that passed the checks (R28).
+struct ValidReview {
+    review: Value,
+    /// The turn that returned it.
+    last: StageOutcome,
+    /// Correction turns it took (R22).
+    corrections: u32,
+}
+
+/// How the turns of a review attempt ended.
+enum ReviewTurns {
+    Valid(ValidReview),
+    /// Still invalid after the correction turns (R22); `last` is the final turn.
+    Rejected {
+        last: StageOutcome,
+    },
+    /// The attempt has already ended (budget, stop, quota or protected state).
+    Ended(Flow),
+}
+
+/// The decision of a valid review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewDecision {
+    Approved,
+    ChangesRequested,
+    Blocked,
+}
+
+impl ReviewDecision {
+    /// The review's transition for the checkpoint `head`.
+    fn event(self, head: &str) -> Ev {
+        let head = head.to_string();
+        match self {
+            Self::Approved => Ev::ReviewApproved { head },
+            Self::ChangesRequested => Ev::ChangesRequested { head },
+            Self::Blocked => Ev::ReviewBlocked { head },
+        }
+    }
+}
+
+/// What a valid review decides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewVerdict {
+    decision: ReviewDecision,
+    /// `approved` with an unmet criterion or a blocking issue is inconsistent and becomes
+    /// `changes_requested`; then these are the unmet criteria (possibly none).
+    downgraded: Option<Vec<String>>,
+}
+
+impl ReviewVerdict {
+    fn of(review: &Value) -> Self {
+        let unmet: Vec<String> = review["acceptance_criteria"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|x| x["met"].as_bool() != Some(true))
+            .filter_map(|x| x["id"].as_str().map(str::to_string))
+            .collect();
+        let blocking = review["issues"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|i| i["blocking"].as_bool() == Some(true));
+        let (decision, downgraded) = match review["decision"].as_str().unwrap_or("") {
+            "approved" if !unmet.is_empty() || blocking => {
+                (ReviewDecision::ChangesRequested, Some(unmet))
+            }
+            "approved" => (ReviewDecision::Approved, None),
+            "blocked" => (ReviewDecision::Blocked, None),
+            _ => (ReviewDecision::ChangesRequested, None),
+        };
+        Self {
+            decision,
+            downgraded,
+        }
+    }
+}
+
+/// R48: a review of the same checkpoint by the same reviewer that was interrupted resumes
+/// its session.
+fn review_resume(prev: Option<&AttemptRow>, head: &str, reviewer: &str) -> Option<String> {
+    prev.filter(|p| {
+        p.status == AttemptStatus::Interrupted
+            && p.subject_commit.as_deref() == Some(head)
+            && p.profile.as_deref() == Some(reviewer)
+    })
+    .and_then(|p| p.external_session_id.clone())
+}
+
+/// The Reviewer's prompt; a resumed session is told that its previous turn was interrupted.
+fn review_prompt(head: &str, acceptance_ids: &[String], resumed: bool) -> String {
+    let prompt = format!(
+        "Review the checkpoint {} in this worktree against TASK.md. DIFF.patch is base → checkpoint; DIFF-incremental.patch is the change since your last review (empty on the first). Acceptance criteria ids: {:?}.",
+        short(head),
+        acceptance_ids
+    );
+    if resumed {
+        format!("Your previous review turn was interrupted before it finished. {prompt} Return the complete review.")
+    } else {
+        prompt
+    }
+}
+
+/// R22: the prompt of a correction turn, with the violations of the rejected review.
+fn correction_prompt(violations: &[String]) -> String {
+    format!("Your previous final response was rejected and was not used. Validation error: {}. Return only a corrected JSON object matching the schema.", violations.join("; "))
+}
+
+/// One verify command's entry in VERIFY_RESULT.json.
+fn command_result(c: &CommandSpec, res: &CommandResult) -> Value {
+    json!({"name": c.name, "argv": std::iter::once(c.program.clone()).chain(c.args.clone()).collect::<Vec<_>>(), "exit": res.exit, "ms": res.duration_ms, "output_tail": res.tail(40)})
+}
+
+/// The feedback of a failed verify: the last command run (the failing one) and its output.
+fn verify_feedback(results: &[Value]) -> String {
+    let f = results.last().cloned().unwrap_or(Value::Null);
+    format!(
+        "- VERIFY FAILED: `{}` exited {:?}. Last output:\n```\n{}\n```",
+        f["name"].as_str().unwrap_or(""),
+        f["exit"],
+        f["output_tail"].as_str().unwrap_or("")
+    )
+}
+
+/// The error class of a prefixed reason: `artifact_tampered: …` → `artifact_tampered`.
+fn reason_class(reason: &str, default: &str) -> String {
+    reason.split(':').next().unwrap_or(default).to_string()
 }
 
 /// The non-blocking issues of a review, one line each (R53).
@@ -1733,25 +2135,14 @@ pub fn approve_now(store: &Store, t: &TaskRow, kind: GateKind, expect: Option<&s
     eprintln!(
         "   [state] {:?} --{}_approved--> {:?}",
         t.state,
-        if kind == GateKind::Plan {
-            "plan"
-        } else {
-            "final"
-        },
+        gate_name(kind),
         m.state()
     );
     let digest = gate_digest(store, &t.id, kind, gate.occurrence).unwrap_or_default();
     super::decisions::append(
         store,
         t,
-        &format!(
-            "{} gate approved",
-            if kind == GateKind::Plan {
-                "plan"
-            } else {
-                "final"
-            }
-        ),
+        &format!("{} gate approved", gate_name(kind)),
         &format!(
             "occurrence {} · subject {} · digest {} · by {}",
             gate.occurrence,
@@ -1787,14 +2178,7 @@ pub fn reject_now(store: &Store, t: &TaskRow, kind: GateKind, reason: &str) -> R
     super::decisions::append(
         store,
         t,
-        &format!(
-            "{} gate rejected",
-            if kind == GateKind::Plan {
-                "plan"
-            } else {
-                "final"
-            }
-        ),
+        &format!("{} gate rejected", gate_name(kind)),
         &format!(
             "occurrence {} · subject {} · by {}\n\nReason: {reason}",
             gate.occurrence,
@@ -1805,14 +2189,18 @@ pub fn reject_now(store: &Store, t: &TaskRow, kind: GateKind, reason: &str) -> R
     Ok(())
 }
 
+/// The gate's name in approval rows, `[state]` lines and DECISIONS.md.
+fn gate_name(kind: GateKind) -> &'static str {
+    match kind {
+        GateKind::Plan => "plan",
+        GateKind::Final => "final",
+    }
+}
+
 pub fn gate_digest(store: &Store, task: &str, kind: GateKind, occurrence: u32) -> Result<String> {
     let t = task.to_string();
     let rows = store.call(move |tx| store::approvals(tx, &t))?;
-    let g = if kind == GateKind::Plan {
-        "plan"
-    } else {
-        "final"
-    };
+    let g = gate_name(kind);
     rows.into_iter()
         .find(|r| r.gate == g && r.occurrence == occurrence)
         .map(|r| r.subject_digest)
@@ -1902,4 +2290,972 @@ pub fn write_summary(store: &Store, t: &TaskRow) -> Result<PathBuf> {
     let p = t.artifacts().join("SUMMARY.md");
     std::fs::write(&p, s)?;
     Ok(p)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The stage decisions without the engine: no store, no git, no agents. The tests that
+    //! pin a reviewed defect (EC-xx) say so; fixing the defect means inverting them.
+
+    use super::*;
+    use crate::engine::state::Machine;
+    use ErrorClass as C;
+    use ImplementOutcome as O;
+
+    const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn outcome(success: bool, class: Option<ErrorClass>, detail: Option<&str>) -> StageOutcome {
+        StageOutcome {
+            success,
+            error_class: class,
+            error_detail: detail.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn attempt(
+        status: AttemptStatus,
+        profile: &str,
+        session: Option<&str>,
+        subject: Option<&str>,
+    ) -> AttemptRow {
+        AttemptRow {
+            id: "T-1/review/1".into(),
+            task_id: "T-1".into(),
+            stage: "review".into(),
+            attempt: 1,
+            kind: "agent".into(),
+            fallback_from: None,
+            profile: Some(profile.into()),
+            external_session_id: session.map(str::to_string),
+            pid: None,
+            pid_created_at: None,
+            status,
+            error_class: None,
+            error_detail: None,
+            git_head_before: None,
+            git_head_after: None,
+            subject_commit: subject.map(str::to_string),
+            partial_commit: None,
+            checkpoint_kind: None,
+            partial_snapshot_id: None,
+            correction_turns: 0,
+            started_at: String::new(),
+            ended_at: None,
+            context_sha256: None,
+        }
+    }
+
+    /// A task whose machine went through `events` (implementers: codex-openai → claude-max).
+    fn task_in(events: &[Ev]) -> TaskRow {
+        let mut machine = Machine::new(3);
+        for e in events {
+            machine.apply(e.clone()).expect("a valid transition");
+        }
+        TaskRow {
+            id: "T-1".into(),
+            title: "t".into(),
+            state: machine.state(),
+            task_sha256: String::new(),
+            acceptance_ids: vec!["AC-1".into(), "AC-2".into()],
+            run_store: PathBuf::from("runs").join("T-1"),
+            config_sha256: String::new(),
+            lock_generation: 1,
+            fix_cycle: machine.fix_cycle(),
+            implementer_index: 0,
+            worktree: PathBuf::from("wts").join("T-1"),
+            branch: "toryo/T-1".into(),
+            base_commit: "b".repeat(40),
+            last_reviewed_head: None,
+            spent_tokens: 0,
+            reserved_tokens: 0,
+            run_lock_owner: None,
+            run_lock_at: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            repo: PathBuf::from("repo"),
+            task_file: PathBuf::from("repo").join("TASK.md"),
+            machine,
+            implementers: vec!["codex-openai".into(), "claude-max".into()],
+            planner: "claude-max".into(),
+            reviewer: "claude-max".into(),
+            feedback: None,
+            handoff: None,
+            budget_tokens: None,
+        }
+    }
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ── plan ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn writing_stage_names_the_fix_cycle() {
+        assert_eq!(writing_stage(0), "implement");
+        assert_eq!(writing_stage(1), "fix-1");
+        assert_eq!(writing_stage(12), "fix-12");
+    }
+
+    #[test]
+    fn the_plan_prompt_prefers_feedback_then_notes_an_interrupted_turn() {
+        let task = PathBuf::from("runstore").join("TASK.md");
+        let shown = task.display().to_string();
+        let again = format!("Your previous turn was interrupted before it finished. Create the plan for the task in {shown} again and return it.");
+        let first = format!("Create the plan for the task in {shown}.");
+        let cases = [
+            (Some("Reason: x"), None, "Reason: x".to_string()),
+            (
+                Some("Reason: x"),
+                Some(AttemptStatus::Interrupted),
+                "Reason: x".to_string(),
+            ),
+            (None, Some(AttemptStatus::Interrupted), again),
+            (None, None, first.clone()),
+            (None, Some(AttemptStatus::Succeeded), first.clone()),
+            (None, Some(AttemptStatus::Failed), first.clone()),
+            (None, Some(AttemptStatus::Running), first),
+        ];
+        for (feedback, prev, want) in cases {
+            assert_eq!(
+                plan_prompt(feedback, prev, &task),
+                want,
+                "{feedback:?} {prev:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_planner_resumes_the_previous_session_of_any_profile() {
+        assert_eq!(plan_resume(None), None);
+        let none = attempt(AttemptStatus::Succeeded, "claude-max", None, None);
+        assert_eq!(plan_resume(Some(&none)), None);
+        let claude = attempt(AttemptStatus::Succeeded, "claude-max", Some("s-1"), None);
+        assert_eq!(plan_resume(Some(&claude)), Some("s-1".into()));
+        // EC-30 (not fixed): the profile is not compared, so a changed planner profile gets
+        // the previous profile's session
+        let codex = attempt(
+            AttemptStatus::Interrupted,
+            "codex-openai",
+            Some("t-1"),
+            None,
+        );
+        assert_eq!(plan_resume(Some(&codex)), Some("t-1".into()));
+    }
+
+    #[test]
+    fn plan_files_are_the_string_entries_of_files_likely_involved() {
+        let cases = [
+            (
+                json!({"files_likely_involved": ["a.ps1", 3, null, "b/c.ps1"]}),
+                strings(&["a.ps1", "b/c.ps1"]),
+            ),
+            (json!({"files_likely_involved": []}), vec![]),
+            (json!({"files_likely_involved": "a.ps1"}), vec![]),
+            (json!({}), vec![]),
+            (Value::Null, vec![]),
+        ];
+        for (plan, want) in cases {
+            assert_eq!(plan_files(&plan), want, "{plan}");
+        }
+    }
+
+    // ── implement: prepare ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn implementer_at_follows_the_chain_and_no_fallback_keeps_the_first() {
+        let t = task_in(&[]);
+        let cases = [
+            (0, false, Some("codex-openai")),
+            (1, false, Some("claude-max")),
+            (2, false, None),
+            (0, true, Some("codex-openai")),
+            // EC-16 (not fixed): after a sticky switch (index 1), --no-fallback leaves no
+            // implementer at all
+            (1, true, None),
+            (2, true, None),
+        ];
+        for (index, no_fallback, want) in cases {
+            assert_eq!(
+                implementer_at(&t, index, no_fallback).as_deref(),
+                want,
+                "index {index}, no_fallback {no_fallback}"
+            );
+        }
+        let mut one = task_in(&[]);
+        one.implementers = strings(&["codex-openai"]);
+        assert_eq!(implementer_at(&one, 1, false), None);
+    }
+
+    #[test]
+    fn the_quota_pause_reason_names_what_is_left() {
+        assert_eq!(
+            implementer_quota_reason("codex-openai → claude-max, --no-fallback"),
+            "implementer_quota: no implementer left (codex-openai → claude-max, --no-fallback); the worktree keeps any partial changes — `toryo resume` when the quota is back"
+        );
+    }
+
+    #[test]
+    fn the_implementer_prompt_adds_fix_cycle_feedback_and_the_hand_over() {
+        let base = "Implement the approved plan (PLAN.md) for the task (TASK.md) in this worktree, following your role and the project rules in the context.\n";
+        let fb = "- AC-2 NOT MET: no zero test\n";
+        let note = "\n## Hand-over\nnote\n";
+        let fix = format!("\n## Fix cycle 2\nThe previous checkpoint was not accepted. Address the following, then report the issue ids you fixed in `resolved`:\n\n{fb}\n");
+        let cases = [
+            (0, None, None, base.to_string()),
+            // feedback counts only in a fix cycle (a re-plan's feedback is the planner's)
+            (0, Some(fb), None, base.to_string()),
+            (2, None, None, base.to_string()),
+            (2, Some(fb), None, format!("{base}{fix}")),
+            (0, None, Some(note), format!("{base}{note}")),
+            (2, Some(fb), Some(note), format!("{base}{fix}{note}")),
+        ];
+        for (cycle, feedback, handoff, want) in cases {
+            assert_eq!(
+                implementer_prompt(cycle, feedback, handoff),
+                want,
+                "cycle {cycle}, {feedback:?}, {handoff:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_claude_implementer_prompt_adds_the_session_notes() {
+        let p = claude_implementer_prompt("BASE\n");
+        assert!(
+            p.starts_with("BASE\n\n## Session notes (Claude implementer)\n"),
+            "{p}"
+        );
+        assert!(p.contains("You have NO shell in this session"), "{p}");
+        assert!(
+            p.ends_with("(the run store is not accessible to you).\n"),
+            "{p}"
+        );
+    }
+
+    #[test]
+    fn only_an_interrupted_claude_implementer_resumes_its_session() {
+        use AttemptStatus::{Failed, Interrupted, Succeeded};
+        use ProfileKind::{Claude, Codex};
+        let cases = [
+            (None, Claude, "claude-max", None),
+            (
+                Some(attempt(Interrupted, "claude-max", Some("s-1"), None)),
+                Claude,
+                "claude-max",
+                Some("s-1"),
+            ),
+            // R48: Codex starts fresh, the recovery hand-over names the partial commit
+            (
+                Some(attempt(Interrupted, "codex-openai", Some("t-1"), None)),
+                Codex,
+                "codex-openai",
+                None,
+            ),
+            (
+                Some(attempt(Failed, "claude-max", Some("s-1"), None)),
+                Claude,
+                "claude-max",
+                None,
+            ),
+            (
+                Some(attempt(Succeeded, "claude-max", Some("s-1"), None)),
+                Claude,
+                "claude-max",
+                None,
+            ),
+            // another profile's session is never resumed
+            (
+                Some(attempt(Interrupted, "claude-other", Some("s-1"), None)),
+                Claude,
+                "claude-max",
+                None,
+            ),
+            (
+                Some(attempt(Interrupted, "claude-max", None, None)),
+                Claude,
+                "claude-max",
+                None,
+            ),
+        ];
+        for (prev, kind, profile, want) in cases {
+            assert_eq!(
+                implementer_resume(prev.as_ref(), kind, profile).as_deref(),
+                want,
+                "{kind:?} {profile} after {:?}",
+                prev.as_ref().map(|p| (p.status, p.profile.clone()))
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_from_names_the_replaced_implementer_on_its_first_attempt() {
+        let mut t = task_in(&[]);
+        assert_eq!(fallback_from(&t, None, "codex-openai"), None);
+        t.implementer_index = 1;
+        let codex = attempt(AttemptStatus::Failed, "codex-openai", None, None);
+        let claude = attempt(AttemptStatus::Interrupted, "claude-max", None, None);
+        assert_eq!(
+            fallback_from(&t, None, "claude-max").as_deref(),
+            Some("codex-openai")
+        );
+        assert_eq!(
+            fallback_from(&t, Some(&codex), "claude-max").as_deref(),
+            Some("codex-openai")
+        );
+        // a later attempt of the same implementer is no longer a fallback
+        assert_eq!(fallback_from(&t, Some(&claude), "claude-max"), None);
+    }
+
+    #[test]
+    fn the_hand_over_note_lists_the_partial_changes() {
+        assert_eq!(
+            handover_note("codex-openai", "quota exhausted: x", &[]),
+            "\n## Hand-over\nThe previous implementer (`codex-openai`) stopped before producing any change (quota exhausted: x). Start the task from the plan.\n"
+        );
+        assert_eq!(
+            handover_note(
+                "codex-openai",
+                "RateLimited after 2 retries",
+                &strings(&["?? src/a.ps1", " M src/b.ps1"])
+            ),
+            "\n## Hand-over\nThe previous implementer (`codex-openai`) stopped before finishing (RateLimited after 2 retries). The worktree contains its UNCOMMITTED partial changes:\n- `?? src/a.ps1`\n- ` M src/b.ps1`\nInspect them, keep what is correct, fix or complete the rest, and finish the task.\n"
+        );
+    }
+
+    // ── implement: interpret ────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_turn_is_cut_short_by_the_budget_first_then_by_a_stop() {
+        let cancelled = StageOutcome {
+            cancelled: true,
+            ..Default::default()
+        };
+        let timed_out = StageOutcome {
+            timed_out: true,
+            error_class: Some(C::Timeout),
+            ..Default::default()
+        };
+        let done = outcome(true, None, None);
+        let cases = [
+            (&done, true, Some(O::BudgetHit)),
+            // the live interrupt cancels the turn too: it is the budget, not a stop
+            (&cancelled, true, Some(O::BudgetHit)),
+            (&cancelled, false, Some(O::Stopped)),
+            (&done, false, None),
+            (&timed_out, false, None),
+        ];
+        for (r, budget_hit, want) in cases {
+            assert_eq!(ImplementOutcome::interrupted(r, budget_hit), want, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn quota_switches_and_rate_limits_retry_twice_then_switch() {
+        let secs = Duration::from_secs;
+        let cases = [
+            (None, None, 0, None),
+            (Some(C::Unknown), Some("x"), 0, None),
+            (Some(C::Timeout), None, 1, None),
+            (Some(C::PermissionDenied), None, 0, None),
+            (Some(C::ContextWindowExceeded), None, 0, None),
+            (Some(C::Auth), None, 2, None),
+            (
+                Some(C::QuotaExceeded),
+                Some("weekly limit"),
+                0,
+                Some(O::Switch {
+                    reason: "quota exhausted: weekly limit".into(),
+                }),
+            ),
+            // a quota switch does not wait for the rate-limit retries
+            (
+                Some(C::QuotaExceeded),
+                None,
+                1,
+                Some(O::Switch {
+                    reason: "quota exhausted: ".into(),
+                }),
+            ),
+            (
+                Some(C::RateLimited),
+                Some("429"),
+                0,
+                Some(O::Retry {
+                    retry: 1,
+                    wait: secs(30),
+                }),
+            ),
+            (
+                Some(C::Overloaded),
+                None,
+                1,
+                Some(O::Retry {
+                    retry: 2,
+                    wait: secs(60),
+                }),
+            ),
+            (
+                Some(C::RateLimited),
+                None,
+                2,
+                Some(O::Switch {
+                    reason: "RateLimited after 2 retries".into(),
+                }),
+            ),
+            (
+                Some(C::Overloaded),
+                None,
+                7,
+                Some(O::Switch {
+                    reason: "Overloaded after 2 retries".into(),
+                }),
+            ),
+        ];
+        for (class, detail, retries, want) in cases {
+            let r = outcome(false, class, detail);
+            assert_eq!(
+                ImplementOutcome::quota(&r, retries, 30),
+                want,
+                "{class:?} after {retries} retries"
+            );
+        }
+        // TORYO_RETRY_BASE_SECS=0 (the tests): no wait
+        let r = outcome(false, Some(C::RateLimited), None);
+        assert_eq!(
+            ImplementOutcome::quota(&r, 1, 0),
+            Some(O::Retry {
+                retry: 2,
+                wait: Duration::ZERO
+            })
+        );
+    }
+
+    #[test]
+    fn after_the_checks_the_path_policy_comes_before_a_failed_turn() {
+        let protect = Protected::new(strings(&["scripts/test.ps1"]), &[])
+            .with_policy(&[], &strings(&["**/ZZZ/**"]));
+        let ok = outcome(true, None, None);
+        let failed = outcome(false, Some(C::Unknown), Some("exit 1"));
+        let bare = outcome(false, None, None);
+        let changed = |paths: &[&str]| -> Vec<(String, String)> {
+            paths.iter().map(|p| ("??".into(), p.to_string())).collect()
+        };
+        let cases = [
+            (&ok, changed(&[]), O::Done),
+            (&ok, changed(&["src/a.ps1"]), O::Done),
+            (
+                &failed,
+                changed(&[]),
+                O::Failed {
+                    reason: "implementer failed: Some(Unknown) exit 1".into(),
+                },
+            ),
+            (
+                &bare,
+                changed(&[]),
+                O::Failed {
+                    reason: "implementer failed: None ".into(),
+                },
+            ),
+            // EC-15 (not fixed): a failed turn that left changes goes on to the checkpoint
+            (&failed, changed(&["src/a.ps1"]), O::Done),
+            (
+                &ok,
+                changed(&[
+                    "src/a.ps1",
+                    "AGENTS.md",
+                    "x/zzz/secret.txt",
+                    "scripts/test.ps1",
+                ]),
+                O::PathPolicy {
+                    paths: strings(&["AGENTS.md", "x/zzz/secret.txt", "scripts/test.ps1"]),
+                },
+            ),
+            (
+                &failed,
+                changed(&[".claude/settings.json"]),
+                O::PathPolicy {
+                    paths: strings(&[".claude/settings.json"]),
+                },
+            ),
+        ];
+        for (r, changed, want) in cases {
+            assert_eq!(
+                ImplementOutcome::after_checks(r, &changed, &protect),
+                want,
+                "{changed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_limit_retries_count_up_and_start_over_after_anything_else() {
+        let cases = [
+            (
+                O::Retry {
+                    retry: 2,
+                    wait: Duration::ZERO,
+                },
+                1,
+                2,
+            ),
+            (O::BudgetHit, 1, 1),
+            (O::Stopped, 2, 2),
+            (O::Switch { reason: "q".into() }, 2, 0),
+            (O::ProtectedChanged { reason: "p".into() }, 1, 0),
+            (O::PathPolicy { paths: vec![] }, 1, 0),
+            (O::Failed { reason: "f".into() }, 1, 0),
+            (O::Done, 1, 0),
+        ];
+        for (o, before, after) in cases {
+            assert_eq!(o.retries_after(before), after, "{o:?}");
+        }
+    }
+
+    // ── review ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_interrupted_review_of_the_same_checkpoint_resumes_its_session() {
+        use AttemptStatus::{Failed, Interrupted};
+        let cases = [
+            (None, None),
+            (
+                Some(attempt(Interrupted, "claude-max", Some("s-1"), Some(HEAD))),
+                Some("s-1"),
+            ),
+            // another checkpoint, reviewer or status: a fresh session
+            (
+                Some(attempt(
+                    Interrupted,
+                    "claude-max",
+                    Some("s-1"),
+                    Some("f00d"),
+                )),
+                None,
+            ),
+            (
+                Some(attempt(Interrupted, "claude-max", Some("s-1"), None)),
+                None,
+            ),
+            (
+                Some(attempt(
+                    Interrupted,
+                    "codex-openai",
+                    Some("s-1"),
+                    Some(HEAD),
+                )),
+                None,
+            ),
+            (
+                Some(attempt(Failed, "claude-max", Some("s-1"), Some(HEAD))),
+                None,
+            ),
+            (
+                Some(attempt(Interrupted, "claude-max", None, Some(HEAD))),
+                None,
+            ),
+        ];
+        for (prev, want) in cases {
+            assert_eq!(
+                review_resume(prev.as_ref(), HEAD, "claude-max").as_deref(),
+                want,
+                "{:?}",
+                prev.as_ref()
+                    .map(|p| (p.status, p.profile.clone(), p.subject_commit.clone()))
+            );
+        }
+    }
+
+    #[test]
+    fn the_review_prompt_names_the_checkpoint_and_the_criteria() {
+        let ids = strings(&["AC-1", "AC-2"]);
+        let fresh = "Review the checkpoint 0123456789ab in this worktree against TASK.md. DIFF.patch is base → checkpoint; DIFF-incremental.patch is the change since your last review (empty on the first). Acceptance criteria ids: [\"AC-1\", \"AC-2\"].";
+        assert_eq!(review_prompt(HEAD, &ids, false), fresh);
+        assert_eq!(
+            review_prompt(HEAD, &ids, true),
+            format!("Your previous review turn was interrupted before it finished. {fresh} Return the complete review.")
+        );
+        // a short head is shown as it is
+        assert!(review_prompt("abc", &[], false).contains("checkpoint abc in"));
+    }
+
+    #[test]
+    fn review_violations_seen_by_the_correction_loop() {
+        let ids = strings(&["AC-1", "AC-2"]);
+        let ac = |id: &str, met: bool, ev: &str| json!({"id": id, "met": met, "evidence": ev});
+        let cases = [
+            // no structured output at all: the loop checks `Value::Null`
+            (
+                Value::Null,
+                vec![
+                    "decision must be approved|changes_requested|blocked, got ``",
+                    "missing acceptance criteria: [\"AC-1\", \"AC-2\"]",
+                ],
+            ),
+            (
+                json!({"decision": "approved", "acceptance_criteria": [ac("AC-1", true, "a.ps1:3"), ac("AC-2", true, "t")], "issues": []}),
+                vec![],
+            ),
+            // a placeholder counts only for a met criterion; trimmed, any case
+            (
+                json!({"decision": "approved", "acceptance_criteria": [ac("AC-1", true, " N/A "), ac("AC-2", false, "n/a")]}),
+                vec!["AC-1: evidence is empty or a placeholder"],
+            ),
+            (
+                json!({"decision": "blocked", "acceptance_criteria": [ac("AC-1", false, ""), {"id": "AC-2", "met": true}]}),
+                vec![
+                    "AC-1: evidence is empty or a placeholder",
+                    "AC-2: evidence is empty or a placeholder",
+                ],
+            ),
+            (
+                json!({"decision": "approved", "acceptance_criteria": [ac("AC-1", true, "e"), ac("AC-1", true, "e"), ac("AC-2", true, "e")]}),
+                vec!["duplicate acceptance-criteria ids"],
+            ),
+            (
+                json!({"decision": "approved", "acceptance_criteria": [ac("AC-1", true, "e"), ac("AC-2", true, "e"), ac("AC-9", true, "e")]}),
+                vec!["unknown acceptance criteria: [\"AC-9\"]"],
+            ),
+            (
+                json!({"decision": "approved", "acceptance_criteria": [{"met": true, "evidence": ""}]}),
+                vec![
+                    "missing acceptance criteria: [\"AC-1\", \"AC-2\"]",
+                    "?: evidence is empty or a placeholder",
+                ],
+            ),
+            (
+                json!({"decision": "changes_requested", "acceptance_criteria": [ac("AC-1", true, "e"), ac("AC-2", true, "e")], "issues": []}),
+                vec!["changes_requested needs at least one unmet criterion or one issue"],
+            ),
+            (
+                json!({"decision": "changes_requested", "acceptance_criteria": [ac("AC-1", true, "e"), ac("AC-2", false, "no test")]}),
+                vec![],
+            ),
+        ];
+        for (review, want) in cases {
+            assert_eq!(review_violations(&review, &ids), want, "{review}");
+        }
+    }
+
+    #[test]
+    fn a_correction_prompt_quotes_the_violations() {
+        let viol = review_violations(&Value::Null, &strings(&["AC-1"]));
+        assert_eq!(
+            correction_prompt(&viol),
+            "Your previous final response was rejected and was not used. Validation error: decision must be approved|changes_requested|blocked, got ``; missing acceptance criteria: [\"AC-1\"]. Return only a corrected JSON object matching the schema."
+        );
+    }
+
+    #[test]
+    fn an_inconsistent_approval_becomes_changes_requested() {
+        use ReviewDecision::{Approved, Blocked, ChangesRequested};
+        let ac = |id: &str, met: Value| json!({"id": id, "met": met, "evidence": "e"});
+        let blocking =
+            json!({"id": "I-1", "severity": "high", "blocking": true, "description": "d"});
+        let minor = json!({"id": "I-2", "severity": "low", "blocking": false, "description": "d"});
+        let cases = [
+            (
+                json!({"decision": "approved", "acceptance_criteria": [ac("AC-1", json!(true))], "issues": [minor]}),
+                Approved,
+                None,
+            ),
+            (
+                json!({"decision": "approved", "acceptance_criteria": [ac("AC-1", json!(true)), ac("AC-2", json!(false))]}),
+                ChangesRequested,
+                Some(vec!["AC-2"]),
+            ),
+            // `met` missing or not a boolean is unmet
+            (
+                json!({"decision": "approved", "acceptance_criteria": [{"id": "AC-3", "evidence": "e"}, ac("AC-4", json!("yes"))]}),
+                ChangesRequested,
+                Some(vec!["AC-3", "AC-4"]),
+            ),
+            (
+                json!({"decision": "approved", "acceptance_criteria": [ac("AC-1", json!(true))], "issues": [minor, blocking]}),
+                ChangesRequested,
+                Some(vec![]),
+            ),
+            // only `blocking: true` blocks
+            (
+                json!({"decision": "approved", "issues": [{"id": "I-3", "blocking": "true"}]}),
+                Approved,
+                None,
+            ),
+            // an unmet criterion without an id does not count (R28 checks reject it first)
+            (
+                json!({"decision": "approved", "acceptance_criteria": [{"met": false}]}),
+                Approved,
+                None,
+            ),
+            (
+                json!({"decision": "blocked", "acceptance_criteria": [ac("AC-1", json!(false))], "issues": [blocking]}),
+                Blocked,
+                None,
+            ),
+            (
+                json!({"decision": "changes_requested", "acceptance_criteria": [ac("AC-1", json!(false))]}),
+                ChangesRequested,
+                None,
+            ),
+            (json!({"decision": "maybe"}), ChangesRequested, None),
+            (json!({}), ChangesRequested, None),
+        ];
+        for (review, decision, downgraded) in cases {
+            assert_eq!(
+                ReviewVerdict::of(&review),
+                ReviewVerdict {
+                    decision,
+                    downgraded: downgraded.map(|d| strings(&d)),
+                },
+                "{review}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_review_decision_is_the_transition_for_its_checkpoint() {
+        let head = || HEAD.to_string();
+        assert_eq!(
+            ReviewDecision::Approved.event(HEAD),
+            Ev::ReviewApproved { head: head() }
+        );
+        assert_eq!(
+            ReviewDecision::ChangesRequested.event(HEAD),
+            Ev::ChangesRequested { head: head() }
+        );
+        assert_eq!(
+            ReviewDecision::Blocked.event(HEAD),
+            Ev::ReviewBlocked { head: head() }
+        );
+    }
+
+    #[test]
+    fn review_feedback_lists_the_unmet_criteria_then_every_issue() {
+        let cases = [
+            (json!({}), ""),
+            (json!({"acceptance_criteria": "x", "issues": null}), ""),
+            (
+                json!({"acceptance_criteria": [{"id": "AC-1", "met": true, "evidence": "ok"}], "issues": []}),
+                "",
+            ),
+            (
+                json!({"acceptance_criteria": [
+                    {"id": "AC-1", "met": false, "evidence": "no test"},
+                    {"id": "AC-2", "evidence": "met missing"},
+                    {"id": "AC-3", "met": "yes", "evidence": "not a boolean"},
+                    {"id": "AC-4", "met": true, "evidence": "e"},
+                    {"met": false}]}),
+                "- AC-1 NOT MET: no test\n- AC-2 NOT MET: met missing\n- AC-3 NOT MET: not a boolean\n-  NOT MET: \n",
+            ),
+            (
+                json!({"issues": [
+                    {"id": "I-1", "severity": "high", "blocking": true, "file": "src/a.ps1", "description": "d1"},
+                    {"id": "I-2", "severity": "low", "blocking": false, "description": "d2"},
+                    {}]}),
+                "- I-1 [high, blocking] src/a.ps1: d1\n- I-2 [low] d2\n-  [] \n",
+            ),
+            (
+                json!({"acceptance_criteria": [{"id": "AC-2", "met": false, "evidence": "e"}],
+                       "issues": [{"id": "I-1", "severity": "medium", "description": "d"}]}),
+                "- AC-2 NOT MET: e\n- I-1 [medium] d\n",
+            ),
+        ];
+        for (review, want) in cases {
+            assert_eq!(review_feedback(&review), want, "{review}");
+        }
+    }
+
+    #[test]
+    fn non_blocking_keeps_every_issue_not_marked_blocking() {
+        let cases = [
+            (
+                json!({"issues": [
+                    {"id": "I-1", "severity": "high", "blocking": true, "description": "b"},
+                    {"id": "I-2", "severity": "low", "blocking": false, "file": "src/x.ps1", "description": "nb"},
+                    {"id": "I-3", "severity": "medium", "description": "no flag"},
+                    {"id": "I-4", "severity": "low", "blocking": "true", "description": "a string"}]}),
+                vec![
+                    "- I-2 [low] src/x.ps1: nb",
+                    "- I-3 [medium] no flag",
+                    "- I-4 [low] a string",
+                ],
+            ),
+            (json!({"issues": [{}]}), vec!["-  [] "]),
+            (json!({"issues": []}), vec![]),
+            (json!({"issues": {}}), vec![]),
+            (json!({}), vec![]),
+        ];
+        for (review, want) in cases {
+            assert_eq!(non_blocking(&review), want, "{review}");
+        }
+    }
+
+    // ── verify ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_command_result_records_argv_exit_time_and_the_output_tail() {
+        let c = CommandSpec {
+            name: "test".into(),
+            program: "pwsh".into(),
+            args: strings(&["-File", "scripts/test.ps1"]),
+            timeout_min: None,
+        };
+        let output: String = (1..=45).map(|i| format!("line {i}\n")).collect();
+        let res = CommandResult {
+            name: "test".into(),
+            exit: Some(1),
+            timed_out: false,
+            cancelled: false,
+            duration_ms: 1500,
+            output,
+        };
+        let tail: Vec<String> = (6..=45).map(|i| format!("line {i}")).collect();
+        assert_eq!(
+            command_result(&c, &res),
+            json!({"name": "test", "argv": ["pwsh", "-File", "scripts/test.ps1"], "exit": 1, "ms": 1500, "output_tail": tail.join("\n")})
+        );
+        let stopped = CommandResult {
+            exit: None,
+            output: String::new(),
+            ..res
+        };
+        assert_eq!(command_result(&c, &stopped)["exit"], Value::Null);
+        assert_eq!(command_result(&c, &stopped)["output_tail"], json!(""));
+    }
+
+    #[test]
+    fn verify_feedback_quotes_the_last_command_and_its_output() {
+        let failed = [
+            json!({"name": "build", "exit": 0, "output_tail": "ok"}),
+            json!({"name": "test", "exit": 1, "output_tail": "1 failed\nat line 3"}),
+        ];
+        let stopped = [json!({"name": "slow", "exit": null, "output_tail": ""})];
+        // the exit code is shown with the Debug format of a JSON value ("Number(1)")
+        let cases: [(&[Value], &str); 3] = [
+            (
+                &failed,
+                "- VERIFY FAILED: `test` exited Number(1). Last output:\n```\n1 failed\nat line 3\n```",
+            ),
+            (
+                &stopped,
+                "- VERIFY FAILED: `slow` exited Null. Last output:\n```\n\n```",
+            ),
+            (&[], "- VERIFY FAILED: `` exited Null. Last output:\n```\n\n```"),
+        ];
+        for (results, want) in cases {
+            assert_eq!(verify_feedback(results), want, "{results:?}");
+        }
+    }
+
+    #[test]
+    fn the_error_class_is_the_reason_up_to_the_first_colon() {
+        let cases = [
+            ("artifact_tampered: TASK.md of T-1 …", "artifact_tampered"),
+            ("verify_mutated_tree: a: b", "verify_mutated_tree"),
+            ("no colon at all", "no colon at all"),
+            (": leading", ""),
+            ("", ""),
+        ];
+        for (reason, want) in cases {
+            assert_eq!(reason_class(reason, "default"), want, "{reason:?}");
+        }
+    }
+
+    // ── gates and the next action ───────────────────────────────────────────────────
+
+    #[test]
+    fn gate_names_match_the_approval_rows() {
+        assert_eq!(gate_name(GateKind::Plan), "plan");
+        assert_eq!(gate_name(GateKind::Final), "final");
+    }
+
+    #[test]
+    fn next_action_names_the_command_for_every_state() {
+        let head = || HEAD.to_string();
+        let implementing = vec![
+            Ev::Start,
+            Ev::PlanReady {
+                subject: "p".into(),
+            },
+            Ev::PlanApproved {
+                occurrence: 1,
+                subject: "p".into(),
+            },
+        ];
+        let with = |base: &[Ev], more: &[Ev]| -> Vec<Ev> { [base, more].concat() };
+        let checkpointing = with(&implementing, &[Ev::ImplementationDone]);
+        let verifying = with(&checkpointing, &[Ev::Checkpointed { head: head() }]);
+        let reviewing = with(&verifying, &[Ev::VerifyPassed { head: head() }]);
+        let final_gate = with(&reviewing, &[Ev::ReviewApproved { head: head() }]);
+        let run = "`toryo run T-1` (or `toryo resume T-1` after a crash)".to_string();
+        let plan_md = task_in(&[])
+            .artifacts()
+            .join("PLAN.md")
+            .display()
+            .to_string();
+        let escalated = |reason: &str| {
+            vec![
+                Ev::Start,
+                Ev::Escalate {
+                    reason: reason.into(),
+                },
+            ]
+        };
+        let protected = format!("{}: AGENTS.md changed", protect::REASON);
+        let cases = [
+            (vec![], "`toryo run T-1`".to_string()),
+            (vec![Ev::Start], run.clone()),
+            (implementing.clone(), run.clone()),
+            (checkpointing, run.clone()),
+            (verifying, run.clone()),
+            (reviewing.clone(), run.clone()),
+            (with(&reviewing, &[Ev::ChangesRequested { head: head() }]), run),
+            (
+                with(&implementing[..2], &[]),
+                format!("review {plan_md}, then `toryo approve T-1 --gate plan --continue` or `toryo reject T-1 --gate plan --reason \"…\"`"),
+            ),
+            (
+                final_gate.clone(),
+                "review the branch toryo/T-1 (REVIEW.md in the run store), then `toryo approve T-1 --gate final` or `toryo reject T-1 --gate final --reason \"…\"`".to_string(),
+            ),
+            (
+                with(&final_gate, &[Ev::FinalApproved { occurrence: 2, subject: head() }]),
+                "done — merge `toryo/T-1` yourself (toryo never merges); `toryo task cleanup T-1` afterwards".to_string(),
+            ),
+            (
+                escalated(&protected),
+                format!("{protected}\n  → restore the file(s) and `toryo resume T-1`, or `toryo resume T-1 --accept-protected-change <path>` (recorded in DECISIONS.md)"),
+            ),
+            (
+                escalated("recovery_policy_violation: partial"),
+                "recovery_policy_violation: partial\n  → `toryo resume T-1 --discard-partial` (after a snapshot check) or fix the worktree by hand and `toryo resume T-1 --keep-partial`".to_string(),
+            ),
+            (
+                escalated("the reviewer blocked the task"),
+                "the reviewer blocked the task\n  → `toryo resume T-1 --note \"…\"` (another fix cycle), `toryo approve T-1 --gate final --force`, or give up: `toryo task cleanup T-1`".to_string(),
+            ),
+            (
+                vec![Ev::Start, Ev::Pause { reason: "planner_quota: x".into() }],
+                "paused — planner_quota: x\n  → `toryo resume T-1`".to_string(),
+            ),
+            (vec![Ev::Cancel], "cancelled — `toryo task cleanup T-1`".to_string()),
+            (
+                vec![Ev::Fail { error: "boom".into() }],
+                "failed: boom — `toryo task cleanup T-1`".to_string(),
+            ),
+        ];
+        for (events, want) in cases {
+            let t = task_in(&events);
+            assert_eq!(next_action(&t), want, "{:?}", t.state);
+        }
+        // a budget pause shows what is used (spent + reserved) of the cap
+        let mut t = task_in(&[Ev::Start, Ev::BudgetExceeded]);
+        (t.spent_tokens, t.reserved_tokens, t.budget_tokens) = (900, 200, Some(1000));
+        assert_eq!(
+            next_action(&t),
+            "paused (budget): 1100 of 1000 tokens used — `toryo budget set T-1 --tokens N`, then `toryo resume T-1`"
+        );
+    }
 }
