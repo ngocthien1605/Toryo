@@ -122,7 +122,9 @@ pub fn import_codex_profile(
         }
     }
     for (k, v) in prof {
-        if SKIP_PROFILE_KEYS.contains(&k.as_str()) {
+        if SKIP_PROFILE_KEYS.contains(&k.as_str())
+            || crate::config::denied_override(k, false).is_some()
+        {
             warnings.push(format!(
                 "not imported from [profiles.{name}]: `{k}` (toryo sets its own policy)"
             ));
@@ -435,6 +437,30 @@ experimental_bearer_token = "sk-should-not-travel"
         assert!(!yaml.contains("codex-foundry:"));
         assert!(yaml.contains("CODEX_HOME"));
         assert!(warnings.iter().any(|w| w.contains("SKIPPED")));
+    }
+
+    /// Keys that config validation refuses in `codex.overrides` are not imported, so the
+    /// generated configuration always loads (ARCH-05).
+    #[test]
+    fn sandbox_like_keys_are_not_imported() {
+        let cfg = format!(
+            "{CFG}\n[profiles.loose]\nmodel = \"gpt-5\"\nsandbox_permissions = [\"disk-full-read-access\"]\nwindows.sandbox = \"elevated\"\n"
+        );
+        let imp = import_codex_profile(&cfg, "loose", "codex.cmd", "unelevated").unwrap();
+        let o = &imp.profile.codex.as_ref().unwrap().overrides;
+        assert!(
+            o.keys()
+                .all(|k| crate::config::denied_override(k, false).is_none()),
+            "{o:?}"
+        );
+        assert!(!o.contains_key("sandbox_permissions"), "{o:?}");
+        assert!(
+            imp.warnings
+                .iter()
+                .any(|w| w.contains("sandbox_permissions")),
+            "{:?}",
+            imp.warnings
+        );
     }
 
     #[test]

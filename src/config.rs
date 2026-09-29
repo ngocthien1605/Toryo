@@ -59,7 +59,7 @@ fn default_wire_api() -> String {
     "responses".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CodexSettings {
     #[serde(default = "default_sandbox_mode")]
@@ -77,6 +77,21 @@ pub struct CodexSettings {
 }
 fn default_sandbox_mode() -> String {
     "workspace-write".into()
+}
+
+/// The same defaults as a `codex:` block that sets nothing: a Codex profile without a
+/// `codex:` block runs with `sandbox_mode = workspace-write`, not an empty value.
+impl Default for CodexSettings {
+    fn default() -> Self {
+        Self {
+            sandbox_mode: default_sandbox_mode(),
+            windows_sandbox: None,
+            provider: None,
+            project_doc_max_bytes: None,
+            model_reasoning_effort: None,
+            overrides: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -470,7 +485,7 @@ fn problems(repo: &RepoConfig) -> Vec<String> {
 /// re-set; without one, overrides are how `toryo spike init-config` selects the provider of a
 /// translated Codex profile. The key is taken as Codex reads it: up to the first `=`,
 /// without whitespace or quotes.
-fn denied_override(key: &str, has_provider: bool) -> Option<&'static str> {
+pub fn denied_override(key: &str, has_provider: bool) -> Option<&'static str> {
     let k: String = key
         .split('=')
         .next()
@@ -775,6 +790,15 @@ policy:
         );
         load_str(&SAMPLE.replace("windows_sandbox: unelevated", "windows_sandbox: elevated"))
             .unwrap();
+    }
+
+    /// A Codex profile without a `codex:` block gets the documented defaults, not an
+    /// empty `sandbox_mode` (which the launch preflight would refuse).
+    #[test]
+    fn default_codex_settings_use_workspace_write() {
+        let d = CodexSettings::default();
+        assert_eq!(d.sandbox_mode, "workspace-write");
+        assert!(d.windows_sandbox.is_none() && d.overrides.is_empty() && d.provider.is_none());
     }
 
     /// ARCH-05: overrides that would re-set the sandbox, approvals or environment policy.

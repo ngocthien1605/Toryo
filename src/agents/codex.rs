@@ -114,6 +114,13 @@ impl CodexLaunch {
                 self.settings.sandbox_mode
             ));
         }
+        // a frozen configuration is not validated again, so check the overrides here too
+        let has_provider = self.settings.provider.is_some();
+        for k in self.settings.overrides.keys() {
+            if let Some(why) = crate::config::denied_override(k, has_provider) {
+                w.push(format!("codex.overrides.{k} {why}"));
+            }
+        }
         w
     }
 }
@@ -386,6 +393,23 @@ mod tests {
             resume_thread: None,
             extra_args: vec![],
         }
+    }
+
+    /// A frozen configuration is not validated again at load, so the launch preflight
+    /// refuses the overrides that config validation refuses (ARCH-05).
+    #[test]
+    fn preflight_refuses_overrides_that_reset_the_sandbox() {
+        let mut l = launch();
+        assert!(!l.preflight().iter().any(|w| w.contains("overrides")));
+        l.settings
+            .overrides
+            .insert("sandbox_mode".into(), "\"danger-full-access\"".into());
+        let w = l.preflight();
+        assert!(
+            w.iter()
+                .any(|w| w.contains("codex.overrides.sandbox_mode") && w.contains("sandbox")),
+            "{w:?}"
+        );
     }
 
     #[test]
