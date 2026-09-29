@@ -47,7 +47,7 @@ impl Fences {
                 true
             }
             None => {
-                for c in [b'`', b'~'] {
+                for c in *b"`~" {
                     let k = run(c);
                     // an info string after backticks may not contain a backtick (inline code)
                     if k >= 3 && !(c == b'`' && t[k..].contains(&b'`')) {
