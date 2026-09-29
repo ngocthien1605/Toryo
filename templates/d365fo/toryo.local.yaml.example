@@ -1,0 +1,72 @@
+# D365FO machine config (M9-C1) — %USERPROFILE%\.toryo\toryo.local.yaml on the UDE machine,
+# outside every repository. The ONLY place for agent profiles and the X++ toolchain (R59/R60).
+# Merge it with what the file already holds (one `profiles:`, one `roles:`, one `git:`).
+#
+# TODO(owner):
+#   1. profiles.*.exe — where claude.exe and codex.exe are installed on this machine.
+#   2. claude-foundry / codex-foundry — the Foundry resource, the deployment names, the base_url.
+#   3. secret_env — the Credential Manager targets (`toryo secrets set toryo/<name>`).
+#   4. codex-foundry.env.CODEX_HOME — a folder of its own (auth and sessions only).
+#   5. toolchains.xpp.msbuild — `toryo doctor` proposes the path vswhere finds.
+#   6. toolchains.xpp.nugets — the five CI/CD NuGets for the release the UDE runs, extracted.
+#   7. toolchains.xpp.ude_metadata — the UDE's PackagesLocalDirectory (version check only).
+#   8. roles — which Claude profile plans and reviews on this machine.
+#   9. git.trusted_filters — only if the repository uses Git LFS (Open decision 14).
+profiles:
+  claude-max:                               # personal machine: Claude Max subscription
+    kind: claude
+    billing: subscription
+    exe: C:\Users\<you>\.local\bin\claude.exe            # TODO(owner) 1
+    version: "2.1.x"
+    env:
+      CLAUDE_CODE_GIT_BASH_PATH: C:\Program Files\Git\bin\bash.exe
+
+  claude-foundry:                           # company laptop: approved Foundry models
+    kind: claude
+    billing: foundry
+    exe: C:\Users\<you>\.local\bin\claude.exe            # TODO(owner) 1
+    version: "2.1.x"
+    env:
+      CLAUDE_CODE_USE_FOUNDRY: "1"
+      ANTHROPIC_FOUNDRY_RESOURCE: my-foundry             # TODO(owner) 2
+      ANTHROPIC_DEFAULT_OPUS_MODEL: claude-opus-5-5      # TODO(owner) 2
+      CLAUDE_CODE_GIT_BASH_PATH: C:\Program Files\Git\bin\bash.exe
+    secret_env:
+      ANTHROPIC_FOUNDRY_API_KEY: credman:toryo/foundry-claude   # TODO(owner) 3
+
+  codex-foundry:
+    kind: codex
+    billing: foundry
+    exe: C:\tools\codex\codex.exe                        # TODO(owner) 1
+    model: gpt-5-codex                                   # TODO(owner) 2: the deployment name
+    env:
+      CODEX_HOME: C:\Users\<you>\.toryo\codex-home       # TODO(owner) 4
+    secret_env:
+      AZURE_OPENAI_API_KEY: credman:toryo/foundry-openai # TODO(owner) 3
+    codex:
+      sandbox_mode: workspace-write
+      windows_sandbox: unelevated                        # R18: without it the Windows sandbox is OFF
+      provider:
+        id: foundry
+        name: Azure Foundry
+        base_url: https://my-foundry.openai.azure.com/openai/v1   # TODO(owner) 2
+        env_key: AZURE_OPENAI_API_KEY
+        wire_api: responses
+
+toolchains:
+  xpp:
+    msbuild: 'C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe'   # TODO(owner) 5
+    nugets: 'D:\D365\cicd-nugets\10.0.45'                # TODO(owner) 6
+    extra_references: []                                 # folders of binary packages the models reference (ISV)
+    bp_check: false                                      # xppbp.exe: not supported yet (V08-VERIFY 4)
+    ude_metadata: '%LOCALAPPDATA%\Microsoft\Dynamics365\10.0.2345.12\PackagesLocalDirectory'   # TODO(owner) 7
+
+roles:                                      # TODO(owner) 8 — override the repository's roles on this machine
+  planner:  { profile: claude-max, model: opus }
+  reviewer: { profile: claude-max, model: opus }
+
+git:
+  trusted_filters: {}                       # TODO(owner) 9 — with Git LFS:
+  #   lfs:
+  #     process: '"C:\Program Files\Git LFS\git-lfs.exe" filter-process'
+  #     required: true

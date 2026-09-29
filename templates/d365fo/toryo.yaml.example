@@ -1,0 +1,68 @@
+# D365FO repository config (M9-C1) — copy to the root of the D365FO repository as `toryo.yaml`.
+# The repository part only: no `profiles:` and no `toolchains:` here (R60) — they are in the
+# machine config, %USERPROFILE%\.toryo\toryo.local.yaml (see toryo.local.yaml.example).
+#
+# TODO(owner):
+#   1. project.root / project.worktrees_root — the repository and a worktree folder on the UDE machine.
+#   2. commands.verify[0].metadata — the X++ source folder of the repository (usually Metadata).
+#   3. commands.verify[0].projects — one dedicated build project per package, in build order.
+#   4. policy.deny_paths — the exact ZZZ rule (the folder pattern of local-only models).
+#   5. verify.checkout — `clean` until Open decision 9 is closed (V08-VERIFY 2 measures `tracked`).
+#   6. verify.boundary — `low_integrity` until V08-VERIFY 3 says otherwise (Open decision 12).
+#   7. roles — profile names the machine config defines (company laptop: claude-foundry).
+version: 1
+project:
+  root: D:\D365-Git                         # TODO(owner) 1
+  worktrees_root: D:\D365-worktrees         # TODO(owner) 1
+  runs_root: '%LOCALAPPDATA%\toryo\runs'
+  base_branch: main
+
+roles:                                      # names of profiles the machine config defines (R60)
+  planner:     { profile: claude-max, model: opus }
+  implementer: { profile: codex-foundry, fallback: [claude-max] }
+  reviewer:    { profile: claude-max, model: opus }
+
+pipeline:
+  max_fix_cycles: 3
+  budget_tokens: 2000000
+
+policy:
+  deny_paths: ["**/ZZZ/**", "**/*.pfx", "**/.env*"]   # TODO(owner) 4
+  protected_paths:
+    - "@verify-scripts"                     # the build projects of tool: xpp and every Directory.Build.* (R59)
+    - "toryo.yaml"
+    - ".toryo/**"
+    - "AGENTS.md"
+    - "CLAUDE.md"
+    - ".claude/**"
+    - ".codex/**"
+    - ".mcp.json"
+    - ".gitattributes"
+    - ".githooks/**"
+    - "toryo.local.yaml"
+    - ".gitmodules"
+  neutralize_untrusted_filters: false
+  allow_submodules: false
+  allow_codex_project_config: false
+
+verify:
+  checkout: clean                           # TODO(owner) 5
+  boundary: low_integrity                   # TODO(owner) 6
+  verify_root: '%LOCALAPPDATA%\toryo-verify'
+  final_clean: true
+
+commands:
+  verify:
+    - name: build
+      tool: xpp                             # toryo writes the MSBuild command from the machine's toolchains.xpp
+      metadata: Metadata                    # TODO(owner) 2
+      projects:                             # TODO(owner) 3 — one per package, in build order
+        - Projects/Build/ContosoCore.Build.rnrproj
+      timeout_min: 90
+
+timeouts:
+  agent_stall_min: 10
+  agent_stage_max_min: 60
+
+context:
+  budget_kb: { implementer: 60 }            # the policy files in .toryo/context are never trimmed

@@ -647,12 +647,49 @@ Mẹo viết AC (giống viết FDD tốt):
 - Có ít nhất một AC về **test** → Codex buộc phải viết test, Claude có evidence để chấm.
 - Task nhỏ (≤ ½ ngày công người) → plan ngắn, review chính xác, ít vòng fix.
 
-### 7.3 Với D365FO?
+### 7.3 Với D365FO (X++) — thiết lập repo trên máy UDE (M9)
 
-X++ cần build trên VM dev (xppc / MSBuild, DB sync) — nặng và lâu. Hiện tại nên dùng Toryo cho các phần
-chạy được bằng script trên máy anh: **PowerShell tooling (deploy, LCS/Azure DevOps automation), Power Platform
-(solution unpack/pack + test), Azure Functions / Logic Apps code, data migration scripts (DMF packages)**.
-Khi có lệnh build/test X++ chạy không tương tác trên dev VM, chỉ cần khai báo nó trong `commands.verify`.
+Toryo chạy trên chính máy UDE của anh (Visual Studio 2022 + extension F&O). Verify build X++ giống pipeline
+build của Microsoft (MSBuild + 5 gói NuGet CI/CD) — **chỉ chứng minh compile**, không DB sync, không SysTest.
+Bộ mẫu nằm ở `templates\d365fo\`; mỗi file liệt kê các mục `TODO(owner)` ở đầu.
+
+1. **Copy mẫu vào repo D365FO**
+   ```powershell
+   $kit = 'C:\.thien\AgentOrchestrator\toryo\templates\d365fo'
+   Copy-Item "$kit\toryo.yaml.example" D:\D365-Git\toryo.yaml
+   Copy-Item "$kit\.toryo" D:\D365-Git\.toryo -Recurse
+   New-Item -ItemType Directory -Force D:\D365-Git\tasks | Out-Null
+   Copy-Item "$kit\TASK.example.md" D:\D365-Git\tasks\TASK.example.md
+   # phần máy: GỘP vào file đang có (một profiles:, một roles:, một git:)
+   notepad $env:USERPROFILE\.toryo\toryo.local.yaml    # dán từ $kit\toryo.local.yaml.example
+   ```
+2. **Điền các `TODO(owner)`**: đường dẫn repo/worktree, thư mục `Metadata`, danh sách build project, quy tắc
+   ZZZ (`policy.deny_paths`); trong `.toryo\context\`: model/package, prefix công ty, label file và ngôn ngữ
+   (en-US, ja), checklist reviewer. Phần máy: exe của claude/codex, Foundry, `toolchains.xpp`.
+   Commit `toryo.yaml` và `.toryo\` (sau đó agent không sửa được — protected).
+3. **Tạo build project cho từng package**: trong Visual Studio tạo một Finance and Operations project cho mỗi
+   package, đặt Model = model của package, lưu thành `Projects\Build\<Package>.Build.rnrproj` (không cần object:
+   package luôn được build nguyên gói), commit. Các project này và mọi `Directory.Build.*` được bảo vệ.
+4. **Tải NuGet CI/CD**: Visual Studio › Tools › Options › Power Platform Tools › General › bật
+   *Download Dynamics 365 FnO NuGets for CI/CD*; rồi Tools › *Download Dynamics365 FnO NuGets for CI/CD* đúng
+   release UDE đang chạy. Mỗi gói một thư mục trong `toolchains.xpp.nugets`; nếu chỉ có file `.nupkg` thì giải
+   nén (`mkdir <id>; tar -xf <id>.<ver>.nupkg -C <id>`) — `toryo doctor` sẽ báo gói nào thiếu.
+5. **`toryo doctor`** (trong thư mục repo): các dòng `xpp` phải OK — MSBuild (thiếu thì doctor đề xuất đường
+   dẫn vswhere tìm được), 5 gói + version, version UDE (khác version NuGet → WARN), metadata và project có thật.
+6. **Xem lệnh build**: `toryo xpp build --repo D:\D365-Git --project Projects\Build\ContosoCore.Build.rnrproj --print-only`
+   in đúng lệnh MSBuild mà Verify sẽ chạy. Bỏ `--print-only` để build thử ngoài task (V08-VERIFY 2), thêm `--low`
+   để thử ở Low integrity (V08-VERIFY 3) — build lỗi thì in danh sách lỗi và log đầy đủ.
+7. **Task đầu tiên**: viết `TASK.md` theo `TASK.example.md` (mỗi AC một dòng `- AC-n:`; ghi rõ AC nào chỉ kiểm
+   được trên cloud tier), rồi
+   ```powershell
+   toryo task create --file tasks\SJP-1234.md
+   toryo run SJP-1234        # plan → duyệt plan → implement → verify (compile) → review → final gate
+   ```
+   `toryo status` luôn ghi `verify: compile only (X++: no DB sync, no unit tests)`: sau final gate anh vẫn
+   deploy lên cloud tier, DB sync và test tay như bình thường.
+
+Ngoài X++, Toryo vẫn dùng tốt cho phần chạy được bằng script: PowerShell tooling, Power Platform, Azure
+Functions / Logic Apps, script migration — khai báo lệnh trong `commands.verify` với `program`/`args`.
 
 ---
 

@@ -200,3 +200,31 @@ Every entry: what was decided, why, and where. The owner folds these into plan v
   - Output: one `✔/✘ build/<stem> (exit n, s) — e error(s), w warning(s) — full output: <log>` line per
     project, then the parsed errors; stops at the first failure; exit 1 on failure, 0 when all build.
   - `--timeout-min` (default 90) covers all projects.
+
+## C — D365FO starter kit
+
+### C1 — `templates/d365fo/` and HUONG-DAN §7.3
+
+- **Files:** `toryo.yaml.example` (repository part), `toryo.local.yaml.example` (machine part: `claude-max`,
+  `claude-foundry`, `codex-foundry`, `toolchains.xpp`, role overrides, `git.trusted_filters: {}` with a
+  commented `lfs`), `.toryo/context/10-d365fo-models.md`, `20-naming.md`, `30-labels.md`, `40-build.md`,
+  `50-xpp-roles.md`, `TASK.example.md`.
+- **Defaults chosen while Open decisions are open:** `verify.checkout: clean` (decision 9),
+  `verify.boundary: low_integrity` (decision 12 — V08-VERIFY 3 may change it), `git.trusted_filters: {}`
+  (decision 14: empty, so a filter the repository references fails admission until the owner adds `lfs`),
+  no extra protection for working projects or `Descriptor/*.xml` (decision 10 — the context files tell
+  agents to leave descriptors alone unless the task says so; enforcement stays a D3 decision).
+- **Roles:** the repository part names `claude-max` for planner/reviewer and `codex-foundry` with
+  `fallback: [claude-max]` for the implementer; the machine part overrides planner/reviewer per machine
+  (company laptop: `claude-foundry`).
+- **Per-role notes** live in one policy file (`50-xpp-roles.md`) that every role reads, not in
+  `.toryo/roles/*.md`: a repository role file *replaces* the embedded template (with its output contract),
+  which the owner should not have to maintain.
+- **`TODO(owner)` placement:** YAML files list them in the leading `#` comment, numbered, and mark each line
+  with its number; Markdown files in a first-line HTML comment (not sent as a heading). The ZZZ rule,
+  company prefix, model names and label file ids are placeholders (`SJP`, `ContosoCore`) the owner replaces.
+- **Size:** each policy file is under 2 KB (plan §7: never trimmed); the test enforces ≤ 2048 bytes.
+- **Test** `config::tests::d365fo_templates_load`: the two parts load together; the five policy files exist
+  in order and are small; every file starts with `TODO(owner)`; `TASK.example.md` parses to AC-1…AC-5.
+- **§7.3** of HUONG-DAN is rewritten as the seven-step setup (copy, TODOs, build projects, NuGets, `doctor`,
+  `xpp build --print-only`, first task); it uses only commands that exist after B4.

@@ -1572,6 +1572,77 @@ commands:
         assert!(cfg.trusted_filters.contains_key("lfs"));
     }
 
+    /// M9-C1 AC-1/AC-2: the D365FO starter kit — the repository and machine parts load together
+    /// (a `tool: xpp` build with the machine's toolchain, no profiles in the repository part);
+    /// every file starts with its `TODO(owner)` items; the policy files stay small (plan §7:
+    /// never trimmed); the task example parses.
+    #[test]
+    fn d365fo_templates_load() {
+        let t = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("templates")
+            .join("d365fo");
+        let cfg = Effective::load(
+            &t.join("toryo.yaml.example"),
+            Some(&t.join("toryo.local.yaml.example")),
+        )
+        .unwrap();
+        assert!(cfg.repo.commands.verify[0].is_xpp());
+        assert!(cfg.toolchains.xpp.is_some());
+        assert_eq!(cfg.origins.profiles.len(), 3);
+        assert!(cfg.repo.policy.deny_paths.iter().any(|d| d == "**/ZZZ/**"));
+        assert_eq!(cfg.repo.verify.checkout, "clean");
+        let mut files = vec![
+            t.join("toryo.yaml.example"),
+            t.join("toryo.local.yaml.example"),
+            t.join("TASK.example.md"),
+        ];
+        let ctx = t.join(".toryo").join("context");
+        let mut policy: Vec<PathBuf> = std::fs::read_dir(&ctx)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        policy.sort();
+        let names: Vec<String> = policy
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "10-d365fo-models.md",
+                "20-naming.md",
+                "30-labels.md",
+                "40-build.md",
+                "50-xpp-roles.md"
+            ]
+        );
+        for p in &policy {
+            let size = std::fs::metadata(p).unwrap().len();
+            assert!(size <= 2048, "{}: {size} bytes", p.display());
+        }
+        files.extend(policy);
+        for f in files {
+            // the leading comment: `#` lines of a YAML file, the first line (`<!-- … -->`) of
+            // a Markdown file
+            let text = std::fs::read_to_string(&f).unwrap();
+            let head: Vec<&str> = if f.extension().is_some_and(|x| x == "md") {
+                text.lines().take(1).collect()
+            } else {
+                text.lines().take_while(|l| l.starts_with('#')).collect()
+            };
+            assert!(
+                head.iter().any(|l| l.contains("TODO(owner)")),
+                "{}: TODO(owner) items at the top",
+                f.display()
+            );
+        }
+        let task = std::fs::read_to_string(t.join("TASK.example.md")).unwrap();
+        assert_eq!(
+            crate::engine::checks::parse_acceptance_ids(&task).unwrap(),
+            ["AC-1", "AC-2", "AC-3", "AC-4", "AC-5"]
+        );
+    }
+
     /// EC-28: `%ProgramFiles(x86)%`-style names expand; unknown ones stay an error.
     #[test]
     fn expand_vars_takes_parenthesised_names() {

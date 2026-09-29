@@ -96,6 +96,12 @@ toolchain — MSBuild and the five CI/CD NuGet packages — is `toolchains.xpp` 
 repository verify command names only what to build: `{ name, tool: xpp, metadata, projects, timeout_min }`
 instead of `program`/`args`.
 
+**D365FO starter kit (M9):** `templates/d365fo/` — the repository part (`toryo.yaml.example`: `tool: xpp`,
+ZZZ deny rule, protected build projects), the machine part (`toryo.local.yaml.example`: the Foundry and Max
+profiles, `toolchains.xpp`), `.toryo/context/` policy files (models, naming, labels, build, per-role X++
+notes) and `TASK.example.md`. Each file lists its `TODO(owner)` items at the top; setup steps are in
+`docs/HUONG-DAN.md` §7.3.
+
 **Hướng dẫn tiếng Việt (flow, cài đặt, cấu hình, thực hành với app mẫu BatchRename): `docs/HUONG-DAN.md`.**
 `spike pipeline` is the single-process reference prototype (R52); it prints a warning and gets no new features — use the engine (`toryo task create` + `toryo run`).
 
