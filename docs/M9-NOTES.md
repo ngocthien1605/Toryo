@@ -110,3 +110,37 @@ Every entry: what was decided, why, and where. The owner folds these into plan v
 - **`spike pipeline`** runs only `program` commands and refuses `tool: xpp` with a message (it is the frozen
   R52 reference and gets no new features).
 - `templates/toryo.local.yaml.example` shows a commented `toolchains.xpp` block.
+
+### B2 — running `tool: xpp`
+
+- **Module** `engine::xpp`: `resolve_packages` (pure, temp-dir tests `xpp_packages_*`), `resolve`,
+  `argv` (`xpp_command_line`), `runs`, `entry`. Package folders match `<id>` or `<id>.<version>` with the
+  version starting with a digit, case-insensitively; a look-alike folder (`<id>Extra`) does not match. The
+  version comes from `<id>.nuspec` (else any `.nuspec` in the folder), else the folder suffix, else none.
+  A `.nupkg`-only package gets the hint `tar -xf <file> -C <id>` (Windows `tar` reads zip) or
+  `nuget install … -ExcludeVersion`.
+- **Admission.** `task create` resolves the toolchain and requires MSBuild to be a file
+  (`xpp::for_config`), like the verify-boundary probe. At the start of each verify the same check runs
+  again; a failure there **escalates** (`xpp_toolchain_unavailable`) instead of sending the checkpoint to
+  a fix cycle — the implementer cannot repair the machine.
+- **Timeout.** `timeout_min` of a `tool: xpp` command defaults to **90** (program commands keep 30). It
+  bounds all projects of the command: each MSBuild run gets the time that is left, and a project that
+  gets none is recorded as "not started" (timed out) without spawning MSBuild.
+- **Entries.** One `VERIFY_RESULT.json` entry per project, `name: <command>/<project file stem>`
+  (`build/ContosoCore.Build`), with `kind: "xpp"`, `scope: "compile"`, `project`, `argv` (MSBuild first,
+  like a program entry), `exit`, `ms`, `output_tail`, and `toolchain` (`msbuild`, `packages[]` with `id`,
+  `version`, `dir`, and `extra_references`). The top level gets `scope: "compile"` when any xpp entry exists.
+- **Output folder.** `<verify_root>\<task>\build\xpp` is created by toryo before the first run (it inherits
+  the Low label of `build`). In `clean` mode `build` is emptied before each verify, as before; in
+  `tracked` mode the compiler output survives between runs.
+- **Gate integrity.** `verify_files` returns every project of a `tool: xpp` command whether or not it
+  exists yet, so a build project cannot be created or changed by the implementer; `checks::verify_globs`
+  adds `**/Directory.Build.*` to the protected globs of `task_policy` whenever an xpp command exists (with
+  or without `@verify-scripts` in the list, like the verify files). **Deviation from the AC wording:** an
+  edit of the tracked build project is a path-policy violation (restored, fix cycle), but a **new**
+  `Directory.Build.props` is an untracked protected file, which R35 escalates as
+  `protected_config_changed` rather than sending back — the existing rule for every untracked protected
+  file (a tool may already have read it). Nothing is committed in either case (`xpp_gate_integrity`).
+- **Tests.** `tests/m9_xpp.rs` uses a fake MSBuild (`msbuild.cmd` on Windows, `msbuild.sh` elsewhere) that
+  logs its arguments, prints a prepared output and fails for one project stem unless the checkout has
+  `src/FIXED`. The Windows variant was written for CI and has not run on Windows here.

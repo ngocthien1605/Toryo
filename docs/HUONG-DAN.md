@@ -241,6 +241,15 @@ Mỗi mục `commands.verify` có **hoặc** `program` (+ `args`) **hoặc** `to
 thì lỗi load nêu đúng key đó (`commands.verify[0] (build).metadata: …`), tất cả lỗi một lần. Toolchain
 được đóng băng theo task như profile; `task config --reload` với toolchain mới buộc verify lại.
 
+Khi verify, với mỗi project (theo thứ tự) Toryo tự viết lệnh MSBuild giống pipeline build X++ của
+Microsoft (`-noAutoResponse -nodeReuse:false`, output ở `<verify_root>\<task>\build\xpp`, ngoài checkout),
+dừng ở project lỗi đầu tiên; `timeout_min` (mặc định 90) là tổng thời gian cho mọi project của lệnh đó.
+`VERIFY_RESULT.json` có một mục cho mỗi project (`build/<tên project>`, `kind: xpp`, argv, version 5 gói
+NuGet) và `scope: compile`. Project build và mọi `Directory.Build.*` được bảo vệ: agent sửa project →
+bị trả lại (fix cycle); agent thêm `Directory.Build.props` → Escalated (`protected_config_changed`).
+Thiếu MSBuild hay thiếu gói NuGet: `task create` từ chối; nếu hỏng sau đó thì verify dừng ở Escalated
+(`xpp_toolchain_unavailable`) — sửa toolchain rồi `toryo resume ID`.
+
 ### 4.3 Dữ liệu được lưu ở đâu?
 
 `%LOCALAPPDATA%\toryo\` (hoặc `$env:TORYO_DATA_DIR` nếu anh đặt):

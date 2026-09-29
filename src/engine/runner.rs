@@ -31,7 +31,7 @@ use serde_json::{json, Value};
 
 use super::checks::{
     parse_allow_protected, resolve_program, review_violations, verify_commands, verify_files,
-    Protected,
+    verify_globs, Protected,
 };
 use super::context;
 use super::contracts;
@@ -43,6 +43,7 @@ use super::task::{frozen_config, sha256_hex, task_git};
 use super::untrusted;
 use super::verify;
 use super::worktree::{rel, Worktree, T_AGENT, T_ATTEMPT, T_NO_CHANGE, T_PARTIAL, T_STAGE, T_TASK};
+use super::xpp;
 use crate::agents::adapter::TurnHooks;
 use crate::agents::hub::AgentHub;
 use crate::config::{expand_vars, Billing, CommandKind, CommandSpec, Effective, ProfileKind};
@@ -109,7 +110,10 @@ pub fn task_policy(t: &TaskRow, cfg: &Effective) -> Result<(GitCmd, Protected, V
         );
     }
     let task_md = String::from_utf8_lossy(&task_md).to_string();
-    let p = Protected::new(exact, &cfg.repo.policy.protected_paths).with_policy(
+    // R59: `tool: xpp` adds `**/Directory.Build.*` — MSBuild reads them from parent folders
+    let mut globs = cfg.repo.policy.protected_paths.clone();
+    globs.extend(verify_globs(&cmds));
+    let p = Protected::new(exact, &globs).with_policy(
         &parse_allow_protected(&task_md),
         &cfg.repo.policy.deny_paths,
     );
@@ -122,6 +126,30 @@ pub fn writing_stage(fix_cycle: u32) -> String {
         "implement".into()
     } else {
         format!("fix-{fix_cycle}")
+    }
+}
+
+/// Where and how the verify commands of one run are started: the checkout, its environment,
+/// the boundary and the stop watch.
+struct VerifyAt<'a> {
+    co: &'a verify::Checkout,
+    env: BTreeMap<String, String>,
+    boundary: Boundary,
+    stop: &'a StopWatch,
+}
+
+impl VerifyAt<'_> {
+    fn spec(&self, name: &str, program: PathBuf, args: Vec<String>, timeout: Duration) -> RunSpec {
+        RunSpec {
+            name: name.to_string(),
+            program,
+            args,
+            cwd: self.co.dir.clone(),
+            env: self.env.clone(),
+            boundary: self.boundary,
+            timeout,
+            cancel: Some(self.stop.flag.clone()),
+        }
     }
 }
 
@@ -1132,6 +1160,17 @@ impl<'a> Engine<'a> {
             subject_commit: Some(&head),
         })?;
         crash_point("verify:after_begin");
+        // R59: the machine's X++ toolchain must still be there (a NuGet folder moved or
+        // replaced since `task create`) — not something another fix cycle can repair
+        let xpp = match xpp::for_config(&self.cfg) {
+            Ok(x) => x,
+            Err(e) => {
+                let reason = format!("{e:#}");
+                eprintln!("!! {reason}");
+                self.escalate_attempt(&a, xpp::UNAVAILABLE.into(), reason)?;
+                return Ok(Flow::Next);
+            }
+        };
         let Some((b, co)) = self.verify_checkout(t, &a, &head)? else {
             return Ok(Flow::Next);
         };
@@ -1142,7 +1181,8 @@ impl<'a> Engine<'a> {
             co.dir.display()
         );
         let stop = self.lock.watch_stop();
-        let Some((results, failure)) = self.run_verify_commands(b, &co, &stop)? else {
+        let Some((results, failure)) = self.run_verify_commands(b, &co, &stop, xpp.as_ref())?
+        else {
             self.finish_and(
                 &a,
                 AttemptStatus::Interrupted,
@@ -1160,7 +1200,7 @@ impl<'a> Engine<'a> {
             true,
             &["rev-parse", &format!("{head}^{{tree}}")],
         )?;
-        let vr = json!({
+        let mut vr = json!({
             "head": head,
             "tree": tree.trim(),
             "pass": pass && mutated.is_none(),
@@ -1172,6 +1212,10 @@ impl<'a> Engine<'a> {
             "mutated": mutated,
             "commands": results,
         });
+        // R59: an X++ build proves compile level only — no DB sync, no unit tests
+        if results.iter().any(|r| r["kind"] == "xpp") {
+            vr["scope"] = json!("compile");
+        }
         self.put(
             t,
             &a,
@@ -1230,59 +1274,104 @@ impl<'a> Engine<'a> {
     }
 
     /// Run the verify commands in the checkout, inside the boundary, and stop at the first
-    /// failure (§5.2). Returns each command's result and, if one failed, the feedback for the
-    /// implementer; `None` when a stop request ended a command (R38).
+    /// failure (§5.2). A `tool: xpp` command runs MSBuild once per project, in order, within
+    /// the command's `timeout_min` (R59). Returns each run's result and, if one failed, the
+    /// feedback for the implementer; `None` when a stop request ended a command (R38).
     fn run_verify_commands(
         &self,
         b: Boundary,
         co: &verify::Checkout,
         stop: &StopWatch,
+        xpp: Option<&xpp::Toolchain>,
     ) -> Result<Option<(Vec<Value>, Option<String>)>> {
-        let env = verify::env(co);
+        let at = VerifyAt {
+            co,
+            env: verify::env(co),
+            boundary: b,
+            stop,
+        };
         let mut results = Vec::new();
-        let mut failure = None;
         for c in &self.cmds {
-            let CommandKind::Program { program, args } = c.kind() else {
-                bail!("{}: `tool: xpp` runs from M9-B2", c.name);
+            let ran = match (c.kind(), xpp) {
+                (CommandKind::Program { program, args }, _) => {
+                    let program = verify_program(&expand_vars(program)?, &co.dir);
+                    let run = at.spec(&c.name, program, args.to_vec(), xpp::command_timeout(c));
+                    self.run_verify_command(run, stop)?.map(|res| {
+                        results.push(command_result(c, &res));
+                        (!res.ok()).then(|| verify_feedback(&res))
+                    })
+                }
+                (CommandKind::Xpp { .. }, Some(tc)) => {
+                    self.run_xpp_command(c, tc, &at, &mut results)?
+                }
+                (CommandKind::Xpp { .. }, None) => {
+                    bail!("{}: `tool: xpp` without a resolved toolchain", c.name)
+                }
             };
-            let program = verify_program(&expand_vars(program)?, &co.dir);
-            let res = self.hub.block_on(LocalRunner.run(
-                RunSpec {
-                    name: c.name.clone(),
-                    program,
-                    args: args.to_vec(),
-                    cwd: co.dir.clone(),
-                    env: env.clone(),
-                    boundary: b,
-                    timeout: Duration::from_secs(60 * c.timeout_min.unwrap_or(30)),
-                    cancel: Some(stop.flag.clone()),
-                },
-                None,
-            ))?;
-            if res.cancelled || stop.stopped() {
-                return Ok(None);
-            }
-            let ok = res.ok();
-            let exit = match res.exit {
-                Some(code) => format!("exit {code}"),
-                None if res.timed_out => "timed out".to_string(),
-                None => "no exit code".to_string(),
-            };
-            eprintln!(
-                "  {} {} ({exit}, {:.1}s)",
-                if ok { "✔" } else { "✘" },
-                c.name,
-                res.duration_ms as f64 / 1000.0
-            );
-            // R50: LocalRunner strips ANSI (CSI/OSC) from everything it captures
-            results.push(command_result(c, &res));
-            if !ok {
+            match ran {
+                None => return Ok(None),
                 // R61: verify output comes from the code under test — data, not instructions
-                failure = Some(untrusted::wrap("verify", None, &verify_feedback(&res)));
-                break; // stop at the first failure (§5.2)
+                Some(Some(f)) => {
+                    return Ok(Some((results, Some(untrusted::wrap("verify", None, &f)))))
+                }
+                Some(None) => {}
             }
         }
-        Ok(Some((results, failure)))
+        Ok(Some((results, None)))
+    }
+
+    /// R59: MSBuild on each project of a `tool: xpp` command, in order, stopping at the first
+    /// failure; each run gets the time the command has left. One `VERIFY_RESULT.json` entry per
+    /// project. `None`: stopped; `Some(Some(feedback))`: a project failed.
+    fn run_xpp_command(
+        &self,
+        c: &CommandSpec,
+        tc: &xpp::Toolchain,
+        at: &VerifyAt,
+        results: &mut Vec<Value>,
+    ) -> Result<Option<Option<String>>> {
+        let out = at.co.build().join("xpp");
+        let runs = xpp::runs(c, tc, &at.co.dir, &out).unwrap_or_default();
+        std::fs::create_dir_all(&out)?;
+        let deadline = std::time::Instant::now() + xpp::command_timeout(c);
+        for r in runs {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let res = if left.is_zero() {
+                xpp::not_started(&r.name)
+            } else {
+                let run = at.spec(&r.name, tc.msbuild.clone(), r.args.clone(), left);
+                match self.run_verify_command(run, at.stop)? {
+                    Some(res) => res,
+                    None => return Ok(None),
+                }
+            };
+            results.push(xpp::entry(&r, tc, &res));
+            if !res.ok() {
+                return Ok(Some(Some(verify_feedback(&res))));
+            }
+        }
+        Ok(Some(None))
+    }
+
+    /// One verify process through `LocalRunner`, with its ✔/✘ line; `None` when a stop
+    /// request ended it (R38). R50: LocalRunner strips ANSI (CSI/OSC) from what it captures.
+    fn run_verify_command(&self, run: RunSpec, stop: &StopWatch) -> Result<Option<CommandResult>> {
+        let name = run.name.clone();
+        let res = self.hub.block_on(LocalRunner.run(run, None))?;
+        if res.cancelled || stop.stopped() {
+            return Ok(None);
+        }
+        let exit = match res.exit {
+            Some(code) => format!("exit {code}"),
+            None if res.timed_out => "timed out".to_string(),
+            None => "no exit code".to_string(),
+        };
+        eprintln!(
+            "  {} {name} ({exit}, {:.1}s)",
+            if res.ok() { "✔" } else { "✘" },
+            res.duration_ms as f64 / 1000.0
+        );
+        Ok(Some(res))
     }
 
     // ── Reviewing ────────────────────────────────────────────────────────────────────

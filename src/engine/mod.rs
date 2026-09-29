@@ -18,6 +18,7 @@ pub mod task;
 pub mod untrusted;
 pub mod verify;
 pub mod worktree;
+pub mod xpp;
 
 pub use state::{
     Gate, GateKind, Machine, PipelineError, PipelineEvent, PipelineState, MAX_PLAN_AUTO_REJECTIONS,
