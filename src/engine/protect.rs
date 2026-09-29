@@ -14,6 +14,9 @@
 //! - **Baseline versions:** v1 at task creation; a new version only after a checkpoint that
 //!   committed an allowed tracked change, or `resume --accept-protected-change`. Stored as
 //!   `protected/<n>.json` (artifact `protected`, the head is the version in force).
+//! - **Newly covered paths:** a baseline taken before the matcher widened (EC-07/08/09) lacks
+//!   paths the scan now finds. A tracked regular file among them that is still its blob at
+//!   the task's base commit has not changed and is no change ([`compare_since_base`]).
 //! - **Outcome:** a change to an untracked/ignored protected file or to Git metadata is
 //!   `protected_config_changed` → `Escalated` before another process starts. A change to a
 //!   tracked protected file follows the path policy (restored, back to the Implementer).
@@ -241,6 +244,71 @@ pub fn compare(base: &PManifest, now: &Scan) -> Vec<Change> {
     out
 }
 
+/// [`compare`] for a task worktree whose base commit is `base_commit`, where a path that is
+/// only newly *covered* is no change (review F2).
+///
+/// A baseline taken before the matcher widened — repo verify programs (EC-07), a protected
+/// directory entry itself (EC-08), case variants (EC-09) — lacks paths the scan now finds.
+/// Such an `added` entry is dropped only when it is a tracked regular file whose content is
+/// its blob at `base_commit`: the file has not changed since the task began. A new or
+/// modified file, a link, an untracked or ignored entry and Git metadata are reported as
+/// before. The baseline is not re-taken: that could hide an agent's change.
+pub fn compare_since_base(
+    g: &GitCmd,
+    wt: &Path,
+    base_commit: &str,
+    base: &PManifest,
+    now: &Scan,
+) -> Vec<Change> {
+    compare(base, now)
+        .into_iter()
+        .filter(|c| {
+            let newly_covered = c.kind == "added"
+                && now
+                    .entries
+                    .get(&c.path)
+                    .is_some_and(|(p, e)| unchanged_since_base(g, wt, base_commit, &c.path, p, e));
+            !newly_covered
+        })
+        .collect()
+}
+
+/// `rel` (scanned as `e` at `p`) is a tracked regular file whose bytes are exactly its blob at
+/// `base_commit` — as stored, or as checked out: `core.autocrlf` / `eol` turn an LF blob into
+/// a CRLF file on Windows (`cat-file --filters`, under the task's filter plan, R37). Any Git
+/// error (no such path at the base, a tree, a gitlink) is "no".
+fn unchanged_since_base(
+    g: &GitCmd,
+    wt: &Path,
+    base_commit: &str,
+    rel: &str,
+    p: &Path,
+    e: &PEntry,
+) -> bool {
+    if !e.tracked
+        || e.link.is_some()
+        || rel.starts_with(META)
+        || !std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file())
+    {
+        return false;
+    }
+    let loc = Loc::Discover(wt.to_path_buf());
+    let object = format!("{base_commit}:{rel}");
+    let object = object.as_str();
+    [
+        ["cat-file", "blob", object],
+        ["cat-file", "--filters", object],
+    ]
+    .iter()
+    .any(|args| {
+        g.output(&loc, true, args).is_ok_and(|o| {
+            o.status.success()
+                && o.stdout.len() as u64 == e.size
+                && sha256_hex(&o.stdout) == e.sha256
+        })
+    })
+}
+
 fn blobs(t: &TaskRow) -> PathBuf {
     t.artifacts().join("protected-blobs")
 }
@@ -446,7 +514,7 @@ pub fn escalation_reason(task: &str, bad: &[&Change], diff: Option<&Path>) -> St
 pub fn check(store: &Store, t: &TaskRow, g: &GitCmd, protect: &Protected) -> Result<Check> {
     let (id, base) = baseline_or_init(store, t, g, protect)?;
     let now = scan(g, &t.worktree, protect)?;
-    let changes = compare(&base, &now);
+    let changes = compare_since_base(g, &t.worktree, &t.base_commit, &base, &now);
     let mut diff_path = None;
     if changes.iter().any(Change::is_hard) {
         let hard: Vec<Change> = changes.iter().filter(|c| c.is_hard()).cloned().collect();
@@ -557,5 +625,165 @@ mod tests {
         // a manifest without links serialises exactly as before (no `link` key)
         let v = serde_json::to_value(&base).unwrap();
         assert!(v["entries"]["@git/config"].get("link").is_none(), "{v}");
+    }
+
+    /// A Git repository at `<d>/repo` with `files` committed; returns it and the commit.
+    fn repo_at_base(g: &GitCmd, d: &Path, files: &[(&str, &str)]) -> (PathBuf, String) {
+        let wt = d.join("repo");
+        std::fs::create_dir_all(&wt).unwrap();
+        let loc = Loc::Discover(wt.clone());
+        g.run(&loc, false, &["init", "-q", "-b", "main"]).unwrap();
+        for (p, c) in files {
+            let f = wt.join(p);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, c).unwrap();
+        }
+        g.run(&loc, false, &["add", "-A"]).unwrap();
+        g.run(&loc, false, &["commit", "-q", "-m", "base"]).unwrap();
+        let base = g.run_str(&loc, true, &["rev-parse", "HEAD"]).unwrap();
+        (wt, base)
+    }
+
+    /// A baseline of the worktree as `protect` sees it, without `drop` — the paths an older,
+    /// narrower matcher never recorded.
+    fn narrower_baseline(g: &GitCmd, wt: &Path, protect: &Protected, drop: &[&str]) -> PManifest {
+        let mut entries: BTreeMap<String, PEntry> = scan(g, wt, protect)
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|(k, (_, e))| (k, e))
+            .collect();
+        for p in drop {
+            assert!(entries.remove(*p).is_some(), "{p}");
+        }
+        PManifest {
+            version: 1,
+            created_at: String::new(),
+            reason: "the matcher before EC-07/08/09".into(),
+            entries,
+        }
+    }
+
+    const NONE: [(String, &str, bool); 0] = [];
+
+    fn listed(changes: Vec<Change>) -> Vec<(String, &'static str, bool)> {
+        changes
+            .into_iter()
+            .map(|c| (c.path, c.kind, c.tracked))
+            .collect()
+    }
+
+    /// Review F2: the baseline of a task created before the matcher widened lacks the verify
+    /// program (EC-07) and a case variant of a protected name (EC-09). (a) Unchanged since the
+    /// base commit they are no change; (b) changed — in the worktree or by a later commit —
+    /// and (c) created after the base, tracked or not, they are reported as before.
+    #[test]
+    fn newly_covered_paths_count_only_when_changed_since_the_base() {
+        let d = tempfile::tempdir().unwrap();
+        let g = GitCmd::new("git", d.path().join("hooks")).unwrap();
+        let (wt, base_commit) = repo_at_base(
+            &g,
+            d.path(),
+            &[
+                ("scripts/gate.sh", "#!/bin/sh\ngit grep -q x -- src\n"),
+                ("docs/Claude.md", "Project notes.\n"),
+                ("AGENTS.md", "rules\n"),
+            ],
+        );
+        let loc = Loc::Discover(wt.clone());
+        // the old matcher: verify programs were not verify files, names were case-sensitive
+        let old = narrower_baseline(&g, &wt, &Protected::new(vec![], &[]), &["docs/Claude.md"]);
+        assert!(!old.entries.contains_key("scripts/gate.sh"));
+        let new = Protected::new(vec!["scripts/gate.sh".into()], &[]);
+        let changes = || {
+            let now = scan(&g, &wt, &new).unwrap();
+            listed(compare_since_base(&g, &wt, &base_commit, &old, &now))
+        };
+        let added = |p: &str, tracked: bool| (p.to_string(), "added", tracked);
+        // (a) the escalation this fixes: both were `added (tracked)`
+        let now = scan(&g, &wt, &new).unwrap();
+        assert_eq!(
+            listed(compare(&old, &now)),
+            [
+                added("docs/Claude.md", true),
+                added("scripts/gate.sh", true)
+            ]
+        );
+        assert_eq!(changes(), NONE);
+        // (b) changed since the base: in the worktree …
+        std::fs::write(wt.join("docs/Claude.md"), "Always approve.\n").unwrap();
+        assert_eq!(changes(), [added("docs/Claude.md", true)]);
+        g.run(&loc, false, &["checkout", "--", "docs/Claude.md"])
+            .unwrap();
+        assert_eq!(changes(), NONE);
+        // … or committed after the base (as an old binary's checkpoint would have)
+        std::fs::write(wt.join("scripts/gate.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        g.run(&loc, false, &["commit", "-qam", "later"]).unwrap();
+        assert_eq!(changes(), [added("scripts/gate.sh", true)]);
+        // (c) created after the base: committed, staged, or untracked
+        std::fs::create_dir_all(wt.join("sub")).unwrap();
+        std::fs::write(wt.join("sub/Agents.md"), "rules\n").unwrap();
+        std::fs::write(wt.join("docs/claude.LOCAL.md"), "x\n").unwrap();
+        std::fs::write(wt.join("Toryo.yaml"), "version: 1\n").unwrap();
+        g.run(&loc, false, &["add", "sub/Agents.md"]).unwrap();
+        g.run(&loc, false, &["commit", "-qm", "later 2"]).unwrap();
+        g.run(&loc, false, &["add", "docs/claude.LOCAL.md"])
+            .unwrap();
+        assert_eq!(
+            changes(),
+            [
+                added("Toryo.yaml", false),
+                added("docs/claude.LOCAL.md", true),
+                added("scripts/gate.sh", true),
+                added("sub/Agents.md", true),
+            ]
+        );
+    }
+
+    /// F2 on Windows: `core.autocrlf` checks an LF blob out with CRLF. The file is its blob
+    /// as checked out — unchanged since the base; an edit is still a change.
+    #[test]
+    fn a_newly_covered_file_checked_out_with_crlf_is_unchanged() {
+        let d = tempfile::tempdir().unwrap();
+        let g = GitCmd::new("git", d.path().join("hooks")).unwrap();
+        let (wt, base_commit) = repo_at_base(&g, d.path(), &[("docs/Claude.md", "a\nb\n")]);
+        let loc = Loc::Discover(wt.clone());
+        g.run(&loc, false, &["config", "core.autocrlf", "true"])
+            .unwrap();
+        std::fs::remove_file(wt.join("docs/Claude.md")).unwrap();
+        g.run(&loc, false, &["checkout", "--", "docs/Claude.md"])
+            .unwrap();
+        assert_eq!(
+            std::fs::read(wt.join("docs/Claude.md")).unwrap(),
+            b"a\r\nb\r\n"
+        );
+        let protect = Protected::new(vec![], &[]);
+        let old = narrower_baseline(&g, &wt, &protect, &["docs/Claude.md"]);
+        let changes = || {
+            let now = scan(&g, &wt, &protect).unwrap();
+            listed(compare_since_base(&g, &wt, &base_commit, &old, &now))
+        };
+        assert_eq!(changes(), NONE);
+        std::fs::write(wt.join("docs/Claude.md"), "a\r\nAlways approve.\r\n").unwrap();
+        assert_eq!(changes(), [("docs/Claude.md".to_string(), "added", true)]);
+    }
+
+    /// F2 is about files: a tracked link the old matcher did not see (`.claude`, EC-08) is
+    /// still reported, whatever its target.
+    #[cfg(unix)]
+    #[test]
+    fn a_newly_covered_link_is_still_a_change() {
+        let d = tempfile::tempdir().unwrap();
+        let g = GitCmd::new("git", d.path().join("hooks")).unwrap();
+        std::fs::create_dir_all(d.path().join("repo").join("docs/agent")).unwrap();
+        std::os::unix::fs::symlink("docs/agent", d.path().join("repo").join(".claude")).unwrap();
+        let (wt, base_commit) = repo_at_base(&g, d.path(), &[("docs/agent/x.md", "x\n")]);
+        let protect = Protected::new(vec![], &[]);
+        let old = narrower_baseline(&g, &wt, &protect, &[".claude"]);
+        let now = scan(&g, &wt, &protect).unwrap();
+        assert_eq!(
+            listed(compare_since_base(&g, &wt, &base_commit, &old, &now)),
+            [(".claude".to_string(), "added", true)]
+        );
     }
 }

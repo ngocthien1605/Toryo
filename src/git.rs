@@ -204,10 +204,12 @@ impl GitCmd {
     }
 
     /// R37 admission: collect driver names (defined in any config, or referenced by the
-    /// tree) and resolve each against the trusted table. Config files reached through
-    /// `include` / `includeIf` count whatever their condition (EC-21): the drivers they define
-    /// are planned (trusted command or neutralised), and a `core.attributesFile` they set is
-    /// checked against the tree like the configured one.
+    /// tree) and resolve each against the trusted table. Config files the repository's own
+    /// config reaches through `include` / `includeIf` count whatever their condition (EC-21):
+    /// the drivers they define are planned (trusted command or neutralised), and a
+    /// `core.attributesFile` they set is checked against the tree like the configured one.
+    /// Includes in system and global config are the user's own, trusted configuration (R37)
+    /// and count only as Git evaluates them.
     pub fn plan_filters(
         &self,
         repo: &Path,
@@ -311,6 +313,11 @@ fn filter_names(entries: &[(String, String)]) -> BTreeSet<String> {
 const INCLUDE_KEYS: &str = r"^include(if\..*)?\.path$";
 /// Git's own limit on nested includes.
 const MAX_INCLUDE_DEPTH: usize = 10;
+/// The config scopes (`git config --show-scope`) that belong to the repository: its
+/// `config` and, with `extensions.worktreeConfig`, `config.worktree` — untrusted, data only
+/// (R37). `system` and `global` are the user's machine (trusted); `command` is toryo's own
+/// `-c` overrides.
+const REPO_SCOPES: [&str; 2] = ["local", "worktree"];
 
 /// Where an include directive in `from` points: relative to the including file's
 /// directory, `~/` in the home directory (Git's rules).
@@ -330,34 +337,50 @@ fn include_target(from: &Path, value: &str) -> PathBuf {
 }
 
 /// Every existing config file reachable through `include.path` / `includeIf.*.path` from
-/// any scope, **whatever the condition** (R37: repository config and "anything they
-/// include/includeIf" is untrusted; EC-21). A condition such as `onbranch:toryo/**` or
-/// `gitdir:…` is false where admission runs and true in the task worktree or the verify
-/// checkout, so it is never evaluated here — every target counts.
+/// the repository's own config ([`REPO_SCOPES`]), **whatever the condition** (R37:
+/// repository config and "anything they include/includeIf" is untrusted; EC-21). A
+/// condition such as `onbranch:toryo/**` or `gitdir:…` is false where admission runs and
+/// true in the task worktree or the verify checkout, so it is never evaluated here — every
+/// target counts. System and global config are trusted (R37): an inactive per-client
+/// include in `~/.gitconfig` is not repository data and never fails admission.
 pub fn included_config_files(g: &GitCmd, loc: &Loc) -> Result<Vec<PathBuf>> {
     let cwd = match loc {
         Loc::Discover(d) => d.clone(),
         Loc::Explicit { work_tree, .. } => work_tree.clone(),
     };
-    let out = g.output(
-        loc,
-        true,
-        &[
-            "config",
-            "-z",
-            "--show-origin",
-            "--get-regexp",
-            INCLUDE_KEYS,
-        ],
-    )?;
-    // with --show-origin: `file:<path>\0key\nvalue\0` per directive (exit 1 = none)
+    let args = [
+        "config",
+        "-z",
+        "--show-scope",
+        "--show-origin",
+        "--get-regexp",
+        INCLUDE_KEYS,
+    ];
+    let out = g.output(loc, true, &args)?;
+    // exit 1 = no directive; any other failure must not read as "no include"
+    if !out.status.success() && out.status.code() != Some(1) {
+        bail!(
+            "git {} failed ({}): {}",
+            args.join(" "),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    // with --show-scope --show-origin: `<scope>\0file:<path>\0key\nvalue\0` per directive;
+    // one in a file an active include reached carries the scope of the including file
     let fields: Vec<&[u8]> = out.stdout.split(|b| *b == 0).collect();
     let mut todo: Vec<(PathBuf, usize)> = Vec::new();
-    for pair in fields.chunks(2) {
-        let [origin, kv] = pair else { continue };
+    for triple in fields.chunks(3) {
+        let [scope, origin, kv] = triple else {
+            continue;
+        };
+        let scope = String::from_utf8_lossy(scope);
+        if !REPO_SCOPES.contains(&&*scope) {
+            continue; // system/global: trusted (R37); command line: toryo's own overrides
+        }
         let origin = String::from_utf8_lossy(origin);
         let Some(file) = origin.strip_prefix("file:") else {
-            continue; // `command line:` etc.: toryo's own overrides name no include
+            continue;
         };
         let from = cwd.join(file); // a relative origin is relative to Git's cwd
         for (_, v) in config_entries(kv) {
