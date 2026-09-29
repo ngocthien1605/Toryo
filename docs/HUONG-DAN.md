@@ -250,6 +250,13 @@ bị trả lại (fix cycle); agent thêm `Directory.Build.props` → Escalated 
 Thiếu MSBuild hay thiếu gói NuGet: `task create` từ chối; nếu hỏng sau đó thì verify dừng ở Escalated
 (`xpp_toolchain_unavailable`) — sửa toolchain rồi `toryo resume ID`.
 
+Lỗi compile được tách khỏi output MSBuild (có thể dài hàng nghìn dòng): mỗi mục `xpp` trong
+`VERIFY_RESULT.json` có `diagnostics` (50 lỗi đầu, mỗi lỗi một lần, đường dẫn tương đối với checkout),
+`errors_total`, `warnings_total`; feedback cho implementer ở vòng fix liệt kê các lỗi này **trước**, rồi
+mới tới 40 dòng cuối. Vì verify local chỉ chứng minh mức compile (không DB sync, không SysTest),
+`toryo status`, `toryo task show` và final gate đều ghi: `verify: compile only (X++: no DB sync, no unit tests)`
+— giống build pipeline của LCS/Azure DevOps: xanh nghĩa là compile được, chưa phải đã test.
+
 ### 4.3 Dữ liệu được lưu ở đâu?
 
 `%LOCALAPPDATA%\toryo\` (hoặc `$env:TORYO_DATA_DIR` nếu anh đặt):

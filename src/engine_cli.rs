@@ -880,6 +880,10 @@ pub fn status(id: Option<&str>) -> Result<i32> {
                 .unwrap_or_default(),
             active
         );
+        // R59: an X++ verify proves compile level only — say so wherever the state is shown
+        if task::frozen_config(&t).is_ok_and(|c| toryo::engine::xpp::compile_only(&c)) {
+            println!("               {}", toryo::engine::xpp::COMPILE_ONLY);
+        }
         let next = if t.state.is_terminal() && !t.run_store.exists() && !t.worktree.exists() {
             toryo::engine::runner::cleaned_up_action(&t)
         } else {

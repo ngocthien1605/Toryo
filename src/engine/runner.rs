@@ -1298,7 +1298,7 @@ impl<'a> Engine<'a> {
                     let run = at.spec(&c.name, program, args.to_vec(), xpp::command_timeout(c));
                     self.run_verify_command(run, stop)?.map(|res| {
                         results.push(command_result(c, &res));
-                        (!res.ok()).then(|| verify_feedback(&res))
+                        (!res.ok()).then(|| verify_feedback(&res, ""))
                     })
                 }
                 (CommandKind::Xpp { .. }, Some(tc)) => {
@@ -1345,9 +1345,12 @@ impl<'a> Engine<'a> {
                     None => return Ok(None),
                 }
             };
-            results.push(xpp::entry(&r, tc, &res));
+            // R59/ARCH-10: the first real errors, ahead of a tail that may be 3 000 lines later
+            let diags = xpp::diagnostics(&res.output, &at.co.dir);
+            results.push(xpp::entry(&r, tc, &res, &diags));
             if !res.ok() {
-                return Ok(Some(Some(verify_feedback(&res))));
+                let errors = xpp::feedback_errors(&diags);
+                return Ok(Some(Some(verify_feedback(&res, &errors))));
             }
         }
         Ok(Some(None))
@@ -3142,11 +3145,12 @@ fn command_result(c: &CommandSpec, res: &CommandResult) -> Value {
     json!({"name": c.name, "argv": argv, "exit": res.exit, "ms": res.duration_ms, "output_tail": res.tail(40)})
 }
 
-/// The feedback of a failed verify for the implementer: the failing command, how it ended
-/// and the tail of its output (the `output_tail` of VERIFY_RESULT.json).
-fn verify_feedback(res: &CommandResult) -> String {
+/// The feedback of a failed verify for the implementer: the failing command, how it ended,
+/// `errors` (the parsed X++ diagnostics, R59; empty for a program) and the tail of its output
+/// (the `output_tail` of VERIFY_RESULT.json).
+fn verify_feedback(res: &CommandResult, errors: &str) -> String {
     format!(
-        "- VERIFY FAILED: `{}` {}. Last output:\n```\n{}\n```",
+        "- VERIFY FAILED: `{}` {}. {errors}Last output:\n```\n{}\n```",
         res.name,
         ended(res),
         res.tail(40)
@@ -3213,10 +3217,15 @@ pub fn non_blocking(review: &Value) -> Vec<String> {
         .collect()
 }
 
-/// What the human should see at the final gate (R53, R49): the approved review's
-/// non-blocking issues, and a note when the implementer and the reviewer share a vendor.
+/// What the human should see at the final gate (R53, R49, R59): that verify proved compile
+/// level only (X++), the approved review's non-blocking issues, and a note when the
+/// implementer and the reviewer share a vendor.
 pub fn final_gate_notes(store: &Store, t: &TaskRow) -> Result<Vec<String>> {
     let mut out = Vec::new();
+    let cfg = frozen_config(t)?;
+    if xpp::compile_only(&cfg) {
+        out.push(xpp::COMPILE_ONLY.to_string());
+    }
     if let Some((_, b)) = super::artifacts::read_head(store, t, "review")? {
         let v: Value = serde_json::from_slice(&b)?;
         let nb = non_blocking(&v);
@@ -3227,7 +3236,6 @@ pub fn final_gate_notes(store: &Store, t: &TaskRow) -> Result<Vec<String>> {
             ));
         }
     }
-    let cfg = frozen_config(t)?;
     let i = t.id.clone();
     let atts = store.call(move |tx| store::attempts(tx, &i))?;
     let mut imps: Vec<String> = atts
@@ -4569,8 +4577,14 @@ mod tests {
             ),
         ];
         for (r, want) in cases {
-            assert_eq!(verify_feedback(&r), want, "{r:?}");
+            assert_eq!(verify_feedback(&r, ""), want, "{r:?}");
         }
+        // R59: an X++ build's errors come first
+        let r = res(Some(1), false, false, "Build FAILED.\n");
+        assert_eq!(
+            verify_feedback(&r, "X++ build errors (1 of 1):\n  - a.xml(1,1): error X: e\n"),
+            "- VERIFY FAILED: `test` exited 1. X++ build errors (1 of 1):\n  - a.xml(1,1): error X: e\nLast output:\n```\nBuild FAILED.\n```"
+        );
     }
 
     #[test]

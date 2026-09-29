@@ -144,3 +144,25 @@ Every entry: what was decided, why, and where. The owner folds these into plan v
 - **Tests.** `tests/m9_xpp.rs` uses a fake MSBuild (`msbuild.cmd` on Windows, `msbuild.sh` elsewhere) that
   logs its arguments, prints a prepared output and fails for one project stem unless the checkout has
   `src/FIXED`. The Windows variant was written for CI and has not run on Windows here.
+
+### B3 — X++ diagnostics and `scope: compile`
+
+- **Parser** `xpp::parse_line`: one regex over MSBuild's canonical form,
+  `origin[(pos)]: [subcategory ]error|warning [CODE]: message`, with `origin`, `(pos)` and `CODE` optional
+  (so `MSBUILD : error MSB1009: …` and `error : …` parse); `pos` may be `(l)`, `(l,c)`, `(l,c,el,ec)` or a
+  range. Severity is case-insensitive. A trailing ` [..]` is stripped only when it looks like a project
+  (holds a path separator or `proj`), so `index [3] out of range` keeps its bracket. Lines such as
+  `Build FAILED.`, `2 Error(s)` and `Compiling Foo: error count 0` are not diagnostics.
+- **Paths.** An origin under the verify checkout is made relative with `/` (compared case-insensitively,
+  ASCII only, with `\`/`/` equal); anything else — `MSBUILD`, a targets file under `Program Files` — is
+  kept as written. The JSON field is `file` for either.
+- **Dedup and caps.** Every (file, line, column, severity, code, message) counts once, so the summary
+  MSBuild repeats at the end adds nothing. `diagnostics` keeps the first 50 errors; `errors_total` and
+  `warnings_total` count all; warnings are counted, not listed (they are listed once `bp_check` exists).
+- **Feedback.** `verify_feedback(res, errors)`: for `tool: xpp`, "X++ build errors (n of N[; w warning(s)
+  not listed]):" and one line per error come before "Last output:", all inside the `source="verify"` block
+  (A3). Program commands get exactly the old text.
+- **Compile-only note.** `xpp::COMPILE_ONLY` ("verify: compile only (X++: no DB sync, no unit tests)") is
+  printed by `status` (so also by `task show`), is the first final-gate note (end of `run`, SUMMARY.md).
+  Decided from the **frozen configuration** (a `tool: xpp` command exists), not from the latest
+  `VERIFY_RESULT.json`: a task that has not verified yet already shows what its verify will prove.

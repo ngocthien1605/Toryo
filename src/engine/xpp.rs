@@ -334,8 +334,8 @@ pub fn toolchain_json(tc: &Toolchain) -> Value {
     })
 }
 
-/// A project's `VERIFY_RESULT.json` entry.
-pub fn entry(run: &Run, tc: &Toolchain, res: &CommandResult) -> Value {
+/// A project's `VERIFY_RESULT.json` entry, with its parsed diagnostics (B3).
+pub fn entry(run: &Run, tc: &Toolchain, res: &CommandResult, diags: &Diagnostics) -> Value {
     let argv: Vec<String> = std::iter::once(tc.msbuild.display().to_string())
         .chain(run.args.iter().cloned())
         .collect();
@@ -347,9 +347,183 @@ pub fn entry(run: &Run, tc: &Toolchain, res: &CommandResult) -> Value {
         "argv": argv,
         "exit": res.exit,
         "ms": res.duration_ms,
+        "diagnostics": diags.errors,
+        "errors_total": diags.errors_total,
+        "warnings_total": diags.warnings_total,
         "output_tail": res.tail(40),
         "toolchain": toolchain_json(tc),
     })
+}
+
+// ── diagnostics (B3, ARCH-10) ──────────────────────────────────────────────────────────
+
+/// How many errors `VERIFY_RESULT.json` and the fix feedback carry.
+pub const DIAGNOSTICS_MAX: usize = 50;
+
+/// One MSBuild diagnostic line: `origin(line,col): [subcategory ]error|warning [CODE]: message`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct Diagnostic {
+    /// The origin: a file (relative to the checkout, `/` separators, when it lies inside it),
+    /// or a tool such as `MSBUILD`; none for a bare `error : …`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<u32>,
+    /// `error` or `warning`.
+    pub severity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    pub message: String,
+}
+
+impl Diagnostic {
+    /// The line as the fixer reads it: `src/Foo.xml(12,5): error XPP0001: message`.
+    pub fn render(&self) -> String {
+        let pos = match (self.line, self.column) {
+            (Some(l), Some(c)) => format!("({l},{c})"),
+            (Some(l), None) => format!("({l})"),
+            _ => String::new(),
+        };
+        let origin = match &self.file {
+            Some(f) => format!("{f}{pos}: "),
+            None => String::new(),
+        };
+        let code = self
+            .code
+            .as_ref()
+            .map(|c| format!(" {c}"))
+            .unwrap_or_default();
+        format!("{origin}{}{code}: {}", self.severity, self.message)
+    }
+}
+
+/// The errors of a build's output (the first [`DIAGNOSTICS_MAX`], each once) and the counts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Diagnostics {
+    pub errors: Vec<Diagnostic>,
+    pub errors_total: usize,
+    pub warnings_total: usize,
+}
+
+static LINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?x)^\s*
+        (?:(?P<origin>.*?)(?:\((?P<pos>\d+(?:\s*[,-]\s*\d+){0,3})\))?\s*:\s*)?   # origin[(pos)]:
+        (?:(?P<sub>[A-Za-z][A-Za-z\ ]*?)\s+)?                                        # subcategory
+        (?P<sev>(?i:error|warning))
+        (?:\s+(?P<code>[A-Za-z][A-Za-z0-9_.-]*))?
+        \s*:\s*(?P<msg>.*?)\s*$",
+    )
+    .expect("diagnostic regex")
+});
+
+static PROJECT_SUFFIX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\s+\[(?P<p>[^\[\]]+)\]$").expect("project suffix regex")
+});
+
+/// `/`-separated, ASCII lower case (same byte length): how two Windows paths are compared.
+fn norm(p: &str) -> String {
+    p.replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+/// `origin` relative to the checkout (with `/`) when it lies inside it; otherwise as written.
+fn relative_origin(origin: &str, checkout: &Path) -> String {
+    let co = norm(&checkout.display().to_string());
+    let o = norm(origin);
+    match o.strip_prefix(&co).and_then(|r| r.strip_prefix('/')) {
+        Some(rest) if !co.is_empty() => {
+            // the original spelling of the part below the checkout (same byte offsets)
+            let orig = origin.replace('\\', "/");
+            orig[o.len() - rest.len()..o.len()].to_string()
+        }
+        _ => origin.to_string(),
+    }
+}
+
+/// One MSBuild diagnostic, or `None` for any other line (`Build FAILED.`, `2 Error(s)`, …).
+pub fn parse_line(line: &str, checkout: &Path) -> Option<Diagnostic> {
+    let c = LINE.captures(line)?;
+    let origin = c
+        .name("origin")
+        .map(|m| m.as_str().trim())
+        .filter(|o| !o.is_empty());
+    let mut msg = c["msg"].to_string();
+    if let Some(p) = PROJECT_SUFFIX.captures(&msg) {
+        let inner = &p["p"];
+        if inner.contains(['/', '\\']) || inner.to_ascii_lowercase().contains("proj") {
+            msg.truncate(p.get(0).map(|m| m.start()).unwrap_or(msg.len()));
+        }
+    }
+    let nums: Vec<u32> = c
+        .name("pos")
+        .map(|p| {
+            p.as_str()
+                .split([',', '-'])
+                .filter_map(|n| n.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(Diagnostic {
+        file: origin.map(|o| relative_origin(o, checkout)),
+        line: nums.first().copied(),
+        column: nums.get(1).copied(),
+        severity: c["sev"].to_ascii_lowercase(),
+        code: c.name("code").map(|m| m.as_str().to_string()),
+        message: msg.trim().to_string(),
+    })
+}
+
+/// The diagnostics of a build's output: every error and warning once (MSBuild repeats them in
+/// its final summary), errors in order of appearance, the first [`DIAGNOSTICS_MAX`] kept.
+pub fn diagnostics(output: &str, checkout: &Path) -> Diagnostics {
+    let mut seen = std::collections::HashSet::new();
+    let mut d = Diagnostics::default();
+    for line in output.lines() {
+        let Some(x) = parse_line(line, checkout) else {
+            continue;
+        };
+        if !seen.insert(x.clone()) {
+            continue;
+        }
+        if x.severity == "error" {
+            d.errors_total += 1;
+            if d.errors.len() < DIAGNOSTICS_MAX {
+                d.errors.push(x);
+            }
+        } else {
+            d.warnings_total += 1;
+        }
+    }
+    d
+}
+
+/// The fix feedback of a failed X++ build (inside the `verify` data block): its errors first,
+/// then the command's usual "last output" part.
+pub fn feedback_errors(d: &Diagnostics) -> String {
+    if d.errors.is_empty() {
+        return String::new();
+    }
+    let more = d.errors_total - d.errors.len();
+    format!(
+        "X++ build errors ({} of {}{}):\n{}\n",
+        d.errors.len(),
+        d.errors_total,
+        if d.warnings_total > 0 {
+            format!("; {} warning(s) not listed", d.warnings_total)
+        } else {
+            String::new()
+        },
+        d.errors
+            .iter()
+            .map(|e| format!("  - {}", e.render()))
+            .chain((more > 0).then(|| format!("  - … and {more} more")))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
 }
 
 /// True when a configuration's verify is compile level only (it has a `tool: xpp` command).
@@ -513,12 +687,116 @@ mod tests {
             ["build/Core.Build", "build/Ext"]
         );
         assert_eq!(command_timeout(&c), Duration::from_secs(90 * 60));
-        let e = entry(&r[0], &tc, &not_started("build/Core.Build"));
+        let e = entry(
+            &r[0],
+            &tc,
+            &not_started("build/Core.Build"),
+            &Diagnostics::default(),
+        );
+        assert_eq!(e["diagnostics"], json!([]));
+        assert_eq!(e["errors_total"], 0);
         assert_eq!(e["kind"], "xpp");
         assert_eq!(e["scope"], "compile");
         assert_eq!(e["argv"][0], s(d.path().join("MSBuild.exe")));
         assert_eq!(e["toolchain"]["packages"][0]["version"], "7.0.7198.40");
         assert!(runs(&CommandSpec::program("t", "git", &[], None), &tc, &co, &out).is_none());
+    }
+
+    /// M9-B3 AC-1: realistic MSBuild lines — with and without a column, with a project suffix,
+    /// `MSB` errors without a location, warnings, the repeated summary, paths outside the
+    /// checkout — and the lines that are not diagnostics.
+    #[test]
+    fn msbuild_lines_are_parsed() {
+        let co = Path::new("C:/verify/T-1/T-1.verify");
+        let p = |l: &str| parse_line(l, co);
+        let d = p(r"  C:\verify\T-1\T-1.verify\Metadata\Core\Core\AxClass\CoreTax.xml(12,5): error XPP0101: 'amount' is not declared. [C:\verify\T-1\T-1.verify\Projects\Build\Core.Build.rnrproj]").unwrap();
+        assert_eq!(
+            d.file.as_deref(),
+            Some("Metadata/Core/Core/AxClass/CoreTax.xml")
+        );
+        assert_eq!((d.line, d.column), (Some(12), Some(5)));
+        assert_eq!(d.severity, "error");
+        assert_eq!(d.code.as_deref(), Some("XPP0101"));
+        assert_eq!(d.message, "'amount' is not declared.");
+        assert_eq!(
+            d.render(),
+            "Metadata/Core/Core/AxClass/CoreTax.xml(12,5): error XPP0101: 'amount' is not declared."
+        );
+        // line only, the long form, no code, other case of the checkout
+        let d = p(r"c:\VERIFY\t-1\T-1.verify\Metadata\Core\Descriptor\Core.xml(3): error : Model reference missing").unwrap();
+        assert_eq!(d.file.as_deref(), Some("Metadata/Core/Descriptor/Core.xml"));
+        assert_eq!((d.line, d.column, d.code.as_deref()), (Some(3), None, None));
+        let d = p(r"C:\verify\T-1\T-1.verify\x.xml(1,2,3,4): warning BP123: long form").unwrap();
+        assert_eq!(
+            (d.line, d.column, d.severity.as_str()),
+            (Some(1), Some(2), "warning")
+        );
+        // no location
+        let d = p("MSBUILD : error MSB1009: Project file does not exist.").unwrap();
+        assert_eq!(d.file.as_deref(), Some("MSBUILD"));
+        assert_eq!((d.code.as_deref(), d.line), (Some("MSB1009"), None));
+        assert_eq!(d.message, "Project file does not exist.");
+        let d = p("error : The build tasks folder was not found").unwrap();
+        assert_eq!((d.file.as_deref(), d.code.as_deref()), (None, None));
+        // a subcategory
+        let d = p(r"Main.cs(17,20): Command line warning CS0168: never used").unwrap();
+        assert_eq!(
+            (d.severity.as_str(), d.code.as_deref()),
+            ("warning", Some("CS0168"))
+        );
+        // outside the checkout: kept as written
+        let d = p(r"C:\Program Files\MSBuild\Microsoft.Common.targets(2302,5): warning MSB3245: Could not resolve this reference. [C:\verify\T-1\T-1.verify\Projects\Build\Core.Build.rnrproj]").unwrap();
+        assert_eq!(
+            d.file.as_deref(),
+            Some(r"C:\Program Files\MSBuild\Microsoft.Common.targets")
+        );
+        assert_eq!(d.message, "Could not resolve this reference.");
+        // a bracket that is not a project stays in the message
+        let d = p("error X1: index [3] out of range").unwrap();
+        assert_eq!(d.message, "index [3] out of range");
+        for other in [
+            "Build FAILED.",
+            "    2 Error(s)",
+            "    0 Warning(s)",
+            "  Core -> C:\\out\\Core.dll",
+            "Time Elapsed 00:01:02.34",
+            "Compiling Foo: error count 0",
+            "",
+        ] {
+            assert_eq!(p(other), None, "{other}");
+        }
+    }
+
+    /// The summary repeats every error: each is kept once; warnings are counted, errors capped.
+    #[test]
+    fn diagnostics_are_deduplicated_counted_and_capped() {
+        let co = Path::new("/v/T/T.verify");
+        let mut out = String::new();
+        let e1 = "/v/T/T.verify/src/A.xml(1,1): error XPP1: one [/v/T/T.verify/P/B.rnrproj]";
+        let e2 = "/v/T/T.verify/src/B.xml(2,1): error XPP2: two [/v/T/T.verify/P/B.rnrproj]";
+        let w = "/v/T/T.verify/src/C.xml(3,1): warning XPP3: three";
+        for l in [e1, w, e2, "Build FAILED.", "", e1, w, e2, "    2 Error(s)"] {
+            out.push_str(l);
+            out.push('\n');
+        }
+        let d = diagnostics(&out, co);
+        assert_eq!((d.errors_total, d.warnings_total), (2, 1));
+        assert_eq!(
+            d.errors
+                .iter()
+                .map(|e| e.file.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["src/A.xml", "src/B.xml"]
+        );
+        let f = feedback_errors(&d);
+        assert!(f.starts_with("X++ build errors (2 of 2; 1 warning(s) not listed):\n  - src/A.xml(1,1): error XPP1: one\n"), "{f}");
+        let many: String = (0..70)
+            .map(|i| format!("/v/T/T.verify/src/X{i}.xml(1,1): error XPP9: e{i}\n"))
+            .collect();
+        let d = diagnostics(&many, co);
+        assert_eq!((d.errors.len(), d.errors_total), (DIAGNOSTICS_MAX, 70));
+        assert!(feedback_errors(&d).ends_with("  - … and 20 more\n"));
+        assert_eq!(feedback_errors(&Diagnostics::default()), "");
     }
 
     #[test]

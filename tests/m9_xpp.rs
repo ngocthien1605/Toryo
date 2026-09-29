@@ -22,19 +22,30 @@ struct Xpp {
     nugets: PathBuf,
 }
 
-/// The fake MSBuild: logs its arguments, prints `output`, exits 1 when its first argument (the
-/// project) has the stem `fail_stem` — unless the checkout has `src/FIXED` (a fix).
-fn fake_msbuild(root: &Path, fail_stem: &str, output: &str) -> (PathBuf, PathBuf) {
+/// The fake MSBuild: logs its arguments, prints `errors`, then `output`, then `errors` again
+/// (MSBuild's summary), and exits 1 when its first argument (the project) has the stem
+/// `fail_stem` — unless the checkout has `src/FIXED` (a fix). In `errors`, `{CWD}` is the
+/// working directory (the verify checkout) and `{SEP}` the path separator.
+fn fake_msbuild(root: &Path, fail_stem: &str, output: &str, errors: &[&str]) -> (PathBuf, PathBuf) {
     let log = root.join("msbuild-argv.log");
     let out = root.join("msbuild-output.txt");
     std::fs::write(&out, output).unwrap();
     #[cfg(windows)]
     let exe = {
         let p = root.join("msbuild.cmd");
+        let echo: String = errors
+            .iter()
+            .map(|e| {
+                format!(
+                    "echo {}\r\n",
+                    e.replace("{CWD}", "%CD%").replace("{SEP}", "\\")
+                )
+            })
+            .collect();
         std::fs::write(
             &p,
             format!(
-                "@echo off\r\n>>\"{log}\" echo %*\r\ntype \"{out}\"\r\nif exist \"src\\FIXED\" exit /b 0\r\nif /I \"%~n1\"==\"{fail_stem}\" exit /b 1\r\nexit /b 0\r\n",
+                "@echo off\r\n>>\"{log}\" echo %*\r\n{echo}type \"{out}\"\r\n{echo}if exist \"src\\FIXED\" exit /b 0\r\nif /I \"%~n1\"==\"{fail_stem}\" exit /b 1\r\nexit /b 0\r\n",
                 log = log.display(),
                 out = out.display()
             ),
@@ -46,10 +57,19 @@ fn fake_msbuild(root: &Path, fail_stem: &str, output: &str) -> (PathBuf, PathBuf
     let exe = {
         use std::os::unix::fs::PermissionsExt;
         let p = root.join("msbuild.sh");
+        let echo: String = errors
+            .iter()
+            .map(|e| {
+                format!(
+                    "echo \"{}\"\n",
+                    e.replace("{CWD}", "$PWD").replace("{SEP}", "/")
+                )
+            })
+            .collect();
         std::fs::write(
             &p,
             format!(
-                "#!/bin/sh\necho \"$@\" >> '{log}'\ncat '{out}'\nif [ -f src/FIXED ]; then exit 0; fi\ncase \"$(basename \"$1\")\" in {fail_stem}.*) exit 1;; esac\nexit 0\n",
+                "#!/bin/sh\necho \"$@\" >> '{log}'\n{echo}cat '{out}'\n{echo}if [ -f src/FIXED ]; then exit 0; fi\ncase \"$(basename \"$1\")\" in {fail_stem}.*) exit 1;; esac\nexit 0\n",
                 log = log.display(),
                 out = out.display()
             ),
@@ -70,6 +90,17 @@ fn fwd(p: &Path) -> String {
 /// verify command over `projects` (after the fixture's `divide-present` program command when
 /// `with_program`).
 fn setup_xpp(projects: &[&str], fail_stem: &str, output: &str, with_program: bool) -> Xpp {
+    setup_xpp_with(projects, fail_stem, output, &[], with_program)
+}
+
+/// [`setup_xpp`] with error lines the fake MSBuild prints (see [`fake_msbuild`]).
+fn setup_xpp_with(
+    projects: &[&str],
+    fail_stem: &str,
+    output: &str,
+    errors: &[&str],
+    with_program: bool,
+) -> Xpp {
     let env = setup("codex-openai");
     let files: Vec<(String, String)> = projects
         .iter()
@@ -95,7 +126,7 @@ fn setup_xpp(projects: &[&str], fail_stem: &str, output: &str, with_program: boo
         )
         .unwrap();
     }
-    let (msbuild, log) = fake_msbuild(&env.root, fail_stem, output);
+    let (msbuild, log) = fake_msbuild(&env.root, fail_stem, output, errors);
     let machine = std::fs::read_to_string(&env.machine).unwrap();
     std::fs::write(
         &env.machine,
@@ -418,4 +449,101 @@ fn a_broken_xpp_toolchain_refuses_admission_or_escalates() {
         .unwrap();
     assert_eq!(v.error_class.as_deref(), Some("xpp_toolchain_unavailable"));
     assert!(built(&x).is_empty());
+}
+
+/// M9-B3 AC-2/AC-3 (`xpp_diagnostics`, plan §16): the fake MSBuild prints 3 000 lines with two
+/// errors near the top (repeated in its summary). Both errors are in `diagnostics` of the
+/// failed verify, once each, with paths relative to the checkout; the fixer's feedback starts
+/// with them; `status` and the final gate say that verify was compile only.
+#[test]
+fn xpp_diagnostics() {
+    let errors = [
+        "{CWD}{SEP}src{SEP}Calculator.xml(12,5): error XPP0101: 'amount' is not declared. [{CWD}{SEP}Projects{SEP}Build{SEP}Calc.Build.rnrproj]",
+        "{CWD}{SEP}src{SEP}Tax.xml(40): error XPP0202: Method calc not found.",
+    ];
+    let filler: String = (1..=3000)
+        .map(|i| format!("  compiling object {i} of 3000\n"))
+        .collect();
+    let x = setup_xpp_with(&["Calc.Build"], "Calc.Build", &filler, &errors, false);
+    let env = &x.env;
+    create(env, "X-5");
+    let s = script(
+        env,
+        "x5.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()]),
+                turn(vec![write("src/FIXED", "1"), implementation()]),
+            ],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(env, &["run", "X-5", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    let (code, err) = toryo(
+        env,
+        &[
+            "approve",
+            "X-5",
+            "--gate",
+            "plan",
+            "--continue",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = task(env, "X-5");
+    assert_eq!(t.state, St::WaitingFinalApproval, "{err}");
+    assert_eq!(t.fix_cycle, 1);
+    const NOTE: &str = "verify: compile only (X++: no DB sync, no unit tests)";
+    assert!(err.contains(&format!("final gate — {NOTE}")), "{err}");
+    assert!(status_out(env, "X-5").contains(NOTE));
+    let summary = std::fs::read_to_string(t.artifacts().join("SUMMARY.md")).unwrap();
+    assert!(summary.contains(NOTE), "{summary}");
+
+    // the failed verify: version 1 of VERIFY_RESULT.json
+    let dir = toryo::engine::artifacts::root(&t).join("verify-result");
+    let first = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy().starts_with("1-"))
+        .unwrap();
+    let vr: Value = serde_json::from_slice(&std::fs::read(first.path()).unwrap()).unwrap();
+    assert_eq!(vr["pass"], false);
+    assert_eq!(vr["scope"], "compile");
+    let c = &vr["commands"][0];
+    assert_eq!(c["errors_total"], 2);
+    assert_eq!(c["warnings_total"], 0);
+    assert_eq!(
+        c["diagnostics"],
+        json!([
+            {"file": "src/Calculator.xml", "line": 12, "column": 5, "severity": "error", "code": "XPP0101", "message": "'amount' is not declared."},
+            {"file": "src/Tax.xml", "line": 40, "severity": "error", "code": "XPP0202", "message": "Method calc not found."},
+        ])
+    );
+    assert!(
+        !c["output_tail"]
+            .as_str()
+            .unwrap()
+            .contains("compiling object 100 of"),
+        "the tail is the end of the output"
+    );
+    // the fixer reads the errors first, inside the verify data block
+    let fix = calls(env, "X-5")
+        .into_iter()
+        .filter(|c| c["key"] == "implementer")
+        .nth(1)
+        .unwrap();
+    let prompt = fix["prompt"].as_str().unwrap();
+    let block = prompt
+        .split("<untrusted_data source=\"verify\">\n")
+        .nth(1)
+        .unwrap();
+    assert!(
+        block.starts_with("- VERIFY FAILED: `build/Calc.Build` exited 1. X++ build errors (2 of 2):\n  - src/Calculator.xml(12,5): error XPP0101: 'amount' is not declared.\n  - src/Tax.xml(40): error XPP0202: Method calc not found.\nLast output:"),
+        "{block}"
+    );
 }
