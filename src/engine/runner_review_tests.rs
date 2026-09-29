@@ -552,3 +552,35 @@ fn a_rooted_or_drive_relative_program_is_not_anchored() {
         PathBuf::from(r"D:tools\x.exe")
     );
 }
+
+/// An IDE opened on the task worktree during a read-only turn (Visual Studio `.vs/`,
+/// JetBrains `.idea/`) is not the role's write; anything else next to it still is.
+#[test]
+fn an_ide_state_folder_created_during_a_read_only_turn_is_not_a_write() {
+    let h = "a".repeat(40);
+    let before = tree(Some(&h), &[]);
+    let ide = tree(
+        Some(&h),
+        &[
+            (".vs/toryo/v17/.suo", "??", "v1"),
+            (".VS/ProjectSettings.json", "??", "v2"),
+            (".idea/workspace.xml", "??", "i1"),
+        ],
+    );
+    assert_eq!(read_only_write(&before, &ide), None);
+    let mixed = tree(
+        Some(&h),
+        &[(".vs/toryo/v17/.suo", "??", "v1"), ("notes.md", "??", "n1")],
+    );
+    assert_eq!(
+        read_only_write(&before, &mixed),
+        Some(
+            "policy_violation: the worktree changed during a read-only stage: [\"notes.md\"]"
+                .into()
+        )
+    );
+    // a folder that only starts like one is not an IDE folder
+    let other = tree(Some(&h), &[(".vscode-notes/x.md", "??", "x1")]);
+    assert!(read_only_write(&before, &other).is_some());
+    assert!(!ide_state(".vsix/a") && ide_state(".vs") && ide_state(".idea\\x"));
+}

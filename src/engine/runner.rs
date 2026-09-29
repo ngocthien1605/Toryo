@@ -2831,7 +2831,11 @@ fn content_hash(p: &Path) -> String {
 /// (the wording of recovery's check). What was already there before the turn is not its
 /// write (F5).
 fn read_only_write(before: &TreeState, after: &TreeState) -> Option<String> {
-    let changed = after.changed_since(before);
+    let changed: Vec<String> = after
+        .changed_since(before)
+        .into_iter()
+        .filter(|p| !ide_state(p))
+        .collect();
     if !changed.is_empty() {
         return Some(format!(
             "policy_violation: the worktree changed during a read-only stage: {changed:?}"
@@ -2845,6 +2849,13 @@ fn read_only_write(before: &TreeState, after: &TreeState) -> Option<String> {
             at(&after.head)
         )
     })
+}
+
+/// An IDE's own state folder (Visual Studio `.vs/`, JetBrains `.idea/`): an IDE opened on the
+/// task worktree creates it at any time, so it is never a read-only role's write.
+fn ide_state(path: &str) -> bool {
+    let first = path.split(['/', '\\']).next().unwrap_or_default();
+    first.eq_ignore_ascii_case(".vs") || first.eq_ignore_ascii_case(".idea")
 }
 
 /// The plan of a Planner turn that was not retried or escalated: its structured output when

@@ -514,6 +514,8 @@ pub fn denied_override(key: &str, provider_id: Option<&str>) -> Option<&'static 
         Some("re-sets the approval policy of the unattended `codex exec` turn")
     } else if k.starts_with("shell_environment_policy") {
         Some("re-sets the environment of Codex's commands, which toryo builds (R23)")
+    } else if k == "profile" || is_or_under(&k, "profiles") {
+        Some("selects or defines a Codex profile, whose settings would re-set the sandbox and provider that toryo sets")
     } else if provider_id.is_some_and(|id| resets_provider(&k, id)) {
         Some("re-sets the provider of codex.provider (change it there)")
     } else {
@@ -856,6 +858,24 @@ policy:
     /// approval or environment policy are refused; the provider's selector and the fields
     /// toryo passes for it only with a `codex.provider` block. A key is read as Codex reads
     /// it (up to `=`, no whitespace or quotes), in any case.
+    /// `-c profile="x"` with `-c profiles.x.sandbox_mode=…` would re-set the sandbox through
+    /// a profile, so both are refused, like the sandbox keys themselves.
+    #[test]
+    fn codex_overrides_cannot_select_or_define_a_profile() {
+        for key in [
+            "profile",
+            "Profile",
+            "profiles",
+            "profiles.x.sandbox_mode",
+            "profiles.x",
+        ] {
+            assert!(denied_override(key, None).is_some(), "{key}");
+        }
+        for key in ["profiles_dir", "profile_name", "model_profile"] {
+            assert!(denied_override(key, None).is_none(), "{key}");
+        }
+    }
+
     #[test]
     fn codex_overrides_refuse_exactly_what_toryo_sets() {
         let foundry = Some("foundry");

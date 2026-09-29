@@ -174,7 +174,10 @@ fn ec01_a_denied_reviewer_turn_never_approves_the_task() {
 /// refusal (a refused Codex preflight): escalated at once with the real class.
 #[test]
 fn ec01_ec14_denials_and_policy_refusals_escalate_at_once() {
-    let refused = fail("PolicyRefusal", "preflight: sandbox_mode is `read-only`");
+    let refused = fail(
+        "PolicyRefusal",
+        "preflight: sandbox_mode is `danger-full-access`",
+    );
     for (id, first, class) in [
         ("P-2", turn(vec![deny(), approved()]), "PermissionDenied"),
         ("P-3", turn(vec![refused]), "PolicyRefusal"),
