@@ -1331,7 +1331,8 @@ impl<'a> Engine<'a> {
         results: &mut Vec<Value>,
     ) -> Result<Option<Option<String>>> {
         let out = at.co.build().join("xpp");
-        let runs = xpp::runs(c, tc, &at.co.dir, &out).unwrap_or_default();
+        // the response files go to the task's verify folder, which the build cannot write
+        let runs = xpp::runs(c, tc, &at.co.dir, &out, &at.co.base).unwrap_or_default();
         std::fs::create_dir_all(&out)?;
         let deadline = std::time::Instant::now() + xpp::command_timeout(c);
         for r in runs {
@@ -1339,7 +1340,10 @@ impl<'a> Engine<'a> {
             let res = if left.is_zero() {
                 xpp::not_started(&r.name)
             } else {
-                let run = at.spec(&r.name, tc.msbuild.clone(), r.args.clone(), left);
+                r.write_response()?;
+                let mut run = at.spec(&r.name, tc.msbuild.clone(), r.command.clone(), left);
+                run.env
+                    .extend(xpp::ENV.map(|(k, v)| (k.to_string(), v.to_string())));
                 match self.run_verify_command(run, at.stop)? {
                     Some(res) => res,
                     None => return Ok(None),

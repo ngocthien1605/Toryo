@@ -116,6 +116,9 @@ pub fn run(cli: &Cli, cmd: &XppCmd) -> Result<i32> {
     if a.low && !cfg!(windows) {
         bail!("--low needs Windows (the Low integrity boundary, R36)");
     }
+    if a.low && a.out.is_some() {
+        bail!("--out cannot be used with --low: at Low integrity the output goes to the Low-labelled scratch folder");
+    }
     let name = repo
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -132,11 +135,18 @@ pub fn run(cli: &Cli, cmd: &XppCmd) -> Result<i32> {
     };
     let projects: Vec<&str> = a.projects.iter().map(String::as_str).collect();
     let spec = CommandSpec::xpp("build", &a.metadata, &projects, Some(a.timeout_min));
-    let runs = xpp::runs(&spec, &tc, &checkout, &out).unwrap_or_default();
+    // the response files (the properties, see xpp::invocation) go to the scratch folder, which
+    // the build itself cannot write
+    let runs = xpp::runs(&spec, &tc, &checkout, &out, &scratch).unwrap_or_default();
     if a.print_only {
         for r in &runs {
+            r.write_response()?;
             println!("# {} ({})", r.name, r.project);
-            println!("{}", xpp::powershell_line(&tc.msbuild, &r.args));
+            println!("# response file {}:", r.rsp.display());
+            for l in r.response.lines() {
+                println!("#   {l}");
+            }
+            println!("{}", xpp::powershell_line(&tc.msbuild, &r.command));
         }
         if a.low {
             println!(
@@ -184,7 +194,8 @@ pub fn run(cli: &Cli, cmd: &XppCmd) -> Result<i32> {
         .context("labelling the scratch folder Low (R45: verify_root needs WRITE_OWNER)")?;
     }
     std::fs::create_dir_all(&out)?;
-    let env = verify::env(&co);
+    let mut env = verify::env(&co);
+    env.extend(xpp::ENV.map(|(k, v)| (k.to_string(), v.to_string())));
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -206,11 +217,12 @@ pub fn run(cli: &Cli, cmd: &XppCmd) -> Result<i32> {
             return Ok(1);
         }
         eprintln!("── {} ({}) …", r.name, r.project);
+        r.write_response()?;
         let res = rt.block_on(LocalRunner.run(
             RunSpec {
                 name: r.name.clone(),
                 program: tc.msbuild.clone(),
-                args: r.args.clone(),
+                args: r.command.clone(),
                 cwd: checkout.clone(),
                 env: env.clone(),
                 boundary: if a.low {

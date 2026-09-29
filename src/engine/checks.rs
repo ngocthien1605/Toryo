@@ -457,9 +457,12 @@ pub fn verify_files(cmds: &[CommandSpec], repo: &Path) -> Vec<String> {
         let (program, args) = match c.kind() {
             CommandKind::Program { program, args } => (program, args),
             CommandKind::Xpp { projects, .. } => {
+                // the project and the `.user` file MSBuild imports next to it
                 for p in projects {
-                    if let Some(r) = repo_relative(repo, p) {
-                        add(r);
+                    for f in [p.clone(), format!("{p}.user")] {
+                        if let Some(r) = repo_relative(repo, &f) {
+                            add(r);
+                        }
                     }
                 }
                 continue;
@@ -487,14 +490,30 @@ pub fn verify_files(cmds: &[CommandSpec], repo: &Path) -> Vec<String> {
 pub const XPP_PROTECTED_GLOB: &str = "**/Directory.Build.*";
 
 /// The protected globs the verify commands add to `policy.protected_paths` (R59): for
-/// `tool: xpp`, [`XPP_PROTECTED_GLOB`]. Like the files of [`verify_files`], they are protected
-/// whether or not the list names [`VERIFY_SCRIPTS`].
+/// `tool: xpp`, [`XPP_PROTECTED_GLOB`] and the `obj` folder next to each project (MSBuild
+/// imports `obj/<project>.*.props|targets`). Like the files of [`verify_files`], they are
+/// protected whether or not the list names [`VERIFY_SCRIPTS`].
 pub fn verify_globs(cmds: &[CommandSpec]) -> Vec<String> {
-    if cmds.iter().any(CommandSpec::is_xpp) {
-        vec![XPP_PROTECTED_GLOB.to_string()]
-    } else {
-        Vec::new()
+    let mut out: Vec<String> = Vec::new();
+    for c in cmds {
+        let CommandKind::Xpp { projects, .. } = c.kind() else {
+            continue;
+        };
+        if out.is_empty() {
+            out.push(XPP_PROTECTED_GLOB.to_string());
+        }
+        for p in projects {
+            let n = norm_path(p);
+            let obj = match n.rsplit_once('/') {
+                Some((dir, _)) => format!("{dir}/obj/**"),
+                None => "obj/**".to_string(),
+            };
+            if !out.contains(&obj) {
+                out.push(obj);
+            }
+        }
     }
+    out
 }
 
 #[cfg(test)]
@@ -794,7 +813,9 @@ mod tests {
             files,
             [
                 "Projects/Build/Core.Build.rnrproj",
-                "Projects/Build/Missing.rnrproj"
+                "Projects/Build/Core.Build.rnrproj.user",
+                "Projects/Build/Missing.rnrproj",
+                "Projects/Build/Missing.rnrproj.user"
             ]
         );
         let mut globs = vec![VERIFY_SCRIPTS.to_string()];
@@ -806,6 +827,8 @@ mod tests {
             "Directory.Build.props",
             "Metadata/Directory.Build.targets",
             "Projects/Build/directory.build.rsp",
+            "Projects/Build/Core.Build.rnrproj.user",
+            "Projects/Build/obj/Core.Build.rnrproj.x.targets",
         ] {
             assert!(p.violates(f), "{f}");
         }

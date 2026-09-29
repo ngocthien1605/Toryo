@@ -444,7 +444,7 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     let verify_changed = serde_json::to_value(&old.repo.commands.verify)?
         != serde_json::to_value(&new.repo.commands.verify)?
         || serde_json::to_value(&old.repo.verify)? != serde_json::to_value(&new.repo.verify)?
-        || old.toolchains != new.toolchains; // R59: another MSBuild or NuGet release
+        || toryo::engine::xpp::build_toolchain(&old) != toryo::engine::xpp::build_toolchain(&new); // R59
     let reverify = verify_changed && artifacts::head(&st, &t, "verify-result")?.is_some();
     let invalidated = serde_json::to_vec_pretty(
         &serde_json::json!({"invalidated": true, "reason": "task config --reload changed the verify configuration", "config_sha256": new_sha}),

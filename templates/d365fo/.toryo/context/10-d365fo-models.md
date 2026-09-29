@@ -6,8 +6,8 @@
 - Models here: TODO(owner) — e.g. `ContosoCore` (package ContosoCore). Each model uses only objects of
   the packages its descriptor references. A new package reference is a design decision: only when
   the task says so.
-- **ZZZ**: `ZZZ*` models and folders are local experiments. Never create, change or commit anything
-  under `**/ZZZ/**` — toryo refuses such changes.
+- **ZZZ**: `ZZZ` folders hold local experiments. Never create, change or commit anything under
+  `**/ZZZ/**` — toryo refuses such changes. TODO(owner): the exact rule, the same in `deny_paths`.
 - Source layout: `Metadata/<Package>/<Model>/Ax<Type>/<Object>.xml` (AxClass, AxTable, AxForm, …),
   one object per file, the file named after the object.
 

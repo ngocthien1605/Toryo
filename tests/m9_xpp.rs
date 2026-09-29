@@ -121,8 +121,7 @@ fn setup_xpp_with(
         std::fs::create_dir_all(
             nugets
                 .join(format!("{id}.7.0.7198.40"))
-                .join("ref")
-                .join("net40"),
+                .join(toryo::engine::xpp::marker(id)),
         )
         .unwrap();
     }
@@ -154,6 +153,25 @@ fn setup_xpp_with(
     };
     std::fs::write(&env.config, cfg.replace(divide, &with)).unwrap();
     Xpp { env, log, nugets }
+}
+
+/// The response-file lines of a `VERIFY_RESULT.json` xpp entry.
+fn response_lines(c: &Value) -> Vec<String> {
+    c["response_file"]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The value of property `name` in an xpp entry's response file (`/p:Name="value"`).
+fn property(c: &Value, name: &str) -> String {
+    response_lines(c)
+        .iter()
+        .find_map(|l| l.strip_prefix(&format!("/p:{name}=\"")))
+        .map(|v| v.trim_end_matches('"').to_string())
+        .unwrap()
 }
 
 /// The logged MSBuild runs: the project file name of each, in order.
@@ -228,12 +246,25 @@ fn a_passing_xpp_build_passes_verify() {
         assert!(argv[0].contains("msbuild"), "{argv:?}");
         assert!(argv[1].ends_with(&format!("{stem}.rnrproj")));
         assert!(argv.contains(&"-noAutoResponse") && argv.contains(&"-nodeReuse:false"));
-        let out = argv
+        // the properties went through a response file with quoted values (MSBuild splits an
+        // unquoted -p: value at `;`), which the fake MSBuild received as `@<path>`
+        let rsp = argv.last().unwrap().strip_prefix('@').unwrap();
+        assert_eq!(c["response_file"]["path"], rsp);
+        let bytes = std::fs::read(rsp).unwrap();
+        assert_eq!(&bytes[..3], [0xEF, 0xBB, 0xBF]);
+        let lines = response_lines(c);
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.starts_with("/p:") && l.ends_with('"')),
+            "{lines:?}"
+        );
+        assert!(lines
             .iter()
-            .find_map(|a| a.strip_prefix("/p:OutputDirectory="))
-            .unwrap();
-        assert!(Path::new(out).ends_with("X-1/build/xpp"), "{out}");
-        assert!(Path::new(out).is_dir(), "the output folder is created");
+            .any(|l| l.starts_with("/p:ReferenceFolder=\"") && l.contains(';')));
+        let out = property(c, "OutputDirectory");
+        assert!(Path::new(&out).ends_with("X-1/build/xpp"), "{out}");
+        assert!(Path::new(&out).is_dir(), "the output folder is created");
         let pk = &c["toolchain"]["packages"];
         assert_eq!(pk.as_array().unwrap().len(), 5);
         assert_eq!(pk[0]["id"], PACKAGES[0]);
@@ -427,6 +458,25 @@ fn a_broken_xpp_toolchain_refuses_admission_or_escalates() {
     );
 
     std::fs::rename(&aside, &suite).unwrap();
+    // a build project that is not in the repository (protected: the implementer cannot add it)
+    let cfg = std::fs::read_to_string(&env.config).unwrap();
+    std::fs::write(
+        &env.config,
+        cfg.replace(
+            "projects: [Projects/Build/Calc.Build.rnrproj]",
+            "projects: [Projects/Build/Calc.Build.rnrproj, Projects/Build/Nope.rnrproj]",
+        ),
+    )
+    .unwrap();
+    let (code, err) = toryo(
+        env,
+        &["task", "create", "--file", "TASK.md", "--id", "X-4"],
+        &[],
+    );
+    assert_ne!(code, 0);
+    assert!(err.contains("xpp_project_missing"), "{err}");
+    assert!(err.contains("project Projects/Build/Nope.rnrproj"), "{err}");
+    std::fs::write(&env.config, cfg).unwrap();
     create(env, "X-4");
     let s = script(
         env,
@@ -584,11 +634,7 @@ fn xpp_build_print_only_prints_the_verify_argv() {
         .map(|a| a.as_str().unwrap().to_string())
         .collect();
     let checkout = vr["verify_checkout"].as_str().unwrap().to_string();
-    let out = argv
-        .iter()
-        .find_map(|a| a.strip_prefix("/p:OutputDirectory="))
-        .unwrap()
-        .to_string();
+    let out = property(&vr["commands"][0], "OutputDirectory");
     let runs_before = built(&x).len();
     let (code, stdout, stderr) = run_out(
         env,
@@ -607,8 +653,19 @@ fn xpp_build_print_only_prints_the_verify_argv() {
         ],
     );
     assert_eq!(code, 0, "{stderr}");
-    let line = toryo::engine::xpp::powershell_line(Path::new(&argv[0]), &argv[1..]);
-    assert!(stdout.contains(&line), "{line}\n---\n{stdout}");
+    // the same properties, and the same command up to the response file's own path
+    for l in response_lines(&vr["commands"][0]) {
+        assert!(
+            stdout.contains(&format!("\n#   {l}\n")),
+            "{l}\n---\n{stdout}"
+        );
+    }
+    let n = argv.len();
+    let prefix = toryo::engine::xpp::powershell_line(Path::new(&argv[0]), &argv[1..n - 1]) + " '@";
+    assert!(
+        stdout.lines().any(|l| l.starts_with(&prefix)),
+        "{prefix}\n---\n{stdout}"
+    );
     assert!(stdout.contains("# build/Calc.Build (Projects/Build/Calc.Build.rnrproj)"));
     assert_eq!(built(&x).len(), runs_before, "--print-only builds nothing");
     // --low: Windows only (the Low integrity boundary)
@@ -628,6 +685,14 @@ fn xpp_build_print_only_prints_the_verify_argv() {
     if cfg!(windows) {
         assert_eq!(code, 0, "{stderr}");
         assert!(stdout.contains("# --low: builds a copy of src"), "{stdout}");
+        let mut with_out = low.to_vec();
+        with_out.extend(["--out", &out]);
+        let (code, _, stderr) = run_out(env, &with_out);
+        assert_ne!(code, 0);
+        assert!(
+            stderr.contains("--out cannot be used with --low"),
+            "{stderr}"
+        );
     } else {
         assert_ne!(code, 0);
         assert!(stderr.contains("--low needs Windows"), "{stderr}");

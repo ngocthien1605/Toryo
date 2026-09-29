@@ -112,8 +112,10 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     let g = task_git(cfg, &repo)?;
     // R36/R45 admission: the verify boundary must be available before anything is created
     super::verify::probe(cfg)?;
-    // R59 admission: a `tool: xpp` command needs MSBuild and the five CI/CD packages here
+    // R59 admission: a `tool: xpp` command needs MSBuild and the five CI/CD packages here, and
+    // its metadata folder and (protected) projects in the repository
     super::xpp::for_config(cfg)?;
+    super::xpp::check_repo(cfg, &repo)?;
     let repol = Loc::Discover(repo.clone());
     if !g
         .output(&repol, true, &["rev-parse", "--git-dir"])?

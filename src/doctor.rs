@@ -969,7 +969,8 @@ mod tests {
         .unwrap();
         let nugets = d.join("nugets");
         for id in crate::engine::xpp::PACKAGES {
-            std::fs::create_dir_all(nugets.join(format!("{id}.7.0.7198.40"))).unwrap();
+            let dir = nugets.join(format!("{id}.7.0.7198.40"));
+            std::fs::create_dir_all(dir.join(crate::engine::xpp::marker(id))).unwrap();
         }
         let msbuild = d.join("MSBuild.exe");
         std::fs::write(&msbuild, "").unwrap();

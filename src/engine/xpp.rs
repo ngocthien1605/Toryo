@@ -41,6 +41,10 @@ pub const DEFAULT_TIMEOUT_MIN: u64 = 90;
 /// The error class of a toolchain that cannot be used (a missing MSBuild or package).
 pub const UNAVAILABLE: &str = "xpp_toolchain_unavailable";
 
+/// Added to the verify environment of an MSBuild run: English messages, whatever language pack
+/// Visual Studio has — the diagnostics parser and the fixer read them.
+pub const ENV: [(&str, &str); 1] = [("VSLANG", "1033")];
+
 /// What `status`, `task show` and the final gate say about a compile-only verify (R59).
 pub const COMPILE_ONLY: &str = "verify: compile only (X++: no DB sync, no unit tests)";
 
@@ -105,9 +109,48 @@ fn nuspec_version(dir: &Path, id: &str) -> Option<String> {
     re.captures(&text).map(|c| c[1].to_string())
 }
 
+/// What the build reads in a package: `DevAlm` in the compiler package, `ref\net40` in the
+/// others ([`argv`]).
+pub fn marker(id: &str) -> PathBuf {
+    if id == COMPILER {
+        PathBuf::from("DevAlm")
+    } else {
+        Path::new("ref").join("net40")
+    }
+}
+
+/// The folder of a package whose content is `dir` itself, or — the NuGet cache layout
+/// `<id>\<version>\` — its only version subfolder. `None` when neither holds [`marker`].
+fn package_root(dir: &Path, id: &str) -> Option<(PathBuf, Option<String>)> {
+    let m = marker(id);
+    if dir.join(&m).is_dir() {
+        return Some((dir.to_path_buf(), None));
+    }
+    let versions: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(|c: char| c.is_ascii_digit()))
+                && p.join(&m).is_dir()
+        })
+        .collect();
+    match versions.as_slice() {
+        [one] => {
+            let v = one.file_name().map(|n| n.to_string_lossy().to_string());
+            Some((one.clone(), v))
+        }
+        _ => None,
+    }
+}
+
 /// The five packages under `nugets`: exactly one folder per id, named `<id>` or
-/// `<id>.<version>`. Every problem is reported at once: a missing package, one found twice,
-/// and one that is only a `.nupkg` (with how to extract it).
+/// `<id>.<version>` (or the NuGet cache layout `<id>\<version>\`), holding what the build
+/// reads (`DevAlm`, `ref\net40`). Every problem is reported at once: a missing package, one
+/// found twice, one that is only a `.nupkg` (with how to extract it), one without its content.
 pub fn resolve_packages(nugets: &Path) -> Result<Vec<Package>> {
     let entries: Vec<(String, PathBuf, bool)> = std::fs::read_dir(nugets)
         .with_context(|| {
@@ -131,14 +174,22 @@ pub fn resolve_packages(nugets: &Path) -> Result<Vec<Package>> {
             .collect();
         dirs.sort_by(|a, b| a.0.cmp(&b.0));
         match dirs.as_slice() {
-            [(name, dir, _)] => {
-                let suffix = package_suffix(name, id).filter(|s| !s.is_empty());
-                found.push(Package {
-                    id: id.to_string(),
-                    version: nuspec_version(dir, id).or(suffix.map(str::to_string)),
-                    dir: dir.clone(),
-                });
-            }
+            [(name, dir, _)] => match package_root(dir, id) {
+                Some((root, sub)) => {
+                    let suffix = package_suffix(name, id).filter(|s| !s.is_empty());
+                    found.push(Package {
+                        id: id.to_string(),
+                        version: nuspec_version(&root, id)
+                            .or(suffix.map(str::to_string))
+                            .or(sub),
+                        dir: root,
+                    });
+                }
+                None => problems.push(format!(
+                    "{id}: {name} has no {} folder — a partly extracted package? Extract the whole .nupkg again",
+                    marker(id).display()
+                )),
+            },
             [] => {
                 let nupkg = entries.iter().find(|(n, _, d)| {
                     !*d && n.to_ascii_lowercase().ends_with(".nupkg")
@@ -219,6 +270,37 @@ pub fn for_config(cfg: &Effective) -> Result<Option<Toolchain>> {
     Ok(Some(tc))
 }
 
+/// The error class of a `tool: xpp` command whose metadata folder or project is missing.
+pub const PROJECT_MISSING: &str = "xpp_project_missing";
+
+/// Admission (`task create`): every `tool: xpp` command's metadata folder and projects exist
+/// in `repo`. The projects are protected (the implementer cannot add them later), so a missing
+/// one would fail every verify.
+pub fn check_repo(cfg: &Effective, repo: &Path) -> Result<()> {
+    let mut missing = Vec::new();
+    for c in &cfg.repo.commands.verify {
+        let CommandKind::Xpp { metadata, projects } = c.kind() else {
+            continue;
+        };
+        if !join_rel(repo, metadata).is_dir() {
+            missing.push(format!("{}: metadata folder {metadata}", c.name));
+        }
+        for p in projects {
+            if !join_rel(repo, p).is_file() {
+                missing.push(format!("{}: project {p}", c.name));
+            }
+        }
+    }
+    if !missing.is_empty() {
+        bail!(
+            "{PROJECT_MISSING}: not in {} — {} (create and commit the build projects first; they are protected, R59)",
+            repo.display(),
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// `rel` (with `/` or `\`) below `base`.
 pub fn join_rel(base: &Path, rel: &str) -> PathBuf {
     rel.split(['/', '\\'])
@@ -273,16 +355,66 @@ pub fn argv(
 }
 
 /// One MSBuild run of a `tool: xpp` command: its `VERIFY_RESULT.json` name
-/// (`<command>/<project stem>`), the project and the arguments.
+/// (`<command>/<project stem>`), the project, the arguments of plan §14 ([`argv`]) and how
+/// they reach MSBuild ([`invocation`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Run {
     pub name: String,
     pub project: String,
+    /// The MSBuild arguments as one list: what is built.
     pub args: Vec<String>,
+    /// The response file with the properties (written by [`Run::write_response`]).
+    pub rsp: PathBuf,
+    /// Its content.
+    pub response: String,
+    /// What is spawned after MSBuild: the project, the switches, `@<rsp>`.
+    pub command: Vec<String>,
 }
 
-/// The runs of `c`, in project order; `None` for a program command.
-pub fn runs(c: &CommandSpec, tc: &Toolchain, checkout: &Path, out: &Path) -> Option<Vec<Run>> {
+impl Run {
+    /// Write the response file, UTF-8 with a byte-order mark (MSBuild on .NET Framework reads
+    /// it with the ANSI code page otherwise).
+    pub fn write_response(&self) -> Result<()> {
+        if let Some(d) = self.rsp.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(self.response.as_bytes());
+        std::fs::write(&self.rsp, bytes).with_context(|| format!("writing {}", self.rsp.display()))
+    }
+}
+
+/// How the arguments of [`argv`] reach MSBuild. MSBuild splits a `-p:` value at `;` and `,`
+/// unless the value is quoted in the command line it parses itself, and the process layer's
+/// quoting cannot give it that — so the properties go to a response file, one per line with
+/// the value in quotes (values carry no trailing `\`, see [`value`]); the project and the
+/// switches (`-noAutoResponse` among them) stay on the command line, followed by `@<rsp>`.
+/// `-noAutoResponse` skips only the automatic `MSBuild.rsp`/`Directory.Build.rsp`.
+pub fn invocation(args: &[String], rsp: &Path) -> (Vec<String>, String) {
+    let (props, rest): (Vec<&String>, Vec<&String>) =
+        args.iter().partition(|a| a.starts_with("/p:"));
+    let response: String = props
+        .iter()
+        .map(|p| match p.split_once('=') {
+            Some((k, v)) => format!("{k}=\"{v}\"\r\n"),
+            None => format!("{p}\r\n"),
+        })
+        .collect();
+    let mut command: Vec<String> = rest.into_iter().cloned().collect();
+    command.push(format!("@{}", rsp.display()));
+    (command, response)
+}
+
+/// The runs of `c`, in project order, each with its response file in `rsp_dir` (a folder the
+/// build itself cannot write: the verify folder of the task, not the Low-labelled `build`);
+/// `None` for a program command.
+pub fn runs(
+    c: &CommandSpec,
+    tc: &Toolchain,
+    checkout: &Path,
+    out: &Path,
+    rsp_dir: &Path,
+) -> Option<Vec<Run>> {
     let CommandKind::Xpp { metadata, projects } = c.kind() else {
         return None;
     };
@@ -295,10 +427,17 @@ pub fn runs(c: &CommandSpec, tc: &Toolchain, checkout: &Path, out: &Path) -> Opt
                     .file_stem()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| file.to_string());
+                let name = format!("{}/{stem}", c.name);
+                let args = argv(tc, checkout, metadata, p, out);
+                let rsp = rsp_dir.join(format!("xpp-{}.rsp", name.replace('/', "-")));
+                let (command, response) = invocation(&args, &rsp);
                 Run {
-                    name: format!("{}/{stem}", c.name),
+                    name,
                     project: p.clone(),
-                    args: argv(tc, checkout, metadata, p, out),
+                    args,
+                    rsp,
+                    response,
+                    command,
                 }
             })
             .collect(),
@@ -337,7 +476,7 @@ pub fn toolchain_json(tc: &Toolchain) -> Value {
 /// A project's `VERIFY_RESULT.json` entry, with its parsed diagnostics (B3).
 pub fn entry(run: &Run, tc: &Toolchain, res: &CommandResult, diags: &Diagnostics) -> Value {
     let argv: Vec<String> = std::iter::once(tc.msbuild.display().to_string())
-        .chain(run.args.iter().cloned())
+        .chain(run.command.iter().cloned())
         .collect();
     json!({
         "name": run.name,
@@ -345,6 +484,10 @@ pub fn entry(run: &Run, tc: &Toolchain, res: &CommandResult, diags: &Diagnostics
         "scope": "compile",
         "project": run.project,
         "argv": argv,
+        "response_file": {
+            "path": run.rsp,
+            "lines": run.response.lines().collect::<Vec<_>>(),
+        },
         "exit": res.exit,
         "ms": res.duration_ms,
         "diagnostics": diags.errors,
@@ -536,6 +679,19 @@ pub fn powershell_line(program: &Path, args: &[String]) -> String {
         .join(" ")
 }
 
+/// The part of `toolchains.xpp` a verify build uses — `None` without a `tool: xpp` command, and
+/// without `ude_metadata` (only `doctor` reads it). `task config --reload` verifies again when
+/// this changes (another MSBuild or NuGet release), not for a toolchain the task never uses.
+pub fn build_toolchain(cfg: &Effective) -> Option<XppToolchain> {
+    if !compile_only(cfg) {
+        return None;
+    }
+    cfg.toolchains.xpp.clone().map(|x| XppToolchain {
+        ude_metadata: None,
+        ..x
+    })
+}
+
 /// True when a configuration's verify is compile level only (it has a `tool: xpp` command).
 pub fn compile_only(cfg: &Effective) -> bool {
     cfg.repo.commands.verify.iter().any(CommandSpec::is_xpp)
@@ -545,7 +701,8 @@ pub fn compile_only(cfg: &Effective) -> bool {
 mod tests {
     use super::*;
 
-    /// A `nugets` folder with the five packages (version-suffixed where `versioned`).
+    /// A `nugets` folder with the five packages (version-suffixed where `versioned`), each
+    /// with what the build reads (`DevAlm`, `ref\net40`).
     pub(crate) fn nugets(root: &Path, versioned: bool) -> PathBuf {
         let n = root.join("nugets");
         for id in PACKAGES {
@@ -554,7 +711,7 @@ mod tests {
             } else {
                 id.to_string()
             };
-            std::fs::create_dir_all(n.join(&name).join("ref").join("net40")).unwrap();
+            std::fs::create_dir_all(n.join(&name).join(marker(id))).unwrap();
         }
         n
     }
@@ -598,6 +755,9 @@ mod tests {
         std::fs::write(n.join(format!("{}.10.0.2015.16.nupkg", PACKAGES[4])), "zip").unwrap();
         // a similar-looking folder is not a match
         std::fs::create_dir_all(n.join(format!("{}Extra", PACKAGES[3]))).unwrap();
+        // a partly extracted package: the folder without its content
+        let compiler = n.join(format!("{COMPILER}.7.0.7198.40"));
+        std::fs::remove_dir_all(compiler.join("DevAlm")).unwrap();
         let e = format!("{:#}", resolve_packages(&n).unwrap_err());
         assert!(e.starts_with(UNAVAILABLE), "{e}");
         assert!(
@@ -618,13 +778,86 @@ mod tests {
                 && e.contains("-ExcludeVersion"),
             "nupkg: {e}"
         );
-        assert!(!e.contains(COMPILER), "the compiler package is fine: {e}");
+        assert!(
+            e.contains(&format!(
+                "{COMPILER}: {COMPILER}.7.0.7198.40 has no DevAlm folder — a partly extracted package?"
+            )),
+            "partly extracted: {e}"
+        );
         // not a folder at all
         let e = format!(
             "{:#}",
             resolve_packages(&d.path().join("nope")).unwrap_err()
         );
         assert!(e.contains("is not a readable folder"), "{e}");
+    }
+
+    /// The NuGet cache layout `<id>\<version>\` resolves to the version folder.
+    #[test]
+    fn xpp_packages_in_the_nuget_cache_layout() {
+        let d = tempfile::tempdir().unwrap();
+        let n = d.path().join("nugets");
+        for id in PACKAGES {
+            std::fs::create_dir_all(
+                n.join(id.to_lowercase())
+                    .join("7.0.7198.40")
+                    .join(marker(id)),
+            )
+            .unwrap();
+        }
+        let p = resolve_packages(&n).unwrap();
+        assert!(p
+            .iter()
+            .all(|x| x.version.as_deref() == Some("7.0.7198.40")));
+        assert!(p[0]
+            .dir
+            .ends_with(Path::new(&COMPILER.to_lowercase()).join("7.0.7198.40")));
+    }
+
+    /// MSBuild splits a `-p:` value at `;` unless it is quoted: the properties go to a response
+    /// file with quoted values; the project and the switches stay on the command line.
+    #[test]
+    fn properties_go_to_a_response_file() {
+        let args: Vec<String> = [
+            "C:/co/P/Core.Build.rnrproj",
+            "-nologo",
+            "-noAutoResponse",
+            "/p:ReferenceFolder=C:/a/ref/net40;C:/Program Files/isv;C:/co/Metadata",
+            "/p:OutputDirectory=C:/b/xpp",
+        ]
+        .map(String::from)
+        .to_vec();
+        let (command, response) = invocation(&args, Path::new("C:/v/T-1/xpp-build-Core.Build.rsp"));
+        assert_eq!(
+            command,
+            [
+                "C:/co/P/Core.Build.rnrproj",
+                "-nologo",
+                "-noAutoResponse",
+                "@C:/v/T-1/xpp-build-Core.Build.rsp"
+            ]
+        );
+        assert_eq!(
+            response,
+            "/p:ReferenceFolder=\"C:/a/ref/net40;C:/Program Files/isv;C:/co/Metadata\"\r\n/p:OutputDirectory=\"C:/b/xpp\"\r\n"
+        );
+        let d = tempfile::tempdir().unwrap();
+        let run = Run {
+            name: "build/Core.Build".into(),
+            project: "P/Core.Build.rnrproj".into(),
+            args,
+            rsp: d.path().join("x").join("a.rsp"),
+            response: response.clone(),
+            command,
+        };
+        run.write_response().unwrap();
+        let bytes = std::fs::read(&run.rsp).unwrap();
+        assert_eq!(
+            &bytes[..3],
+            [0xEF, 0xBB, 0xBF],
+            "UTF-8 with a byte-order mark"
+        );
+        assert_eq!(&bytes[3..], response.as_bytes());
     }
 
     /// M9-B2 AC-2 (`xpp_command_line`): the exact argv, including the order of
@@ -691,7 +924,7 @@ mod tests {
             &["P/Core.Build.rnrproj", "P/Ext.rnrproj"],
             None,
         );
-        let r = runs(&c, &tc, &co, &out).unwrap();
+        let r = runs(&c, &tc, &co, &out, d.path()).unwrap();
         assert_eq!(
             r.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(),
             ["build/Core.Build", "build/Ext"]
@@ -709,7 +942,19 @@ mod tests {
         assert_eq!(e["scope"], "compile");
         assert_eq!(e["argv"][0], s(d.path().join("MSBuild.exe")));
         assert_eq!(e["toolchain"]["packages"][0]["version"], "7.0.7198.40");
-        assert!(runs(&CommandSpec::program("t", "git", &[], None), &tc, &co, &out).is_none());
+        assert!(runs(
+            &CommandSpec::program("t", "git", &[], None),
+            &tc,
+            &co,
+            &out,
+            d.path()
+        )
+        .is_none());
+        // what is spawned: MSBuild, the project, the switches, the response file
+        assert_eq!(r[0].rsp, d.path().join("xpp-build-Core.Build.rsp"));
+        assert_eq!(e["argv"].as_array().unwrap().len(), 7);
+        assert_eq!(e["argv"][6], format!("@{}", r[0].rsp.display()));
+        assert_eq!(e["response_file"]["lines"].as_array().unwrap().len(), 7);
     }
 
     /// M9-B3 AC-1: realistic MSBuild lines — with and without a column, with a project suffix,
@@ -807,6 +1052,31 @@ mod tests {
         assert_eq!((d.errors.len(), d.errors_total), (DIAGNOSTICS_MAX, 70));
         assert!(feedback_errors(&d).ends_with("  - … and 20 more\n"));
         assert_eq!(feedback_errors(&Diagnostics::default()), "");
+    }
+
+    /// `task config --reload` verifies again only for what the build uses: not for a toolchain a
+    /// program-only task never uses, not for `ude_metadata` (doctor only).
+    #[test]
+    fn a_reload_compares_only_the_build_toolchain() {
+        let d = tempfile::tempdir().unwrap();
+        let load = |verify: &str, ude: &str| {
+            let (p, m) = (d.path().join("t.yaml"), d.path().join("m.yaml"));
+            std::fs::write(&p, format!("version: 1\nproject: {{ root: r, worktrees_root: w }}\ncommands:\n  verify:\n    - {verify}\n")).unwrap();
+            std::fs::write(
+                &m,
+                format!("toolchains:\n  xpp: {{ msbuild: m, nugets: n, ude_metadata: {ude} }}\n"),
+            )
+            .unwrap();
+            Effective::load(&p, Some(&m)).unwrap()
+        };
+        let prog = "{ name: t, program: git, args: [status] }";
+        let xpp = "{ name: b, tool: xpp, metadata: M, projects: [p.rnrproj] }";
+        assert_eq!(build_toolchain(&load(prog, "a")), None);
+        assert_eq!(
+            build_toolchain(&load(xpp, "a")),
+            build_toolchain(&load(xpp, "b"))
+        );
+        assert!(build_toolchain(&load(xpp, "a")).is_some());
     }
 
     #[test]

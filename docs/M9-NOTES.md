@@ -254,3 +254,39 @@ Every entry: what was decided, why, and where. The owner folds these into plan v
 - **Test** `config::tests::dogfood_template_loads`: loads with a machine config defining the two
   profiles; `scripts/verify.ps1` is the only verify file (so protected and hashed); the script has
   `--locked`, the two cargo variables and passes the exit code on.
+
+## Review fixes (after an independent review of B–D)
+
+- **MSBuild properties go through a response file (deviation from the §14 sketch and the B2 wording
+  "each property is one argv element").** MSBuild splits a `-p:` value at `;` and `,` unless the value is
+  quoted in the command line it parses itself; `ReferenceFolder` is a `;` list, and the process layer's
+  quoting (std `Command` for `boundary: none`, `quote_windows_arg` at Low IL) cannot produce
+  `/p:X="a;b"`. So `xpp::invocation` keeps the project and the switches (`-nologo -noAutoResponse
+  -nodeReuse:false -v:minimal`) on the command line and writes the seven properties to a response file,
+  one `/p:Name="value"` per line, UTF-8 with a BOM (MSBuild on .NET Framework would read it with the ANSI
+  code page otherwise), passed as `@<file>`. `-noAutoResponse` skips only the automatic
+  `MSBuild.rsp`/`Directory.Build.rsp`. The file lives where the build cannot write it: the task's verify
+  folder `<verify_root>\<task>\xpp-<command>-<stem>.rsp` (not the Low-labelled `build`), or the scratch
+  folder of `toryo xpp build`. `xpp::argv` is still the logical list of plan §14 (`xpp_command_line`
+  pins it); `VERIFY_RESULT.json` records the spawned `argv` (ending in `@<file>`) and
+  `response_file: { path, lines }`. `--print-only` writes the response files, prints their lines as
+  `#   …` comments and the PowerShell line with `@<file>`. **V08-VERIFY 2 must confirm this on the UDE
+  machine** (the fake MSBuild cannot).
+- **Package content is checked.** A package folder must hold what the build reads — `DevAlm` in the
+  compiler package, `ref\net40` in the four others (`xpp::marker`) — else "has no … folder — a partly
+  extracted package?". The NuGet cache layout `<id>\<version>\` resolves to its only version folder.
+- **Admission checks the repository** (`xpp::check_repo`, class `xpp_project_missing`): every `tool: xpp`
+  command's metadata folder and projects must exist in the repository at `task create` — they are
+  protected, so a missing one would fail every verify and burn fix cycles.
+- **`task config --reload`** verifies again only when the build toolchain changes
+  (`xpp::build_toolchain`: nothing for a program-only task, `ude_metadata` ignored).
+- **Gate integrity** also covers `<project>.user` (a verify file) and `<project folder>/obj/**` (a protected
+  glob): MSBuild imports both.
+- **`VSLANG=1033`** is added to the environment of every MSBuild run (verify and `xpp build`): English
+  messages for the parser and the fixer. Not solved: MSBuild on .NET Framework writes redirected output in
+  the OEM code page; non-ASCII text (a Japanese path or message) can arrive as replacement characters —
+  check in V08-VERIFY 2; a UTF-8 file logger (`-flp:…;Encoding=UTF-8`) is the fix if needed.
+- **`toryo xpp build --low --out …`** is refused: at Low IL the output must go to the Low-labelled scratch
+  folder; toryo does not label a folder of the owner's choosing.
+- **ZZZ text** in `10-d365fo-models.md` now matches the deny glob `**/ZZZ/**` (a folder named `ZZZ`), with
+  a TODO(owner) to set the real rule in both places.

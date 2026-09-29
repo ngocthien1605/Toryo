@@ -245,7 +245,9 @@ Khi verify, với mỗi project (theo thứ tự) Toryo tự viết lệnh MSBui
 Microsoft (`-noAutoResponse -nodeReuse:false`, output ở `<verify_root>\<task>\build\xpp`, ngoài checkout),
 dừng ở project lỗi đầu tiên; `timeout_min` (mặc định 90) là tổng thời gian cho mọi project của lệnh đó.
 `VERIFY_RESULT.json` có một mục cho mỗi project (`build/<tên project>`, `kind: xpp`, argv, version 5 gói
-NuGet) và `scope: compile`. Project build và mọi `Directory.Build.*` được bảo vệ: agent sửa project →
+NuGet) và `scope: compile`. Các property `/p:…` được truyền qua một response file (`@…rsp`, ghi trong
+`response_file`) vì MSBuild tách giá trị `ReferenceFolder` tại dấu `;` nếu không có ngoặc kép. Project build
+và metadata phải có sẵn trong repo khi `task create` (nếu thiếu: `xpp_project_missing`). Project build và mọi `Directory.Build.*` được bảo vệ: agent sửa project →
 bị trả lại (fix cycle); agent thêm `Directory.Build.props` → Escalated (`protected_config_changed`).
 Thiếu MSBuild hay thiếu gói NuGet: `task create` từ chối; nếu hỏng sau đó thì verify dừng ở Escalated
 (`xpp_toolchain_unavailable`) — sửa toolchain rồi `toryo resume ID`.
