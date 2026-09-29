@@ -6,6 +6,7 @@ pub mod checks;
 pub mod context;
 pub mod contracts;
 pub mod decisions;
+pub mod flight;
 pub mod lock;
 pub mod protect;
 pub mod recovery;

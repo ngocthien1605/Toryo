@@ -11,6 +11,7 @@ use clap::{Subcommand, ValueEnum};
 
 use toryo::agents::claude::LaunchMode;
 use toryo::agents::hub::AgentHub;
+use toryo::engine::flight::{EngineEvent, Recorder};
 use toryo::engine::lock::{self, StopOutcome, TaskLock};
 use toryo::engine::recovery::Recovery;
 use toryo::engine::runner::{
@@ -199,22 +200,40 @@ fn hub_for(t: &TaskRow, d: &DriveArgs) -> Result<AgentHub> {
     AgentHub::new(&cfg, LaunchMode::Restricted, fake)
 }
 
+/// The flight recorder of a command holding the task lock (M10).
+fn recorder(t: &TaskRow, lock: &TaskLock) -> Recorder {
+    Recorder::for_task(t, lock.generation)
+}
+
+/// Record a state change a command made outside the engine (`event`: the pipeline event's
+/// name), if the state changed. The CLI prints no `[state]` line for these.
+fn recorded(rec: &Recorder, from: PipelineState, event: &str, now: &TaskRow) {
+    if now.state != from {
+        rec.transition(from, event, &now.machine, false, false);
+    }
+}
+
 /// Recover (if needed) and run the locked task until it waits, finishes or is stopped.
-fn drive(store: &Store, lock: &TaskLock, d: &DriveArgs) -> Result<i32> {
+fn drive(store: &Store, lock: &TaskLock, rec: &Recorder, d: &DriveArgs) -> Result<i32> {
+    rec.emit_quiet(EngineEvent::RunStarted {
+        owner: lock::owner_label(),
+    });
     // recovery launches no agent: it needs neither the hub nor the R51 check
     let t = get(store, &lock.task)?;
     let cfg = frozen_config(&t)?;
     let (g, protect, _) = task_policy(&t, &cfg)?;
-    let rec = Recovery {
+    let recovery = Recovery {
         store,
         g: &g,
         protect: &protect,
         cfg: &cfg,
     };
-    for n in rec.recover(&lock.task)? {
+    for n in recovery.recover(&lock.task)? {
         eprintln!("↺ recovery: {n}");
     }
+    let before = t.state;
     let t = get(store, &lock.task)?;
+    recorded(rec, before, "recovery", &t);
     let waiting = t.state.is_terminal()
         || matches!(t.state, PipelineState::Escalated | PipelineState::Paused)
         || (!d.yes
@@ -234,6 +253,7 @@ fn drive(store: &Store, lock: &TaskLock, d: &DriveArgs) -> Result<i32> {
             store,
             &hub,
             lock,
+            rec,
             RunOptions {
                 yes: d.yes,
                 no_fallback: d.no_fallback,
@@ -259,6 +279,10 @@ fn drive(store: &Store, lock: &TaskLock, d: &DriveArgs) -> Result<i32> {
     }
     eprintln!("next: {}", next_action(&t));
     eprintln!("summary: {}", summary.display());
+    rec.emit_quiet(EngineEvent::RunEnded {
+        state: t.state,
+        next_action: next_action(&t),
+    });
     Ok(match end {
         RunEnd::Done(PipelineState::Completed) | RunEnd::Stopped => 0,
         RunEnd::Waiting(
@@ -490,6 +514,9 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
         Ok(())
     })?;
     config_v.committed();
+    if to_verify {
+        recorded(&recorder(&t, &lock), t.state, "reverify", &get(&st, id)?);
+    }
     artifacts::write_view(&t, "config.json", new_text.as_bytes())?;
     let mut notes = vec![format!(
         "configuration {} → {} (diff: {})",
@@ -527,7 +554,8 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
 pub fn run(id: &str, d: &DriveArgs) -> Result<i32> {
     let st = store()?;
     let lock = TaskLock::acquire(&st, id)?;
-    let code = drive(&st, &lock, d);
+    let rec = recorder(&get(&st, id)?, &lock);
+    let code = drive(&st, &lock, &rec, d);
     lock.release();
     code
 }
@@ -543,6 +571,7 @@ pub fn approve(
     let st = store()?;
     let lock = TaskLock::acquire(&st, id)?;
     let t = get(&st, id)?;
+    let rec = recorder(&t, &lock);
     let kind: GateKind = gate.into();
     if force {
         if kind != GateKind::Final || t.state != PipelineState::Escalated {
@@ -562,7 +591,9 @@ pub fn approve(
             "final gate forced (reviewer skipped)",
             &format!("From Escalated: {}", t.machine.reason().unwrap_or("")),
         )?;
+        let before = t.state;
         let t = get(&st, id)?;
+        recorded(&rec, before, "force_final", &t);
         eprintln!(
             "{id}: reviewer skipped — the final gate is open for checkpoint {}",
             t.machine.checkpoint().unwrap_or("")
@@ -582,9 +613,9 @@ pub fn approve(
             &digest[..12.min(digest.len())]
         );
     }
-    approve_now(&st, &t, kind, expect)?;
+    approve_now(&st, &rec, &t, kind, expect)?;
     let code = if cont {
-        drive(&st, &lock, d)?
+        drive(&st, &lock, &rec, d)?
     } else {
         let t = get(&st, id)?;
         write_summary(&st, &t)?;
@@ -602,7 +633,7 @@ pub fn reject(id: &str, gate: Gate, reason: &str) -> Result<i32> {
     let st = store()?;
     let lock = TaskLock::acquire(&st, id)?;
     let t = get(&st, id)?;
-    reject_now(&st, &t, gate.into(), reason)?;
+    reject_now(&st, &recorder(&t, &lock), &t, gate.into(), reason)?;
     let t = get(&st, id)?;
     eprintln!("next: {}", next_action(&t));
     lock.release();
@@ -721,13 +752,33 @@ fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Res
             t.state
         );
     }
-    if protected && r.note.is_none() {
-        if !resume_protected(st, &t, &r.accept_protected)? {
-            return Ok(1);
-        }
+    let rec = recorder(&t, lock);
+    let event = if protected && r.note.is_none() {
+        "resume_stage"
     } else if r.discard_partial || r.keep_partial {
-        let cfg = frozen_config(&t)?;
-        let (g, protect, _) = task_policy(&t, &cfg)?;
+        "recovery"
+    } else if r.note.is_some() {
+        "resume_with_note"
+    } else {
+        "unpause"
+    };
+    let go = resume_before_drive(st, &t, r, protected)?;
+    recorded(&rec, t.state, event, &get(st, &lock.task)?);
+    if !go {
+        return Ok(1); // the protected change is still there and not accepted
+    }
+    drive(st, lock, &rec, d)
+}
+
+/// What `resume` changes before the task is driven again: the protected-state check, a
+/// partial-work decision, a note, or the end of a pause. False: the protected change is still
+/// there and not accepted — the task is not driven.
+fn resume_before_drive(st: &Store, t: &TaskRow, r: &ResumeArgs, protected: bool) -> Result<bool> {
+    if protected && r.note.is_none() {
+        return resume_protected(st, t, &r.accept_protected);
+    } else if r.discard_partial || r.keep_partial {
+        let cfg = frozen_config(t)?;
+        let (g, protect, _) = task_policy(t, &cfg)?;
         let rec = Recovery {
             store: st,
             g: &g,
@@ -742,7 +793,7 @@ fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Res
         eprintln!("↺ {msg}");
         toryo::engine::decisions::append(
             st,
-            &t,
+            t,
             if r.discard_partial {
                 "partial work discarded (R31)"
             } else {
@@ -762,7 +813,7 @@ fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Res
         })?;
         toryo::engine::decisions::append(
             st,
-            &t,
+            t,
             "resumed from Escalated with a note (R5)",
             &format!(
                 "Escalation: {}\n\nNote: {note}",
@@ -790,7 +841,7 @@ fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Res
             store::transition(tx, &i, PipelineEvent::Unpause).map(|_| ())
         })?;
     }
-    drive(st, lock, d)
+    Ok(true)
 }
 
 pub fn resume(id: Option<&str>, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {

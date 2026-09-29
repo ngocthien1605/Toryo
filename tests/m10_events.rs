@@ -1,0 +1,282 @@
+//! M10 acceptance (ARCH-02): the engine's events and the per-task flight recorder
+//! (`<data_dir>\runs\<id>\events.jsonl`), on `FakeAgentAdapter`.
+//!
+//! - A1: the lines of a run to the final gate, in order; a later run appends with a higher
+//!   lock generation; an escalation carries its typed reason class; a profile secret never
+//!   reaches the file; an unwritable file does not fail the run.
+#![cfg(feature = "m0-kit")]
+
+mod common;
+use common::*;
+
+use serde_json::{json, Value};
+use toryo::engine::PipelineState as St;
+
+/// The parsed lines of the task's `events.jsonl`.
+fn events(env: &Env, id: &str) -> Vec<Value> {
+    let p = task(env, id).run_store.join("events.jsonl");
+    std::fs::read_to_string(&p)
+        .unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{l}: {e}")))
+        .collect()
+}
+
+fn types(ev: &[Value]) -> Vec<String> {
+    ev.iter()
+        .map(|e| e["type"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The position of the first event matching `f` at or after `from`.
+fn find(ev: &[Value], from: usize, f: impl Fn(&Value) -> bool) -> usize {
+    ev.iter()
+        .enumerate()
+        .skip(from)
+        .find(|(_, e)| f(e))
+        .map(|(i, _)| i)
+        .unwrap_or_else(|| panic!("not found after {from}: {:#?}", types(ev)))
+}
+
+fn happy(env: &Env) -> String {
+    script(
+        env,
+        "happy.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    )
+}
+
+#[test]
+fn a_run_to_the_final_gate_is_recorded_in_order_across_runs() {
+    let env = setup("codex-openai");
+    create(&env, "EV-1");
+    let s = happy(&env);
+    let (code, err) = toryo(&env, &["run", "EV-1", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "EV-1").state, St::WaitingPlanApproval);
+    let first = events(&env, "EV-1");
+    let g1 = first[0]["generation"].as_i64().unwrap();
+    let (code, err) = toryo(
+        &env,
+        &[
+            "approve",
+            "EV-1",
+            "--gate",
+            "plan",
+            "--continue",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "EV-1").state, St::WaitingFinalApproval);
+    let ev = events(&env, "EV-1");
+
+    // AC-1: every line is an envelope; seq strictly increasing
+    for e in &ev {
+        assert_eq!(e["v"], 1, "{e}");
+        assert_eq!(e["task"], "EV-1", "{e}");
+        assert!(e["ts"].as_str().is_some_and(|t| t.contains('T')), "{e}");
+    }
+    let seqs: Vec<u64> = ev.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+    assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+
+    // AC-1: in order
+    let mut at = find(&ev, 0, |e| e["type"] == "run_started");
+    let states: Vec<(String, String)> = ev
+        .iter()
+        .filter(|e| e["type"] == "state_changed")
+        .map(|e| {
+            (
+                e["from"].as_str().unwrap().to_string(),
+                e["to"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let want = [
+        ("New", "Planning"),
+        ("Planning", "WaitingPlanApproval"),
+        ("WaitingPlanApproval", "Implementing"),
+        ("Implementing", "Checkpointing"),
+        ("Checkpointing", "Verifying"),
+        ("Verifying", "Reviewing"),
+        ("Reviewing", "WaitingFinalApproval"),
+    ];
+    let want: Vec<(String, String)> = want
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+    assert_eq!(states, want, "{:#?}", types(&ev));
+    for stage in ["plan", "implement", "verify", "review"] {
+        at = find(&ev, at, |e| {
+            e["type"] == "stage_started" && e["stage"] == stage
+        });
+        at = find(&ev, at, |e| {
+            e["type"] == "stage_finished" && e["stage"] == stage && e["status"] == "succeeded"
+        });
+    }
+    let plan_gate = find(&ev, 0, |e| {
+        e["type"] == "gate_opened" && e["gate"] == "plan"
+    });
+    let final_gate = find(&ev, 0, |e| {
+        e["type"] == "gate_opened" && e["gate"] == "final"
+    });
+    assert!(plan_gate < final_gate);
+    assert!(ev[final_gate]["occurrence"].as_u64().is_some());
+    let last = ev.last().unwrap();
+    assert_eq!(last["type"], "run_ended", "{last}");
+    assert_eq!(last["state"], "WaitingFinalApproval");
+    assert!(last["next_action"]
+        .as_str()
+        .unwrap()
+        .contains("--gate final"));
+    // the turn, checkpoint and verify command events of the run
+    let turn = find(&ev, 0, |e| {
+        e["type"] == "turn_finished" && e["stage"] == "implement"
+    });
+    assert_eq!(ev[turn]["profile"], "codex-openai");
+    assert_eq!(ev[turn]["success"], true);
+    let cp = find(&ev, 0, |e| e["type"] == "checkpoint_created");
+    assert_eq!(ev[cp]["kind"], "normal");
+    let vc = find(&ev, 0, |e| e["type"] == "verify_command");
+    assert_eq!(
+        (
+            ev[vc]["name"].clone(),
+            ev[vc]["exit"].clone(),
+            ev[vc]["ok"].clone()
+        ),
+        (json!("divide-present"), json!(0), json!(true))
+    );
+
+    // AC-2: the second command appended with a higher generation, seq continuing
+    assert!(ev.len() > first.len());
+    assert_eq!(
+        ev[..first.len()],
+        first[..],
+        "earlier lines are kept as they were"
+    );
+    let second = &ev[first.len()..];
+    assert!(second
+        .iter()
+        .all(|e| e["generation"].as_i64().unwrap() > g1));
+    assert_eq!(
+        second[0]["seq"].as_u64().unwrap(),
+        first.last().unwrap()["seq"].as_u64().unwrap() + 1
+    );
+    // the approval itself is recorded by the approving command
+    assert_eq!(second[0]["type"], "state_changed", "{:#?}", types(second));
+    assert_eq!(second[0]["event"], "plan_approved");
+}
+
+#[test]
+fn an_escalation_carries_its_typed_reason_class() {
+    let env = setup("codex-openai");
+    commit_repo(&env, &[(".gitignore", ".claude/\n")], "ignore claude");
+    create(&env, "EV-3");
+    let s = script(
+        &env,
+        "p.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![
+                write("src/Calculator.psm1", DIVIDE),
+                write(".claude/settings.local.json", "{}\n"),
+                implementation(),
+            ])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "EV-3", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "EV-3").state, St::Escalated, "{err}");
+    let ev = events(&env, "EV-3");
+    let esc = find(&ev, 0, |e| e["type"] == "escalated");
+    assert_eq!(
+        ev[esc]["reason_class"], "protected_config_changed",
+        "{}",
+        ev[esc]
+    );
+    assert!(ev[esc]["reason"]
+        .as_str()
+        .unwrap()
+        .contains(".claude/settings.local.json"));
+    // the escalation comes before its state change, the attempt's end before both
+    let sc = find(&ev, esc, |e| {
+        e["type"] == "state_changed" && e["to"] == "Escalated"
+    });
+    assert_eq!(sc, esc + 1);
+    let fin = find(&ev, 0, |e| {
+        e["type"] == "stage_finished" && e["stage"] == "implement"
+    });
+    assert!(fin < esc);
+    assert_eq!(ev[fin]["status"], "failed");
+    assert_eq!(ev[fin]["error_class"], "protected_config_changed");
+    assert_eq!(ev.last().unwrap()["type"], "run_ended");
+    // `task cleanup` removes it with the run store
+    let (code, err) = toryo(&env, &["task", "cleanup", "EV-3"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!task(&env, "EV-3").run_store.join("events.jsonl").exists());
+}
+
+#[test]
+fn a_profile_secret_never_reaches_the_flight_recorder() {
+    const SECRET: &str = "m10-s3cr3t-\"q\"-value";
+    let env = setup("codex-openai");
+    std::fs::write(
+        &env.machine,
+        MACHINE_PROFILES.replace(
+            "exe: codex-not-installed }",
+            "exe: codex-not-installed, secret_env: { TORYO_M10_TOKEN: \"env:TORYO_M10_SECRET\" } }",
+        ),
+    )
+    .unwrap();
+    create(&env, "EV-4");
+    let s = script(
+        &env,
+        "s.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![fail("Unknown", &format!("the tool printed {SECRET} and died"))])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(
+        &env,
+        &["run", "EV-4", "--yes", "--fake-agents", &s],
+        &[("TORYO_M10_SECRET", SECRET)],
+    );
+    assert_eq!(task(&env, "EV-4").state, St::Escalated, "{err}");
+    let text = std::fs::read_to_string(task(&env, "EV-4").run_store.join("events.jsonl")).unwrap();
+    let escaped = serde_json::to_string(SECRET).unwrap();
+    assert!(!text.contains(SECRET), "{text}");
+    assert!(!text.contains(&escaped[1..escaped.len() - 1]), "{text}");
+    let ev = events(&env, "EV-4");
+    let esc = find(&ev, 0, |e| e["type"] == "escalated");
+    let reason = ev[esc]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("[REDACTED:TORYO_M10_TOKEN]") && reason.contains("and died"),
+        "{reason}"
+    );
+    assert_eq!(ev[esc]["reason_class"], "implementer_failed");
+}
+
+#[test]
+fn an_unwritable_flight_recorder_does_not_fail_the_run() {
+    let env = setup("codex-openai");
+    create(&env, "EV-5");
+    let p = task(&env, "EV-5").run_store.join("events.jsonl");
+    std::fs::create_dir_all(&p).unwrap(); // a directory in its place
+    let s = happy(&env);
+    let (code, err) = toryo(&env, &["run", "EV-5", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "EV-5").state, St::Completed, "{err}");
+    assert_eq!(
+        err.matches("!! flight recorder:").count(),
+        1,
+        "reported once: {err}"
+    );
+}
