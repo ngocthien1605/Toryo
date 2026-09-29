@@ -157,7 +157,11 @@ pass — a live budget interrupt of a Claude turn (R64), the fail-closed Codex p
 Codex command that is not killed as stalled (R66). Acceptance on Windows: `scripts\m8-check.ps1`.
 Next: plan v0.8 §17 (D1–D3, M9). `spike pipeline` stays the behavioural reference (R52).
 
-M9 (`M9_task.md`, branch `m9/d365-ready`) — group A, trust boundaries, is done: agent profiles come only
-from the machine config (R60; `doctor` shows each profile's and role's source), and untrusted task-pack text
-reaches agents only as data — paths, or `<untrusted_data>` blocks in the Claude implementer's prompt (R61).
-Real-CLI canary for the owner: `scripts\m9-check.ps1 -Canary`. Decisions made on the way: `docs/M9-NOTES.md`.
+M9 (`M9_task.md`, branch `m9/d365-ready`) is done in code: trust boundaries — agent profiles and
+toolchains come only from the machine config (R60; `doctor` shows each source) and untrusted task-pack text
+reaches agents only as data (R61); X++ verify on the UDE toolchain — `toolchains.xpp`, `tool: xpp`, per-project
+MSBuild runs with parsed diagnostics, `scope: compile`, `doctor` X++ checks and `toryo xpp build` (R59, proposed
+R72); the D365FO starter kit (`templates/d365fo/`) and the dogfooding kit (`templates/dogfood/`,
+`scripts/verify.ps1`). Still to do by the owner on Windows and the UDE machine: section E of `M9_task.md` (the
+real-CLI canary `scripts\m9-check.ps1 -Canary`, V08-VERIFY 2–4 with `toryo xpp build`, the first real D365FO
+task). Decisions made on the way: `docs/M9-NOTES.md`.

@@ -1,4 +1,4 @@
-# Hướng dẫn sử dụng Toryo (M0 kit · M1 adapter · M2 state machine · M3 engine + recovery · M4–M7 · M8 E2E)
+# Hướng dẫn sử dụng Toryo (M0 kit · M1 adapter · M2 state machine · M3 engine + recovery · M4–M7 · M8 E2E · M9 D365FO)
 
 > **Toryo (棟梁 — tōryō)** = "thợ cả": người chỉ huy đội thợ, không tự đục đẽo mà giao việc, kiểm tra từng mối nối
 > và nghiệm thu từng giai đoạn. Tên cũ của tool là `thien` (đổi ngày 2026-09-28, plan v0.7 R55).
