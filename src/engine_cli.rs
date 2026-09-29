@@ -156,21 +156,29 @@ fn get(store: &Store, id: &str) -> Result<TaskRow> {
 fn hub_for(t: &TaskRow, d: &DriveArgs) -> Result<AgentHub> {
     let cfg = frozen_config(t)?;
     let fake = d.fake_agents.as_deref();
-    if fake.is_none() {
+    // the profiles that run a real CLI: all without a fake script; with one, those outside its
+    // `only_profiles` (a script without the list fakes every profile)
+    let script = fake
+        .map(toryo::agents::fake::FakeScript::load)
+        .transpose()?;
+    let real = |p: &str| script.as_ref().is_none_or(|s| !s.fakes(p));
+    let mut ps: Vec<&str> = vec![&t.planner, &t.reviewer];
+    ps.extend(
+        t.implementers
+            .iter()
+            .skip(t.implementer_index)
+            .map(String::as_str),
+    );
+    ps.retain(|p| real(p));
+    if !ps.is_empty() {
         // R51: isolation evidence must match the CLI versions installed now
-        let mut ps: Vec<&str> = vec![&t.planner, &t.reviewer];
-        ps.extend(
-            t.implementers
-                .iter()
-                .skip(t.implementer_index)
-                .map(String::as_str),
-        );
         let mut bad = toryo::evidence::unverified_profiles(&cfg, &ps)?;
         let imps: Vec<&str> = t
             .implementers
             .iter()
             .skip(t.implementer_index)
             .map(String::as_str)
+            .filter(|p| real(p))
             .collect();
         bad.extend(toryo::evidence::unverified_implementers(&cfg, &imps)?);
         if !bad.is_empty() {

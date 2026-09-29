@@ -138,3 +138,8 @@ BatchRename sample (BR-001, then BR-002 with a real fix cycle), and the real-CLI
 pass — a live budget interrupt of a Claude turn (R64), the fail-closed Codex preflight (R62), and a silent
 Codex command that is not killed as stalled (R66). Acceptance on Windows: `scripts\m8-check.ps1`.
 Next: plan v0.8 §17 (D1–D3, M9). `spike pipeline` stays the behavioural reference (R52).
+
+M9 (`M9_task.md`, branch `m9/d365-ready`) — group A, trust boundaries, is done: agent profiles come only
+from the machine config (R60; `doctor` shows each profile's and role's source), and untrusted task-pack text
+reaches agents only as data — paths, or `<untrusted_data>` blocks in the Claude implementer's prompt (R61).
+Real-CLI canary for the owner: `scripts\m9-check.ps1 -Canary`. Decisions made on the way: `docs/M9-NOTES.md`.
