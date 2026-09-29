@@ -55,6 +55,16 @@ pub struct DriveArgs {
     /// Scripted agents instead of the real CLIs (tests / demos; plan §6.4)
     #[arg(long, hide = true)]
     fake_agents: Option<PathBuf>,
+    /// M10: a Windows toast when the task needs you (a gate, an escalation, a pause, the end),
+    /// whatever `notify.toast` in the machine config says
+    #[arg(long, conflicts_with = "no_notify")]
+    notify: bool,
+    /// M10: no toast, whatever `notify.toast` in the machine config says
+    #[arg(long)]
+    no_notify: bool,
+    /// The machine config in use (`--machine-config`, else the default): where `notify:` is read.
+    #[arg(skip)]
+    pub machine_config: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -213,6 +223,32 @@ fn hub_for(t: &TaskRow, d: &DriveArgs) -> Result<AgentHub> {
 /// The flight recorder of a command holding the task lock (M10).
 fn recorder(t: &TaskRow, lock: &TaskLock) -> Recorder {
     Recorder::for_task(t, lock.generation)
+}
+
+/// The recorder of a drive command: [`recorder`] plus the toast notifier when toasts are on
+/// (`--notify` / `--no-notify`, else `notify.toast` of the machine config, M10-D1).
+fn drive_recorder(t: &TaskRow, lock: &TaskLock, d: &DriveArgs) -> Recorder {
+    let rec = recorder(t, lock);
+    if toryo::notify::enabled(d.notify, d.no_notify, machine_notify(d)) {
+        rec.with(Box::new(toryo::notify::Notifier::system()))
+    } else {
+        rec
+    }
+}
+
+/// `notify:` of the machine config in use; a machine config that cannot be read turns toasts
+/// off with a warning (the run itself uses the frozen configuration).
+fn machine_notify(d: &DriveArgs) -> toryo::config::Notify {
+    match d.machine_config.as_deref().filter(|p| p.exists()) {
+        Some(p) => match toryo::config::MachineConfig::load(p) {
+            Ok(m) => m.notify,
+            Err(e) => {
+                eprintln!("WARNING: {e:#} — no toasts");
+                Default::default()
+            }
+        },
+        None => Default::default(),
+    }
 }
 
 /// Record a state change a command made outside the engine (`event`: the pipeline event's
@@ -564,7 +600,7 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
 pub fn run(id: &str, d: &DriveArgs) -> Result<i32> {
     let st = store()?;
     let lock = TaskLock::acquire(&st, id)?;
-    let rec = recorder(&get(&st, id)?, &lock);
+    let rec = drive_recorder(&get(&st, id)?, &lock, d);
     let code = drive(&st, &lock, &rec, d);
     lock.release();
     code
@@ -581,7 +617,12 @@ pub fn approve(
     let st = store()?;
     let lock = TaskLock::acquire(&st, id)?;
     let t = get(&st, id)?;
-    let rec = recorder(&t, &lock);
+    // only a drive (`--continue`) raises toasts: the human is at the keyboard otherwise
+    let rec = if cont {
+        drive_recorder(&t, &lock, d)
+    } else {
+        recorder(&t, &lock)
+    };
     let kind: GateKind = gate.into();
     if force {
         if kind != GateKind::Final || t.state != PipelineState::Escalated {
@@ -762,7 +803,7 @@ fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Res
             t.state
         );
     }
-    let rec = recorder(&t, lock);
+    let rec = drive_recorder(&t, lock, d);
     let event = if protected && r.note.is_none() {
         "resume_stage"
     } else if r.discard_partial || r.keep_partial {

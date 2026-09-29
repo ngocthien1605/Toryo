@@ -61,3 +61,9 @@ git:
     lfs:
       process: '"C:/Program Files/Git LFS/git-lfs.exe" filter-process'
       required: true
+
+# M10: a Windows toast when a task needs you — a gate opens, it escalates or pauses, a run ends
+# Completed or Failed. Default off; `toryo run|resume|approve --continue` take --notify / --no-notify.
+# A machine setting: not frozen with a task, not hashed. Check it with `toryo notify-test`.
+# notify:
+#   toast: true

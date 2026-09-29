@@ -70,3 +70,8 @@ git:
   #   lfs:
   #     process: '"C:\Program Files\Git LFS\git-lfs.exe" filter-process'
   #     required: true
+
+# M10: a Windows toast when a task needs you (a gate, an escalation, a pause, the end of a run).
+# Off by default; `toryo notify-test` shows a sample.
+# notify:
+#   toast: true

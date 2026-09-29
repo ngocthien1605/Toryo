@@ -13,7 +13,7 @@ Branch `m10/flight-recorder` (from `main` @ `5adf204`). One commit per task.
 - [x] B2 — `toryo watch <ID>`
 - [x] C1 — `prices.toml` + `toryo usage <ID>`
 - [x] C2 — scripted turns in mixed runs report zero usage
-- [ ] D1 — Windows toast
+- [x] D1 — Windows toast
 - [ ] E1 — docs, morning summary
 
 ## A — Event backbone (ARCH-02)
@@ -213,3 +213,50 @@ Branch `m10/flight-recorder` (from `main` @ `5adf204`). One commit per task.
   nothing real runs; exact zero rows, `status` without `reserved`; the same script without the list
   reserves), `tests/regress_agents.rs::fake_turns_of_a_mixed_run_report_zero_usage` (complete, fail,
   with a usage step, pure fake).
+
+## D — Notifications
+
+### D1 — Windows toast when the owner is needed
+
+- **Module** `src/notify.rs`: `toast_for(envelope)` (pure) decides; `Notifier` (an `EventSink`) passes
+  the toast to a `Toaster`; `SystemToaster` shows it (Windows) or does nothing (elsewhere).
+- **Which events:** `gate_opened` (plan and final), `escalated`, `paused`, `run_ended` in `Completed` /
+  `Failed` — one toast per stop (`run_ended` at a gate, in `Escalated` or `Paused` raises nothing more).
+  Title `toryo — <id>`, body `<state> — <next action>`, shortened to 200 characters (an ellipsis marks
+  the cut; NUL characters are dropped). The gate, escalation and pause events carry no `next_action`, so
+  the body names the command from the event itself (`toryo approve ID --gate plan --continue` / `toryo
+  reject …`, `toryo status ID` for an escalation — put before the reason so the cut never hides it —,
+  `toryo resume ID`, `toryo budget set …` for a budget pause); `run_ended` has the engine's next action.
+  The text is already redacted by the recorder (R42).
+- **Settings.** `notify: { toast: false }` in the machine config (`MachineConfig`, `deny_unknown_fields`
+  also inside `notify`); `Effective.notify` is `#[serde(skip)]` — not frozen, not hashed, like `origins`.
+  A drive command reads the machine config in use (`--machine-config`, else the default) for it:
+  `DriveArgs.machine_config` (`#[arg(skip)]`, filled by `main::drive_with`). `--notify` / `--no-notify` on
+  `run`, `resume`, `approve`; `--no-notify` wins. `approve` without `--continue` never toasts (the owner
+  is at the keyboard). A machine config that cannot be read: a warning, no toasts (the run uses the
+  frozen configuration anyway).
+- **The toast process.** `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile
+  -NonInteractive -EncodedCommand <SCRIPT>` — Windows PowerShell 5.1, which loads WinRT types
+  (`pwsh` 7 cannot). The script is a constant (`notify::SCRIPT`, base64 of UTF-16LE, a 20-line encoder
+  instead of a crate); it reads `TORYO_TOAST_TITLE` / `TORYO_TOAST_BODY` and puts them into the toast XML
+  with `CreateTextNode` — never parsed as XML or code. AppUserModelID: Windows PowerShell's own
+  (`{1AC14E77-…}\WindowsPowerShell\v1.0\powershell.exe`), so no registration is needed. `CREATE_NO_WINDOW`,
+  no stdin/stdout/stderr, not assigned to any Job (toryo's stage Jobs hold agent processes only); a
+  watcher thread kills it after 10 s while toryo lives. A process that cannot start is a sink error:
+  reported once on stderr, the run goes on. The script's own failure is not reported (fire and forget) —
+  `notify-test` is the check.
+- **`toryo notify-test [--dry-run]`** (hidden): shows a sample toast and waits for the script (exit 0 /
+  1; 124 → stopped after 10 s). `--dry-run` builds the toast (WinRT types, XML, `ToastNotification`)
+  and exits before `Show`. Run once here on 2026-09-30: both exit 0.
+- **Test hook** `TORYO_TEST_TOAST_LOG=<file>`: the system toaster appends each toast there as a JSON line
+  instead of showing it (end-to-end tests without toasts on the desktop).
+- Tests: unit (`notify::tests`: which events notify and the text, the length cap, on/off rules, hostile
+  text only in the environment with a constant program + arguments, base64 vectors),
+  `config::tests::notify_is_a_machine_setting_outside_the_hash` (loads with and without, same hash
+  `7ae81a43…` as `configs_without_toolchains_keep_their_hash`), `tests/m10_notify.rs` (default off,
+  `--notify`, machine setting, `--no-notify` wins, no toast for a plain `approve`, the gates and the
+  completed run with `--yes`, an escalation's body; `notify-test --dry-run` exits 0 on Windows — runs in
+  CI too, no desktop needed; the real toast is `#[ignore]`d: `cargo test --test m10_notify -- --ignored`).
+- **Open:** `notify_test_builds_the_toast` runs Windows PowerShell and loads WinRT types in CI
+  (`windows-latest`). It passed here; if the CI image cannot load them, mark that test `#[ignore]`
+  like the real-toast one — it is the only M10 test that needs more than the Rust toolchain and Git.

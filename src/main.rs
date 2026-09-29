@@ -175,6 +175,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SecretsCmd,
     },
+    /// Show a sample Windows toast (M10-D1): check that notifications reach you.
+    #[command(hide = true)]
+    NotifyTest {
+        /// Build the toast in PowerShell, do not show it
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// M0 spike commands.
     #[cfg(feature = "m0-kit")]
     Spike {
@@ -200,6 +207,16 @@ pub(crate) fn load_config(cli: &Cli) -> Result<Effective> {
         .clone()
         .or_else(default_machine_config_path);
     Effective::load(&path, machine.as_deref())
+}
+
+/// The drive options with the machine config in use, where `notify:` is read (M10-D1).
+fn drive_with(cli: &Cli, d: &DriveArgs) -> DriveArgs {
+    let mut d = d.clone();
+    d.machine_config = cli
+        .machine_config
+        .clone()
+        .or_else(default_machine_config_path);
+    d
 }
 
 fn run(cli: Cli) -> Result<i32> {
@@ -250,7 +267,7 @@ fn run(cli: Cli) -> Result<i32> {
         #[cfg(feature = "m0-kit")]
         Cmd::Spike { cmd } => spike(&cli, cmd),
         Cmd::Task { cmd } => engine_cli::task(&cli, cmd),
-        Cmd::Run { id, drive } => engine_cli::run(id, drive),
+        Cmd::Run { id, drive } => engine_cli::run(id, &drive_with(&cli, drive)),
         Cmd::Approve {
             id,
             gate,
@@ -258,7 +275,14 @@ fn run(cli: Cli) -> Result<i32> {
             force,
             cont,
             drive,
-        } => engine_cli::approve(id, *gate, expect.as_deref(), *force, *cont, drive),
+        } => engine_cli::approve(
+            id,
+            *gate,
+            expect.as_deref(),
+            *force,
+            *cont,
+            &drive_with(&cli, drive),
+        ),
         Cmd::Reject { id, gate, reason } => engine_cli::reject(id, *gate, reason),
         Cmd::Resume {
             id,
@@ -275,7 +299,7 @@ fn run(cli: Cli) -> Result<i32> {
                 keep_partial: *keep_partial,
                 accept_protected: accept_protected.clone(),
             },
-            drive,
+            &drive_with(&cli, drive),
         ),
         Cmd::Stop { id, wait_secs } => engine_cli::stop(id, *wait_secs),
         Cmd::Status { id, json } => engine_cli::status(id.as_deref(), *json),
@@ -290,6 +314,16 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Context { cmd } => engine_cli::context(cmd),
         Cmd::Budget { cmd } => engine_cli::budget(cmd),
         Cmd::Xpp { cmd } => xpp_cli::run(&cli, cmd),
+        Cmd::NotifyTest { dry_run } => {
+            let code = toryo::notify::test_toast(*dry_run)?;
+            match (code, *dry_run) {
+                (0, false) => eprintln!("a toast was shown: \"toryo — notify-test\" (if you see none, check Windows notification settings for Windows PowerShell)"),
+                (0, true) => eprintln!("the toast was built (dry run: not shown)"),
+                (124, _) => eprintln!("the toast script did not finish in 10 s and was stopped"),
+                (c, _) => eprintln!("the toast script failed (exit {c}): Windows PowerShell could not show a toast"),
+            }
+            Ok(if code == 0 { 0 } else { 1 })
+        }
     }
 }
 
