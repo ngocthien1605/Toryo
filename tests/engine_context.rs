@@ -3,7 +3,8 @@
 //! - every agent attempt gets one assembled context, stored as `context/<stage>-<attempt>`
 //!   with its SHA-256 in `stage_attempts.context_sha256`
 //! - fixed source order; Codex does not get AGENTS.md/CLAUDE.md (reads AGENTS.md natively)
-//! - the Claude implementer gets the task pack inline (no run-store access, R49)
+//! - the Claude implementer gets TASK.md and PLAN.md inline (no run-store access, R49); the
+//!   untrusted pack files go to its user prompt as data blocks (R61, `tests/m9_trust.rs`)
 //! - the budget trims with a warning, never the policy files
 //! - `toryo context show` previews exactly what the next attempt receives, and re-checks a
 //!   stored attempt's hash

@@ -15,6 +15,7 @@ pub mod snapshot;
 pub mod state;
 pub mod store;
 pub mod task;
+pub mod untrusted;
 pub mod verify;
 pub mod worktree;
 

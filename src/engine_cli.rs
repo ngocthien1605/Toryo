@@ -1045,6 +1045,10 @@ pub fn context(cmd: &ContextCmd) -> Result<i32> {
                 }
             );
             print!("{text}");
+            eprintln!(
+                "(the user prompt sent with it — for the Claude implementer with the <untrusted_data> blocks, R61 — is captured in {})",
+                t.captures().display()
+            );
             Ok(if ok { 0 } else { 1 })
         }
         None => {
@@ -1059,6 +1063,12 @@ pub fn context(cmd: &ContextCmd) -> Result<i32> {
                 cx::describe(&c)
             );
             print!("{}", c.text);
+            // R61: what goes into the user prompt instead of the context (Claude implementer)
+            if let Some(d) = c.data_prompt() {
+                print!(
+                    "\n<!-- user prompt part: untrusted task files as data blocks (R61) -->\n{d}"
+                );
+            }
             Ok(0)
         }
     }

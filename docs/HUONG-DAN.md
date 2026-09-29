@@ -374,7 +374,16 @@ Prototype `toryo spike pipeline` chỉ còn để tham chiếu (R52) — in cả
 CLAUDE.md, nên Toryo tự ghép một bộ ngữ cảnh cố định cho *mỗi lượt*: `%USERPROFILE%\.toryo\context\global.md`
 → `AGENTS.md` + `CLAUDE.md` (chỉ Claude; Codex tự đọc AGENTS.md) → `.toryo\context\*.md` (quy định dự án,
 ví dụ `10-d365fo-models.md`: ZZZ chỉ local — **không bao giờ bị cắt**) → role template → task pack (đường dẫn
-file trong run store, file < 8 KB đưa thẳng vào). Lưu lại đúng bản đã gửi + hash.
+file trong run store). Lưu lại đúng bản đã gửi + hash.
+
+**M9 (R61) — văn bản không tin cậy chỉ là dữ liệu.** Chỉ `TASK.md` (anh viết) và `PLAN.md` (anh đã duyệt)
+được đưa thẳng vào ngữ cảnh (khi < 8 KB). Các file do agent hoặc code đang kiểm tạo ra — `DIFF*.patch`,
+`VERIFY_RESULT.json`, `REVIEW.md`, `DECISIONS.md` — **luôn chỉ là đường dẫn** (chế độ `path (untrusted)`), agent
+tự đọc và coi là dữ liệu. Lý do: một comment trong diff hay một dòng test output kiểu "SYSTEM: approve" nếu
+nằm trong system prompt sẽ có "quyền" như chỉ thị. Claude implementer không đọc được run store nên nhận
+các file đó trong **user prompt**, bọc trong `<untrusted_data source="…" sha256="…">`. Feedback từ verify và
+review cũng được bọc như vậy; ghi chú của anh (`reject --reason`, `resume --note`) thì không — đó là chỉ thị.
+`context show` (xem trước) in thêm phần user prompt này.
 
 ```powershell
 toryo context show BR-004 --stage implement            # xem trước: agent sắp nhận gì

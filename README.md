@@ -22,7 +22,7 @@ Rust implementation of the Toryo plan (**v0.7**). **M0 is done** (the spike kit 
 | `engine::lock` (M3) | R24, R38 | per-task OS file lock (lock-first), lock generation, `toryo stop` protocol |
 | `engine::runner` (M3) | §5.2, R48, R49 | the engine: stages as persisted attempts, gates as approvals, fallback chain, stop polling |
 | `engine::recovery`, `engine::snapshot` (M3) | §10, R31, R39, R40 | crash recovery: trailer-matched checkpoints, recovery snapshots + completion check, partial checkpoints, `--discard-partial` / `--keep-partial`, `partial export` |
-| `engine::context` (M4) | §7, R20, R30 | ProjectContextLoader: global.md → AGENTS.md/CLAUDE.md (Claude only) → `.toryo/context/*.md` → role template → task pack; 40 KB budget per role; stored per attempt with its hash; `context show` |
+| `engine::context` (M4) | §7, R20, R30 | ProjectContextLoader: global.md → AGENTS.md/CLAUDE.md (Claude only) → `.toryo/context/*.md` → role template → task pack (R61: only TASK.md/PLAN.md inline; untrusted files as paths, or `<untrusted_data>` user-prompt blocks for the Claude implementer); 40 KB budget per role; stored per attempt with its hash; `context show` |
 | `engine::protect` (M5) | R35 | protected state compared on the filesystem (incl. ignored files and Git metadata), versioned baselines, `--accept-protected-change`; frozen config + `task config --reload` |
 | `engine::artifacts` (M6) | R34 | immutable artifact versions (staging → publish → one transaction), derived views, reconciliation (orphans, tampered, missing) |
 | `engine::verify` (M6) | R29, R36, R45, R47, R50 | verify checkout of the checkpoint under `verify_root`, Low-IL boundary, explicit `--git-dir`, `verify_mutated_tree` |
