@@ -192,8 +192,9 @@ pub enum PipelineEvent {
     },
     /// `toryo resume` from `Paused` (after `budget set`, or once the quota is back).
     Unpause,
-    /// The verify configuration changed (`task config --reload`, R35): the current
-    /// checkpoint must be verified again — from the final gate or `Escalated`.
+    /// The verify result of the current checkpoint is no longer current (`task config
+    /// --reload` changed the verify configuration, R35): the checkpoint is verified again —
+    /// from the final gate, `Escalated`, or `Reviewing` before the review starts (EC-10).
     Reverify,
     /// A stop that needs a human (max cycles, InvalidOutput, quota, tampering, …).
     Escalate {
@@ -527,7 +528,7 @@ impl Machine {
                 m.escalated_from = None;
                 m.state = back;
             }
-            (S::WaitingFinalApproval | S::Escalated, E::Reverify) => {
+            (S::WaitingFinalApproval | S::Escalated | S::Reviewing, E::Reverify) => {
                 if !m.plan_approved || m.checkpoint.is_none() {
                     return Err(invalid);
                 }

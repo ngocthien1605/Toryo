@@ -389,8 +389,9 @@ impl<'a> Engine<'a> {
             self.store
                 .call(move |tx| store::last_attempt(tx, &i, "plan"))?
         };
-        // R48: the Planner (Claude) resumes its session for a revision or after an interruption
-        let resume = plan_resume(prev.as_ref());
+        // R48: the Planner resumes its own session for a revision or after an interruption —
+        // never the session of another profile (EC-30)
+        let resume = plan_resume(prev.as_ref(), &t.planner);
         let prompt = plan_prompt(
             t.feedback.as_deref(),
             prev.as_ref().map(|p| p.status),
@@ -414,50 +415,56 @@ impl<'a> Engine<'a> {
             return Ok(Flow::Next);
         };
         let stop = self.lock.watch_stop();
-        let (hooks, budget_hit) = self.hooks(&a.id, &stop, &t.planner)?;
-        let r = self.hub.turn_with(
-            OpenSession {
-                profile: t.planner.clone(),
-                role: Role::Planner,
-                cwd: t.worktree.clone(),
-                run_store: Some(art.clone()),
-                capture_dir: t.captures(),
-                schema: Some(contracts::schema("plan.schema.json")?.into()),
-                context_file: Some(ctx),
-                model: self.role_model("planner"),
-                resume,
-            },
-            TurnInput {
-                prompt,
-                label: format!("plan-{}", a.attempt),
-                echo: true,
-                env: self.capture_env(),
-            },
-            self.limits(),
-            hooks,
-        )?;
-        self.usage(&a, &t.planner, &r)?;
-        if let Some(flow) = self.cut_short(&a, &r, budget_hit.load(Ordering::SeqCst))? {
-            return Ok(flow);
-        }
-        if let Some(flow) = self.after_read_only_turn(t, &a, &r, "planner")? {
-            return Ok(flow);
-        }
-        let Some(plan) = r.structured.clone() else {
-            let reason = format!(
-                "planner returned no structured plan: {:?} {}",
-                r.error_class,
-                r.error_detail.clone().unwrap_or_default()
-            );
-            self.end_and(
-                &a,
-                AttemptStatus::Failed,
-                &r,
-                AttemptEnd::default(),
-                Some(Ev::Escalate { reason }),
-                None,
-            )?;
-            return Ok(Flow::Next);
+        // EC-01/EC-14: a failed turn never yields a plan; a crash, a timeout, a network error or
+        // an unknown failure is retried with the same prompt (bounded), anything else escalates
+        let mut last = StageOutcome::default();
+        let mut retries = 0;
+        let (r, output) = loop {
+            if retries > 0 && !self.admit_next_turn(&a, &last, 0)? {
+                return Ok(Flow::Next);
+            }
+            let ask = Ask {
+                prompt: &prompt,
+                resume: resume.clone(),
+                label: match retries {
+                    0 => format!("plan-{}", a.attempt),
+                    n => format!("plan-{}-{n}", a.attempt),
+                },
+            };
+            let r = match self.read_only_turn(t, &a, Role::Planner, &ctx, &stop, ask)? {
+                Ok(r) => r,
+                Err(flow) => return Ok(flow),
+            };
+            match ReadOnlyTurn::of(&r) {
+                ReadOnlyTurn::Retry(class) if retries < MAX_TURN_RETRIES => {
+                    retries += 1;
+                    eprintln!("{}", retry_note("planner", class, &r, retries));
+                    last = r;
+                }
+                ReadOnlyTurn::Retry(class) | ReadOnlyTurn::Failed(class) => {
+                    return self.read_only_failed(&a, &r, "planner", class, retries, 0);
+                }
+                output @ (ReadOnlyTurn::Output(_) | ReadOnlyTurn::Invalid(_)) => break (r, output),
+            }
+        };
+        // EC-25: a plan that does not match plan.schema.json is no plan (R22, R56: escalate)
+        let plan = match plan_output(output) {
+            Ok(plan) => plan,
+            Err(reason) => {
+                eprintln!("!! {reason}");
+                self.end_and(
+                    &a,
+                    AttemptStatus::Failed,
+                    &r,
+                    AttemptEnd {
+                        error_class: Some("InvalidOutput".into()),
+                        ..Default::default()
+                    },
+                    Some(Ev::Escalate { reason }),
+                    None,
+                )?;
+                return Ok(Flow::Next);
+            }
         };
         let bytes = serde_json::to_vec_pretty(&plan)?;
         let md = super::render::render("plan", &plan)?;
@@ -1084,7 +1091,7 @@ impl<'a> Engine<'a> {
             co.dir.display()
         );
         let stop = self.lock.watch_stop();
-        let Some((results, pass)) = self.run_verify_commands(b, &co, &stop)? else {
+        let Some((results, failure)) = self.run_verify_commands(b, &co, &stop)? else {
             self.finish_and(
                 &a,
                 AttemptStatus::Interrupted,
@@ -1094,6 +1101,7 @@ impl<'a> Engine<'a> {
             )?;
             return self.stopped();
         };
+        let pass = failure.is_none();
         // R29/R47: the checkout must be exactly the checkpoint after the run
         let mutated = verify::mutated(&self.g, &co, &head)?;
         let tree = self.g.run_str(
@@ -1132,14 +1140,13 @@ impl<'a> Engine<'a> {
             self.escalate_attempt(&a, protect::REASON.into(), reason)?;
             return Ok(Flow::Next);
         }
-        let (status, feedback, event) = if pass {
-            (AttemptStatus::Succeeded, None, Ev::VerifyPassed { head })
-        } else {
-            (
+        let (status, feedback, event) = match failure {
+            None => (AttemptStatus::Succeeded, None, Ev::VerifyPassed { head }),
+            Some(f) => (
                 AttemptStatus::Failed,
-                Some(Some(verify_feedback(&results))),
+                Some(Some(f)),
                 Ev::VerifyFailed { head },
-            )
+            ),
         };
         self.finish_and(&a, status, AttemptEnd::default(), feedback, Some(event))?;
         Ok(Flow::Next)
@@ -1172,19 +1179,19 @@ impl<'a> Engine<'a> {
     }
 
     /// Run the verify commands in the checkout, inside the boundary, and stop at the first
-    /// failure (§5.2). Returns each command's result and whether all passed; `None` when a
-    /// stop request ended a command (R38).
+    /// failure (§5.2). Returns each command's result and, if one failed, the feedback for the
+    /// implementer; `None` when a stop request ended a command (R38).
     fn run_verify_commands(
         &self,
         b: Boundary,
         co: &verify::Checkout,
         stop: &StopWatch,
-    ) -> Result<Option<(Vec<Value>, bool)>> {
+    ) -> Result<Option<(Vec<Value>, Option<String>)>> {
         let env = verify::env(co);
         let mut results = Vec::new();
-        let mut pass = true;
+        let mut failure = None;
         for c in &self.cmds {
-            let program = resolve_program(&expand_vars(&c.program)?);
+            let program = verify_program(&expand_vars(&c.program)?, &co.dir);
             let res = self.hub.block_on(LocalRunner.run(
                 RunSpec {
                     name: c.name.clone(),
@@ -1202,7 +1209,6 @@ impl<'a> Engine<'a> {
                 return Ok(None);
             }
             let ok = res.ok();
-            pass &= ok;
             eprintln!(
                 "  {} {} (exit {:?}, {:.1}s)",
                 if ok { "✔" } else { "✘" },
@@ -1213,10 +1219,11 @@ impl<'a> Engine<'a> {
             // R50: LocalRunner strips ANSI (CSI/OSC) from everything it captures
             results.push(command_result(c, &res));
             if !ok {
+                failure = Some(verify_feedback(&res));
                 break; // stop at the first failure (§5.2)
             }
         }
-        Ok(Some((results, pass)))
+        Ok(Some((results, failure)))
     }
 
     // ── Reviewing ────────────────────────────────────────────────────────────────────
@@ -1230,6 +1237,14 @@ impl<'a> Engine<'a> {
             .checkpoint()
             .context("no checkpoint to review")?
             .to_string();
+        // EC-10 (R29): the review starts only on a current passing verify result of this
+        // checkpoint — a `task config --reload` that changed the verify configuration while
+        // the task waited (Paused, Escalated) invalidated it: verify again first
+        if self.verify_stale(t)? {
+            eprintln!("!! checkpoint {} has no current passing verify result (e.g. the verify configuration was reloaded) — it is verified again before the review (R29)", short(&head));
+            self.apply(Ev::Reverify)?;
+            return Ok(Flow::Next);
+        }
         // R48: a review of the same checkpoint that was interrupted (crash, stop) resumes the
         // Reviewer's session
         let prev = {
@@ -1286,14 +1301,21 @@ impl<'a> Engine<'a> {
                 )?;
                 Ok(Flow::Next)
             }
+            ReviewTurns::Failed {
+                last,
+                class,
+                retries,
+                corrections,
+            } => self.read_only_failed(&a, &last, "reviewer", class, retries, corrections),
             ReviewTurns::Ended(flow) => Ok(flow),
         }
     }
 
     /// The review turn and up to two correction turns in the same session (R22): a review
-    /// that fails the checks (R28) is sent back with the violations. Every turn is admitted
-    /// (R41) and checked like any read-only turn. A turn that failed is checked like any
-    /// other (EC-01), and a crash or timeout also gets a correction turn (EC-14).
+    /// that fails its schema (EC-25) or the checks (R28) is sent back with the violations.
+    /// Every turn is admitted (R41) and checked like any read-only turn. A failed turn never
+    /// yields a review (EC-01): a crash, a timeout, a network error or an unknown failure is
+    /// the same turn again (bounded); only invalid output gets a correction turn (EC-14).
     fn review_turns(
         &self,
         t: &TaskRow,
@@ -1304,70 +1326,62 @@ impl<'a> Engine<'a> {
         mut resume: Option<String>,
     ) -> Result<ReviewTurns> {
         let mut last = StageOutcome::default();
-        for corr in 0..=MAX_CORRECTIONS {
-            // R41: every turn is admitted, correction turns too (EC-13: a refusal has already
-            // applied `BudgetExceeded`, so the transition below is refused)
-            if corr > 0 && !self.admitted()? {
-                self.end_and(
-                    a,
-                    AttemptStatus::Failed,
-                    &last,
-                    AttemptEnd {
-                        error_class: Some("budget".into()),
-                        ..Default::default()
-                    },
-                    Some(Ev::BudgetExceeded),
-                    None,
-                )?;
+        let (mut turn, mut corrections, mut retries) = (0, 0, 0);
+        loop {
+            // R41: every turn is admitted, correction turns and retries too
+            if turn > 0 && !self.admit_next_turn(a, &last, corrections)? {
                 return Ok(ReviewTurns::Ended(Flow::Next));
             }
-            let (hooks, budget_hit) = self.hooks(&a.id, stop, &t.reviewer)?;
-            let r = self.hub.turn_with(
-                OpenSession {
-                    profile: t.reviewer.clone(),
-                    role: Role::Reviewer,
-                    cwd: t.worktree.clone(),
-                    run_store: Some(t.artifacts()),
-                    capture_dir: t.captures(),
-                    schema: Some(contracts::schema("review.schema.json")?.into()),
-                    context_file: Some(ctx.to_path_buf()),
-                    model: self.role_model("reviewer"),
-                    resume: resume.clone(),
-                },
-                TurnInput {
-                    prompt: prompt.clone(),
-                    label: format!("review-{}-{corr}", a.attempt),
-                    echo: true,
-                    env: self.capture_env(),
-                },
-                self.limits(),
-                hooks,
-            )?;
-            self.usage(a, &t.reviewer, &r)?;
-            if let Some(flow) = self.cut_short(a, &r, budget_hit.load(Ordering::SeqCst))? {
-                return Ok(ReviewTurns::Ended(flow));
-            }
-            if let Some(flow) = self.after_read_only_turn(t, a, &r, "reviewer")? {
-                return Ok(ReviewTurns::Ended(flow));
-            }
-            let review = r.structured.clone().unwrap_or(Value::Null);
-            let viol = review_violations(&review, &t.acceptance_ids);
+            let ask = Ask {
+                prompt: &prompt,
+                resume: resume.clone(),
+                label: format!("review-{}-{turn}", a.attempt),
+            };
+            turn += 1;
+            let r = match self.read_only_turn(t, a, Role::Reviewer, ctx, stop, ask)? {
+                Ok(r) => r,
+                Err(flow) => return Ok(ReviewTurns::Ended(flow)),
+            };
+            let viol = match ReadOnlyTurn::of(&r) {
+                ReadOnlyTurn::Output(review) => {
+                    let viol = review_problems(&review, &t.acceptance_ids);
+                    if viol.is_empty() {
+                        return Ok(ReviewTurns::Valid(ValidReview {
+                            review,
+                            last: r,
+                            corrections,
+                        }));
+                    }
+                    viol
+                }
+                ReadOnlyTurn::Invalid(why) => vec![why],
+                ReadOnlyTurn::Retry(class) if retries < MAX_TURN_RETRIES => {
+                    retries += 1;
+                    eprintln!("{}", retry_note("reviewer", class, &r, retries));
+                    last = r;
+                    continue; // the same turn again: the same prompt, the same session choice
+                }
+                ReadOnlyTurn::Retry(class) | ReadOnlyTurn::Failed(class) => {
+                    return Ok(ReviewTurns::Failed {
+                        last: r,
+                        class,
+                        retries,
+                        corrections,
+                    });
+                }
+            };
             last = r;
-            if viol.is_empty() {
-                return Ok(ReviewTurns::Valid(ValidReview {
-                    review,
-                    last,
-                    corrections: corr,
-                }));
-            }
             eprintln!(
                 "!! invalid review (correction {}/{MAX_CORRECTIONS}): {viol:?}",
-                corr + 1
+                corrections + 1
             );
+            if corrections == MAX_CORRECTIONS {
+                return Ok(ReviewTurns::Rejected { last });
+            }
+            corrections += 1;
             prompt = correction_prompt(&viol);
             resume = last.session_id.clone();
         }
-        Ok(ReviewTurns::Rejected { last })
     }
 
     /// Publish a valid review (review.json, REVIEW.md) and apply its decision: an
@@ -1435,6 +1449,123 @@ impl<'a> Engine<'a> {
         Ok(Flow::Next)
     }
 
+    /// EC-10: is the verify result in force not a current pass for the checkpoint? A
+    /// tampered or missing verify result is not decided here: the task pack's hash check
+    /// escalates it when the stage starts (R34).
+    fn verify_stale(&self, t: &TaskRow) -> Result<bool> {
+        match verify_current(self.store, t) {
+            Ok(current) => Ok(!current),
+            Err(e) if format!("{e:#}").starts_with("artifact_") => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    // ── read-only turns (Planner, Reviewer) ──────────────────────────────────────────
+
+    /// One turn of a read-only role in attempt `a`. `Err(flow)`: the turn ended the attempt
+    /// — the live budget interrupt, a stop, a quota pause, or a policy escalation.
+    fn read_only_turn(
+        &self,
+        t: &TaskRow,
+        a: &AttemptRow,
+        role: Role,
+        ctx: &Path,
+        stop: &StopWatch,
+        ask: Ask,
+    ) -> Result<Result<StageOutcome, Flow>> {
+        let (profile, schema) = match role {
+            Role::Planner => (&t.planner, "plan.schema.json"),
+            _ => (&t.reviewer, "review.schema.json"),
+        };
+        let (hooks, budget_hit) = self.hooks(&a.id, stop, profile)?;
+        let r = self.hub.turn_with(
+            OpenSession {
+                profile: profile.clone(),
+                role,
+                cwd: t.worktree.clone(),
+                run_store: Some(t.artifacts()),
+                capture_dir: t.captures(),
+                schema: Some(contracts::schema(schema)?.into()),
+                context_file: Some(ctx.to_path_buf()),
+                model: self.role_model(role.as_str()),
+                resume: ask.resume,
+            },
+            TurnInput {
+                prompt: ask.prompt.to_string(),
+                label: ask.label,
+                echo: true,
+                env: self.capture_env(),
+            },
+            self.limits(),
+            hooks,
+        )?;
+        self.usage(a, profile, &r)?;
+        if let Some(flow) = self.cut_short(a, &r, budget_hit.load(Ordering::SeqCst))? {
+            return Ok(Err(flow));
+        }
+        if let Some(flow) = self.after_read_only_turn(t, a, &r, role.as_str())? {
+            return Ok(Err(flow));
+        }
+        Ok(Ok(r))
+    }
+
+    /// R41: a further turn of a running attempt (a correction or a retry) is admitted like
+    /// the first. A refusal has already paused the task (`admitted`), so the attempt only
+    /// ends here, as `budget` — no second `BudgetExceeded` (EC-13).
+    fn admit_next_turn(
+        &self,
+        a: &AttemptRow,
+        last: &StageOutcome,
+        corrections: u32,
+    ) -> Result<bool> {
+        if self.admitted()? {
+            return Ok(true);
+        }
+        self.end_and(
+            a,
+            AttemptStatus::Failed,
+            last,
+            AttemptEnd {
+                error_class: Some("budget".into()),
+                error_detail: Some("the admission budget refused the next turn (R41)".into()),
+                correction_turns: Some(corrections),
+                ..Default::default()
+            },
+            None,
+            None,
+        )?;
+        Ok(false)
+    }
+
+    /// A read-only turn failed for good (EC-01, EC-14): the attempt fails with the turn's
+    /// real class and the task escalates.
+    fn read_only_failed(
+        &self,
+        a: &AttemptRow,
+        last: &StageOutcome,
+        role: &str,
+        class: ErrorClass,
+        retries: u32,
+        corrections: u32,
+    ) -> Result<Flow> {
+        last.print_summary();
+        let reason = read_only_failure(role, class, last.error_detail.as_deref(), retries);
+        eprintln!("!! {reason}");
+        self.end_and(
+            a,
+            AttemptStatus::Failed,
+            last,
+            AttemptEnd {
+                error_class: Some(format!("{class:?}")),
+                correction_turns: Some(corrections),
+                ..Default::default()
+            },
+            Some(Ev::Escalate { reason }),
+            None,
+        )?;
+        Ok(Flow::Next)
+    }
+
     // ── protected state (R35) and pauses (R49) ───────────────────────────────────────
 
     /// Compare the protected state with the baseline in force. `only_hard`: right after an
@@ -1465,7 +1596,9 @@ impl<'a> Engine<'a> {
     }
 
     /// After a Planner/Reviewer turn: quota → `Paused` (no Planner/Reviewer fallback in
-    /// v0.1, R49); a changed protected state → `Escalated`.
+    /// v0.1, R49); a changed protected state → `Escalated`; a changed worktree or a moved
+    /// HEAD → `Escalated` as a policy violation (EC-31: read-only roles write nothing, and
+    /// what one wrote must never reach the next checkpoint under the implementer's name).
     fn after_read_only_turn(
         &self,
         t: &TaskRow,
@@ -1497,6 +1630,24 @@ impl<'a> Engine<'a> {
                 r,
                 AttemptEnd {
                     error_class: Some(protect::REASON.into()),
+                    ..Default::default()
+                },
+                Some(Ev::Escalate { reason }),
+                None,
+            )?;
+            return Ok(Some(Flow::Next));
+        }
+        let wt = Worktree::new(&self.g, &t.worktree);
+        let changed: Vec<String> = wt.changed()?.into_iter().map(|c| c.1).collect();
+        if let Some(reason) = read_only_write(a.git_head_before.as_deref(), &wt.head()?, &changed) {
+            eprintln!("!! {reason}");
+            self.end_and(
+                a,
+                AttemptStatus::Failed,
+                r,
+                AttemptEnd {
+                    error_class: Some("policy_violation".into()),
+                    error_detail: Some(reason.clone()),
                     ..Default::default()
                 },
                 Some(Ev::Escalate { reason }),
@@ -1744,10 +1895,12 @@ impl<'a> Engine<'a> {
 
 // ── stage decisions: pure, unit-tested ───────────────────────────────────────────────
 
-/// R48: the Planner resumes the session of its previous attempt, whatever its profile
-/// (EC-30).
-fn plan_resume(prev: Option<&AttemptRow>) -> Option<String> {
-    prev.and_then(|p| p.external_session_id.clone())
+/// R48: the Planner resumes the session of its previous attempt — only when that attempt ran
+/// with the same profile: after `task config --reload` switched `roles.planner`, the new
+/// planner never gets the old CLI's session id (EC-30).
+fn plan_resume(prev: Option<&AttemptRow>, planner: &str) -> Option<String> {
+    prev.filter(|p| p.profile.as_deref() == Some(planner))
+        .and_then(|p| p.external_session_id.clone())
 }
 
 /// The Planner's prompt: the feedback on a revision, else the task (again, after an
@@ -2183,8 +2336,142 @@ enum ReviewTurns {
     Rejected {
         last: StageOutcome,
     },
-    /// The attempt has already ended (budget, stop, quota or protected state).
+    /// The last turn failed for good (EC-01, EC-14): at once, or after the retries.
+    Failed {
+        last: StageOutcome,
+        class: ErrorClass,
+        retries: u32,
+        corrections: u32,
+    },
+    /// The attempt has already ended (budget, stop, quota, protected state or a policy
+    /// violation).
     Ended(Flow),
+}
+
+/// Why a review returned by a successful turn cannot be used: the checks in code (R28), then
+/// its schema (EC-25). Empty: valid.
+fn review_problems(review: &Value, acceptance_ids: &[String]) -> Vec<String> {
+    let mut out = review_violations(review, acceptance_ids);
+    if let Err(e) = contracts::validate("review.schema.json", review) {
+        out.extend(e);
+    }
+    out
+}
+
+// ── read-only turns (Planner, Reviewer): pure ────────────────────────────────────────
+
+/// Retries of a failed Planner/Reviewer turn (crash, timeout, network, unknown) before the
+/// task escalates with the turn's class (EC-14, plan §11).
+const MAX_TURN_RETRIES: u32 = 2;
+
+/// One turn of a read-only role: what is asked, in which session, under which capture label.
+struct Ask<'p> {
+    prompt: &'p str,
+    resume: Option<String>,
+    label: String,
+}
+
+/// What a finished Planner/Reviewer turn yields (EC-01, EC-14), after the live budget
+/// interrupt, a stop, quota and rate limits (pause) and the policy checks (escalate). A failed
+/// turn never yields a plan or a review — whatever payload it carries (plan §6.2).
+#[derive(Debug, Clone, PartialEq)]
+enum ReadOnlyTurn {
+    /// A successful turn's structured output (`Null` when it returned none), to be checked.
+    Output(Value),
+    /// The turn failed because its output could not be used (no final message, not JSON, too
+    /// long: class `InvalidOutput`): invalid output, like a review that fails its checks (R22).
+    Invalid(String),
+    /// A crash, a timeout, a network error or an unknown failure: the same turn again.
+    Retry(ErrorClass),
+    /// Anything else — a permission denial, a policy refusal, auth, a bad request, a context
+    /// overflow: no blind retry (§11), the task escalates with the class.
+    Failed(ErrorClass),
+}
+
+impl ReadOnlyTurn {
+    fn of(r: &StageOutcome) -> Self {
+        // any denial fails the stage (plan §6.2), even if an adapter reported success
+        let class = match (r.success, r.permission_denials.is_empty()) {
+            (true, true) => return Self::Output(r.structured.clone().unwrap_or(Value::Null)),
+            (true, false) => Some(ErrorClass::PermissionDenied),
+            (false, _) => r.error_class,
+        };
+        match class {
+            Some(ErrorClass::InvalidOutput) => Self::Invalid(format!(
+                "the final response could not be used: {}",
+                r.error_detail.as_deref().unwrap_or("InvalidOutput")
+            )),
+            Some(
+                c @ (ErrorClass::ProcessCrashed
+                | ErrorClass::Timeout
+                | ErrorClass::Network
+                | ErrorClass::Unknown),
+            ) => Self::Retry(c),
+            None => Self::Retry(ErrorClass::Unknown),
+            Some(c) => Self::Failed(c),
+        }
+    }
+}
+
+/// The line printed before a failed read-only turn is run again.
+fn retry_note(role: &str, class: ErrorClass, r: &StageOutcome, retry: u32) -> String {
+    format!(
+        "!! {role} turn failed: {class:?} ({}) — the same turn again ({retry}/{MAX_TURN_RETRIES}, EC-14)",
+        r.error_detail.as_deref().unwrap_or("no detail")
+    )
+}
+
+/// Why the task escalates after a read-only turn failed for good: the turn's real class
+/// first, as in `InvalidOutput: …` (EC-14).
+fn read_only_failure(role: &str, class: ErrorClass, detail: Option<&str>, retries: u32) -> String {
+    let detail = detail.filter(|d| !d.is_empty()).unwrap_or("no detail");
+    if retries == 0 {
+        format!("{class:?}: the {role} turn failed ({detail}); a failed turn is never used and not retried blindly (plan §6.2, §11)")
+    } else {
+        format!("{class:?}: the {role} turn failed ({detail}), also after {retries} retries of the same turn (plan §11)")
+    }
+}
+
+/// EC-31: a read-only role changed the worktree (tracked or untracked, not ignored) or moved
+/// HEAD from where its attempt began — a policy violation (the wording of recovery's check).
+fn read_only_write(head_before: Option<&str>, head: &str, changed: &[String]) -> Option<String> {
+    if !changed.is_empty() {
+        return Some(format!(
+            "policy_violation: the worktree changed during a read-only stage: {changed:?}"
+        ));
+    }
+    match head_before {
+        Some(before) if before != head => Some(format!(
+            "policy_violation: HEAD moved during a read-only stage ({} → {})",
+            short(before),
+            short(head)
+        )),
+        _ => None,
+    }
+}
+
+/// The plan of a Planner turn that was not retried or escalated: its structured output when
+/// it matches plan.schema.json (EC-25), else the escalation reason (R56: no correction turns
+/// for the planner).
+fn plan_output(turn: ReadOnlyTurn) -> std::result::Result<Value, String> {
+    match turn {
+        ReadOnlyTurn::Output(Value::Null) => {
+            Err("InvalidOutput: the planner returned no structured plan".into())
+        }
+        ReadOnlyTurn::Output(plan) => match contracts::validate("plan.schema.json", &plan) {
+            Ok(()) => Ok(plan),
+            Err(e) => Err(format!(
+                "InvalidOutput: the planner returned no valid plan — it does not match plan.schema.json: {}",
+                e.join("; ")
+            )),
+        },
+        ReadOnlyTurn::Invalid(why) => Err(format!(
+            "InvalidOutput: the planner returned no structured plan: {why}"
+        )),
+        ReadOnlyTurn::Retry(c) | ReadOnlyTurn::Failed(c) => Err(format!(
+            "{c:?}: the planner turn failed; a failed turn never yields a plan"
+        )),
+    }
 }
 
 /// The decision of a valid review.
@@ -2280,15 +2567,48 @@ fn command_result(c: &CommandSpec, res: &CommandResult) -> Value {
     json!({"name": c.name, "argv": std::iter::once(c.program.clone()).chain(c.args.clone()).collect::<Vec<_>>(), "exit": res.exit, "ms": res.duration_ms, "output_tail": res.tail(40)})
 }
 
-/// The feedback of a failed verify: the last command run (the failing one) and its output.
-fn verify_feedback(results: &[Value]) -> String {
-    let f = results.last().cloned().unwrap_or(Value::Null);
+/// The feedback of a failed verify for the implementer: the failing command, how it ended
+/// and the tail of its output (the `output_tail` of VERIFY_RESULT.json).
+fn verify_feedback(res: &CommandResult) -> String {
     format!(
-        "- VERIFY FAILED: `{}` exited {:?}. Last output:\n```\n{}\n```",
-        f["name"].as_str().unwrap_or(""),
-        f["exit"],
-        f["output_tail"].as_str().unwrap_or("")
+        "- VERIFY FAILED: `{}` {}. Last output:\n```\n{}\n```",
+        res.name,
+        ended(res),
+        res.tail(40)
     )
+}
+
+/// How a verify command ended, in words: `exited 1`, `timed out`, …
+fn ended(res: &CommandResult) -> String {
+    match (res.timed_out, res.cancelled, res.exit) {
+        (true, _, _) => "timed out".into(),
+        (_, true, _) => "was cancelled".into(),
+        (_, _, Some(code)) => format!("exited {code}"),
+        (_, _, None) => "ended without an exit code (killed)".into(),
+    }
+}
+
+/// The program a verify command runs (item 10): a relative path with a separator
+/// (`scripts/gate.sh`, `.\build.cmd`) names a file of the checkpoint, so it is anchored at the
+/// verify checkout — Windows would otherwise resolve it against toryo's own working
+/// directory. Absolute programs and bare names (a PATH lookup) are unchanged.
+fn verify_program(program: &str, checkout: &Path) -> PathBuf {
+    use std::path::Component;
+    let p = resolve_program(program);
+    let relative_path = (program.contains('/') || program.contains('\\'))
+        && p.components().all(|c| {
+            matches!(
+                c,
+                Component::Normal(_) | Component::CurDir | Component::ParentDir
+            )
+        });
+    if !relative_path {
+        return p; // absolute, rooted (`\tools\x.exe`), drive-relative, or a bare name
+    }
+    program
+        .split(['/', '\\'])
+        .filter(|c| !c.is_empty() && *c != ".")
+        .fold(checkout.to_path_buf(), |dir, c| dir.join(c))
 }
 
 /// The error class of a prefixed reason: `artifact_tampered: …` → `artifact_tampered`.
@@ -2410,7 +2730,10 @@ fn claude_implementer_prompt(base: &str) -> String {
 // ── gate decisions (used by `toryo approve` / `reject` and `--yes`) ──────────────────
 
 /// Approve the open gate after re-checking its subject (R32): the plan on disk must still
-/// hash to the approved digest; the final gate's checkpoint must still be verified.
+/// hash to the approved digest; the final gate's checkpoint must still be the task branch,
+/// with a clean worktree (§11 `approval_mismatch` → `Escalated`, EC-11), and still have a
+/// current passing verify result (else the gate is withdrawn and the checkpoint verified
+/// again, EC-10). A refused approval is an error: nothing was approved.
 pub fn approve_now(store: &Store, t: &TaskRow, kind: GateKind, expect: Option<&str>) -> Result<()> {
     let gate = t
         .machine
@@ -2436,10 +2759,31 @@ pub fn approve_now(store: &Store, t: &TaskRow, kind: GateKind, expect: Option<&s
                 subject: gate.subject.clone(),
             }
         }
-        GateKind::Final => Ev::FinalApproved {
-            occurrence: gate.occurrence,
-            subject: gate.subject.clone(),
-        },
+        GateKind::Final => {
+            if let Some(reason) = approval_mismatch(t, &gate.subject)? {
+                withdraw_final(
+                    store,
+                    t,
+                    Ev::Escalate {
+                        reason: reason.clone(),
+                    },
+                )?;
+                bail!("{reason}");
+            }
+            if !verify_current(store, t)? {
+                withdraw_final(store, t, Ev::Reverify)?;
+                bail!(
+                    "{}: checkpoint {} has no current passing verify result (e.g. the verify configuration was reloaded) — nothing was approved; the final gate was withdrawn: `toryo run {}` verifies the checkpoint again (R29)",
+                    t.id,
+                    short(&gate.subject),
+                    t.id
+                );
+            }
+            Ev::FinalApproved {
+                occurrence: gate.occurrence,
+                subject: gate.subject.clone(),
+            }
+        }
     };
     let i = t.id.clone();
     let m = store.call(move |tx| store::transition(tx, &i, e))?;
@@ -2497,6 +2841,60 @@ pub fn reject_now(store: &Store, t: &TaskRow, kind: GateKind, reason: &str) -> R
             store::whoami()
         ),
     )?;
+    Ok(())
+}
+
+/// §11 `approval_mismatch` (R32, EC-11) of the final gate: the task branch must still point
+/// at the approved checkpoint and the worktree must be clean — what the human merges is what
+/// was verified and reviewed. Returns the escalation reason.
+fn approval_mismatch(t: &TaskRow, checkpoint: &str) -> Result<Option<String>> {
+    let cfg = frozen_config(t)?;
+    let g = task_git(&cfg, &t.repo)?;
+    let branch = g.output(
+        &crate::git::Loc::Discover(t.repo.clone()),
+        true,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}^{{commit}}", t.branch),
+        ],
+    )?;
+    let at = String::from_utf8_lossy(&branch.stdout).trim().to_string();
+    let changed: Vec<String> = if at == checkpoint {
+        Worktree::new(&g, &t.worktree)
+            .changed()?
+            .into_iter()
+            .map(|c| c.1)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(mismatch_reason(&t.branch, &at, checkpoint, &changed))
+}
+
+/// The pure half of [`approval_mismatch`]: the branch is at `at` (empty: gone), the approved
+/// checkpoint is `checkpoint`, the worktree has `changed` paths.
+fn mismatch_reason(branch: &str, at: &str, checkpoint: &str, changed: &[String]) -> Option<String> {
+    if at != checkpoint {
+        let now = if at.is_empty() {
+            "gone".to_string()
+        } else {
+            format!("at {}", short(at))
+        };
+        return Some(format!("approval_mismatch: the branch {branch} is {now}, not at the approved checkpoint {} — nothing was approved (R32)", short(checkpoint)));
+    }
+    if !changed.is_empty() {
+        return Some(format!("approval_mismatch: the worktree has uncommitted changes {changed:?} on top of the approved checkpoint {} — nothing was approved (R32)", short(checkpoint)));
+    }
+    None
+}
+
+/// Withdraw the open final gate with `e` (`Escalate`, `Reverify`): the approval is refused.
+fn withdraw_final(store: &Store, t: &TaskRow, e: Ev) -> Result<()> {
+    let (i, name) = (t.id.clone(), e.name());
+    let m = store.call(move |tx| store::transition(tx, &i, e))?;
+    eprintln!("   [state] {:?} --{name}--> {:?}", t.state, m.state());
     Ok(())
 }
 
@@ -2741,21 +3139,26 @@ mod tests {
     }
 
     #[test]
-    fn the_planner_resumes_the_previous_session_of_any_profile() {
-        assert_eq!(plan_resume(None), None);
+    fn the_planner_resumes_only_its_own_previous_session() {
+        assert_eq!(plan_resume(None, "claude-max"), None);
         let none = attempt(AttemptStatus::Succeeded, "claude-max", None, None);
-        assert_eq!(plan_resume(Some(&none)), None);
+        assert_eq!(plan_resume(Some(&none), "claude-max"), None);
         let claude = attempt(AttemptStatus::Succeeded, "claude-max", Some("s-1"), None);
-        assert_eq!(plan_resume(Some(&claude)), Some("s-1".into()));
-        // EC-30 (not fixed): the profile is not compared, so a changed planner profile gets
-        // the previous profile's session
+        assert_eq!(plan_resume(Some(&claude), "claude-max"), Some("s-1".into()));
+        // EC-30: after the planner profile changed, the previous profile's session is never
+        // resumed — in either direction
         let codex = attempt(
             AttemptStatus::Interrupted,
             "codex-openai",
             Some("t-1"),
             None,
         );
-        assert_eq!(plan_resume(Some(&codex)), Some("t-1".into()));
+        assert_eq!(plan_resume(Some(&codex), "claude-max"), None);
+        assert_eq!(plan_resume(Some(&claude), "codex-openai"), None);
+        assert_eq!(
+            plan_resume(Some(&codex), "codex-openai"),
+            Some("t-1".into())
+        );
     }
 
     #[test]
@@ -3453,26 +3856,52 @@ mod tests {
     }
 
     #[test]
-    fn verify_feedback_quotes_the_last_command_and_its_output() {
-        let failed = [
-            json!({"name": "build", "exit": 0, "output_tail": "ok"}),
-            json!({"name": "test", "exit": 1, "output_tail": "1 failed\nat line 3"}),
-        ];
-        let stopped = [json!({"name": "slow", "exit": null, "output_tail": ""})];
-        // the exit code is shown with the Debug format of a JSON value ("Number(1)")
-        let cases: [(&[Value], &str); 3] = [
+    fn verify_feedback_quotes_the_failing_command_and_its_output() {
+        let res =
+            |exit: Option<i32>, timed_out: bool, cancelled: bool, output: &str| CommandResult {
+                name: "test".into(),
+                exit,
+                timed_out,
+                cancelled,
+                duration_ms: 10,
+                output: output.into(),
+            };
+        let many: String = (1..=45).map(|i| format!("line {i}\n")).collect();
+        let tail: Vec<String> = (6..=45).map(|i| format!("line {i}")).collect();
+        // the exit code in words, never the Debug format of a JSON value ("Number(1)")
+        let cases = [
             (
-                &failed,
-                "- VERIFY FAILED: `test` exited Number(1). Last output:\n```\n1 failed\nat line 3\n```",
+                res(Some(1), false, false, "1 failed\nat line 3\n"),
+                "- VERIFY FAILED: `test` exited 1. Last output:\n```\n1 failed\nat line 3\n```"
+                    .to_string(),
             ),
             (
-                &stopped,
-                "- VERIFY FAILED: `slow` exited Null. Last output:\n```\n\n```",
+                res(Some(-1073741819), false, false, ""),
+                "- VERIFY FAILED: `test` exited -1073741819. Last output:\n```\n\n```".into(),
             ),
-            (&[], "- VERIFY FAILED: `` exited Null. Last output:\n```\n\n```"),
+            (
+                res(None, true, false, "building…\n"),
+                "- VERIFY FAILED: `test` timed out. Last output:\n```\nbuilding…\n```".into(),
+            ),
+            (
+                res(None, false, true, ""),
+                "- VERIFY FAILED: `test` was cancelled. Last output:\n```\n\n```".into(),
+            ),
+            (
+                res(None, false, false, ""),
+                "- VERIFY FAILED: `test` ended without an exit code (killed). Last output:\n```\n\n```".into(),
+            ),
+            // the same 40-line tail as VERIFY_RESULT.json's `output_tail`
+            (
+                res(Some(2), false, false, &many),
+                format!(
+                    "- VERIFY FAILED: `test` exited 2. Last output:\n```\n{}\n```",
+                    tail.join("\n")
+                ),
+            ),
         ];
-        for (results, want) in cases {
-            assert_eq!(verify_feedback(results), want, "{results:?}");
+        for (r, want) in cases {
+            assert_eq!(verify_feedback(&r), want, "{r:?}");
         }
     }
 
@@ -3586,3 +4015,6 @@ mod tests {
         );
     }
 }
+#[cfg(test)]
+#[path = "runner_review_tests.rs"]
+mod review_tests;

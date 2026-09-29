@@ -127,6 +127,7 @@ fn allowed(s: S) -> &'static [&'static str] {
             "review_blocked",
             "budget_exceeded",
             "pause",
+            "reverify",
             "escalate",
             "cancel",
             "fail",
@@ -565,4 +566,27 @@ fn pause_keeps_the_stage_and_reverify_clears_the_verified_head() {
     let mut m = at(S::Escalated);
     m.checkpoint = None;
     assert!(m.apply(E::Reverify).is_err());
+}
+
+#[test]
+fn reverify_before_the_review_takes_the_checkpoint_back_to_verify() {
+    // EC-10: a reload while the task waited (Paused from Reviewing, Escalated, …) invalidated
+    // the verify result; the review stage sends the checkpoint back to Verify first
+    let mut m = at(S::Reviewing);
+    assert_eq!(m.apply(E::Reverify), Ok(S::Verifying));
+    assert_eq!((m.checkpoint(), m.verified_head()), (Some(C1), None));
+    assert_eq!(m.fix_cycle(), 0, "not a fix cycle");
+    // the old verify pass no longer counts: the review of C1 needs a new one
+    assert!(matches!(
+        m.clone().apply(E::ReviewApproved { head: C1.into() }),
+        Err(PipelineError::InvalidTransition { .. })
+    ));
+    assert_eq!(
+        m.apply(E::VerifyPassed { head: C1.into() }),
+        Ok(S::Reviewing)
+    );
+    assert_eq!(
+        m.apply(E::ReviewApproved { head: C1.into() }),
+        Ok(S::WaitingFinalApproval)
+    );
 }
