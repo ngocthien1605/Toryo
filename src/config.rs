@@ -1,7 +1,9 @@
 //! `toryo.yaml` + machine config (`%USERPROFILE%\.toryo\toryo.local.yaml`), plan §14 / R35 / R37.
 //!
 //! The effective configuration of a task is the repo `toryo.yaml` merged with the
-//! machine config, serialised canonically (sorted keys) and hashed. From M3 on it
+//! machine config, serialised canonically (sorted keys) and hashed. Agent profiles come
+//! only from the machine config (R60): a repository file that defines `profiles:` or
+//! `toolchains:` does not load. From M3 on it
 //! is frozen per task (`config.json` artifact); in the M0 spike it is loaded per run
 //! and its hash is printed so results can be tied to a configuration.
 
@@ -236,12 +238,15 @@ pub struct Timeouts {
     pub agent_stage_max_min: Option<u64>,
 }
 
-/// Repo-level `toryo.yaml`.
+/// Repo-level `toryo.yaml`, and — once merged — the effective configuration of a task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoConfig {
     pub version: u32,
     pub project: Project,
+    /// The merged view only: the repository file may not define profiles (R60, checked on
+    /// its raw text by [`Effective::load`]); they come from the machine config and are
+    /// frozen with the task, so `from_frozen` reads them here.
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
     #[serde(default)]
@@ -306,6 +311,16 @@ impl Effective {
     pub fn load(repo_path: &Path, machine_path: Option<&Path>) -> Result<Self> {
         let text = std::fs::read_to_string(repo_path)
             .with_context(|| format!("reading {}", repo_path.display()))?;
+        // R60 (ARCH-05): the repository file never defines an agent's program, environment
+        // or secrets — checked on the raw text, before anything is merged
+        if let Some(part) =
+            machine_only_part(&text).with_context(|| format!("parsing {}", repo_path.display()))?
+        {
+            bail!(
+                "{}",
+                part.refusal(repo_path, &machine_config_hint(machine_path))
+            );
+        }
         let mut repo: RepoConfig = serde_yaml::from_str(&text)
             .with_context(|| format!("parsing {}", repo_path.display()))?;
         if repo.version != 1 {
@@ -332,7 +347,10 @@ impl Effective {
         for (name, role) in &repo.roles {
             for p in std::iter::once(&role.profile).chain(role.fallback.iter().flatten()) {
                 if !repo.profiles.contains_key(p) {
-                    bail!("role `{name}` refers to unknown profile `{p}`");
+                    bail!(
+                        "role `{name}` refers to unknown profile `{p}` — define it under `profiles:` in the machine config ({}) (R60)",
+                        machine_config_hint(machine_path)
+                    );
                 }
             }
         }
@@ -541,6 +559,66 @@ fn resets_provider(key: &str, id: &str) -> bool {
             .any(|f| is_or_under(key, &format!("{table}.{f}")))
 }
 
+/// R60 (ARCH-05): the top-level keys only the machine config may hold. They name the
+/// programs toryo starts, their environment and secrets, and the sandbox they run in — so
+/// repository content (a teammate's commit, merged agent work) must not choose them.
+pub const MACHINE_ONLY_KEYS: [&str; 2] = ["profiles", "toolchains"];
+
+/// The machine-only keys found in a repository `toryo.yaml` (R60).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineOnlyPart {
+    /// The keys found, in [`MACHINE_ONLY_KEYS`] order.
+    pub keys: Vec<String>,
+    /// Those keys and their values as YAML, ready to paste into the machine config.
+    pub yaml: String,
+}
+
+impl MachineOnlyPart {
+    /// The load error: what is wrong, where the block goes, and the block itself.
+    pub fn refusal(&self, repo_path: &Path, machine_config: &str) -> String {
+        let keys: Vec<String> = self.keys.iter().map(|k| format!("`{k}:`")).collect();
+        format!(
+            "{repo}: {keys} may not be defined in the repository config (R60: agent profiles and toolchains come only from the machine config, so repository content cannot choose the programs toryo starts, their secrets or their sandbox).\nMove this block to {machine_config} (merge it with what is there) and delete it from {repo}:\n\n{yaml}",
+            repo = repo_path.display(),
+            keys = keys.join(" and "),
+            yaml = self.yaml.trim_end(),
+        )
+    }
+}
+
+/// The machine-only part of a repository `toryo.yaml` text; `None` when it has none (R60).
+/// Only the top level counts: a key of that name inside another block is not one.
+pub fn machine_only_part(text: &str) -> Result<Option<MachineOnlyPart>> {
+    let doc: serde_yaml::Value = serde_yaml::from_str(text)?;
+    let Some(map) = doc.as_mapping() else {
+        return Ok(None);
+    };
+    let mut part = serde_yaml::Mapping::new();
+    let mut keys = Vec::new();
+    for key in MACHINE_ONLY_KEYS {
+        if let Some(v) = map.get(key) {
+            part.insert(key.into(), v.clone());
+            keys.push(key.to_string());
+        }
+    }
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(MachineOnlyPart {
+        keys,
+        yaml: serde_yaml::to_string(&serde_yaml::Value::Mapping(part))?,
+    }))
+}
+
+/// How to name the machine config in a message: the path in use, else the default one.
+fn machine_config_hint(machine_path: Option<&Path>) -> String {
+    machine_path
+        .map(Path::to_path_buf)
+        .or_else(default_machine_config_path)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "%USERPROFILE%\\.toryo\\toryo.local.yaml".into())
+}
+
 /// `%USERPROFILE%\.toryo\toryo.local.yaml` (or `~/.toryo/toryo.local.yaml`).
 pub fn default_machine_config_path() -> Option<PathBuf> {
     home_dir().map(|h| h.join(".toryo").join("toryo.local.yaml"))
@@ -680,13 +758,29 @@ policy:
   deny_paths: ["**/ZZZ/**"]
 "#;
 
+    /// Test layout (R60): `yaml` written as a repository file without its machine-only
+    /// keys, plus a machine config holding them. Returns (dir, repo path, machine path).
+    fn write_split(yaml: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let mut doc: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let map = doc.as_mapping_mut().unwrap();
+        let mut machine = serde_yaml::Mapping::new();
+        for key in MACHINE_ONLY_KEYS {
+            if let Some(v) = map.remove(key) {
+                machine.insert(key.into(), v);
+            }
+        }
+        let (p, m) = (d.path().join("toryo.yaml"), d.path().join("machine.yaml"));
+        std::fs::write(&p, serde_yaml::to_string(&doc).unwrap()).unwrap();
+        std::fs::write(&m, serde_yaml::to_string(&machine).unwrap()).unwrap();
+        (d, p, m)
+    }
+
     #[test]
     fn loads_and_hashes_stably() {
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("toryo.yaml");
-        std::fs::write(&p, SAMPLE).unwrap();
-        let a = Effective::load(&p, None).unwrap();
-        let b = Effective::load(&p, None).unwrap();
+        let (_d, p, m) = write_split(SAMPLE);
+        let a = Effective::load(&p, Some(&m)).unwrap();
+        let b = Effective::load(&p, Some(&m)).unwrap();
         assert_eq!(a.sha256(), b.sha256());
         assert_eq!(a.repo.verify.boundary, "low_integrity");
         // the frozen copy (R35) round-trips to the same digest
@@ -696,16 +790,17 @@ policy:
 
     #[test]
     fn machine_config_overrides_roles_and_changes_hash() {
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("toryo.yaml");
-        std::fs::write(&p, SAMPLE).unwrap();
-        let m = d.path().join("machine.yaml");
+        let (d, p, base_m) = write_split(SAMPLE);
+        let m = d.path().join("machine-override.yaml");
         std::fs::write(
             &m,
-            "roles:\n  planner: { profile: codex-foundry }\ngit:\n  trusted_filters:\n    lfs: { process: 'git-lfs filter-process', required: true }\n",
+            format!(
+                "{}roles:\n  planner: {{ profile: codex-foundry }}\ngit:\n  trusted_filters:\n    lfs: {{ process: 'git-lfs filter-process', required: true }}\n",
+                std::fs::read_to_string(&base_m).unwrap()
+            ),
         )
         .unwrap();
-        let base = Effective::load(&p, None).unwrap();
+        let base = Effective::load(&p, Some(&base_m)).unwrap();
         let eff = Effective::load(&p, Some(&m)).unwrap();
         assert_eq!(eff.repo.roles["planner"].profile, "codex-foundry");
         assert!(eff.trusted_filters.contains_key("lfs"));
@@ -714,22 +809,91 @@ policy:
 
     #[test]
     fn unknown_keys_are_rejected() {
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("toryo.yaml");
-        std::fs::write(&p, format!("{SAMPLE}\nbogus: 1\n")).unwrap();
-        assert!(Effective::load(&p, None).is_err());
+        assert!(load_str(&format!("{SAMPLE}\nbogus: 1\n")).is_err());
     }
 
     #[test]
     fn role_with_unknown_profile_is_rejected() {
+        let e = load_err(&SAMPLE.replace("profile: claude-max, model: opus", "profile: nope"));
+        assert!(
+            e.contains("role `planner` refers to unknown profile `nope`")
+                && e.contains("define it under `profiles:` in the machine config"),
+            "{e}"
+        );
+    }
+
+    /// R60 (ARCH-05): a repository file that defines `profiles:` or `toolchains:` does not
+    /// load; the message names the file and carries the block to move, and nothing is
+    /// rewritten.
+    #[test]
+    fn repo_file_may_not_define_profiles_or_toolchains() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("toryo.yaml");
+        let m = d.path().join("machine.yaml");
+        std::fs::write(&p, SAMPLE).unwrap();
+        let e = format!("{:#}", Effective::load(&p, Some(&m)).unwrap_err());
+        assert!(e.contains(&p.display().to_string()), "{e}");
+        assert!(
+            e.contains("`profiles:` may not be defined in the repository config (R60"),
+            "{e}"
+        );
+        assert!(
+            e.contains(&format!("Move this block to {}", m.display())),
+            "{e}"
+        );
+        // the block is complete YAML: pasted into the machine config, it loads
+        let block = &e[e.find("\n\nprofiles:").expect("block") + 2..];
+        assert!(block.contains("codex-foundry:") && block.contains("windows_sandbox: unelevated"));
+        let repo_only = {
+            let mut doc: serde_yaml::Value = serde_yaml::from_str(SAMPLE).unwrap();
+            doc.as_mapping_mut().unwrap().remove("profiles");
+            serde_yaml::to_string(&doc).unwrap()
+        };
+        let q = d.path().join("repo-only.yaml");
+        std::fs::write(&q, &repo_only).unwrap();
+        std::fs::write(&m, block).unwrap();
+        Effective::load(&q, Some(&m)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            SAMPLE,
+            "never rewritten"
+        );
+        // toolchains too, each named
         std::fs::write(
             &p,
-            SAMPLE.replace("profile: claude-max, model: opus", "profile: nope"),
+            format!("{SAMPLE}toolchains:\n  xpp: {{ msbuild: m }}\n"),
         )
         .unwrap();
-        assert!(Effective::load(&p, None).is_err());
+        let e = format!("{:#}", Effective::load(&p, None).unwrap_err());
+        assert!(
+            e.contains("`profiles:` and `toolchains:` may not be defined"),
+            "{e}"
+        );
+        assert!(e.contains("toolchains:\n  xpp:"), "{e}");
+        // only the top level counts
+        assert_eq!(
+            machine_only_part("version: 1\nproject: { root: r, profiles: x }\n").unwrap(),
+            None
+        );
+    }
+
+    /// R60 AC-2: the same profiles from the machine config give the same effective
+    /// configuration — and hash — as the old layout with profiles in the repository file.
+    #[test]
+    fn profiles_from_the_machine_config_hash_like_the_old_layout() {
+        let old = Effective {
+            repo: serde_yaml::from_str(SAMPLE).unwrap(),
+            trusted_filters: BTreeMap::new(),
+            repo_path: PathBuf::new(),
+            machine_path: None,
+        };
+        let (_d, p, m) = write_split(SAMPLE);
+        let new = Effective::load(&p, Some(&m)).unwrap();
+        assert_eq!(new.canonical_json(), old.canonical_json());
+        assert_eq!(new.sha256(), old.sha256());
+        // a task frozen with profiles inside its config.json keeps loading
+        let f = Effective::from_frozen(&old.canonical_json(), Path::new("config.json")).unwrap();
+        assert_eq!(f.repo.profiles.len(), 2);
     }
 
     #[test]
@@ -739,11 +903,10 @@ policy:
         assert!(resolve_secret("plain").is_err());
     }
 
+    /// Load `yaml` in the R60 layout: its profiles in a machine config (see `write_split`).
     fn load_str(yaml: &str) -> Result<Effective> {
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("toryo.yaml");
-        std::fs::write(&p, yaml).unwrap();
-        Effective::load(&p, None)
+        let (_d, p, m) = write_split(yaml);
+        Effective::load(&p, Some(&m))
     }
 
     /// The error text of a config that must not load.

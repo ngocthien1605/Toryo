@@ -135,25 +135,17 @@ toryo doctor                                        # kiểm tra tổng quát
 
 ### 4.1 `toryo.yaml` (config của repo / dự án)
 
+> **M9 (R60):** file này **không được** có `profiles:` (hay `toolchains:`). Profile — tức exe,
+> env, secret, cấu hình sandbox của Codex — chỉ nằm trong **machine config** (§4.2). Nếu repo
+> `toryo.yaml` còn `profiles:`, toryo không load và in sẵn khối cần chuyển sang machine config.
+> Task đã tạo trước đó vẫn chạy (config đã đóng băng), chỉ `task config --reload` bị từ chối.
+
 ```yaml
 version: 1
 project:
   root: C:\.thien\m0\calc                 # repo mặc định (pipeline dùng --repo nên ít quan trọng)
   worktrees_root: C:\.thien\m0\worktrees  # nơi tạo worktree cho từng task
-profiles:                                 # "tài khoản" để chạy agent
-  claude-max:
-    kind: claude
-    billing: subscription                 # dùng gói Claude Max (không API key)
-    exe: C:\Users\nguye\.local\bin\claude.exe
-    env: { CLAUDE_CODE_GIT_BASH_PATH: C:\Program Files\Git\bin\bash.exe }
-  codex-openai:
-    kind: codex
-    billing: subscription                 # ChatGPT Plus login
-    exe: C:\Users\nguye\AppData\Roaming\npm\codex.cmd
-    codex:
-      sandbox_mode: workspace-write
-      windows_sandbox: unelevated
-roles:                                    # role → profile
+roles:                                    # role → TÊN profile (profile khai báo trong machine config)
   planner:     { profile: claude-max }
   implementer: { profile: codex-openai, fallback: [claude-max] }   # hết quota → Claude làm thay
                                           # `fallback: []` = không có agent dự phòng; không ghi `fallback` = dùng profile của planner
@@ -183,10 +175,40 @@ Thêm model riêng cho role: `planner: { profile: claude-max, model: opus }` (ho
 Muốn dùng Codex qua **Foundry (API)**: thêm `[profiles.foundry]` trong `~/.codex/config.toml`, chạy lại
 `m0-smoke.ps1 -CodexProfiles openai,foundry -SkipSmoke`, rồi dùng `--implementer codex-foundry`.
 
-### 4.2 Machine config (tuỳ chọn)
+### 4.2 Machine config — nơi DUY NHẤT khai báo profile (R60)
 
-`%USERPROFILE%\.toryo\toryo.local.yaml` — ghi đè `profiles`/`roles` theo máy, và khai báo
-`git.trusted_filters` (ví dụ Git LFS). Không có file này cũng không sao.
+`%USERPROFILE%\.toryo\toryo.local.yaml` (nằm ngoài mọi repo; đổi đường dẫn bằng `--machine-config`):
+
+```yaml
+profiles:                                 # "tài khoản" để chạy agent — chỉ được khai báo ở đây
+  claude-max:
+    kind: claude
+    billing: subscription                 # dùng gói Claude Max (không API key)
+    exe: C:\Users\nguye\.local\bin\claude.exe
+    env: { CLAUDE_CODE_GIT_BASH_PATH: C:\Program Files\Git\bin\bash.exe }
+  codex-openai:
+    kind: codex
+    billing: subscription                 # ChatGPT Plus login
+    exe: C:\Users\nguye\AppData\Roaming\npm\codex.cmd
+    codex:
+      sandbox_mode: workspace-write
+      windows_sandbox: unelevated
+roles:                                    # tuỳ chọn: ghi đè role của repo theo máy này
+  reviewer: { profile: claude-max }
+git:
+  trusted_filters: {}                     # tuỳ chọn: filter Git tin cậy (ví dụ Git LFS, R37)
+```
+
+Vì sao? Repo có thể bị người khác (hoặc code do agent viết đã merge) sửa. Nếu repo được khai
+`exe`/`env`/`secret_env`, repo sẽ quyết định chương trình nào nhận secret trong Credential
+Manager, hoặc nới sandbox của Codex (ARCH-05). Giống D365FO: model chỉ nói *cần build gì*, còn
+server build dùng compiler nào, account nào là cấu hình môi trường — không nằm trong source.
+
+**Chuyển đổi config cũ (làm 1 lần):** chạy `toryo doctor` → lỗi sẽ in đúng khối `profiles:` →
+dán vào `%USERPROFILE%\.toryo\toryo.local.yaml` (gộp với nội dung đang có) → xoá khối đó khỏi
+repo `toryo.yaml` → `toryo doctor` lại. `toryo spike init-config` giờ ghi 2 file: `--out` (phần repo)
+và `--machine-out` (phần profile, mặc định `toryo.local.yaml` cạnh `--out`; không bao giờ ghi đè
+file đã có).
 
 ### 4.3 Dữ liệu được lưu ở đâu?
 

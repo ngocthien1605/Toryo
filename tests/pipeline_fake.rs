@@ -58,7 +58,7 @@ fn toryo(env: &Env, args: &[&str], stdin: &str, extra_env: &[(&str, &str)]) -> (
     c.arg("--config")
         .arg(&env.config)
         .arg("--machine-config")
-        .arg(env.root.join("none.yaml"))
+        .arg(env.root.join("machine.yaml"))
         .args(args)
         .env("TORYO_DATA_DIR", &env.data)
         .current_dir(&env.root)
@@ -97,10 +97,6 @@ fn setup(reviewer: Option<&str>, fallback: &[&str]) -> Env {
 project:
   root: "{repo}"
   worktrees_root: "{wts}"
-profiles:
-  claude-max: {{ kind: claude, billing: subscription, exe: claude-not-installed }}
-  claude-review: {{ kind: claude, billing: subscription, exe: claude-not-installed }}
-  codex-openai: {{ kind: codex, billing: subscription, exe: codex-not-installed }}
 roles:
   planner: {{ profile: claude-max }}
   implementer: {{ profile: codex-openai, fallback: [{fb}] }}
@@ -119,6 +115,12 @@ commands:
         );
     }
     std::fs::write(&config, yaml).unwrap();
+    // R60: the profiles live in the machine config
+    std::fs::write(
+        root.join("machine.yaml"),
+        "profiles:\n  claude-max: { kind: claude, billing: subscription, exe: claude-not-installed }\n  claude-review: { kind: claude, billing: subscription, exe: claude-not-installed }\n  codex-openai: { kind: codex, billing: subscription, exe: codex-not-installed }\n",
+    )
+    .unwrap();
     let env = Env {
         _tmp: tmp,
         root,

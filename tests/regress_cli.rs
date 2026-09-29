@@ -20,11 +20,18 @@ mod common;
 
 use toryo::config::{expand_vars, Effective};
 
+/// Load `yaml` in the R60 layout: its `profiles:` go to a machine config.
 fn load(yaml: &str) -> anyhow::Result<Effective> {
     let d = tempfile::tempdir().unwrap();
-    let p = d.path().join("toryo.yaml");
-    std::fs::write(&p, yaml).unwrap();
-    Effective::load(&p, None)
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+    let mut machine = serde_yaml::Mapping::new();
+    if let Some(v) = doc.as_mapping_mut().unwrap().remove("profiles") {
+        machine.insert("profiles".into(), v);
+    }
+    let (p, m) = (d.path().join("toryo.yaml"), d.path().join("machine.yaml"));
+    std::fs::write(&p, serde_yaml::to_string(&doc).unwrap()).unwrap();
+    std::fs::write(&m, serde_yaml::to_string(&machine).unwrap()).unwrap();
+    Effective::load(&p, Some(&m))
 }
 
 const TWO_PROFILES: &str = "version: 1\nproject: { root: r, worktrees_root: w }\nprofiles:\n  claude-max: { kind: claude, billing: subscription, exe: c }\n  codex-openai: { kind: codex, billing: subscription, exe: x }\nroles:\n  planner: { profile: claude-max }\n";

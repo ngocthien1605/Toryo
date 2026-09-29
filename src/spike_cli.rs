@@ -124,10 +124,15 @@ pub enum SpikeCmd {
         #[arg(long)]
         model: Option<String>,
     },
-    /// Write toryo.yaml for this machine; translate Codex `[profiles.<name>]` into -c overrides.
+    /// Write toryo.yaml (repository part) and a machine config with the profiles (R60);
+    /// translate Codex `[profiles.<name>]` into -c overrides.
     InitConfig {
         #[arg(long)]
         out: PathBuf,
+        /// Where the machine part (profiles) goes; default: toryo.local.yaml next to --out.
+        /// An existing file is never overwritten.
+        #[arg(long)]
+        machine_out: Option<PathBuf>,
         #[arg(long)]
         project_root: String,
         #[arg(long)]
@@ -521,6 +526,7 @@ pub fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
         }
         SpikeCmd::InitConfig {
             out,
+            machine_out,
             project_root,
             worktrees_root,
             claude_exe,
@@ -534,6 +540,7 @@ pub fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
         } => {
             toryo::spike::init_config::init_config(&toryo::spike::init_config::InitArgs {
                 out: out.clone(),
+                machine_out: machine_out.clone(),
                 project_root: project_root.clone(),
                 worktrees_root: worktrees_root.clone(),
                 claude_exe: claude_exe.clone(),

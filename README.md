@@ -40,7 +40,7 @@ M0 kit modules (ported to the core where M1 needs them, R52):
 | `agents::codex` | R18, R19, R21, R22 | canonical `-c` argv (identical on resume), JSONL parser, message classifier |
 | `usage` | R21, R41 | disjoint token buckets, cumulative deltas with reset |
 | `git` | R33, R37 | `GitCmd` hardening prefix, `<CANON_DIFF>`, trusted/neutralised filter plan, canaries, pkt-line filter |
-| `config` | §14, R35 | `toryo.yaml` + machine config, canonical hash, Credential Manager secrets |
+| `config` | §14, R35, R60 | `toryo.yaml` + machine config (the only place for profiles, R60), canonical hash, Credential Manager secrets |
 | `doctor` | §15, R51 | environment / profile / repo checks + version-bound evidence; `--canaries` re-runs them |
 | `spike::*` | §17 | the M0 commands (see `docs/M0-RUNBOOK.md`) — cargo feature `m0-kit`, on by default |
 | `spike::pipeline` | §5.2, R28, R40 | prototype workflow on a real repo: plan gate, guards, checkpoints, verify, exact-AC review, fix cycles |
@@ -75,7 +75,7 @@ toryo spike init-fixture | render | diff | report
 
 **Quick start on Windows (no Rust needed):** `bin\toryo.exe` is a prebuilt binary (cross-compiled,
 x86_64-pc-windows-gnu, stripped). One command installs Claude Code if missing, checks the Claude/Codex
-logins, writes `C:\.thien\m0\toryo.yaml`, and runs `doctor`, `job-test`, `git-canary` and the
+logins, writes `C:\.thien\m0\toryo.yaml` plus the profiles in `C:\.thien\m0\toryo.local.yaml`, and runs `doctor`, `job-test`, `git-canary` and the
 end-to-end `smoke` (Claude plans → Codex implements → toryo checkpoints + verifies → Claude reviews):
 
 ```powershell
@@ -83,6 +83,11 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File C:\.thien\AgentOrchestrator\toryo\
 ```
 
 Results land in `C:\.thien\AgentOrchestrator\thien-m0-data\`.
+
+**Configuration (R60).** Agent profiles — the executable, its environment and secrets, the Codex
+sandbox settings — are defined **only** in the machine config (`%USERPROFILE%\.toryo\toryo.local.yaml`,
+or `--machine-config`). A repository `toryo.yaml` that defines `profiles:` or `toolchains:` does not
+load; the error prints the block to move. The repository file names profiles in `roles`.
 
 **Hướng dẫn tiếng Việt (flow, cài đặt, cấu hình, thực hành với app mẫu BatchRename): `docs/HUONG-DAN.md`.**
 `spike pipeline` is the single-process reference prototype (R52); it prints a warning and gets no new features — use the engine (`toryo task create` + `toryo run`).

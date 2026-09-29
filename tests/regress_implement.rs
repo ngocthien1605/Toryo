@@ -787,18 +787,18 @@ fn ec16_no_fallback_after_a_sticky_switch_continues_with_the_current_implementer
 #[test]
 fn ec16_no_fallback_forbids_a_new_switch_after_a_sticky_one() {
     let env = setup("codex-openai");
-    let cfg = std::fs::read_to_string(&env.config).unwrap();
-    let cfg = cfg
-        .replacen(
-            "  codex-openai: {",
-            "  codex-backup: { kind: codex, billing: subscription, exe: codex-not-installed }\n  codex-openai: {",
-            1,
-        )
-        .replacen(
-            "implementer: { profile: codex-openai }",
-            "implementer: { profile: codex-openai, fallback: [claude-max, codex-backup] }",
-            1,
-        );
+    // R60: the new profile goes to the machine config, the chain to the repository file
+    let machine = std::fs::read_to_string(&env.machine).unwrap().replacen(
+        "  codex-openai: {",
+        "  codex-backup: { kind: codex, billing: subscription, exe: codex-not-installed }\n  codex-openai: {",
+        1,
+    );
+    std::fs::write(&env.machine, machine).unwrap();
+    let cfg = std::fs::read_to_string(&env.config).unwrap().replacen(
+        "implementer: { profile: codex-openai }",
+        "implementer: { profile: codex-openai, fallback: [claude-max, codex-backup] }",
+        1,
+    );
     std::fs::write(&env.config, cfg).unwrap();
     create(&env, "P-9");
     assert_eq!(
