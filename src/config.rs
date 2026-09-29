@@ -1643,6 +1643,48 @@ commands:
         );
     }
 
+    /// M9-D1 AC-1/AC-2: the dogfood example loads with a machine config that defines its
+    /// profiles, runs `scripts/verify.ps1` (protected, hashed) in a tracked checkout, and the
+    /// script keeps cargo from rewriting Cargo.lock.
+    #[test]
+    fn dogfood_template_loads() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let d = tempfile::tempdir().unwrap();
+        let m = d.path().join("machine.yaml");
+        std::fs::write(&m, "profiles:\n  claude-max: { kind: claude, billing: subscription, exe: claude }\n  codex-openai: { kind: codex, billing: subscription, exe: codex, codex: { windows_sandbox: unelevated } }\n").unwrap();
+        let cfg = Effective::load(
+            &root
+                .join("templates")
+                .join("dogfood")
+                .join("toryo.yaml.example"),
+            Some(&m),
+        )
+        .unwrap();
+        assert_eq!(cfg.repo.verify.checkout, "tracked");
+        assert!(cfg.repo.verify.final_clean);
+        let v = &cfg.repo.commands.verify;
+        assert_eq!(
+            v[0].kind(),
+            CommandKind::Program {
+                program: "pwsh",
+                args: &["-NoProfile", "-File", "scripts/verify.ps1"].map(String::from)
+            }
+        );
+        assert_eq!(
+            crate::engine::checks::verify_files(v, root),
+            ["scripts/verify.ps1"]
+        );
+        let script = std::fs::read_to_string(root.join("scripts").join("verify.ps1")).unwrap();
+        for want in [
+            "--locked",
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+            "exit $LASTEXITCODE",
+        ] {
+            assert!(script.contains(want), "{want}");
+        }
+    }
+
     /// EC-28: `%ProgramFiles(x86)%`-style names expand; unknown ones stay an error.
     #[test]
     fn expand_vars_takes_parenthesised_names() {

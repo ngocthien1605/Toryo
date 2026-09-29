@@ -228,3 +228,29 @@ Every entry: what was decided, why, and where. The owner folds these into plan v
   in order and are small; every file starts with `TODO(owner)`; `TASK.example.md` parses to AC-1…AC-5.
 - **§7.3** of HUONG-DAN is rewritten as the seven-step setup (copy, TODOs, build projects, NuGets, `doctor`,
   `xpp build --print-only`, first task); it uses only commands that exist after B4.
+
+## D — Dogfooding kit
+
+### D1 — `scripts/verify.ps1`, `templates/dogfood/toryo.yaml.example`, HUONG-DAN §7.4
+
+- **`scripts/verify.ps1`** sets `CARGO_HOME` (`$XDG_CACHE_HOME\cargo`) and `CARGO_TARGET_DIR`
+  (`$TORYO_VERIFY_BUILD\target`) **only when Toryo's variables are set**, so the same script runs by hand
+  with cargo's defaults. **Deviation:** it also runs `clippy --no-default-features`, so the gate equals CI
+  (section 0 lists that command); the task's sketch had only the default clippy. `cargo fmt --all -- --check`
+  is the CI spelling of `cargo fmt --all --check`.
+- **Template:** `verify.checkout: tracked` + `final_clean: true`; `deny_paths` adds `bin/**` (the prebuilt
+  `bin/toryo.exe` of the kit is never an agent's change); `protected_paths` adds `.github/**` (CI is part of
+  the gate). `Cargo.lock` is **not** protected: adding a crate is a legitimate change (and needs a line in
+  these notes); `--locked` makes a verify that would rewrite it fail instead.
+- **Roles:** planner/reviewer `claude-max`, implementer `codex-openai` with `fallback: [claude-max]` — the
+  personal-machine profiles of HUONG-DAN §4.2; `TODO(owner)` to switch to `codex-foundry`.
+- **Run here:** `pwsh -File scripts/verify.ps1` on Linux (pwsh 7.4) with `XDG_CACHE_HOME` and
+  `TORYO_VERIFY_BUILD` pointing at empty folders, as Toryo sets them: crates downloaded into the new
+  `CARGO_HOME`, the build went to the new target folder, fmt/clippy ×2/tests passed (391 tests), exit 0,
+  `Cargo.lock` unchanged.
+- **Not verified here:** the Low-IL run of the whole test suite on Windows. Some tests may need a writable
+  location they do not get at Low IL; the first dogfood task will show it (then fix the test, or run that
+  task with `boundary: none`, labelled "not isolated").
+- **Test** `config::tests::dogfood_template_loads`: loads with a machine config defining the two
+  profiles; `scripts/verify.ps1` is the only verify file (so protected and hashed); the script has
+  `--locked`, the two cargo variables and passes the exit code on.

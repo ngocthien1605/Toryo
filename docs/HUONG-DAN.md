@@ -691,6 +691,30 @@ Bộ mẫu nằm ở `templates\d365fo\`; mỗi file liệt kê các mục `TODO
 Ngoài X++, Toryo vẫn dùng tốt cho phần chạy được bằng script: PowerShell tooling, Power Platform, Azure
 Functions / Logic Apps, script migration — khai báo lệnh trong `commands.verify` với `program`/`args`.
 
+### 7.4 Dùng Toryo để phát triển Toryo (M9)
+
+Có thể giao task của chính repo `toryo` cho Toryo. Mẫu cấu hình: `templates\dogfood\toryo.yaml.example`
+(copy thành `toryo.yaml` ở gốc repo, sửa `TODO(owner)`, commit). Verify chạy `scripts\verify.ps1` — đúng những gì
+CI chạy: `cargo fmt --check`, `clippy -D warnings` (có và không có M0 kit), `cargo test --locked`.
+
+- **Chạy một bản toryo ổn định cài NGOÀI repo**, không phải bản đang được sửa:
+  ```powershell
+  cargo install --path C:\.thien\AgentOrchestrator\toryo --root C:\tools\toryo --locked
+  C:\tools\toryo\bin\toryo.exe doctor
+  ```
+  Giống việc không deploy model đang sửa lên chính máy build đang build nó: orchestrator phải đứng yên trong
+  lúc agent sửa code của orchestrator. Cài lại sau khi anh đã merge và kiểm tra.
+- **Profile vẫn chỉ ở machine config** (R60) — `toryo.yaml` của repo chỉ ghi tên profile trong `roles`.
+- **Task nhỏ, không dùng `--yes`**: tự đọc plan và diff ở hai gate; mỗi task một thay đổi có test.
+- **`verify.checkout: tracked`**: cache cargo và thư mục `target` (trong `verify_root`, không nằm trong repo) giữ
+  lại giữa các lần verify của một task nên nhanh hơn nhiều; final gate vẫn cần một lần verify `clean`
+  (`final_clean: true`). Lần verify đầu tải crate vào cache Low-IL, lâu hơn.
+- **Codex có thể không chạy được cargo trong sandbox** (ghi vào `%USERPROFILE%\.cargo` bị chặn). Không sao: Verify
+  build và test hộ, lỗi được gửi lại ở vòng fix.
+- **Không bao giờ thêm `.cargo` vào `writable_roots`** của Codex: agent khi đó sửa được source crate trong cache,
+  và lần anh tự `cargo build` (quyền đầy đủ) sẽ chạy code đó — giống cho người ngoài sửa NuGet package trong
+  thư mục build của anh.
+
 ---
 
 ## 8. Giới hạn của bản prototype (cần biết)

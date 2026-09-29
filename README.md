@@ -102,6 +102,11 @@ profiles, `toolchains.xpp`), `.toryo/context/` policy files (models, naming, lab
 notes) and `TASK.example.md`. Each file lists its `TODO(owner)` items at the top; setup steps are in
 `docs/HUONG-DAN.md` §7.3.
 
+**Toryo on Toryo (M9):** `templates/dogfood/toryo.yaml.example` runs `scripts/verify.ps1` (what CI runs, with
+`CARGO_HOME`/`CARGO_TARGET_DIR` in the Low-writable verify folders and `--locked`) in a `tracked` verify checkout.
+Run a stable toryo installed outside the repository (`cargo install --path . --root C:\tools\toryo --locked`),
+never add `.cargo` to Codex's `writable_roots`; details in `docs/HUONG-DAN.md` §7.4.
+
 **Hướng dẫn tiếng Việt (flow, cài đặt, cấu hình, thực hành với app mẫu BatchRename): `docs/HUONG-DAN.md`.**
 `spike pipeline` is the single-process reference prototype (R52); it prints a warning and gets no new features — use the engine (`toryo task create` + `toryo run`).
 
