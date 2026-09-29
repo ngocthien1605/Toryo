@@ -4,9 +4,10 @@
 //! otherwise go unseen and be picked up by the next tool that loads it.
 //!
 //! - **What:** every file in the worktree that the policy protects (tracked, untracked or
-//!   ignored; `.git` and `.toryo-tmp` excluded; links are not followed), plus Git metadata
-//!   outside it: the common `config`, `info/exclude`, `info/attributes`, `hooks/*`, and the
-//!   worktree's `config.worktree`.
+//!   ignored; `.git` and `.toryo-tmp` excluded), plus Git metadata outside it: the common
+//!   `config`, `info/exclude`, `info/attributes`, `hooks/*`, and the worktree's
+//!   `config.worktree`. Links and junctions are never followed: one at a protected name —
+//!   `.claude -> docs/agent` included (EC-08) — is recorded as a link with its target.
 //! - **Record:** path, size, SHA-256, tracked or not; untracked/ignored files and Git
 //!   metadata also get a baseline copy (≤ 1 MB each, ≤ 16 MB per snapshot) so a change can be
 //!   shown as a diff.
@@ -40,6 +41,9 @@ pub struct PEntry {
     pub tracked: bool,
     /// A baseline copy is stored under `protected-blobs/<sha256>`.
     pub copy: bool,
+    /// The entry is a symlink or junction to this target (recorded, never followed; EC-08).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,7 +136,8 @@ fn walk(
             continue;
         }
         if ft.is_symlink() {
-            // junctions and symlinks are not followed; a protected link itself is recorded
+            // junctions and symlinks are not followed; a link at a protected name (a
+            // protected directory name included: `.claude -> docs/agent`) is recorded
             if protect.matches(&rel) {
                 out.push((rel, p));
             }
@@ -145,16 +150,22 @@ fn walk(
     Ok(())
 }
 
-fn hash_file(p: &Path) -> Result<(u64, String)> {
+/// `(size, sha256, link target)` of a protected entry. A link is hashed by its target
+/// (never followed); a FIFO, socket or device is recorded without being opened — reading
+/// one could block forever.
+fn hash_file(p: &Path) -> Result<(u64, String, Option<String>)> {
     let md = std::fs::symlink_metadata(p)?;
     if md.file_type().is_symlink() {
         let t = std::fs::read_link(p)
             .map(|t| t.display().to_string())
             .unwrap_or_default();
-        return Ok((0, sha256_hex(format!("symlink:{t}").as_bytes())));
+        return Ok((0, sha256_hex(format!("symlink:{t}").as_bytes()), Some(t)));
+    }
+    if !md.is_file() {
+        return Ok((0, sha256_hex(b"special file"), None));
     }
     let b = std::fs::read(p).with_context(|| format!("reading {}", p.display()))?;
-    Ok((b.len() as u64, sha256_hex(&b)))
+    Ok((b.len() as u64, sha256_hex(&b), None))
 }
 
 /// Walk the worktree + Git metadata now.
@@ -170,7 +181,7 @@ pub fn scan(g: &GitCmd, wt: &Path, protect: &Protected) -> Result<Scan> {
     };
     let mut entries = BTreeMap::new();
     for (rel, p) in found {
-        let (size, sha256) = hash_file(&p)?;
+        let (size, sha256, link) = hash_file(&p)?;
         let t = tracked.contains(&rel);
         entries.insert(
             rel,
@@ -181,13 +192,14 @@ pub fn scan(g: &GitCmd, wt: &Path, protect: &Protected) -> Result<Scan> {
                     sha256,
                     tracked: t,
                     copy: false,
+                    link,
                 },
             ),
         );
     }
     for (k, p) in git_meta(g, wt)? {
         if p.is_file() {
-            let (size, sha256) = hash_file(&p)?;
+            let (size, sha256, link) = hash_file(&p)?;
             entries.insert(
                 k,
                 (
@@ -197,6 +209,7 @@ pub fn scan(g: &GitCmd, wt: &Path, protect: &Protected) -> Result<Scan> {
                         sha256,
                         tracked: false,
                         copy: false,
+                        link,
                     },
                 ),
             );
@@ -339,6 +352,20 @@ pub fn render_changes(
                 "untracked/ignored"
             }
         ));
+        // a link is described, never diffed: `git diff --no-index` would follow it (EC-08)
+        let was = base.entries.get(&c.path);
+        let is = now.entries.get(&c.path).map(|x| &x.1);
+        if [was, is].iter().flatten().any(|e| e.link.is_some()) {
+            let side = |e: Option<&PEntry>| match e {
+                None => "(absent)".to_string(),
+                Some(PEntry { link: Some(t), .. }) => {
+                    format!("a symlink/junction → `{t}` (not followed)")
+                }
+                Some(e) => format!("a file of {} bytes", e.size),
+            };
+            s.push_str(&format!("before: {}\nafter:  {}\n\n", side(was), side(is)));
+            continue;
+        }
         let before = base
             .entries
             .get(&c.path)
@@ -468,5 +495,67 @@ mod tests {
             tracked: true
         }
         .is_hard());
+    }
+
+    /// EC-08: a link or junction at a protected name (a protected directory name included)
+    /// is recorded with its target and never followed; a FIFO at a protected name is
+    /// recorded without being opened.
+    #[cfg(unix)]
+    #[test]
+    fn links_at_protected_names_are_recorded_not_followed() {
+        use std::os::unix::fs::symlink;
+        let d = tempfile::tempdir().unwrap();
+        let g = GitCmd::new("git", d.path().join("hooks")).unwrap();
+        let wt = d.path().join("repo");
+        std::fs::create_dir_all(wt.join("docs").join("agent")).unwrap();
+        std::fs::create_dir_all(wt.join("sub")).unwrap();
+        let loc = Loc::Discover(wt.clone());
+        g.run(&loc, false, &["init", "-q", "-b", "main"]).unwrap();
+        std::fs::write(wt.join("docs/agent/settings.local.json"), "{}\n").unwrap();
+        std::fs::write(wt.join("sub/keep.txt"), "k\n").unwrap();
+        g.run(&loc, false, &["add", "-A"]).unwrap();
+        g.run(&loc, false, &["commit", "-q", "-m", "init"]).unwrap();
+        let protect = Protected::new(vec![], &[]);
+        let entries = scan(&g, &wt, &protect)
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|(k, (_, e))| (k, e))
+            .collect();
+        let base = PManifest {
+            version: 1,
+            created_at: String::new(),
+            reason: "test".into(),
+            entries,
+        };
+        symlink("docs/agent", wt.join(".claude")).unwrap();
+        symlink("../docs/agent", wt.join("sub").join(".codex")).unwrap();
+        let fifo = std::process::Command::new("mkfifo")
+            .arg(wt.join("CLAUDE.md"))
+            .status()
+            .unwrap();
+        assert!(fifo.success());
+        let now = scan(&g, &wt, &protect).unwrap();
+        assert_eq!(now.entries[".claude"].1.link.as_deref(), Some("docs/agent"));
+        assert_eq!(
+            now.entries["sub/.codex"].1.link.as_deref(),
+            Some("../docs/agent")
+        );
+        assert!(
+            !now.entries.keys().any(|k| k.starts_with(".claude/")),
+            "the link is not followed"
+        );
+        assert_eq!(now.entries["CLAUDE.md"].1.link, None);
+        let changes = compare(&base, &now);
+        let added: Vec<&str> = changes
+            .iter()
+            .filter(|c| c.kind == "added")
+            .map(|c| c.path.as_str())
+            .collect();
+        assert_eq!(added, [".claude", "CLAUDE.md", "sub/.codex"]);
+        assert!(changes.iter().all(Change::is_hard), "{changes:?}");
+        // a manifest without links serialises exactly as before (no `link` key)
+        let v = serde_json::to_value(&base).unwrap();
+        assert!(v["entries"]["@git/config"].get("link").is_none(), "{v}");
     }
 }

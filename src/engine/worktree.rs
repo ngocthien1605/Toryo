@@ -42,12 +42,21 @@ impl<'a> Worktree<'a> {
         self.g.run_str(&self.loc, true, &["rev-parse", "HEAD"])
     }
 
-    /// Every changed path (tracked and untracked, not ignored): `(status, path)`.
+    /// Every changed path (tracked and untracked, not ignored): `(status, path)`. Rename
+    /// detection is off (`--no-renames`), so a rename is the deletion of its source plus the
+    /// addition of its destination: both paths reach the path policy with their own status,
+    /// and repository config (`status.renames`) cannot reshape the list (R37; EC-26).
     pub fn changed(&self) -> Result<Vec<(String, String)>> {
         Ok(parse_status_z(&self.g.run(
             &self.loc,
             true,
-            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--no-renames",
+            ],
         )?))
     }
 
@@ -55,7 +64,8 @@ impl<'a> Worktree<'a> {
         Ok(self.changed()?.is_empty())
     }
 
-    /// Put protected paths back (tracked → HEAD, new untracked → removed).
+    /// Put protected paths back (tracked → HEAD, new untracked → removed; a link or
+    /// junction is removed as a link, never followed).
     pub fn restore(&self, paths: &[String]) -> Result<()> {
         for p in paths {
             let _ = self
@@ -69,7 +79,13 @@ impl<'a> Worktree<'a> {
             {
                 continue;
             }
-            let _ = std::fs::remove_file(self.path.join(p));
+            let f = self.path.join(p);
+            if std::fs::remove_file(&f).is_err()
+                && std::fs::symlink_metadata(&f).is_ok_and(|m| m.file_type().is_symlink())
+            {
+                // a directory symlink or junction on Windows is removed as a directory
+                let _ = std::fs::remove_dir(&f);
+            }
         }
         Ok(())
     }

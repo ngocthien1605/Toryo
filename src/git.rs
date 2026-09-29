@@ -204,7 +204,10 @@ impl GitCmd {
     }
 
     /// R37 admission: collect driver names (defined in any config, or referenced by the
-    /// tree) and resolve each against the trusted table.
+    /// tree) and resolve each against the trusted table. Config files reached through
+    /// `include` / `includeIf` count whatever their condition (EC-21): the drivers they define
+    /// are planned (trusted command or neutralised), and a `core.attributesFile` they set is
+    /// checked against the tree like the configured one.
     pub fn plan_filters(
         &self,
         repo: &Path,
@@ -213,8 +216,17 @@ impl GitCmd {
     ) -> Result<FilterPlan> {
         let loc = Loc::Discover(repo.to_path_buf());
         // Plan with an empty override set first: listing config/attributes runs no filters.
-        let defined = defined_filter_names(self, &loc)?;
-        let referenced = referenced_filter_names(self, &loc)?;
+        let mut defined = defined_filter_names(self, &loc)?;
+        let mut referenced = referenced_filter_names(self, &loc)?;
+        for f in included_config_files(self, &loc)? {
+            let fs = f.display().to_string();
+            let out = self.output(&loc, true, &["config", "-z", "--file", &fs, "--list"])?;
+            let entries = config_entries(&out.stdout);
+            defined.extend(filter_names(&entries));
+            for (_, attrs) in entries.iter().filter(|(k, _)| k == "core.attributesfile") {
+                referenced.extend(referenced_with(self, &loc, Some(attrs))?);
+            }
+        }
         let mut plan = FilterPlan::default();
         for name in defined.union(&referenced) {
             match trusted.get(name) {
@@ -253,7 +265,6 @@ impl GitCmd {
     }
 }
 
-/// Names from `filter.<name>.<var>` keys in every config scope.
 /// The Git executable: `TORYO_GIT`, else `git` from `PATH`.
 pub fn git_exe() -> PathBuf {
     std::env::var_os("TORYO_GIT")
@@ -266,24 +277,129 @@ pub fn default_gitcmd() -> Result<GitCmd> {
     GitCmd::new(git_exe(), crate::config::data_dir().join("empty-hooks"))
 }
 
+/// Names from `filter.<name>.<var>` keys in every config scope.
 pub fn defined_filter_names(g: &GitCmd, loc: &Loc) -> Result<BTreeSet<String>> {
     let out = g.output(loc, true, &["config", "-z", "--get-regexp", r"^filter\."])?;
     // exit 1 = no matching key
-    let mut names = BTreeSet::new();
-    for entry in out.stdout.split(|b| *b == 0) {
-        let key = String::from_utf8_lossy(entry.split(|b| *b == b'\n').next().unwrap_or_default())
-            .to_string();
-        if let Some(rest) = key.strip_prefix("filter.") {
-            if let Some(dot) = rest.rfind('.') {
-                names.insert(rest[..dot].to_string());
+    Ok(filter_names(&config_entries(&out.stdout)))
+}
+
+/// `git config -z` output (`key\nvalue\0` …) as `(key, value)` pairs; keys come canonical
+/// (section and variable lower-case).
+fn config_entries(z: &[u8]) -> Vec<(String, String)> {
+    z.split(|b| *b == 0)
+        .filter(|e| !e.is_empty())
+        .map(|e| {
+            let s = String::from_utf8_lossy(e);
+            match s.split_once('\n') {
+                Some((k, v)) => (k.to_string(), v.to_string()),
+                None => (s.to_string(), String::new()),
             }
+        })
+        .collect()
+}
+
+fn filter_names(entries: &[(String, String)]) -> BTreeSet<String> {
+    entries
+        .iter()
+        .filter_map(|(k, _)| k.strip_prefix("filter."))
+        .filter_map(|rest| rest.rfind('.').map(|dot| rest[..dot].to_string()))
+        .collect()
+}
+
+/// `include.path` and `includeIf.<condition>.path` (canonical key form).
+const INCLUDE_KEYS: &str = r"^include(if\..*)?\.path$";
+/// Git's own limit on nested includes.
+const MAX_INCLUDE_DEPTH: usize = 10;
+
+/// Where an include directive in `from` points: relative to the including file's
+/// directory, `~/` in the home directory (Git's rules).
+fn include_target(from: &Path, value: &str) -> PathBuf {
+    let v = value.trim();
+    if let Some(rest) = v.strip_prefix("~/").or_else(|| v.strip_prefix("~\\")) {
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            return PathBuf::from(home).join(rest);
         }
     }
-    Ok(names)
+    let p = PathBuf::from(v);
+    if p.is_absolute() {
+        p
+    } else {
+        from.parent().map(|d| d.join(&p)).unwrap_or(p)
+    }
+}
+
+/// Every existing config file reachable through `include.path` / `includeIf.*.path` from
+/// any scope, **whatever the condition** (R37: repository config and "anything they
+/// include/includeIf" is untrusted; EC-21). A condition such as `onbranch:toryo/**` or
+/// `gitdir:…` is false where admission runs and true in the task worktree or the verify
+/// checkout, so it is never evaluated here — every target counts.
+pub fn included_config_files(g: &GitCmd, loc: &Loc) -> Result<Vec<PathBuf>> {
+    let cwd = match loc {
+        Loc::Discover(d) => d.clone(),
+        Loc::Explicit { work_tree, .. } => work_tree.clone(),
+    };
+    let out = g.output(
+        loc,
+        true,
+        &[
+            "config",
+            "-z",
+            "--show-origin",
+            "--get-regexp",
+            INCLUDE_KEYS,
+        ],
+    )?;
+    // with --show-origin: `file:<path>\0key\nvalue\0` per directive (exit 1 = none)
+    let fields: Vec<&[u8]> = out.stdout.split(|b| *b == 0).collect();
+    let mut todo: Vec<(PathBuf, usize)> = Vec::new();
+    for pair in fields.chunks(2) {
+        let [origin, kv] = pair else { continue };
+        let origin = String::from_utf8_lossy(origin);
+        let Some(file) = origin.strip_prefix("file:") else {
+            continue; // `command line:` etc.: toryo's own overrides name no include
+        };
+        let from = cwd.join(file); // a relative origin is relative to Git's cwd
+        for (_, v) in config_entries(kv) {
+            todo.push((include_target(&from, &v), 1));
+        }
+    }
+    let mut seen = BTreeSet::new();
+    let mut files = Vec::new();
+    while let Some((p, depth)) = todo.pop() {
+        if depth > MAX_INCLUDE_DEPTH || !p.is_file() {
+            continue;
+        }
+        // each file once, however it is spelled (include cycles)
+        if !seen.insert(std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone())) {
+            continue;
+        }
+        let ps = p.display().to_string();
+        let nested = g.output(
+            loc,
+            true,
+            &["config", "-z", "--file", &ps, "--get-regexp", INCLUDE_KEYS],
+        )?;
+        for (_, v) in config_entries(&nested.stdout) {
+            todo.push((include_target(&p, &v), depth + 1));
+        }
+        files.push(p);
+    }
+    Ok(files)
 }
 
 /// Driver names that `filter` attributes select for tracked or untracked-not-ignored files.
 pub fn referenced_filter_names(g: &GitCmd, loc: &Loc) -> Result<BTreeSet<String>> {
+    referenced_with(g, loc, None)
+}
+
+/// [`referenced_filter_names`], with `core.attributesFile` set to `attributes_file` (one
+/// named by an included config file) instead of the configured one.
+fn referenced_with(
+    g: &GitCmd,
+    loc: &Loc,
+    attributes_file: Option<&str>,
+) -> Result<BTreeSet<String>> {
     let files = g.run(
         loc,
         true,
@@ -300,6 +416,10 @@ pub fn referenced_filter_names(g: &GitCmd, loc: &Loc) -> Result<BTreeSet<String>
         return Ok(names);
     }
     let mut cmd = g.command(loc, true);
+    if let Some(f) = attributes_file {
+        // Git expands `~/` and resolves a relative path itself, as for the configured value
+        cmd.arg("-c").arg(format!("core.attributesFile={f}"));
+    }
     cmd.args(["check-attr", "--stdin", "-z", "filter"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
@@ -335,6 +455,12 @@ pub fn short(sha: &str) -> &str {
 }
 
 /// Parse `git status --porcelain=v1 -z` into (XY, path) pairs.
+///
+/// A rename or copy — `R`/`C` in the index (X) **or** the worktree (Y) column — is followed
+/// by its source path. Both paths are returned, the destination first, then the source with
+/// the same XY: a path policy must see the deny-listed or protected file a rename took away
+/// (EC-26), and a worktree rename (` R`, e.g. after `git add -N`) is never misread as an
+/// entry of its own. A listed path need not exist: a rename's source is usually gone.
 pub fn parse_status_z(out: &[u8]) -> Vec<(String, String)> {
     let mut v = Vec::new();
     let mut it = out.split(|b| *b == 0).filter(|s| !s.is_empty());
@@ -344,10 +470,16 @@ pub fn parse_status_z(out: &[u8]) -> Vec<(String, String)> {
         }
         let xy = String::from_utf8_lossy(&entry[..2]).to_string();
         let path = String::from_utf8_lossy(&entry[3..]).to_string();
-        if xy.starts_with('R') || xy.starts_with('C') {
-            it.next(); // origin path follows
+        let source = xy
+            .chars()
+            .any(|c| c == 'R' || c == 'C')
+            .then(|| it.next())
+            .flatten()
+            .map(|s| String::from_utf8_lossy(s).to_string());
+        v.push((xy.clone(), path));
+        if let Some(s) = source {
+            v.push((xy, s));
         }
-        v.push((xy, path));
     }
     v
 }
@@ -368,6 +500,7 @@ mod tests {
 
     #[test]
     fn status_z_parsing_handles_spaces_and_renames() {
+        // EC-26: the source of a rename is returned too (this test used to pin it dropped)
         let raw = b" M a b.txt\0?? new file\0R  new.txt\0old.txt\0";
         let p = parse_status_z(raw);
         assert_eq!(
@@ -376,6 +509,26 @@ mod tests {
                 (" M".into(), "a b.txt".into()),
                 ("??".into(), "new file".into()),
                 ("R ".into(), "new.txt".into()),
+                ("R ".into(), "old.txt".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn status_z_worktree_renames_and_copies_return_both_paths() {
+        // ` R` (worktree rename after `git add -N`) used to leave its source to be misread
+        // as an entry: `AGENTS.md` → ("AG", "NTS.md")
+        let raw = b" R readme.txt\0AGENTS.md\0RM b.xml\0ZZZ/a.xml\0C  copy.txt\0orig.txt\0?? x\0";
+        assert_eq!(
+            parse_status_z(raw),
+            vec![
+                (" R".into(), "readme.txt".into()),
+                (" R".into(), "AGENTS.md".into()),
+                ("RM".into(), "b.xml".into()),
+                ("RM".into(), "ZZZ/a.xml".into()),
+                ("C ".into(), "copy.txt".into()),
+                ("C ".into(), "orig.txt".into()),
+                ("??".into(), "x".into()),
             ]
         );
     }
@@ -399,6 +552,94 @@ mod tests {
             "color.ui=never",
         ] {
             assert!(p.contains(needle), "missing {needle}");
+        }
+    }
+
+    /// EC-21: drivers and attributes files reached through `include`/`includeIf` count
+    /// whatever the condition — an `onbranch:toryo/**` include is inactive where admission
+    /// runs (on main) and active in the task worktree.
+    #[test]
+    fn plan_filters_sees_conditional_includes() {
+        use std::io::Write;
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().join("r");
+        std::fs::create_dir_all(&r).unwrap();
+        let g = GitCmd::new("git", d.path().join("hooks")).unwrap();
+        let loc = Loc::Discover(r.clone());
+        g.run(&loc, false, &["init", "-q", "-b", "main"]).unwrap();
+        std::fs::write(r.join("a.txt"), "a\n").unwrap();
+        g.run(&loc, false, &["add", "-A"]).unwrap();
+        g.run(&loc, false, &["commit", "-q", "-m", "init"]).unwrap();
+        let attrs = d.path().join("evil.attributes");
+        std::fs::write(&attrs, "*.txt filter=evil\n").unwrap();
+        let dot = r.join(".git");
+        std::fs::write(
+            dot.join("evil.inc"),
+            format!(
+                "[filter \"evil\"]\n\tclean = cat\n[core]\n\tattributesFile = {}\n[includeIf \"gitdir:/nowhere/\"]\n\tpath = deep.inc\n",
+                attrs.display().to_string().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        // nested, conditional, and a cycle back to evil.inc
+        std::fs::write(
+            dot.join("deep.inc"),
+            "[filter \"deep\"]\n\tsmudge = cat\n[include]\n\tpath = evil.inc\n",
+        )
+        .unwrap();
+        let mut cfg = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dot.join("config"))
+            .unwrap();
+        writeln!(cfg, "[includeIf \"onbranch:toryo/**\"]\n\tpath = evil.inc").unwrap();
+        drop(cfg);
+        // inactive on main: plain `git config` does not see the driver
+        assert!(!defined_filter_names(&g, &loc).unwrap().contains("evil"));
+        let files = included_config_files(&g, &loc).unwrap();
+        for f in ["evil.inc", "deep.inc"] {
+            assert_eq!(
+                files.iter().filter(|p| p.ends_with(f)).count(),
+                1,
+                "{f}: {files:?}"
+            );
+        }
+        let e = g
+            .plan_filters(&r, &BTreeMap::new(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("untrusted_git_filter") && e.contains("evil"),
+            "{e}"
+        );
+        let plan = g.plan_filters(&r, &BTreeMap::new(), true).unwrap();
+        assert_eq!(plan.drivers.get("evil"), Some(&None));
+        assert_eq!(plan.drivers.get("deep"), Some(&None));
+        assert!(plan.untrusted_referenced.contains(&"evil".to_string()));
+        let prefix = GitCmd {
+            filters: plan,
+            ..g.clone()
+        }
+        .prefix(false)
+        .join(" ");
+        assert!(prefix.contains("filter.evil.clean= ") && prefix.contains("filter.deep.smudge="));
+    }
+
+    #[test]
+    fn include_targets_follow_gits_rules() {
+        let from = Path::new("/r/.git/config");
+        assert_eq!(
+            include_target(from, "evil.inc"),
+            PathBuf::from("/r/.git/evil.inc")
+        );
+        assert_eq!(
+            include_target(from, "../shared/x.inc"),
+            PathBuf::from("/r/.git/../shared/x.inc")
+        );
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            assert_eq!(
+                include_target(from, "~/work.inc"),
+                PathBuf::from(home).join("work.inc")
+            );
         }
     }
 

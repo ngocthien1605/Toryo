@@ -3,31 +3,102 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use anyhow::{bail, Result};
+use regex::Regex;
 use serde_json::Value;
 
-use crate::config::{CommandSpec, Effective};
+use crate::config::{expand_vars, CommandSpec, Effective};
 
-/// `AC-<n>` ids under `## Acceptance criteria` (R28). At least one, unique.
+/// An acceptance-criteria item: an optional bullet (`-`, `*`, `+`), number (`1.`, `1)`) or
+/// task-list box (`[ ]`), then the id (optionally bold) and `:`, `.` or `)` (or a full-width
+/// `：`). The id group is deliberately loose so a malformed id is reported, not skipped.
+static AC_ITEM: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^\s*(?:[-*+]\s*|[0-9]{1,9}[.)]\s*)?(?:\[[ xX]\]\s*)?\**(?P<id>(?i:ac)-[0-9A-Za-z_]*)\**\s*[:.)：]",
+    )
+    .expect("regex")
+});
+static AC_ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^AC-[1-9][0-9]*$").expect("regex"));
+
+/// A Markdown heading as the AC parser sees it: `(level, text)`.
+fn heading(line: &str) -> Option<(usize, &str)> {
+    let t = line.trim();
+    let level = t.bytes().take_while(|b| *b == b'#').count();
+    (level > 0).then(|| (level, t[level..].trim()))
+}
+
+/// Tracks fenced code blocks (``` or ~~~, CommonMark rules): `true` while `line` is part of
+/// a fence (its opening and closing lines included).
+#[derive(Default)]
+struct Fences(Option<(u8, usize)>);
+
+impl Fences {
+    fn in_fence(&mut self, line: &str) -> bool {
+        let t = line.trim_start().as_bytes();
+        let run = |c: u8| t.iter().take_while(|b| **b == c).count();
+        match self.0 {
+            Some((c, n)) => {
+                let k = run(c);
+                if k >= n && t[k..].iter().all(|b| b.is_ascii_whitespace()) {
+                    self.0 = None;
+                }
+                true
+            }
+            None => {
+                for c in [b'`', b'~'] {
+                    let k = run(c);
+                    // an info string after backticks may not contain a backtick (inline code)
+                    if k >= 3 && !(c == b'`' && t[k..].contains(&b'`')) {
+                        self.0 = Some((c, k));
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+}
+
+/// `AC-<n>` ids under `## Acceptance criteria` (R28): at least one, unique, and exactly the
+/// items a reader of TASK.md sees, because the reviewer must return exactly this set (EC-22):
+/// - the section ends at the next heading of the **same or a higher** level: sub-headings
+///   (`### Functional`) stay inside it;
+/// - items may be bulleted, numbered (`1. AC-2: …`) or task-list boxes, the id may be bold;
+/// - fenced code blocks are examples: ids (and `#` lines) inside them do not count;
+/// - an item with a malformed id (`AC-01`, `AC-0`, `ac-1`, `AC-1a`) is an error, never
+///   silently dropped.
 pub fn parse_acceptance_ids(task: &str) -> Result<Vec<String>> {
-    let re = regex::Regex::new(r"(?m)^\s*[-*]?\s*\**(AC-[1-9][0-9]*)\**\s*[:.)]").expect("regex");
-    let mut in_section = false;
+    let mut section: Option<usize> = None;
+    let mut fences = Fences::default();
     let mut ids = Vec::new();
-    for line in task.lines() {
-        let t = line.trim();
-        if t.starts_with('#') {
-            in_section = t
-                .trim_start_matches('#')
-                .trim()
-                .to_ascii_lowercase()
-                .starts_with("acceptance criteria");
+    for (n, line) in task.lines().enumerate() {
+        if fences.in_fence(line) {
             continue;
         }
-        if in_section {
-            if let Some(c) = re.captures(line) {
-                ids.push(c[1].to_string());
+        if let Some((level, text)) = heading(line) {
+            if section.is_none_or(|l| level <= l) {
+                section = text
+                    .to_lowercase()
+                    .starts_with("acceptance criteria")
+                    .then_some(level);
             }
+            continue;
+        }
+        if section.is_none() {
+            continue;
+        }
+        if let Some(c) = AC_ITEM.captures(line) {
+            let id = &c["id"];
+            if !AC_ID.is_match(id) {
+                bail!(
+                    "TASK.md line {}: malformed acceptance-criteria id `{id}` in `{}` — ids are `AC-<n>` with n = 1, 2, … (no leading zero), e.g. `- AC-1: …` (R28)",
+                    n + 1,
+                    line.trim()
+                );
+            }
+            ids.push(id.to_string());
         }
     }
     if ids.is_empty() {
@@ -113,13 +184,81 @@ pub fn review_violations(v: &Value, ac_ids: &[String]) -> Vec<String> {
 
 /// Protected paths (plan §8/§14, simplified): verify scripts, the task file, instruction /
 /// config files, and `policy.protected_paths` globs from toryo.yaml.
+///
+/// Every comparison is **case-insensitive** (EC-09): NTFS is, so on Windows `agents.md` *is*
+/// `AGENTS.md` (Codex loads it as project instructions) and `.Claude\` is `.claude\`. The
+/// paths are repo-relative with `/` or `\`.
 pub struct Protected {
+    /// Normalised (`/`, no `./`), lower-case.
     exact: Vec<String>,
     globs: Vec<regex::Regex>,
     /// `## Allow protected` in TASK.md (R28): tracked protected paths this task may change.
     allowed: Vec<regex::Regex>,
     /// `policy.deny_paths` (§8): never changed, never planned (e.g. `**/ZZZ/**`).
     deny: Vec<regex::Regex>,
+}
+
+/// `policy.protected_paths` entry for "every repo file referenced by `commands.verify[]`"
+/// (plan §14, R29). Not a glob: its expansion is [`verify_files`], which every caller passes
+/// to [`Protected::new`] as exact paths (verify files are protected whether or not the list
+/// names the macro).
+pub const VERIFY_SCRIPTS: &str = "@verify-scripts";
+
+/// File names protected at any depth (R35: tools discover them on their own).
+const PROTECTED_NAMES: [&str; 9] = [
+    "agents.md",
+    "agents.override.md",
+    "claude.md",
+    "claude.local.md",
+    ".mcp.json",
+    ".gitattributes",
+    "toryo.yaml",
+    "toryo.local.yaml",
+    ".gitmodules",
+];
+
+/// Directories protected at any depth — the entry itself (a link or junction put in its
+/// place, EC-08) as well as everything under it.
+const PROTECTED_DIRS: [&str; 5] = [".claude", ".codex", ".toryo", ".githooks", ".git"];
+
+/// A glob as a case-insensitive regex (see [`glob_to_regex`]). `dir/**` also matches `dir`
+/// itself: a link or junction put in place of the directory is a change to it (EC-08).
+fn glob_ci(g: &str) -> regex::Regex {
+    let g = g.replace('\\', "/");
+    let re = match g.strip_suffix("/**").filter(|d| !d.is_empty()) {
+        Some(dir) => {
+            let base = glob_to_regex(dir);
+            let base = base.as_str();
+            format!("(?i){}(?:/.*)?$", base.strip_suffix('$').unwrap_or(base))
+        }
+        None => format!("(?i){}", glob_to_regex(&g).as_str()),
+    };
+    regex::Regex::new(&re).unwrap_or_else(|_| glob_to_regex(&g))
+}
+
+/// The form `git status` prints a path in: `/` separators, `.` and `..` segments resolved
+/// (`./gradlew` is `gradlew`). A leading `/` (an absolute path, never a repo path) and a
+/// trailing `/` (a directory, as `ls-files` prints a nested repository) are kept.
+fn norm_path(p: &str) -> String {
+    let s = p.replace('\\', "/");
+    let mut parts: Vec<&str> = Vec::new();
+    for c in s.split('/') {
+        match c {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|l| *l != "..") => {
+                parts.pop();
+            }
+            c => parts.push(c),
+        }
+    }
+    let mut out = parts.join("/");
+    if s.starts_with('/') {
+        out.insert(0, '/');
+    }
+    if s.ends_with('/') && !parts.is_empty() {
+        out.push('/');
+    }
+    out
 }
 
 /// Paths/globs listed under `## Allow protected` in TASK.md (R28).
@@ -172,10 +311,20 @@ pub fn glob_to_regex(g: &str) -> regex::Regex {
 }
 
 impl Protected {
+    /// `exact`: repo-relative files (the verify files and the task file); `globs`:
+    /// `policy.protected_paths`, where [`VERIFY_SCRIPTS`] stands for the verify files in
+    /// `exact` rather than a path of its own.
     pub fn new(exact: Vec<String>, globs: &[String]) -> Self {
         Self {
-            exact: exact.into_iter().map(|e| e.replace('\\', "/")).collect(),
-            globs: globs.iter().map(|g| glob_to_regex(g)).collect(),
+            exact: exact
+                .iter()
+                .map(|e| norm_path(e).trim_end_matches('/').to_lowercase())
+                .collect(),
+            globs: globs
+                .iter()
+                .filter(|g| g.trim() != VERIFY_SCRIPTS)
+                .map(|g| glob_ci(g))
+                .collect(),
             allowed: Vec::new(),
             deny: Vec::new(),
         }
@@ -183,14 +332,8 @@ impl Protected {
 
     /// Add the task's `## Allow protected` list and `policy.deny_paths`.
     pub fn with_policy(mut self, allowed: &[String], deny: &[String]) -> Self {
-        self.allowed = allowed.iter().map(|g| glob_to_regex(g)).collect();
-        self.deny = deny
-            .iter()
-            .map(|g| {
-                regex::Regex::new(&format!("(?i){}", glob_to_regex(g).as_str()))
-                    .unwrap_or_else(|_| glob_to_regex(g))
-            })
-            .collect();
+        self.allowed = allowed.iter().map(|g| glob_ci(g)).collect();
+        self.deny = deny.iter().map(|g| glob_ci(g)).collect();
         self
     }
 
@@ -204,40 +347,32 @@ impl Protected {
         self.is_protected(path) || self.is_denied(path)
     }
 
-    /// Listed under `## Allow protected` in TASK.md.
+    /// Listed under `## Allow protected` in TASK.md (case-insensitive, like the protection
+    /// it lifts).
     pub fn is_allowed(&self, path: &str) -> bool {
-        let p = path.replace('\\', "/");
+        let p = norm_path(path);
         self.allowed.iter().any(|g| g.is_match(&p))
     }
 
     /// Matches `policy.deny_paths` (case-insensitive).
     pub fn is_denied(&self, path: &str) -> bool {
-        let p = path.replace('\\', "/");
+        let p = norm_path(path);
         self.deny.iter().any(|g| g.is_match(&p))
     }
 
     /// Protected by the policy, whether or not this task may change it (the R35 snapshot
-    /// covers every match).
+    /// covers every match). A protected directory name matches the entry itself at any
+    /// depth — a symlink or junction `.claude -> docs/agent` included — as well as every
+    /// path under it (EC-08).
     pub fn matches(&self, path: &str) -> bool {
-        let p = path.replace('\\', "/");
-        let name = p.rsplit('/').next().unwrap_or(&p);
-        self.exact.contains(&p)
+        let p = norm_path(path);
+        let lower = p.to_lowercase();
+        let parts: Vec<&str> = lower.split('/').filter(|c| !c.is_empty()).collect();
+        let name = parts.last().copied().unwrap_or_default();
+        self.exact.iter().any(|e| e == lower.trim_end_matches('/'))
             || self.globs.iter().any(|g| g.is_match(&p))
-            || matches!(
-                name,
-                "AGENTS.md"
-                    | "AGENTS.override.md"
-                    | "CLAUDE.md"
-                    | "CLAUDE.local.md"
-                    | ".mcp.json"
-                    | ".gitattributes"
-                    | "toryo.yaml"
-                    | "toryo.local.yaml"
-                    | ".gitmodules"
-            )
-            || [".claude/", ".codex/", ".toryo/", ".githooks/", ".git/"]
-                .iter()
-                .any(|d| p.starts_with(d) || p.contains(&format!("/{d}")))
+            || PROTECTED_NAMES.contains(&name)
+            || parts.iter().any(|c| PROTECTED_DIRS.contains(c))
     }
 }
 
@@ -290,12 +425,53 @@ pub fn verify_commands(cfg: &Effective, repo: &Path) -> Result<Vec<CommandSpec>>
     Ok(v)
 }
 
+/// `p` as a path inside `repo`, in the form `git status` prints (`./gradlew` → `gradlew`,
+/// `scripts\build.cmd` → `scripts/build.cmd`); `None` when it points outside.
+fn repo_relative(repo: &Path, p: &str) -> Option<String> {
+    let path = Path::new(p);
+    let rel = if path.is_absolute() || path.has_root() {
+        path.strip_prefix(repo).ok()?.to_string_lossy().to_string()
+    } else {
+        p.to_string()
+    };
+    let n = norm_path(&rel);
+    let n = n.trim_end_matches('/');
+    (!n.is_empty() && !n.starts_with('/') && n.split('/').all(|c| c != "..")).then(|| n.to_string())
+}
+
+/// Every repo file a verify command runs or reads — the expansion of
+/// [`VERIFY_SCRIPTS`] (R29). Protected, and hashed into `VERIFY_RESULT.json`'s `scripts`:
+/// - the **program** when it is a path inside the repo (`scripts/gate.sh`, `./gradlew`,
+///   `scripts\build.cmd`): an implementer who rewrites the gate to `exit 0` breaks the path
+///   policy instead of passing verify (EC-07). A bare name (`pwsh`, `git`) is a PATH lookup;
+/// - every argument naming a file in the repo.
+///
+/// Repo files are listed in `git status` form, once each; an argument naming a file outside
+/// the repo (an absolute path) is kept as written.
 pub fn verify_files(cmds: &[CommandSpec], repo: &Path) -> Vec<String> {
-    cmds.iter()
-        .flat_map(|c| c.args.iter())
-        .filter(|a| repo.join(a).is_file())
-        .map(|a| a.replace('\\', "/"))
-        .collect()
+    let mut out: Vec<String> = Vec::new();
+    let mut add = |f: String| {
+        if !out.contains(&f) {
+            out.push(f);
+        }
+    };
+    let in_repo = |p: &str| repo_relative(repo, p).filter(|r| repo.join(r).is_file());
+    for c in cmds {
+        let program = expand_vars(&c.program).unwrap_or_else(|_| c.program.clone());
+        if program.contains('/') || program.contains('\\') || Path::new(&program).is_absolute() {
+            if let Some(r) = in_repo(&program) {
+                add(r);
+            }
+        }
+        for a in &c.args {
+            if let Some(r) = in_repo(a) {
+                add(r);
+            } else if repo.join(a).is_file() {
+                add(a.replace('\\', "/"));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -368,5 +544,211 @@ mod tests {
             parse_allow_protected(t),
             vec!["scripts/test.ps1".to_string(), "AGENTS.md".to_string()]
         );
+    }
+
+    /// EC-22: the AC set is exactly what a reader sees.
+    #[test]
+    fn ac_parser_sections_numbered_fenced_and_malformed() {
+        let ids = |t: &str| parse_acceptance_ids(t).unwrap();
+        // sub-headings stay inside the section; a heading of the same level ends it
+        assert_eq!(
+            ids("# T-1\n## Acceptance criteria\n### Functional\n- AC-1: a\n#### Edge\n- AC-2: b\n### Non-functional\n- AC-3: c\n## Scope\n- AC-9: no\n"),
+            ["AC-1", "AC-2", "AC-3"]
+        );
+        // a higher-level heading ends it too; a later AC section adds to it
+        assert_eq!(
+            ids("## Acceptance criteria\n- AC-1: a\n# Notes\n- AC-8: no\n## Acceptance criteria (more)\n- AC-2: b\n"),
+            ["AC-1", "AC-2"]
+        );
+        // numbered items, task-list boxes, bold, a full-width colon
+        assert_eq!(
+            ids("## Acceptance criteria\n1. AC-1: a\n2) AC-2) b\n- [ ] AC-3: c\n- [x] **AC-4**: d\n- AC-5：日本語の基準\n"),
+            ["AC-1", "AC-2", "AC-3", "AC-4", "AC-5"]
+        );
+        // fenced examples are not contract ids, and a `#` line inside a fence is no heading
+        assert_eq!(
+            ids("## Acceptance criteria\n- AC-1: a\n```md\n- AC-9: example\n# not a heading\n```\n- AC-2: b\n~~~\n- AC-7: x\n~~~\n````\n```\n- AC-6: still fenced\n````\n"),
+            ["AC-1", "AC-2"]
+        );
+        // inline code is not a fence
+        assert_eq!(
+            ids("## Acceptance criteria\n```x``` inline\n- AC-1: a\n"),
+            ["AC-1"]
+        );
+        // malformed ids are errors with the id and the line, never dropped
+        for (bad, id) in [
+            ("- AC-01: a", "AC-01"),
+            ("- AC-0: a", "AC-0"),
+            ("1. ac-2: a", "ac-2"),
+            ("- **AC-1a**: a", "AC-1a"),
+            ("- AC-: a", "AC-"),
+        ] {
+            let e = parse_acceptance_ids(&format!("## Acceptance criteria\n- AC-1: ok\n{bad}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains(&format!("`{id}`")) && e.contains("line 3"),
+                "{bad}: {e}"
+            );
+        }
+        // outside the section a malformed id is just text
+        assert_eq!(
+            ids("## Notes\n- AC-01: x\n## Acceptance criteria\n- AC-1: a\n"),
+            ["AC-1"]
+        );
+        // an id that is not at the start of an item is text
+        assert_eq!(
+            ids("## Acceptance criteria\n- AC-1: covers AC-01 and ac-2\n- Note: AC-3 follows\n"),
+            ["AC-1"]
+        );
+    }
+
+    /// EC-09: NTFS is case-insensitive — so is every protected-path comparison.
+    #[test]
+    fn protected_paths_are_case_insensitive() {
+        let p = Protected::new(
+            vec!["scripts/Test.ps1".into(), "tasks/BR-001.md".into()],
+            &["**/AGENTS.md".into(), "Build-Cfg/**".into()],
+        )
+        .with_policy(&["docs/ALLOWED.md".into()], &["**/*.pfx".into()]);
+        for path in [
+            "AGENTS.md",
+            "agents.md",
+            "Agents.md",
+            "sub/agents.MD",
+            "claude.md",
+            "CLAUDE.LOCAL.md",
+            ".Claude/settings.json",
+            ".CODEX/config.toml",
+            "Toryo.yaml",
+            "TORYO.LOCAL.YAML",
+            ".GitAttributes",
+            ".MCP.json",
+            "SCRIPTS/test.ps1",
+            "scripts\\TEST.ps1",
+            "Tasks/br-001.md",
+            "build-cfg/tool.yaml",
+            ".githooks/pre-commit",
+            "x/.GIT/config",
+        ] {
+            assert!(p.matches(path) && p.violates(path), "{path}");
+        }
+        assert!(p.is_allowed("DOCS/allowed.md") && !p.is_protected("docs/allowed.md"));
+        assert!(p.is_denied("cert.PFX") && p.is_denied("a/B.Pfx"));
+        for path in [
+            "src/agents.mdx",
+            "scripts/test.ps2",
+            ".github/workflows/ci.yml",
+        ] {
+            assert!(!p.matches(path), "{path}");
+        }
+    }
+
+    /// EC-08: a protected directory name matches the entry itself (a link or junction put in
+    /// its place) at any depth, not only the paths under it.
+    #[test]
+    fn protected_dirs_match_the_entry_itself() {
+        let p = Protected::new(vec![], &[]);
+        for path in [
+            ".claude",
+            "sub/.claude",
+            ".claude/",
+            ".codex",
+            "a/b/.codex",
+            ".toryo",
+            ".githooks",
+            ".git",
+            "vendor/lib/.git",
+            ".claude/settings.local.json",
+            "sub/.toryo/policy.md",
+            "./.claude",
+        ] {
+            assert!(p.matches(path) && p.violates(path), "{path}");
+        }
+        for path in [
+            ".claude-backup/x",
+            "claude/x",
+            ".github/x",
+            "docs/.gitkeep",
+            "x.claude",
+        ] {
+            assert!(!p.matches(path), "{path}");
+        }
+        // the same for a configured directory glob (`dir/**`), and for deny/allow globs
+        let p = Protected::new(vec![], &["build-cfg/**".into(), "**/$weird$/**".into()])
+            .with_policy(&["docs/**".into()], &["**/ZZZ/**".into()]);
+        for path in ["build-cfg", "Build-Cfg", "build-cfg/x.yaml", "a/$weird$"] {
+            assert!(p.matches(path), "{path}");
+        }
+        for path in ["build-cfgx", "build-cfg-old/x", "a/weird"] {
+            assert!(!p.matches(path), "{path}");
+        }
+        for path in ["ZZZ", "Metadata/zzz", "Metadata/ZZZ/Foo.xml", "ZZZ/"] {
+            assert!(p.is_denied(path), "{path}");
+        }
+        for path in ["ZZZa", "src/ZZZa/b", "ZZZ.xml"] {
+            assert!(!p.is_denied(path), "{path}");
+        }
+        assert!(p.is_allowed("docs") && p.is_allowed("DOCS/a.md") && !p.is_allowed("docsx"));
+    }
+
+    /// EC-07: a verify program that is a repo file is a verify file (protected, hashed);
+    /// `@verify-scripts` stands for the verify files, not for a path of that name.
+    #[test]
+    fn verify_files_include_a_repo_program() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path();
+        for f in [
+            "scripts/gate.sh",
+            "gradlew",
+            "scripts/build.cmd",
+            "scripts/test.ps1",
+            "@verify-scripts",
+        ] {
+            let p = repo.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "x").unwrap();
+        }
+        let outside = d.path().parent().unwrap().join("outside-tool.sh");
+        let cmd = |program: &str, args: &[&str]| CommandSpec {
+            name: program.into(),
+            program: program.into(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            timeout_min: None,
+        };
+        let cmds = [
+            cmd("scripts/gate.sh", &[]),
+            cmd("./gradlew", &["build"]),
+            cmd("scripts\\build.cmd", &[]),
+            cmd("pwsh", &["-NoProfile", "-File", "./scripts/test.ps1"]),
+            cmd("git", &["grep", "-q", "x", "--", "src"]),
+            cmd(&outside.display().to_string(), &[]),
+            cmd("scripts/missing.sh", &["../escape.txt"]),
+            cmd("scripts/gate.sh", &["scripts/gate.sh"]),
+        ];
+        let files = verify_files(&cmds, repo);
+        assert_eq!(
+            files,
+            [
+                "scripts/gate.sh",
+                "gradlew",
+                "scripts/build.cmd",
+                "scripts/test.ps1"
+            ]
+        );
+        let p = Protected::new(files, &[VERIFY_SCRIPTS.into(), "docs/**".into()]);
+        for f in [
+            "scripts/gate.sh",
+            "gradlew",
+            "scripts/build.cmd",
+            "scripts/test.ps1",
+        ] {
+            assert!(p.violates(f), "{f}");
+        }
+        assert!(
+            !p.matches("@verify-scripts"),
+            "the macro is not a literal path"
+        );
+        assert!(p.matches("docs/x.md"), "the other globs still apply");
     }
 }
