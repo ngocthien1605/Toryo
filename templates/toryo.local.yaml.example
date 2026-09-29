@@ -43,6 +43,14 @@ profiles:                                  # R60: never in the repository's tory
         env_key: AZURE_OPENAI_API_KEY
         wire_api: responses
 
+# toolchains:                              # R59/R60: machine facts for `tool:` verify commands; never in the repository
+#   xpp:                                   # X++ (D365FO) on the UDE machine — see templates/d365fo/
+#     msbuild: 'C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe'
+#     nugets: 'D:\D365\cicd-nugets\<release>'   # the five CI/CD NuGet packages, extracted (one folder each)
+#     extra_references: []                 # folders of binary packages the models reference (e.g. ISV)
+#     bp_check: false                      # `true` is refused until xppbp.exe is supported
+#     ude_metadata: '%LOCALAPPDATA%\Microsoft\Dynamics365\<ApplicationVersion>\PackagesLocalDirectory'   # doctor only
+
 roles:
   planner:  { profile: claude-max, model: opus }
   reviewer: { profile: claude-max, model: opus }

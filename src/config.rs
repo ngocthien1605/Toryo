@@ -196,15 +196,95 @@ fn default_true() -> bool {
     true
 }
 
+/// A `commands.verify[]` item: a repository program (`program` + `args`) or, since R59, a
+/// built-in kind (`tool: xpp` + `metadata` + `projects`) whose command line toryo writes from
+/// the machine's toolchain. [`problems`] makes sure an item is exactly one of the two. The
+/// new keys are serialised only when set, so a configuration without them keeps its hash.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandSpec {
     pub name: String,
-    pub program: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub timeout_min: Option<u64>,
+    /// R59: a built-in verify kind; `xpp` is the only one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// `tool: xpp`: the X++ source folder, relative to the repository (→ `MetadataDirectory`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>,
+    /// `tool: xpp`: one X++ project per package, relative to the repository, in build order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<String>,
+}
+
+/// The built-in verify kinds (`commands.verify[].tool`, R59).
+pub const VERIFY_TOOLS: &[&str] = &["xpp"];
+
+/// What a verify command runs, as [`CommandSpec::kind`] reads a validated item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandKind<'a> {
+    /// A program (a PATH name, or a path in or outside the repository) with its arguments.
+    Program {
+        program: &'a str,
+        args: &'a [String],
+    },
+    /// `tool: xpp` (R59): MSBuild on each project, with the machine's `toolchains.xpp`.
+    Xpp {
+        metadata: &'a str,
+        projects: &'a [String],
+    },
+}
+
+impl CommandSpec {
+    /// A `program` command.
+    pub fn program(name: &str, program: &str, args: &[&str], timeout_min: Option<u64>) -> Self {
+        Self {
+            name: name.into(),
+            program: Some(program.into()),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            timeout_min,
+            tool: None,
+            metadata: None,
+            projects: Vec::new(),
+        }
+    }
+
+    /// A `tool: xpp` command (R59).
+    pub fn xpp(name: &str, metadata: &str, projects: &[&str], timeout_min: Option<u64>) -> Self {
+        Self {
+            name: name.into(),
+            program: None,
+            args: Vec::new(),
+            timeout_min,
+            tool: Some("xpp".into()),
+            metadata: Some(metadata.into()),
+            projects: projects.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    /// What this command runs. Load-time validation guarantees exactly one of `program` and
+    /// `tool`; a frozen configuration from before R59 only has `program`.
+    pub fn kind(&self) -> CommandKind<'_> {
+        match &self.tool {
+            Some(_) => CommandKind::Xpp {
+                metadata: self.metadata.as_deref().unwrap_or_default(),
+                projects: &self.projects,
+            },
+            None => CommandKind::Program {
+                program: self.program.as_deref().unwrap_or_default(),
+                args: &self.args,
+            },
+        }
+    }
+
+    /// True for a built-in `tool: xpp` command.
+    pub fn is_xpp(&self) -> bool {
+        matches!(self.kind(), CommandKind::Xpp { .. })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -284,6 +364,46 @@ pub struct MachineGit {
     pub trusted_filters: BTreeMap<String, TrustedFilter>,
 }
 
+/// `toolchains.xpp` (R59): the X++ build toolchain of this machine — MSBuild and the five
+/// CI/CD NuGet packages, extracted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct XppToolchain {
+    /// MSBuild.exe (`%VAR%` expanded); `doctor` proposes the path `vswhere` finds.
+    pub msbuild: String,
+    /// The folder holding the five CI/CD packages, one folder each (`<id>` or `<id>.<version>`).
+    pub nugets: String,
+    /// Folders of binary packages the models reference (e.g. ISV), in this order.
+    #[serde(default)]
+    pub extra_references: Vec<String>,
+    /// `xppbp.exe` after the compile; refused until V08-VERIFY 4 (M9 B-later).
+    #[serde(default)]
+    pub bp_check: bool,
+    /// The UDE's `PackagesLocalDirectory`, for `doctor`'s version check only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ude_metadata: Option<String>,
+}
+
+/// `toolchains:` of the machine config (R59/R60): machine facts that `tool:` verify commands
+/// use. Frozen with the task like the profiles.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Toolchains {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xpp: Option<XppToolchain>,
+}
+
+impl Toolchains {
+    pub fn is_empty(&self) -> bool {
+        self.xpp.is_none()
+    }
+
+    /// The names of the defined toolchains.
+    pub fn names(&self) -> Vec<&'static str> {
+        self.xpp.iter().map(|_| "xpp").collect()
+    }
+}
+
 /// Machine config, outside every repository (R35/R37).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -292,8 +412,20 @@ pub struct MachineConfig {
     pub roles: BTreeMap<String, Role>,
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
+    /// R59/R60: only here, never in the repository file.
+    #[serde(default)]
+    pub toolchains: Toolchains,
     #[serde(default)]
     pub git: MachineGit,
+}
+
+impl MachineConfig {
+    /// Read and parse a machine config file.
+    pub fn load(path: &Path) -> Result<Self> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    }
 }
 
 /// Where an entry of the effective configuration came from (R60, shown by `doctor`).
@@ -324,6 +456,7 @@ impl Origin {
 pub struct Origins {
     pub profiles: BTreeMap<String, Origin>,
     pub roles: BTreeMap<String, Origin>,
+    pub toolchains: BTreeMap<String, Origin>,
 }
 
 /// Effective configuration = repo config with machine overrides applied.
@@ -331,6 +464,10 @@ pub struct Origins {
 pub struct Effective {
     pub repo: RepoConfig,
     pub trusted_filters: BTreeMap<String, TrustedFilter>,
+    /// R59: the machine's toolchains, frozen and hashed with the task; left out of the
+    /// canonical JSON when empty, so a configuration without them keeps its hash.
+    #[serde(skip_serializing_if = "Toolchains::is_empty")]
+    pub toolchains: Toolchains,
     #[serde(skip)]
     pub repo_path: PathBuf,
     #[serde(skip)]
@@ -360,6 +497,7 @@ impl Effective {
             bail!("unsupported toryo.yaml version {}", repo.version);
         }
         let mut trusted_filters = BTreeMap::new();
+        let mut toolchains = Toolchains::default();
         let mut used_machine = None;
         let mut origins = Origins::default();
         for k in repo.roles.keys() {
@@ -367,10 +505,7 @@ impl Effective {
         }
         if let Some(mp) = machine_path {
             if mp.exists() {
-                let mt = std::fs::read_to_string(mp)
-                    .with_context(|| format!("reading {}", mp.display()))?;
-                let machine: MachineConfig = serde_yaml::from_str(&mt)
-                    .with_context(|| format!("parsing {}", mp.display()))?;
+                let machine = MachineConfig::load(mp)?;
                 for (k, v) in machine.roles {
                     let o = if repo.roles.contains_key(&k) {
                         Origin::RepoOverriddenByMachine
@@ -385,6 +520,10 @@ impl Effective {
                     repo.profiles.insert(k, v);
                 }
                 trusted_filters = machine.git.trusted_filters;
+                toolchains = machine.toolchains;
+                for name in toolchains.names() {
+                    origins.toolchains.insert(name.into(), Origin::Machine);
+                }
                 used_machine = Some(mp.to_path_buf());
             }
         }
@@ -401,6 +540,7 @@ impl Effective {
         let eff = Self {
             repo,
             trusted_filters,
+            toolchains,
             repo_path: repo_path.to_path_buf(),
             machine_path: used_machine,
             origins,
@@ -417,7 +557,8 @@ impl Effective {
     /// `codex.overrides` that would re-set what toryo sets itself. A frozen configuration
     /// ([`Effective::from_frozen`]) is not re-checked: it is what its task was created with.
     pub fn validate(&self) -> Result<()> {
-        let problems = problems(&self.repo);
+        let hint = machine_config_hint(self.machine_path.as_deref());
+        let problems = problems(&self.repo, &self.toolchains, &hint);
         if problems.is_empty() {
             return Ok(());
         }
@@ -432,12 +573,15 @@ impl Effective {
             repo: RepoConfig,
             #[serde(default)]
             trusted_filters: BTreeMap<String, TrustedFilter>,
+            #[serde(default)]
+            toolchains: Toolchains,
         }
         let f: Frozen =
             serde_json::from_str(canonical_json).context("parsing the frozen config.json")?;
         Ok(Self {
             repo: f.repo,
             trusted_filters: f.trusted_filters,
+            toolchains: f.toolchains,
             repo_path: origin.to_path_buf(),
             machine_path: None,
             origins: Origins::default(),
@@ -500,8 +644,9 @@ fn known_key(out: &mut Vec<String>, section: &str, name: &str, what: &str, valid
     }
 }
 
-/// Every semantic problem of a (merged) configuration, as `key: what is wrong`.
-fn problems(repo: &RepoConfig) -> Vec<String> {
+/// Every semantic problem of a (merged) configuration, as `key: what is wrong`. `machine` names
+/// the machine config for the messages that send the reader there.
+fn problems(repo: &RepoConfig, toolchains: &Toolchains, machine: &str) -> Vec<String> {
     let mut out = Vec::new();
     let roles = role_names();
     for name in repo.roles.keys() {
@@ -542,7 +687,98 @@ fn problems(repo: &RepoConfig) -> Vec<String> {
             }
         }
     }
+    for (i, c) in repo.commands.verify.iter().enumerate() {
+        let key = format!("commands.verify[{i}]");
+        verify_command_problems(&mut out, &key, c, toolchains, machine);
+    }
+    if let Some(x) = &toolchains.xpp {
+        for (k, v) in [("msbuild", &x.msbuild), ("nugets", &x.nugets)] {
+            if v.trim().is_empty() {
+                out.push(format!(
+                    "toolchains.xpp.{k}: empty (machine config {machine})"
+                ));
+            }
+        }
+        if x.bp_check {
+            out.push(format!("toolchains.xpp.bp_check: `true` is not supported yet — xppbp.exe waits for V08-VERIFY 4; set it to false (machine config {machine})"));
+        }
+    }
     out
+}
+
+/// The problems of one `commands.verify[]` item (R59): exactly one of `program` and `tool`;
+/// `tool` is `xpp`; `tool: xpp` has `metadata` and projects, as relative paths inside the
+/// repository, and needs `toolchains.xpp` in the machine config.
+fn verify_command_problems(
+    out: &mut Vec<String>,
+    key: &str,
+    c: &CommandSpec,
+    toolchains: &Toolchains,
+    machine: &str,
+) {
+    let key = format!("{key} ({})", c.name);
+    let Some(tool) = &c.tool else {
+        if c.program.is_none() {
+            out.push(format!("{key}: needs `program` (with `args`) or `tool`"));
+        }
+        for (k, set) in [
+            ("metadata", c.metadata.is_some()),
+            ("projects", !c.projects.is_empty()),
+        ] {
+            if set {
+                out.push(format!(
+                    "{key}.{k}: only for `tool: xpp`, not for a `program` command"
+                ));
+            }
+        }
+        return;
+    };
+    if c.program.is_some() {
+        out.push(format!("{key}: has both `program` and `tool` — use one"));
+    }
+    if !c.args.is_empty() {
+        out.push(format!("{key}.args: only for a `program` command — `tool: xpp` takes `metadata` and `projects`"));
+    }
+    one_of(out, &format!("{key}.tool"), tool, VERIFY_TOOLS);
+    if tool != "xpp" {
+        return;
+    }
+    match &c.metadata {
+        None => out.push(format!("{key}.metadata: required for `tool: xpp` (the X++ source folder, relative to the repository)")),
+        Some(m) => {
+            if let Some(why) = not_a_repo_path(m) {
+                out.push(format!("{key}.metadata: `{m}` {why}"));
+            }
+        }
+    }
+    if c.projects.is_empty() {
+        out.push(format!("{key}.projects: `tool: xpp` needs at least one project (one X++ project per package, in build order)"));
+    }
+    for p in &c.projects {
+        if let Some(why) = not_a_repo_path(p) {
+            out.push(format!("{key}.projects: `{p}` {why}"));
+        }
+    }
+    if toolchains.xpp.is_none() {
+        out.push(format!("{key}.tool: `tool: xpp` needs `toolchains.xpp` in the machine config ({machine}): msbuild, nugets (R59)"));
+    }
+}
+
+/// Why `p` is not a relative path inside the repository, or None: empty, absolute, rooted,
+/// with a drive, or with a `..` segment.
+fn not_a_repo_path(p: &str) -> Option<&'static str> {
+    let t = p.trim();
+    if t.is_empty() {
+        return Some("is empty");
+    }
+    let rooted = t.starts_with(['/', '\\']) || t.chars().nth(1) == Some(':');
+    if rooted || Path::new(t).is_absolute() {
+        return Some("must be relative to the repository");
+    }
+    if t.split(['/', '\\']).any(|c| c == "..") {
+        return Some("may not contain `..`");
+    }
+    None
 }
 
 /// The fields of `codex.provider` that toryo passes as `model_providers.<id>.<field>`.
@@ -930,6 +1166,7 @@ policy:
         let old = Effective {
             repo: serde_yaml::from_str(SAMPLE).unwrap(),
             trusted_filters: BTreeMap::new(),
+            toolchains: Toolchains::default(),
             repo_path: PathBuf::new(),
             machine_path: None,
             origins: Origins::default(),
@@ -1193,6 +1430,134 @@ roles:
             cfg.repo.roles["implementer"].fallback,
             Some(vec!["claude-max".to_string()])
         );
+    }
+
+    /// The R59 shape: `toolchains.xpp` from the machine config, `tool: xpp` in the repository.
+    const XPP: &str = r#"
+version: 1
+project: { root: D:\D365-Git, worktrees_root: D:\D365-worktrees }
+profiles:
+  claude-max: { kind: claude, billing: subscription, exe: claude }
+roles:
+  planner: { profile: claude-max }
+toolchains:
+  xpp:
+    msbuild: 'C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe'
+    nugets: 'D:\D365\cicd-nugets\10.0.45'
+    extra_references: ['D:\ISV\Bin']
+    bp_check: false
+    ude_metadata: '%LOCALAPPDATA%\Microsoft\Dynamics365\10.0.2345.12\PackagesLocalDirectory'
+commands:
+  verify:
+    - name: build
+      tool: xpp
+      metadata: Metadata
+      projects: [Projects/Build/ContosoCore.Build.rnrproj]
+      timeout_min: 90
+    - { name: labels, program: pwsh, args: [-NoProfile, -File, scripts/check-labels.ps1] }
+"#;
+
+    /// R59 (M9-B1 AC-1): the shape loads; the toolchain comes from the machine config, is
+    /// frozen with the task and changes the hash.
+    #[test]
+    fn xpp_toolchain_and_verify_kind_load() {
+        let cfg = load_str(XPP).unwrap();
+        let x = cfg.toolchains.xpp.as_ref().unwrap();
+        assert_eq!(x.nugets, r"D:\D365\cicd-nugets\10.0.45");
+        assert_eq!(x.extra_references, [r"D:\ISV\Bin"]);
+        assert_eq!(cfg.origins.toolchains["xpp"], Origin::Machine);
+        let v = &cfg.repo.commands.verify;
+        assert_eq!(
+            v[0].kind(),
+            CommandKind::Xpp {
+                metadata: "Metadata",
+                projects: &["Projects/Build/ContosoCore.Build.rnrproj".to_string()]
+            }
+        );
+        assert!(v[0].is_xpp() && !v[1].is_xpp());
+        let frozen = cfg.canonical_json();
+        assert!(frozen.contains(r#""toolchains":{"xpp":{"bp_check":false,"extra_references""#));
+        let back = Effective::from_frozen(&frozen, Path::new("config.json")).unwrap();
+        assert_eq!(back.toolchains, cfg.toolchains);
+        assert_eq!(back.sha256(), cfg.sha256());
+        // another NuGet release is another configuration
+        let other = load_str(&XPP.replace("10.0.45", "10.0.46")).unwrap();
+        assert_ne!(other.sha256(), cfg.sha256());
+    }
+
+    /// M9-B1 AC-2: every invalid combination is reported at once, naming its key.
+    #[test]
+    fn invalid_xpp_commands_name_the_key() {
+        let verify = |items: &str| {
+            XPP.split("commands:").next().unwrap().to_string() + "commands:\n  verify:\n" + items
+        };
+        let e = load_err(&verify(
+            r#"    - { name: both, program: pwsh, tool: xpp, metadata: M, projects: [p.rnrproj] }
+    - { name: neither }
+    - { name: other, tool: cmake }
+    - { name: nometa, tool: xpp, projects: [p.rnrproj] }
+    - { name: noproj, tool: xpp, metadata: M }
+    - { name: paths, tool: xpp, metadata: 'C:\M', projects: ['../x.rnrproj', '/abs.rnrproj'] }
+    - { name: args, tool: xpp, metadata: M, projects: [p.rnrproj], args: [-x] }
+    - { name: prog, program: pwsh, metadata: M, projects: [p.rnrproj] }
+"#,
+        ));
+        for want in [
+            "commands.verify[0] (both): has both `program` and `tool` — use one",
+            "commands.verify[1] (neither): needs `program` (with `args`) or `tool`",
+            "commands.verify[2] (other).tool: `cmake` is not a valid value (valid: xpp)",
+            "commands.verify[3] (nometa).metadata: required for `tool: xpp`",
+            "commands.verify[4] (noproj).projects: `tool: xpp` needs at least one project",
+            r"commands.verify[5] (paths).metadata: `C:\M` must be relative to the repository",
+            "commands.verify[5] (paths).projects: `../x.rnrproj` may not contain `..`",
+            "commands.verify[5] (paths).projects: `/abs.rnrproj` must be relative to the repository",
+            "commands.verify[6] (args).args: only for a `program` command",
+            "commands.verify[7] (prog).metadata: only for `tool: xpp`",
+            "commands.verify[7] (prog).projects: only for `tool: xpp`",
+        ] {
+            assert!(e.contains(want), "{want}\n---\n{e}");
+        }
+        // no toolchain in the machine config
+        let (head, rest) = XPP.split_once("toolchains:").unwrap();
+        let no_tc = format!("{head}commands:{}", rest.split_once("commands:").unwrap().1);
+        let e = load_err(&no_tc);
+        assert!(
+            e.contains("commands.verify[0] (build).tool: `tool: xpp` needs `toolchains.xpp` in the machine config"),
+            "{e}"
+        );
+        // bp_check: true waits for V08-VERIFY 4
+        let e = load_err(&XPP.replace("bp_check: false", "bp_check: true"));
+        assert!(
+            e.contains("toolchains.xpp.bp_check: `true` is not supported yet"),
+            "{e}"
+        );
+        // unknown toolchain keys are refused by serde
+        let e = load_err(&XPP.replace("bp_check: false", "bpcheck: false"));
+        assert!(e.contains("bpcheck"), "{e}");
+    }
+
+    /// M9-B1 AC-3: a configuration without the new keys keeps the hash it had before R59
+    /// (value computed with the M9-A4 build), and a frozen one reads back unchanged.
+    #[test]
+    fn configs_without_toolchains_keep_their_hash() {
+        let d = tempfile::tempdir().unwrap();
+        let (p, m) = (d.path().join("toryo.yaml"), d.path().join("machine.yaml"));
+        std::fs::write(&p, "version: 1\nproject: { root: D:\\\\R, worktrees_root: D:\\\\W }\nroles:\n  planner: { profile: claude-max }\ncommands:\n  verify:\n    - { name: build, program: pwsh, args: [-File, scripts/build.ps1], timeout_min: 20 }\n    - { name: test, program: git, args: [status] }\n").unwrap();
+        std::fs::write(
+            &m,
+            "profiles:\n  claude-max: { kind: claude, billing: subscription, exe: claude }\n",
+        )
+        .unwrap();
+        let e = Effective::load(&p, Some(&m)).unwrap();
+        assert_eq!(
+            e.sha256(),
+            "7ae81a43f08d24ea1866b54a3cbb30bce443dc15aa02a212f01cace2f719a3b8"
+        );
+        let frozen = e.canonical_json();
+        assert!(!frozen.contains("toolchains") && !frozen.contains("\"tool\""));
+        let back = Effective::from_frozen(&frozen, Path::new("config.json")).unwrap();
+        assert_eq!(back.canonical_json(), frozen);
+        assert!(back.toolchains.is_empty());
     }
 
     /// The shipped templates keep loading under the checks.

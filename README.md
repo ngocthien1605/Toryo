@@ -40,7 +40,7 @@ M0 kit modules (ported to the core where M1 needs them, R52):
 | `agents::codex` | R18, R19, R21, R22 | canonical `-c` argv (identical on resume), JSONL parser, message classifier |
 | `usage` | R21, R41 | disjoint token buckets, cumulative deltas with reset |
 | `git` | R33, R37 | `GitCmd` hardening prefix, `<CANON_DIFF>`, trusted/neutralised filter plan, canaries, pkt-line filter |
-| `config` | §14, R35, R60 | `toryo.yaml` + machine config (the only place for profiles, R60), canonical hash, Credential Manager secrets |
+| `config` | §14, R35, R59, R60 | `toryo.yaml` + machine config (the only place for profiles and toolchains, R60), verify kinds (`program` or `tool: xpp`), canonical hash, Credential Manager secrets |
 | `doctor` | §15, R51 | environment / profile / repo checks + version-bound evidence; `--canaries` re-runs them |
 | `spike::*` | §17 | the M0 commands (see `docs/M0-RUNBOOK.md`) — cargo feature `m0-kit`, on by default |
 | `spike::pipeline` | §5.2, R28, R40 | prototype workflow on a real repo: plan gate, guards, checkpoints, verify, exact-AC review, fix cycles |
@@ -87,7 +87,10 @@ Results land in `C:\.thien\AgentOrchestrator\thien-m0-data\`.
 **Configuration (R60).** Agent profiles — the executable, its environment and secrets, the Codex
 sandbox settings — are defined **only** in the machine config (`%USERPROFILE%\.toryo\toryo.local.yaml`,
 or `--machine-config`). A repository `toryo.yaml` that defines `profiles:` or `toolchains:` does not
-load; the error prints the block to move. The repository file names profiles in `roles`.
+load; the error prints the block to move. The repository file names profiles in `roles`. (R59) The X++
+toolchain — MSBuild and the five CI/CD NuGet packages — is `toolchains.xpp` in the machine config; a
+repository verify command names only what to build: `{ name, tool: xpp, metadata, projects, timeout_min }`
+instead of `program`/`args`.
 
 **Hướng dẫn tiếng Việt (flow, cài đặt, cấu hình, thực hành với app mẫu BatchRename): `docs/HUONG-DAN.md`.**
 `spike pipeline` is the single-process reference prototype (R52); it prints a warning and gets no new features — use the engine (`toryo task create` + `toryo run`).

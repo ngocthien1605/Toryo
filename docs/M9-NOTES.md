@@ -87,3 +87,26 @@ Every entry: what was decided, why, and where. The owner folds these into plan v
   reviewer reports AC-2 unmet and no reviewer context contains the planted text. The scripted fix turn
   fails (`Auth`) so the task escalates and no more tokens are spent. The flow was dry-run on Linux with
   every agent fake (pwsh 7.4); the script itself has not run on Windows.
+
+## B — X++ verify on the UDE toolchain (R59)
+
+### B1 — `toolchains.xpp` and `tool: xpp`
+
+- **`CommandSpec.program` became optional** (`Option<String>`, serialised only when set) and the item
+  gained `tool`, `metadata` and `projects` (serialised only when set). A configuration without the new keys
+  has exactly the canonical JSON it had before — test `configs_without_toolchains_keep_their_hash` pins
+  the digest computed with the M9-A4 build. `CommandSpec::kind()` gives `Program { program, args }` or
+  `Xpp { metadata, projects }`; every reader of `program` goes through it.
+- **`Effective.toolchains`** comes from the machine config, is frozen and hashed, and is left out of the
+  canonical JSON when empty. `from_frozen` defaults it. `Origins.toolchains` gives `doctor` its "toolchain
+  xpp — source: the machine config" line (the A2 follow-up).
+- **Validation** (`config::verify_command_problems`, R63 style, every problem at once) names the item as
+  `commands.verify[<i>] (<name>)`: exactly one of `program`/`tool`; `tool` ∈ {`xpp`}; `metadata` and at least
+  one project, relative, no `..`, no drive; `args` only with `program`, `metadata`/`projects` only with
+  `tool`; `tool: xpp` without `toolchains.xpp` names the machine config; `toolchains.xpp.bp_check: true` is
+  refused ("not supported yet", V08-VERIFY 4); empty `msbuild`/`nugets` are refused.
+- **`task config --reload`** treats a changed toolchain like a changed `commands.verify`: the current
+  verify result is invalidated and the checkpoint is verified again (EC-10).
+- **`spike pipeline`** runs only `program` commands and refuses `tool: xpp` with a message (it is the frozen
+  R52 reference and gets no new features).
+- `templates/toryo.local.yaml.example` shows a commented `toolchains.xpp` block.

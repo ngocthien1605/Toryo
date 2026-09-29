@@ -210,9 +210,36 @@ repo `toryo.yaml` → `toryo doctor` lại. `toryo spike init-config` giờ ghi 
 và `--machine-out` (phần profile, mặc định `toryo.local.yaml` cạnh `--out`; không bao giờ ghi đè
 file đã có).
 
-`toryo doctor` in nguồn của từng profile và role (dòng `info`): profile luôn từ machine config; role
-có thể từ repo, từ machine, hoặc "repo, bị machine ghi đè". Với `--json`, mỗi dòng này có thêm
-trường `source` (`repo` / `machine` / `repo_overridden_by_machine`).
+`toryo doctor` in nguồn của từng profile, toolchain và role (dòng `info`): profile và toolchain luôn
+từ machine config; role có thể từ repo, từ machine, hoặc "repo, bị machine ghi đè". Với `--json`, mỗi
+dòng này có thêm trường `source` (`repo` / `machine` / `repo_overridden_by_machine`).
+
+**Toolchain X++ (R59, M9-B).** Compiler cũng là "sự thật của máy" nên cũng chỉ nằm trong machine config;
+repo chỉ nói *build cái gì*:
+
+```yaml
+# machine config
+toolchains:
+  xpp:
+    msbuild: 'C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe'
+    nugets: 'D:\D365\cicd-nugets\10.0.45'   # 5 gói NuGet CI/CD, đã giải nén, mỗi gói một thư mục
+    extra_references: []                       # tuỳ chọn: thư mục package binary (ISV…)
+    bp_check: false                            # `true` bị từ chối cho tới khi hỗ trợ xppbp.exe
+    ude_metadata: '%LOCALAPPDATA%\Microsoft\Dynamics365\<ApplicationVersion>\PackagesLocalDirectory'   # chỉ doctor dùng
+
+# repo toryo.yaml
+commands:
+  verify:
+    - name: build
+      tool: xpp                                # thay cho program/args
+      metadata: Metadata                       # thư mục source X++, tương đối với repo
+      projects: [Projects/Build/ContosoCore.Build.rnrproj]   # một project mỗi package, theo thứ tự build
+      timeout_min: 90
+```
+
+Mỗi mục `commands.verify` có **hoặc** `program` (+ `args`) **hoặc** `tool`, không có cả hai. Sai chỗ nào
+thì lỗi load nêu đúng key đó (`commands.verify[0] (build).metadata: …`), tất cả lỗi một lần. Toolchain
+được đóng băng theo task như profile; `task config --reload` với toolchain mới buộc verify lại.
 
 ### 4.3 Dữ liệu được lưu ở đâu?
 

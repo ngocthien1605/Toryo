@@ -48,9 +48,9 @@ impl Report {
     }
 }
 
-/// R60: where each profile and role of the effective configuration came from — profiles only
-/// from the machine config; roles from the repository, the machine, or the repository
-/// overridden by the machine. One `info` line each.
+/// R60: where each profile, toolchain and role of the effective configuration came from —
+/// profiles and toolchains only from the machine config; roles from the repository, the
+/// machine, or the repository overridden by the machine. One `info` line each.
 pub fn origin_checks(cfg: &Effective) -> Vec<Check> {
     let machine = cfg
         .machine_path
@@ -70,6 +70,18 @@ pub fn origin_checks(cfg: &Effective) -> Vec<Check> {
         out.push(Check {
             level: Level::Info,
             area: format!("profile {name}"),
+            message: match source {
+                Some(o) => format!("source: {}", place(o)),
+                None => "source: frozen configuration".into(),
+            },
+            source,
+        });
+    }
+    for name in cfg.toolchains.names() {
+        let source = cfg.origins.toolchains.get(name).copied();
+        out.push(Check {
+            level: Level::Info,
+            area: format!("toolchain {name}"),
             message: match source {
                 Some(o) => format!("source: {}", place(o)),
                 None => "source: frozen configuration".into(),
@@ -691,10 +703,10 @@ fn finish(r: Report, json: bool) -> Result<i32> {
 mod tests {
     use super::*;
 
-    /// R60 (M9-A2): each profile and role says where it came from, in text and in `--json`;
+    /// R60 (M9-A2, B1): each profile, toolchain and role says where it came from, in text and in `--json`;
     /// the config hash does not depend on it.
     #[test]
-    fn profiles_and_roles_name_their_source() {
+    fn profiles_toolchains_and_roles_name_their_source() {
         let d = tempfile::tempdir().unwrap();
         let (p, m) = (d.path().join("toryo.yaml"), d.path().join("machine.yaml"));
         std::fs::write(
@@ -704,13 +716,17 @@ mod tests {
         .unwrap();
         std::fs::write(
             &m,
-            "profiles:\n  a: { kind: claude, billing: subscription, exe: c }\n  b: { kind: codex, billing: subscription, exe: x }\nroles:\n  reviewer: { profile: b }\n  implementer: { profile: b }\n",
+            "profiles:\n  a: { kind: claude, billing: subscription, exe: c }\n  b: { kind: codex, billing: subscription, exe: x }\nroles:\n  reviewer: { profile: b }\n  implementer: { profile: b }\ntoolchains:\n  xpp: { msbuild: m, nugets: n }\n",
         )
         .unwrap();
         let cfg = Effective::load(&p, Some(&m)).unwrap();
         let checks = origin_checks(&cfg);
         let get = |area: &str| checks.iter().find(|c| c.area == area).unwrap();
         assert_eq!(get("profile a").source, Some(Origin::Machine));
+        assert_eq!(get("toolchain xpp").source, Some(Origin::Machine));
+        assert!(get("toolchain xpp")
+            .message
+            .starts_with("source: the machine config"));
         assert!(get("profile b").message.contains(&m.display().to_string()));
         assert_eq!(get("role planner").source, Some(Origin::Repo));
         assert_eq!(get("role implementer").source, Some(Origin::Machine));

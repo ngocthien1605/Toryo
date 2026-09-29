@@ -9,7 +9,7 @@ use anyhow::{bail, Result};
 use regex::Regex;
 use serde_json::Value;
 
-use crate::config::{expand_vars, CommandSpec, Effective};
+use crate::config::{expand_vars, CommandKind, CommandSpec, Effective};
 
 /// An acceptance-criteria item: an optional bullet (`-`, `*`, `+`), number (`1.`, `1)`) or
 /// task-list box (`[ ]`), then the id (optionally bold) and `:`, `.` or `)` (or a full-width
@@ -406,17 +406,12 @@ pub fn verify_commands(cfg: &Effective, repo: &Path) -> Result<Vec<CommandSpec>>
     let mut v = Vec::new();
     for (name, rel) in [("build", "scripts/build.ps1"), ("test", "scripts/test.ps1")] {
         if repo.join(rel).exists() {
-            v.push(CommandSpec {
-                name: name.into(),
-                program: "pwsh".into(),
-                args: vec![
-                    "-NoProfile".into(),
-                    "-NonInteractive".into(),
-                    "-File".into(),
-                    rel.into(),
-                ],
-                timeout_min: Some(30),
-            });
+            v.push(CommandSpec::program(
+                name,
+                "pwsh",
+                &["-NoProfile", "-NonInteractive", "-File", rel],
+                Some(30),
+            ));
         }
     }
     if v.is_empty() {
@@ -444,7 +439,9 @@ fn repo_relative(repo: &Path, p: &str) -> Option<String> {
 /// - the **program** when it is a path inside the repo (`scripts/gate.sh`, `./gradlew`,
 ///   `scripts\build.cmd`): an implementer who rewrites the gate to `exit 0` breaks the path
 ///   policy instead of passing verify (EC-07). A bare name (`pwsh`, `git`) is a PATH lookup;
-/// - every argument naming a file in the repo.
+/// - every argument naming a file in the repo;
+/// - (R59) every project of a `tool: xpp` command, whether or not it exists yet: the
+///   implementer may not change what is built. [`verify_globs`] adds `Directory.Build.*`.
 ///
 /// Repo files are listed in `git status` form, once each; an argument naming a file outside
 /// the repo (an absolute path) is kept as written.
@@ -457,13 +454,24 @@ pub fn verify_files(cmds: &[CommandSpec], repo: &Path) -> Vec<String> {
     };
     let in_repo = |p: &str| repo_relative(repo, p).filter(|r| repo.join(r).is_file());
     for c in cmds {
-        let program = expand_vars(&c.program).unwrap_or_else(|_| c.program.clone());
+        let (program, args) = match c.kind() {
+            CommandKind::Program { program, args } => (program, args),
+            CommandKind::Xpp { projects, .. } => {
+                for p in projects {
+                    if let Some(r) = repo_relative(repo, p) {
+                        add(r);
+                    }
+                }
+                continue;
+            }
+        };
+        let program = expand_vars(program).unwrap_or_else(|_| program.to_string());
         if program.contains('/') || program.contains('\\') || Path::new(&program).is_absolute() {
             if let Some(r) = in_repo(&program) {
                 add(r);
             }
         }
-        for a in &c.args {
+        for a in args {
             if let Some(r) = in_repo(a) {
                 add(r);
             } else if repo.join(a).is_file() {
@@ -472,6 +480,21 @@ pub fn verify_files(cmds: &[CommandSpec], repo: &Path) -> Vec<String> {
         }
     }
     out
+}
+
+/// MSBuild reads `Directory.Build.props`/`.targets`/`.rsp` from every parent folder of a
+/// project (R59): protected, with [`VERIFY_SCRIPTS`], whenever a `tool: xpp` command runs.
+pub const XPP_PROTECTED_GLOB: &str = "**/Directory.Build.*";
+
+/// The protected globs the verify commands add to `policy.protected_paths` (R59): for
+/// `tool: xpp`, [`XPP_PROTECTED_GLOB`]. Like the files of [`verify_files`], they are protected
+/// whether or not the list names [`VERIFY_SCRIPTS`].
+pub fn verify_globs(cmds: &[CommandSpec]) -> Vec<String> {
+    if cmds.iter().any(CommandSpec::is_xpp) {
+        vec![XPP_PROTECTED_GLOB.to_string()]
+    } else {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -710,12 +733,7 @@ mod tests {
             std::fs::write(p, "x").unwrap();
         }
         let outside = d.path().parent().unwrap().join("outside-tool.sh");
-        let cmd = |program: &str, args: &[&str]| CommandSpec {
-            name: program.into(),
-            program: program.into(),
-            args: args.iter().map(|a| a.to_string()).collect(),
-            timeout_min: None,
-        };
+        let cmd = |program: &str, args: &[&str]| CommandSpec::program(program, program, args, None);
         let cmds = [
             cmd("scripts/gate.sh", &[]),
             cmd("./gradlew", &["build"]),
@@ -750,5 +768,52 @@ mod tests {
             "the macro is not a literal path"
         );
         assert!(p.matches("docs/x.md"), "the other globs still apply");
+    }
+
+    /// R59 (as EC-07): `@verify-scripts` covers the projects of a `tool: xpp` command — also
+    /// one that does not exist yet — and every `Directory.Build.*`; nothing for a program-only
+    /// configuration.
+    #[test]
+    fn xpp_projects_and_directory_build_files_are_verify_files() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path();
+        let xpp = CommandSpec::xpp(
+            "build",
+            "Metadata",
+            &[
+                "Projects/Build/Core.Build.rnrproj",
+                "Projects\\Build\\Missing.rnrproj",
+            ],
+            None,
+        );
+        let git = CommandSpec::program("grep", "git", &["grep", "x"], None);
+        assert!(verify_globs(std::slice::from_ref(&git)).is_empty());
+        let cmds = [git, xpp];
+        let files = verify_files(&cmds, repo);
+        assert_eq!(
+            files,
+            [
+                "Projects/Build/Core.Build.rnrproj",
+                "Projects/Build/Missing.rnrproj"
+            ]
+        );
+        let mut globs = vec![VERIFY_SCRIPTS.to_string()];
+        globs.extend(verify_globs(&cmds));
+        let p = Protected::new(files, &globs);
+        for f in [
+            "projects/build/core.build.rnrproj",
+            "Projects/Build/Missing.rnrproj",
+            "Directory.Build.props",
+            "Metadata/Directory.Build.targets",
+            "Projects/Build/directory.build.rsp",
+        ] {
+            assert!(p.violates(f), "{f}");
+        }
+        for f in [
+            "Metadata/Core/AxClass/Foo.xml",
+            "Projects/Work/Core.rnrproj",
+        ] {
+            assert!(!p.violates(f), "{f}");
+        }
     }
 }

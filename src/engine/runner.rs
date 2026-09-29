@@ -45,7 +45,7 @@ use super::verify;
 use super::worktree::{rel, Worktree, T_AGENT, T_ATTEMPT, T_NO_CHANGE, T_PARTIAL, T_STAGE, T_TASK};
 use crate::agents::adapter::TurnHooks;
 use crate::agents::hub::AgentHub;
-use crate::config::{expand_vars, Billing, CommandSpec, Effective, ProfileKind};
+use crate::config::{expand_vars, Billing, CommandKind, CommandSpec, Effective, ProfileKind};
 use crate::domain::{ErrorClass, OpenSession, Role, StageOutcome, Tri, TurnInput, TurnLimits};
 use crate::git::GitCmd;
 use crate::process::Boundary;
@@ -1242,12 +1242,15 @@ impl<'a> Engine<'a> {
         let mut results = Vec::new();
         let mut failure = None;
         for c in &self.cmds {
-            let program = verify_program(&expand_vars(&c.program)?, &co.dir);
+            let CommandKind::Program { program, args } = c.kind() else {
+                bail!("{}: `tool: xpp` runs from M9-B2", c.name);
+            };
+            let program = verify_program(&expand_vars(program)?, &co.dir);
             let res = self.hub.block_on(LocalRunner.run(
                 RunSpec {
                     name: c.name.clone(),
                     program,
-                    args: c.args.clone(),
+                    args: args.to_vec(),
                     cwd: co.dir.clone(),
                     env: env.clone(),
                     boundary: b,
@@ -3041,7 +3044,13 @@ fn correction_prompt(violations: &[String]) -> String {
 
 /// One verify command's entry in VERIFY_RESULT.json.
 fn command_result(c: &CommandSpec, res: &CommandResult) -> Value {
-    json!({"name": c.name, "argv": std::iter::once(c.program.clone()).chain(c.args.clone()).collect::<Vec<_>>(), "exit": res.exit, "ms": res.duration_ms, "output_tail": res.tail(40)})
+    let argv: Vec<String> = match c.kind() {
+        CommandKind::Program { program, args } => std::iter::once(program.to_string())
+            .chain(args.iter().cloned())
+            .collect(),
+        CommandKind::Xpp { .. } => Vec::new(),
+    };
+    json!({"name": c.name, "argv": argv, "exit": res.exit, "ms": res.duration_ms, "output_tail": res.tail(40)})
 }
 
 /// The feedback of a failed verify for the implementer: the failing command, how it ended
@@ -4401,12 +4410,7 @@ mod tests {
 
     #[test]
     fn a_command_result_records_argv_exit_time_and_the_output_tail() {
-        let c = CommandSpec {
-            name: "test".into(),
-            program: "pwsh".into(),
-            args: strings(&["-File", "scripts/test.ps1"]),
-            timeout_min: None,
-        };
+        let c = CommandSpec::program("test", "pwsh", &["-File", "scripts/test.ps1"], None);
         let output: String = (1..=45).map(|i| format!("line {i}\n")).collect();
         let res = CommandResult {
             name: "test".into(),
