@@ -8,7 +8,7 @@ Branch `m10/flight-recorder` (from `main` @ `5adf204`). One commit per task.
 
 - [x] docs: owner verification E1, E7 (M9) — the owner's uncommitted notes, committed alone
 - [x] A1 — `EngineEvent`, sinks, `events.jsonl` flight recorder
-- [ ] A2 — the engine's CLI lines rendered from events
+- [x] A2 — the engine's CLI lines rendered from events
 - [ ] B1 — `status --json`, `task show --json`
 - [ ] B2 — `toryo watch <ID>`
 - [ ] C1 — `prices.toml` + `toryo usage <ID>`
@@ -66,3 +66,35 @@ Branch `m10/flight-recorder` (from `main` @ `5adf204`). One commit per task.
   classes, numbering + redaction + a broken sink, partial last line, unwritable file, elapsed time.
   Integration (`tests/m10_events.rs`): AC-1 to AC-5, plus `task cleanup` removes the file.
 
+
+### A2 — the engine's CLI lines come from events
+
+- **`flight::render(&Envelope)`** gives every event a text; **`StderrSink`** prints it for every event
+  that is not `quiet`. `Recorder::for_task` has both sinks (file, then stderr). The engine's
+  `eprintln!` for these lines are gone from `engine/runner.rs`: `[state]` (engine, `approve_now`,
+  `reject_now`, `withdraw_final`), the four stage headers, `✔ checkpoint …` (both lines of a trailer
+  match: one event with `found`), the verify command lines, `!! budget: …`, and the `!! <reason>` line
+  printed before an escalation or a reason-carrying pause (it is the `escalated`/`paused` event; the
+  paths that never printed it emit it quiet).
+- **Same text.** `reject_now` has always printed `--rejected-->`: the renderer maps `plan_rejected` /
+  `final_rejected` to that. Unit test `events_render_the_text_the_engine_printed` compares each
+  variant with the old format expressions. End to end, `main`'s binary and this one were run on the
+  same fake scenarios (fix cycles with a failing and a passing verify, review changes, a final
+  rejection that escalates at the fix-cycle bound, a protected-config escalation, an implementer
+  failure without changes, resume with a note, a budget warning and the admission pause): after
+  normalising paths, hashes and durations the 335 stderr lines are identical.
+- **One difference**, only when a secret is involved: the stderr lines now go through the task's
+  redaction (R42) like the file — a reason that carried a profile secret was printed as is before.
+- **Lines that are not events** (unchanged `eprintln!`, `engine/runner.rs`): `TORYO_TEST_CRASH_AT`,
+  `!! admission cap reached …` (the pause itself is the quiet `paused` event), `!! budget reached
+  during the turn …`, the stop notes (`■ stop request handled …`, `■ stopped at a stage boundary`,
+  `■ stop requested during the backoff`), `(Plan gate approved automatically: --yes)`, the retry notes
+  (`retry_note`, `!! <profile>: <class> — retry n/2 in Ns`), the rendered PLAN.md and REVIEW.md, the
+  plan-time policy rejection, the path policy restore, the schema-violation note of
+  implementation.json, the HEAD-guard soft reset, the failed-turn-kept note (the stage runs again),
+  `!! implementer X: … → switching to Y`, `protected baseline renewed`, the stale-verify re-verify
+  note, `!! invalid review (correction n/2)`, `review_inconsistent`, the context warnings and
+  `context: N bytes, …`, the final-approval uncommitted-changes note. Outside the engine: the turn
+  streaming and `print_summary` (adapters), `↺ recovery: …`, and `drive`'s closing lines
+  (`══════════ …`, `final gate — …`, `next:`, `summary:`; the `run_ended` event renders the first and
+  `next:` for `watch`, emitted quiet).

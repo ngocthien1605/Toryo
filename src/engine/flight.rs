@@ -200,6 +200,141 @@ impl EventSink for FileSink {
     }
 }
 
+/// The text of an event: for the events the CLI printed before M10, exactly that text (the
+/// stage headers start with an empty line); for the others (`quiet` live), a line for
+/// `toryo watch`.
+pub fn render(env: &Envelope) -> String {
+    use EngineEvent as E;
+    let secs = |ms: u64| ms as f64 / 1000.0;
+    match &env.event {
+        E::RunStarted { owner } => format!(
+            "▶ {} — run started (generation {}, {owner})",
+            env.task, env.generation
+        ),
+        E::StateChanged { from, to, event } => {
+            // the gate rejections have always been printed as `--rejected-->`
+            let name = match event.as_str() {
+                "plan_rejected" | "final_rejected" => "rejected",
+                n => n,
+            };
+            format!("   [state] {from:?} --{name}--> {to:?}")
+        }
+        E::StageStarted {
+            stage,
+            attempt,
+            profile,
+            detail,
+        } => {
+            let parts: Vec<&str> = [profile.as_deref(), detail.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect();
+            format!(
+                "\n── {} (attempt {attempt}, {}) ──",
+                stage.to_uppercase(),
+                parts.join(", ")
+            )
+        }
+        E::StageFinished {
+            stage,
+            attempt,
+            status,
+            error_class,
+            duration_ms,
+        } => format!(
+            "   {stage} attempt {attempt}: {}{} ({:.1}s)",
+            serde_json::to_value(status)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default(),
+            error_class
+                .as_deref()
+                .map(|c| format!(", {c}"))
+                .unwrap_or_default(),
+            secs(*duration_ms)
+        ),
+        E::TurnFinished {
+            stage,
+            attempt,
+            profile,
+            success,
+            usage,
+            duration_ms,
+        } => format!(
+            "   turn {stage}/{attempt} ({profile}): {} · {} ({:.1}s)",
+            if *success { "completed" } else { "failed" },
+            match usage {
+                Some(u) => format!(
+                    "{} tokens, {}",
+                    u.buckets.total(),
+                    serde_json::to_value(u.accounting)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_default()
+                ),
+                None => "no usage reported".into(),
+            },
+            secs(*duration_ms)
+        ),
+        E::CheckpointCreated { head, kind, found } => {
+            let h = crate::git::short(head);
+            let line = format!("✔ checkpoint {h} ({kind})");
+            if *found {
+                format!("✔ checkpoint {h} already committed (trailer match)\n{line}")
+            } else {
+                line
+            }
+        }
+        E::VerifyCommand {
+            name,
+            exit,
+            timed_out,
+            ok,
+            duration_ms,
+        } => {
+            let exit = match exit {
+                Some(code) => format!("exit {code}"),
+                None if *timed_out => "timed out".to_string(),
+                None => "no exit code".to_string(),
+            };
+            format!(
+                "  {} {name} ({exit}, {:.1}s)",
+                if *ok { "✔" } else { "✘" },
+                secs(*duration_ms)
+            )
+        }
+        E::GateOpened { gate, occurrence } => {
+            format!("   gate open: {gate} (occurrence {occurrence})")
+        }
+        E::BudgetWarning { used, cap } => format!(
+            "!! budget: {used} of {cap} tokens used (≥ 80 %; admission cap, may overshoot by one turn)"
+        ),
+        E::Escalated { reason, .. } | E::Paused { reason } => format!("!! {reason}"),
+        E::RunEnded { state, next_action } => {
+            format!(
+                "══════════ {}: {state:?} ══════════\nnext: {next_action}",
+                env.task
+            )
+        }
+    }
+}
+
+/// The engine's lines on stderr (A2): [`render`] of every event that is not `quiet`.
+pub struct StderrSink;
+
+impl EventSink for StderrSink {
+    fn name(&self) -> &str {
+        "stderr"
+    }
+
+    fn emit(&self, e: &Envelope) -> Result<()> {
+        if !e.quiet {
+            eprintln!("{}", render(e));
+        }
+        Ok(())
+    }
+}
+
 /// Does the file end in a partial line (no final newline)?
 fn ends_open(f: &mut std::fs::File) -> Result<bool> {
     let len = f.metadata()?.len();
@@ -381,13 +516,15 @@ impl Recorder {
     }
 
     /// The recorder of a command that holds the task lock at `generation`: the flight
-    /// recorder file, with the task's secrets redacted.
+    /// recorder file and the stderr lines, with the task's secrets redacted.
     pub fn for_task(t: &TaskRow, generation: i64) -> Self {
         let path = events_path(t);
         let redact = super::task::frozen_config(t)
             .map(|c| task_redactions(&c, t))
             .unwrap_or_else(|_| Redactions::empty());
-        Self::new(&t.id, generation, last_seq(&path), redact).with(Box::new(FileSink::new(path)))
+        Self::new(&t.id, generation, last_seq(&path), redact)
+            .with(Box::new(FileSink::new(path)))
+            .with(Box::new(StderrSink))
     }
 
     pub fn with(mut self, sink: Box<dyn EventSink>) -> Self {
@@ -569,6 +706,235 @@ mod tests {
             assert_eq!(back.event, e, "{line}");
             assert!(!back.quiet);
         }
+    }
+
+    fn env(e: EngineEvent) -> Envelope {
+        Envelope {
+            v: 1,
+            seq: 1,
+            ts: "t".into(),
+            task: "T-1".into(),
+            generation: 2,
+            event: e,
+            quiet: false,
+        }
+    }
+
+    /// A2 AC-2: every event the CLI printed before M10 renders to exactly the text the
+    /// engine's `eprintln!` produced (the old format expressions, copied here).
+    #[test]
+    fn events_render_the_text_the_engine_printed() {
+        let r = |e: EngineEvent| render(&env(e));
+        let (from, to, name) = (St::Reviewing, St::WaitingFinalApproval, "review_approved");
+        assert_eq!(
+            r(EngineEvent::StateChanged {
+                from,
+                to,
+                event: name.into()
+            }),
+            format!("   [state] {from:?} --{name}--> {to:?}")
+        );
+        // approve_now: `--{gate}_approved-->`, reject_now: `--rejected-->`
+        assert_eq!(
+            r(EngineEvent::StateChanged {
+                from: St::WaitingPlanApproval,
+                to: St::Implementing,
+                event: "plan_approved".into()
+            }),
+            format!(
+                "   [state] {:?} --{}_approved--> {:?}",
+                St::WaitingPlanApproval,
+                "plan",
+                St::Implementing
+            )
+        );
+        for rejected in ["plan_rejected", "final_rejected"] {
+            assert_eq!(
+                r(EngineEvent::StateChanged {
+                    from: St::WaitingFinalApproval,
+                    to: St::Fixing,
+                    event: rejected.into()
+                }),
+                format!(
+                    "   [state] {:?} --rejected--> {:?}",
+                    St::WaitingFinalApproval,
+                    St::Fixing
+                )
+            );
+        }
+        // the stage headers: plan, implement / fix-N, verify, review (fresh and resumed)
+        let started = |stage: &str, profile: Option<&str>, detail: Option<&str>| {
+            r(EngineEvent::StageStarted {
+                stage: stage.into(),
+                attempt: 2,
+                profile: profile.map(str::to_string),
+                detail: detail.map(str::to_string),
+            })
+        };
+        assert_eq!(
+            started("plan", Some("claude-max"), None),
+            format!("\n── PLAN (attempt {}, {}) ──", 2, "claude-max")
+        );
+        assert_eq!(
+            started("fix-1", Some("codex-openai"), None),
+            format!(
+                "\n── {} (attempt {}, {}) ──",
+                "fix-1".to_uppercase(),
+                2,
+                "codex-openai"
+            )
+        );
+        assert_eq!(
+            started("verify", None, Some("none in C:\\v\\T-1")),
+            format!(
+                "\n── VERIFY (attempt {}, {} in {}) ──",
+                2, "none", "C:\\v\\T-1"
+            )
+        );
+        for resumed in [false, true] {
+            assert_eq!(
+                started(
+                    "review",
+                    Some("claude-max"),
+                    resumed.then_some("resuming the interrupted session")
+                ),
+                format!(
+                    "\n── REVIEW (attempt {}, {}{}) ──",
+                    2,
+                    "claude-max",
+                    if resumed {
+                        ", resuming the interrupted session"
+                    } else {
+                        ""
+                    }
+                )
+            );
+        }
+        let head = "0123456789abcdef0123";
+        for (found, kind) in [(false, "normal"), (true, "no_change")] {
+            let mut old = String::new();
+            if found {
+                old.push_str(&format!(
+                    "✔ checkpoint {} already committed (trailer match)\n",
+                    crate::git::short(head)
+                ));
+            }
+            old.push_str(&format!(
+                "✔ checkpoint {} ({kind})",
+                crate::git::short(head)
+            ));
+            assert_eq!(
+                r(EngineEvent::CheckpointCreated {
+                    head: head.into(),
+                    kind: kind.into(),
+                    found
+                }),
+                old
+            );
+        }
+        for (exit, timed_out, ok, text) in [
+            (Some(0), false, true, "exit 0"),
+            (Some(3), false, false, "exit 3"),
+            (None, true, false, "timed out"),
+            (None, false, false, "no exit code"),
+        ] {
+            let name = "unit-tests";
+            assert_eq!(
+                r(EngineEvent::VerifyCommand {
+                    name: name.into(),
+                    exit,
+                    timed_out,
+                    ok,
+                    duration_ms: 1234
+                }),
+                format!(
+                    "  {} {name} ({text}, {:.1}s)",
+                    if ok { "✔" } else { "✘" },
+                    1234_f64 / 1000.0
+                )
+            );
+        }
+        let (used, b) = (85i64, 100i64);
+        assert_eq!(
+            r(EngineEvent::BudgetWarning { used, cap: b }),
+            format!("!! budget: {used} of {b} tokens used (≥ 80 %; admission cap, may overshoot by one turn)")
+        );
+        let reason = "protected_config_changed: .claude/settings.local.json";
+        assert_eq!(
+            r(EngineEvent::Escalated {
+                reason_class: "protected_config_changed".into(),
+                reason: reason.into()
+            }),
+            format!("!! {reason}")
+        );
+        let reason = "reviewer_quota: QuotaExceeded x — `toryo resume T-1` when the quota is back";
+        assert_eq!(
+            r(EngineEvent::Paused {
+                reason: reason.into()
+            }),
+            format!("!! {reason}")
+        );
+        // drive's closing lines (the final gate notes and the summary path go between)
+        let (state, next) = (St::Completed, "done — merge it");
+        assert_eq!(
+            r(EngineEvent::RunEnded {
+                state,
+                next_action: next.into()
+            }),
+            format!(
+                "══════════ {}: {:?} ══════════\nnext: {}",
+                "T-1", state, next
+            )
+        );
+    }
+
+    /// The events with no line before M10 get one for `watch`; they are always emitted quiet.
+    #[test]
+    fn events_without_a_cli_line_render_for_watch() {
+        let r = |e: EngineEvent| render(&env(e));
+        assert_eq!(
+            r(EngineEvent::RunStarted {
+                owner: "me pid 7".into()
+            }),
+            "▶ T-1 — run started (generation 2, me pid 7)"
+        );
+        assert_eq!(
+            r(EngineEvent::StageFinished {
+                stage: "plan".into(),
+                attempt: 1,
+                status: AttemptStatus::Failed,
+                error_class: Some("InvalidOutput".into()),
+                duration_ms: 1500
+            }),
+            "   plan attempt 1: failed, InvalidOutput (1.5s)"
+        );
+        assert_eq!(
+            r(EngineEvent::TurnFinished {
+                stage: "review".into(),
+                attempt: 1,
+                profile: "claude-max".into(),
+                success: true,
+                usage: Some(TurnUsage {
+                    buckets: Buckets {
+                        uncached_input: 10,
+                        cache_read: 20,
+                        cache_write: 0,
+                        output: 5,
+                        reasoning: None
+                    },
+                    accounting: Accounting::Exact
+                }),
+                duration_ms: 2000
+            }),
+            "   turn review/1 (claude-max): completed · 35 tokens, exact (2.0s)"
+        );
+        assert_eq!(
+            r(EngineEvent::GateOpened {
+                gate: "final".into(),
+                occurrence: 2
+            }),
+            "   gate open: final (occurrence 2)"
+        );
     }
 
     #[test]
