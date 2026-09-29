@@ -54,9 +54,31 @@ pub fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
     Some((c[1].parse().ok()?, c[2].parse().ok()?, c[3].parse().ok()?))
 }
 
+/// A profile's `version:` pin (plan §14: `"2.1.x"`, `"0.15x"`) against a `--version` output,
+/// component by component (EC-27: never a substring test). The output's version is the first
+/// `x.y.z` in it ([`results::parse_version`]); its numeric components are compared in order
+/// with the pin's: a number must be equal, `x` matches any number, and a number followed by
+/// `x` any number that starts with those digits (`15x`: 15, 150–159, …). Components the pin
+/// leaves out are not constrained; an empty pin matches everything.
 fn version_matches(pattern: &str, actual: &str) -> bool {
-    let p = pattern.trim_end_matches('x').trim_end_matches('.');
-    actual.contains(p)
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return true;
+    }
+    let Some(v) = results::parse_version(actual) else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let got: Vec<&str> = v.split(['.', '-', '+']).take_while(|c| digits(c)).collect();
+    let pin: Vec<&str> = pattern.split('.').collect();
+    pin.len() <= got.len()
+        && pin
+            .iter()
+            .zip(&got)
+            .all(|(p, g)| match p.strip_suffix('x') {
+                Some(prefix) => prefix.bytes().all(|b| b.is_ascii_digit()) && g.starts_with(prefix),
+                None => digits(p) && p.trim_start_matches('0') == g.trim_start_matches('0'),
+            })
 }
 
 pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Result<i32> {
@@ -624,5 +646,34 @@ mod tests {
         assert!(version_matches("2.1.x", "2.1.260 (Claude Code)"));
         assert!(!version_matches("0.15x", "codex-cli 0.16.0"));
         assert!(version_matches("0.15x", "codex-cli 0.150.1"));
+    }
+
+    /// EC-27 (the review's probe, inverted): the pin is compared per component.
+    #[test]
+    fn version_pin_is_compared_per_component() {
+        for (pin, actual) in [
+            ("2.1.x", "2.10.5 (Claude Code)"),
+            ("2.1.x", "12.1.0"),
+            ("0.15x", "codex-cli 10.15.0"),
+            ("0.15x", "codex-cli 0.14.9"),
+            ("2.1.260", "2.1.261 (Claude Code)"),
+            ("2.1.x", "no version here"),
+            ("2.1.0.x", "2.1.0"),
+        ] {
+            assert!(!version_matches(pin, actual), "{pin} vs {actual}");
+        }
+        for (pin, actual) in [
+            ("2.1.x", "2.1.283 (Claude Code)"),
+            ("2.1", "2.1.283 (Claude Code)"),
+            ("2.x", "2.10.5"),
+            ("2.1.283", "2.1.283 (Claude Code)"),
+            ("0.15x", "codex-cli 0.157.1"),
+            ("0.15x", "codex-cli 0.15.0"),
+            ("2.47.x", "git version 2.47.1.windows.2"),
+            ("2.1.260", "2.1.260-beta.1"),
+            ("", "anything"),
+        ] {
+            assert!(version_matches(pin, actual), "{pin} vs {actual}");
+        }
     }
 }

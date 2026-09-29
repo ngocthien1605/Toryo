@@ -652,7 +652,7 @@ pub fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
                     .repo
                     .roles
                     .get("implementer")
-                    .map(|r| r.fallback.clone())
+                    .and_then(|r| r.fallback.clone())
                     .unwrap_or_default();
                 let fb = if !implementer_fallback.is_empty() {
                     implementer_fallback.clone()

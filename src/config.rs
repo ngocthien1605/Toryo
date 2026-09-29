@@ -106,9 +106,10 @@ pub struct Role {
     #[serde(default)]
     pub model: Option<String>,
     /// Profiles to switch to, in order, when this role's profile is out of quota
-    /// (implementer only in the prototype).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fallback: Vec<String>,
+    /// (implementer only in the prototype). Absent: the engine falls back to the planner's
+    /// profile (R49); `[]`: no fallback (EC-23).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -314,18 +315,35 @@ impl Effective {
             }
         }
         for (name, role) in &repo.roles {
-            for p in std::iter::once(&role.profile).chain(&role.fallback) {
+            for p in std::iter::once(&role.profile).chain(role.fallback.iter().flatten()) {
                 if !repo.profiles.contains_key(p) {
                     bail!("role `{name}` refers to unknown profile `{p}`");
                 }
             }
         }
-        Ok(Self {
+        let eff = Self {
             repo,
             trusted_filters,
             repo_path: repo_path.to_path_buf(),
             machine_path: used_machine,
-        })
+        };
+        eff.validate().with_context(|| match &eff.machine_path {
+            Some(m) => format!("{} (with {})", repo_path.display(), m.display()),
+            None => repo_path.display().to_string(),
+        })?;
+        Ok(eff)
+    }
+
+    /// The semantic checks serde cannot express (DES-05, EC-23, ARCH-05), all problems at
+    /// once: unknown role keys, enum-like strings outside their documented set, and
+    /// `codex.overrides` that would re-set what toryo sets itself. A frozen configuration
+    /// ([`Effective::from_frozen`]) is not re-checked: it is what its task was created with.
+    pub fn validate(&self) -> Result<()> {
+        let problems = problems(&self.repo);
+        if problems.is_empty() {
+            return Ok(());
+        }
+        bail!("invalid configuration:\n  - {}", problems.join("\n  - "))
     }
 
     /// Rebuild the configuration frozen by `toryo task create` (R35): a task never re-reads
@@ -366,6 +384,115 @@ impl Effective {
     }
 }
 
+/// `verify.boundary` values v0.1 implements (R36; `separate_user` is not in v0.1).
+pub const VERIFY_BOUNDARIES: &[&str] = &["low_integrity", "none"];
+/// `verify.checkout` (R29).
+pub const VERIFY_CHECKOUTS: &[&str] = &["clean", "tracked"];
+/// `codex.sandbox_mode`: the plan runs Codex in `workspace-write` only (R18/R19).
+pub const CODEX_SANDBOX_MODES: &[&str] = &["workspace-write"];
+/// `codex.windows_sandbox` (R18).
+pub const CODEX_WINDOWS_SANDBOXES: &[&str] = &["unelevated", "elevated"];
+/// `pipeline.budget_weights` keys: the four token buckets (R41).
+pub const BUDGET_WEIGHT_KEYS: &[&str] = &["uncached_input", "cache_read", "cache_write", "output"];
+
+/// The pipeline's roles: the keys of `roles` and `context.budget_kb`.
+fn role_names() -> [&'static str; 3] {
+    use crate::domain::Role as R;
+    [R::Planner, R::Implementer, R::Reviewer].map(R::as_str)
+}
+
+/// A problem for `key` unless `value` is one of `valid` (the message lists them).
+fn one_of(out: &mut Vec<String>, key: &str, value: &str, valid: &[&str]) {
+    if !valid.contains(&value) {
+        let valid = valid.join(", ");
+        out.push(format!(
+            "{key}: `{value}` is not a valid value (valid: {valid})"
+        ));
+    }
+}
+
+/// A problem for the key `section.name` unless `name` is one of `valid`.
+fn known_key(out: &mut Vec<String>, section: &str, name: &str, what: &str, valid: &[&str]) {
+    if !valid.contains(&name) {
+        let valid = valid.join(", ");
+        out.push(format!("{section}.{name}: unknown {what} (valid: {valid})"));
+    }
+}
+
+/// Every semantic problem of a (merged) configuration, as `key: what is wrong`.
+fn problems(repo: &RepoConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    let roles = role_names();
+    for name in repo.roles.keys() {
+        known_key(&mut out, "roles", name, "role", &roles);
+    }
+    for name in repo.context.budget_kb.keys() {
+        known_key(&mut out, "context.budget_kb", name, "role", &roles);
+    }
+    for name in repo.pipeline.budget_weights.iter().flat_map(|w| w.keys()) {
+        let section = "pipeline.budget_weights";
+        known_key(&mut out, section, name, "bucket", BUDGET_WEIGHT_KEYS);
+    }
+    // plan §14 (R41): `auto` = the largest exact turn of the stage, else a token count
+    if let Some(v) = &repo.pipeline.unknown_turn_reservation_tokens {
+        if v.as_u64().is_none() && v.as_str() != Some("auto") {
+            let shown = serde_yaml::to_string(v).unwrap_or_default();
+            out.push(format!(
+                "pipeline.unknown_turn_reservation_tokens: `{}` is not a valid value (valid: auto, or a number of tokens)",
+                shown.trim()
+            ));
+        }
+    }
+    let v = &repo.verify;
+    one_of(&mut out, "verify.boundary", &v.boundary, VERIFY_BOUNDARIES);
+    one_of(&mut out, "verify.checkout", &v.checkout, VERIFY_CHECKOUTS);
+    for (name, p) in &repo.profiles {
+        let Some(c) = &p.codex else { continue };
+        let key = format!("profiles.{name}.codex.sandbox_mode");
+        one_of(&mut out, &key, &c.sandbox_mode, CODEX_SANDBOX_MODES);
+        if let Some(ws) = &c.windows_sandbox {
+            let key = format!("profiles.{name}.codex.windows_sandbox");
+            one_of(&mut out, &key, ws, CODEX_WINDOWS_SANDBOXES);
+        }
+        for k in c.overrides.keys() {
+            if let Some(why) = denied_override(k, c.provider.is_some()) {
+                out.push(format!("profiles.{name}.codex.overrides.{k}: {why}"));
+            }
+        }
+    }
+    out
+}
+
+/// Why a `codex.overrides` key is refused (ARCH-05), or None. The overrides are passed after
+/// toryo's own `-c` settings and Codex applies the last one, so these keys would re-set the
+/// sandbox (`sandbox*`, `windows.*`), the approval policy or the environment policy.
+/// `model_provider*` is refused when the profile has a `codex.provider` block, which it would
+/// re-set; without one, overrides are how `toryo spike init-config` selects the provider of a
+/// translated Codex profile. The key is taken as Codex reads it: up to the first `=`,
+/// without whitespace or quotes.
+fn denied_override(key: &str, has_provider: bool) -> Option<&'static str> {
+    let k: String = key
+        .split('=')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let is_or_under = |p: &str| k == p || k.starts_with(&format!("{p}."));
+    if k.starts_with("sandbox") || is_or_under("windows") {
+        Some("re-sets the sandbox that toryo sets (codex.sandbox_mode / codex.windows_sandbox, R18/R19)")
+    } else if is_or_under("approval_policy") {
+        Some("re-sets the approval policy of the unattended `codex exec` turn")
+    } else if k.starts_with("shell_environment_policy") {
+        Some("re-sets the environment of Codex's commands, which toryo builds (R23)")
+    } else if has_provider && k.starts_with("model_provider") {
+        Some("re-sets the provider of codex.provider (change it there)")
+    } else {
+        None
+    }
+}
+
 /// `%USERPROFILE%\.toryo\toryo.local.yaml` (or `~/.toryo/toryo.local.yaml`).
 pub fn default_machine_config_path() -> Option<PathBuf> {
     home_dir().map(|h| h.join(".toryo").join("toryo.local.yaml"))
@@ -396,8 +523,9 @@ pub fn data_dir() -> PathBuf {
 }
 
 /// Expand `%VAR%` (Windows style) and `${VAR}` / `$VAR`-free paths. Unknown variables are an error.
+/// Names may contain `(` `)`, as in `%ProgramFiles(x86)%` (EC-28).
 pub fn expand_vars(s: &str) -> Result<String> {
-    let re = regex::Regex::new(r"%([A-Za-z_][A-Za-z0-9_]*)%").expect("regex");
+    let re = regex::Regex::new(r"%([A-Za-z_][A-Za-z0-9_()]*)%").expect("regex");
     let mut err = None;
     let out = re.replace_all(s, |c: &regex::Captures| match std::env::var(&c[1]) {
         Ok(v) => v,
@@ -561,5 +689,186 @@ policy:
         std::env::set_var("TORYO_TEST_SECRET_X", "v");
         assert_eq!(resolve_secret("env:TORYO_TEST_SECRET_X").unwrap(), "v");
         assert!(resolve_secret("plain").is_err());
+    }
+
+    fn load_str(yaml: &str) -> Result<Effective> {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("toryo.yaml");
+        std::fs::write(&p, yaml).unwrap();
+        Effective::load(&p, None)
+    }
+
+    /// The error text of a config that must not load.
+    fn load_err(yaml: &str) -> String {
+        format!(
+            "{:#}",
+            load_str(yaml).expect_err("the config must be refused")
+        )
+    }
+
+    /// EC-23: an explicit `fallback: []` is kept (and hashed) apart from an absent one.
+    #[test]
+    fn empty_fallback_is_kept_apart_from_an_absent_one() {
+        let absent = load_str(SAMPLE).unwrap();
+        let empty = load_str(&SAMPLE.replace(
+            "implementer: { profile: codex-foundry }",
+            "implementer: { profile: codex-foundry, fallback: [] }",
+        ))
+        .unwrap();
+        assert_eq!(absent.repo.roles["implementer"].fallback, None);
+        assert_eq!(empty.repo.roles["implementer"].fallback, Some(vec![]));
+        assert!(!absent.canonical_json().contains("fallback"));
+        assert!(empty.canonical_json().contains(r#""fallback":[]"#));
+        let f = Effective::from_frozen(&empty.canonical_json(), Path::new("c.json")).unwrap();
+        assert_eq!(f.sha256(), empty.sha256());
+        assert_eq!(f.repo.roles["implementer"].fallback, Some(vec![]));
+    }
+
+    /// EC-23 / DES-05: typos in role keys and enum-like values are refused, all at once.
+    #[test]
+    fn unknown_roles_and_values_are_refused() {
+        let roles = |extra: &str| {
+            SAMPLE.replace(
+                "  implementer: { profile: codex-foundry }\n",
+                &format!("  implementer: {{ profile: codex-foundry }}\n{extra}"),
+            )
+        };
+        let yaml = format!(
+            "{}verify: {{ boundary: lowintegrity, checkout: trackd }}\npipeline: {{ unknown_turn_reservation_tokens: lots, budget_weights: {{ cached_read: 0.1, output: 2.0 }} }}\ncontext: {{ budget_kb: {{ reviewer: 50, planer: 30 }} }}\n",
+            roles("  reviwer: { profile: claude-max }\n  implementor: { profile: claude-max }\n")
+        );
+        let e = load_err(&yaml);
+        for want in [
+            "roles.reviwer: unknown role (valid: planner, implementer, reviewer)",
+            "roles.implementor: unknown role",
+            "verify.boundary: `lowintegrity` is not a valid value (valid: low_integrity, none)",
+            "verify.checkout: `trackd` is not a valid value (valid: clean, tracked)",
+            "pipeline.unknown_turn_reservation_tokens: `lots` is not a valid value",
+            "pipeline.budget_weights.cached_read: unknown bucket",
+            "context.budget_kb.planer: unknown role",
+        ] {
+            assert!(e.contains(want), "{want:?} missing in:\n{e}");
+        }
+        assert!(!e.contains("budget_weights.output") && !e.contains("budget_kb.reviewer"));
+        // the valid spellings load
+        let ok = format!(
+            "{}verify: {{ boundary: none, checkout: tracked }}\npipeline: {{ unknown_turn_reservation_tokens: auto, budget_weights: {{ uncached_input: 1.0, cache_read: 0.1, cache_write: 1.25, output: 1.0 }} }}\ncontext: {{ budget_kb: {{ planner: 30, implementer: 60, reviewer: 50 }} }}\n",
+            roles("  reviewer: { profile: claude-max }\n")
+        );
+        load_str(&ok).unwrap();
+        load_str(&ok.replace("tokens: auto", "tokens: 150000")).unwrap();
+    }
+
+    #[test]
+    fn codex_sandbox_values_are_checked() {
+        let e = load_err(&SAMPLE.replace(
+            "windows_sandbox: unelevated",
+            "windows_sandbox: elevatd\n      sandbox_mode: danger-full-access",
+        ));
+        assert!(
+            e.contains("profiles.codex-foundry.codex.windows_sandbox: `elevatd` is not a valid value (valid: unelevated, elevated)"),
+            "{e}"
+        );
+        assert!(
+            e.contains("profiles.codex-foundry.codex.sandbox_mode: `danger-full-access` is not a valid value (valid: workspace-write)"),
+            "{e}"
+        );
+        load_str(&SAMPLE.replace("windows_sandbox: unelevated", "windows_sandbox: elevated"))
+            .unwrap();
+    }
+
+    /// ARCH-05: overrides that would re-set the sandbox, approvals or environment policy.
+    #[test]
+    fn codex_overrides_cannot_reset_the_sandbox() {
+        let with = |key: &str| {
+            SAMPLE.replace(
+                "windows_sandbox: unelevated",
+                &format!("windows_sandbox: unelevated\n      overrides: {{ '{key}': '\"x\"' }}"),
+            )
+        };
+        for key in [
+            "sandbox_mode",
+            "sandbox_workspace_write.network_access",
+            "windows.sandbox",
+            "windows",
+            "approval_policy",
+            "shell_environment_policy.inherit",
+            " sandbox_mode ",
+            "sandbox_mode=\"danger-full-access\"#",
+            "model_provider",
+            "model_providers.foundry.base_url",
+        ] {
+            let e = load_err(&with(key));
+            assert!(
+                e.contains("codex.overrides.") && e.contains("re-sets"),
+                "{key}: {e}"
+            );
+        }
+        // without a codex.provider block, the provider comes from the overrides (init-config)
+        let no_provider = with("model_provider").replace(
+            "      provider: { id: foundry, name: Azure Foundry, base_url: https://x.openai.azure.com/openai/v1, env_key: AZURE_OPENAI_API_KEY }\n",
+            "",
+        );
+        assert!(!no_provider.contains("provider: {"));
+        load_str(&no_provider).unwrap();
+        for key in ["model_reasoning_effort", "model_verbosity", "windows_x"] {
+            load_str(&with(key)).unwrap();
+        }
+    }
+
+    /// The configuration shape `toryo spike init-config` writes (explicit nulls), as in use.
+    #[test]
+    fn an_init_config_style_config_loads() {
+        let yaml = r#"version: 1
+project: { root: C:\r, worktrees_root: C:\w }
+profiles:
+  claude-max: { kind: claude, billing: subscription, exe: c.exe, env: { CLAUDE_CODE_GIT_BASH_PATH: b.exe }, codex: null, model: null, version: null }
+  codex-openai:
+    kind: codex
+    billing: subscription
+    exe: codex.cmd
+    codex: { model_reasoning_effort: null, overrides: {}, project_doc_max_bytes: null, provider: null, sandbox_mode: workspace-write, windows_sandbox: unelevated }
+    env: {}
+    model: null
+    version: null
+roles:
+  implementer: { profile: codex-openai, fallback: [claude-max] }
+  planner: { profile: claude-max }
+  reviewer: { profile: claude-max }
+"#;
+        let cfg = load_str(yaml).unwrap();
+        assert_eq!(
+            cfg.repo.roles["implementer"].fallback,
+            Some(vec!["claude-max".to_string()])
+        );
+    }
+
+    /// The shipped templates keep loading under the checks.
+    #[test]
+    fn templates_load() {
+        let t = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
+        let cfg = Effective::load(
+            &t.join("toryo.yaml.example"),
+            Some(&t.join("toryo.local.yaml.example")),
+        )
+        .unwrap();
+        assert!(cfg.trusted_filters.contains_key("lfs"));
+    }
+
+    /// EC-28: `%ProgramFiles(x86)%`-style names expand; unknown ones stay an error.
+    #[test]
+    fn expand_vars_takes_parenthesised_names() {
+        std::env::set_var("TORYO_TEST_DIR(x86)", "C:\\PF86");
+        assert_eq!(
+            expand_vars("%TORYO_TEST_DIR(x86)%\\Git\\bin\\git.exe").unwrap(),
+            "C:\\PF86\\Git\\bin\\git.exe"
+        );
+        let e = expand_vars("%TORYO_TEST_UNSET(x86)%\\x").unwrap_err();
+        assert!(
+            format!("{e:#}").contains("%TORYO_TEST_UNSET(x86)% is not set"),
+            "{e:#}"
+        );
+        // not a variable reference: left alone
+        assert_eq!(expand_vars("50% (approx)").unwrap(), "50% (approx)");
     }
 }

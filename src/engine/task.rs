@@ -39,10 +39,10 @@ pub fn roles(cfg: &Effective) -> Result<(String, Vec<String>, String)> {
         .context("toryo.yaml has no `roles.planner`")?;
     let imp = role("implementer").context("toryo.yaml has no `roles.implementer`")?;
     let mut chain = vec![imp.profile.clone()];
-    let fb = if imp.fallback.is_empty() {
-        vec![planner.clone()]
-    } else {
-        imp.fallback.clone()
+    // an absent `fallback` defaults to the planner's profile; `fallback: []` is none (EC-23)
+    let fb = match &imp.fallback {
+        None => vec![planner.clone()],
+        Some(list) => list.clone(),
     };
     for f in fb {
         if !chain.contains(&f) {
