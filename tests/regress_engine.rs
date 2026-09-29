@@ -5,13 +5,16 @@
 //! - EC-01 a failed read-only turn (a permission denial) never yields a review or a plan
 //! - EC-10 a reload while Paused sends the checkpoint back to Verify before the review; the
 //!   final approval refuses a verify result that is not current and withdraws the gate
-//! - EC-11 the final approval refuses a moved branch or a dirty worktree (`approval_mismatch`)
+//! - EC-11 the final approval refuses a moved branch (`approval_mismatch`); uncommitted changes
+//!   in the worktree (an IDE's `.vs/`) are a one-line note, never a refusal (F6)
 //! - EC-13 a review correction turn refused by the admission budget pauses the task once
-//! - EC-14 a crashed Planner/Reviewer turn is retried with the same prompt, then escalates with
-//!   its real class; denials and policy refusals escalate at once; only invalid output corrects
+//! - EC-14 a failed Planner/Reviewer turn runs again as plan §11 says for its class — resumed
+//!   or fresh, how often (F7) — then escalates with its real class; denials and policy
+//!   refusals escalate at once; only invalid output corrects
 //! - EC-25 plans and reviews are validated against their schemas in Rust
 //! - EC-30 the planner never resumes another profile's session
-//! - EC-31 a write by a read-only role is a policy violation, never implementer work
+//! - EC-31 a write by a read-only role is a policy violation, never implementer work — only
+//!   what changed during its turn, not what a human left in the worktree before (F5)
 //! - item 9: the verify feedback names the exit code in words
 //! - item 10: a relative verify program runs from the verify checkout
 #![cfg(feature = "m0-kit")]
@@ -258,12 +261,16 @@ fn ec14_reviewer_crashes_retry_the_same_turn_then_escalate_with_their_class() {
     );
     for (n, c) in turns.iter().enumerate() {
         assert_eq!(c["prompt"], turns[0]["prompt"], "the same prompt: {c}");
-        assert!(
-            c["resume"].is_null(),
-            "a fresh session, like the first: {c}"
-        );
         assert_eq!(c["label"], format!("review-1-{n}"));
     }
+    // F7 (plan §11): resume within the stage once, then a new attempt in a fresh session
+    // (the fake numbers its sessions: planner 1, implementer 2, the first review turn 3)
+    let resumed: Vec<&Value> = turns.iter().map(|c| &c["resume"]).collect();
+    assert_eq!(
+        resumed,
+        [&Value::Null, &json!("fake-claude-max-3"), &Value::Null],
+        "fresh, resumed, fresh"
+    );
     assert!(turns[0]["prompt"]
         .as_str()
         .unwrap()
@@ -307,7 +314,7 @@ fn ec14_a_crashed_review_turn_is_retried_not_corrected() {
     );
 }
 
-/// The Planner gets the same retry.
+/// The Planner gets the same retry: its crashed turn's session, resumed (F7, plan §11).
 #[test]
 fn ec14_a_crashed_planner_turn_is_retried_with_the_same_prompt() {
     let env = setup("codex-openai");
@@ -327,8 +334,104 @@ fn ec14_a_crashed_planner_turn_is_retried_with_the_same_prompt() {
         (turns[0]["label"].as_str(), turns[1]["label"].as_str()),
         (Some("plan-1"), Some("plan-1-1"))
     );
+    assert_eq!(
+        (&turns[0]["resume"], &turns[1]["resume"]),
+        (&Value::Null, &json!("fake-claude-max-1")),
+        "resumed within the stage"
+    );
     let p = stage(&env, "R-3", "plan");
     assert_eq!((p.len(), p[0].status), (1, AttemptStatus::Succeeded));
+}
+
+// ── F7: plan §11 per class — how often a failed review turn runs again, and how ──────
+
+/// A failing review turn of `class`.
+fn failing(class: &str) -> Value {
+    turn(vec![fail(class, &format!("{class} detail"))])
+}
+
+#[test]
+fn f7_a_failed_review_turn_runs_again_as_plan_section_11_says_for_its_class() {
+    // (task, the failing turns before an approval, whether each reviewer turn resumed the
+    // previous session, how it ends)
+    let cases = [
+        // Timeout: a new attempt once, then escalated (was: the same turn, two retries)
+        (
+            "F-1",
+            vec!["Timeout", "Timeout"],
+            vec![false, false],
+            Some("Timeout: the reviewer turn failed (Timeout detail), also after 1 retry (plan §11)"),
+        ),
+        // Unknown: like ProcessCrashed, once
+        (
+            "F-2",
+            vec!["Unknown", "Unknown"],
+            vec![false, true],
+            Some("Unknown: the reviewer turn failed (Unknown detail), also after 1 retry (plan §11)"),
+        ),
+        // ContextWindowExceeded: a new session once, then escalated (was: escalated at once)
+        (
+            "F-3",
+            vec!["ContextWindowExceeded", "ContextWindowExceeded"],
+            vec![false, false],
+            Some("ContextWindowExceeded: the reviewer turn failed (ContextWindowExceeded detail), also after 1 retry (plan §11)"),
+        ),
+        (
+            "F-4",
+            vec!["ContextWindowExceeded"],
+            vec![false, false],
+            None,
+        ),
+        // Network: like ProcessCrashed — resumed, then fresh, then escalated
+        (
+            "F-5",
+            vec!["Network", "Network", "Network"],
+            vec![false, true, false],
+            Some("Network: the reviewer turn failed (Network detail), also after 2 retries (plan §11)"),
+        ),
+        // mixed: each class its own allowance, the attempt at most two retries
+        (
+            "F-6",
+            vec!["Timeout", "ProcessCrashed", "ProcessCrashed"],
+            vec![false, false, true],
+            Some("ProcessCrashed: the reviewer turn failed (ProcessCrashed detail), also after 2 retries (plan §11)"),
+        ),
+    ];
+    for (id, fails, resumed, escalation) in cases {
+        let env = setup("codex-openai");
+        create(&env, id);
+        let mut reviewer: Vec<Value> = fails.iter().map(|c| failing(c)).collect();
+        reviewer.push(turn(vec![approved()]));
+        let s = script(&env, "f.json", to_review(reviewer));
+        let (code, err) = toryo(&env, &["run", id, "--yes", "--fake-agents", &s], &[]);
+        let turns = calls_of(&env, id, "reviewer");
+        let got: Vec<bool> = turns.iter().map(|c| c["resume"].is_string()).collect();
+        assert_eq!(got, resumed, "{id} {fails:?}: {err}");
+        // a resumed turn is asked the same again; a fresh one the review prompt
+        assert!(
+            turns.iter().all(|c| c["prompt"] == turns[0]["prompt"]),
+            "{id}: never a correction prompt"
+        );
+        let review = stage(&env, id, "review");
+        assert_eq!(review.len(), 1, "{id}: one attempt");
+        match escalation {
+            Some(why) => {
+                assert_eq!(code, 1, "{id}: {err}");
+                assert_eq!(task(&env, id).state, St::Escalated, "{id}: {err}");
+                assert_eq!(reason(&env, id), why, "{id}");
+                assert_eq!(
+                    (review[0].status, review[0].error_class.as_deref()),
+                    (AttemptStatus::Failed, why.split(':').next()),
+                    "{id}"
+                );
+            }
+            None => {
+                assert_eq!(code, 0, "{id}: {err}");
+                assert_eq!(task(&env, id).state, St::Completed, "{id}: {err}");
+                assert_eq!(review[0].status, AttemptStatus::Succeeded, "{id}");
+            }
+        }
+    }
 }
 
 // ── EC-25: structured outputs are validated against their schemas ────────────────────
@@ -691,26 +794,36 @@ fn ec11_the_final_approval_refuses_a_moved_branch() {
     assert_eq!(task(&env, "C-1").state, St::Completed);
 }
 
-/// Uncommitted changes in the worktree at the final gate are an `approval_mismatch` too.
+/// F6 (owner decision): uncommitted changes in the worktree at the final gate — an IDE folder
+/// such as Visual Studio's `.vs/` — are not part of the approved checkpoint: a one-line note,
+/// and the approval goes through (was: `approval_mismatch` → Escalated).
 #[test]
-fn ec11_the_final_approval_refuses_uncommitted_changes() {
+fn ec11_uncommitted_changes_at_the_final_approval_are_noted_not_refused() {
     let env = setup("codex-openai");
     create(&env, "C-2");
     let s = script(&env, "c2.json", to_review(vec![turn(vec![approved()])]));
     to_final_gate(&env, "C-2", &s);
+    let cp = task(&env, "C-2").machine.checkpoint().unwrap().to_string();
     let w = wt(&env, "C-2");
+    std::fs::create_dir_all(w.join(".vs/calc/v17")).unwrap();
+    std::fs::write(w.join(".vs/calc/v17/.suo"), [0u8, 1, 2, 3]).unwrap();
     std::fs::write(w.join("src/Extra.ps1"), "# not reviewed\n").unwrap();
     let (code, err) = toryo(&env, &["approve", "C-2", "--gate", "final"], &[]);
-    assert_eq!(code, 2, "refused: {err}");
-    assert_eq!(task(&env, "C-2").state, St::Escalated, "{err}");
-    let why = reason(&env, "C-2");
-    assert!(
-        why.starts_with(
-            "approval_mismatch: the worktree has uncommitted changes [\"src/Extra.ps1\"]"
-        ),
-        "{why}"
+    assert_eq!(code, 0, "approved: {err}");
+    assert_eq!(task(&env, "C-2").state, St::Completed, "{err}");
+    let note: Vec<&str> = err.lines().filter(|l| l.starts_with("note: ")).collect();
+    assert_eq!(
+        note,
+        [format!(
+            "note: the worktree has uncommitted changes (.vs/calc/v17/.suo, src/Extra.ps1) — they are not part of the approved checkpoint {} and stay uncommitted",
+            &cp[..12]
+        )],
+        "{err}"
     );
-    assert!(w.join("src/Extra.ps1").exists(), "nothing was cleaned");
+    // the branch is the approved checkpoint; the changes stay in the worktree, uncommitted
+    assert_eq!(git(&w, &["rev-parse", "refs/heads/toryo/C-2"]).trim(), cp);
+    assert!(w.join("src/Extra.ps1").exists() && w.join(".vs/calc/v17/.suo").exists());
+    assert!(!clean(&w));
 }
 
 // ── EC-30: the planner never resumes another profile's session ───────────────────────
@@ -820,6 +933,77 @@ fn ec31_a_reviewer_write_is_a_policy_violation() {
     assert!(log.trim().is_empty(), "never committed: {log}");
     // left in place for the human, uncommitted
     assert!(git(&t.worktree, &["status", "--porcelain"]).contains("src/Calculator.psm1"));
+}
+
+/// Run `id` until the reviewer's quota pauses it, then leave `review-notes.txt` in the
+/// worktree — a human's file, written while the task waits.
+fn paused_in_review_with_a_human_file(env: &Env, id: &str) -> std::path::PathBuf {
+    create(env, id);
+    let s = script(
+        env,
+        "q.json",
+        to_review(vec![turn(vec![fail(
+            "QuotaExceeded",
+            "You've hit your usage limit",
+        )])]),
+    );
+    let (code, err) = toryo(env, &["run", id, "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(env, id).state, St::Paused, "{err}");
+    let w = wt(env, id);
+    std::fs::write(w.join("review-notes.txt"), "what to look at\n").unwrap();
+    w
+}
+
+/// F5: a file that was in the worktree before the review turn is not the reviewer's write
+/// — only what changes during the turn is (was: `policy_violation` → Escalated).
+#[test]
+fn ec31_a_file_left_before_the_review_turn_is_not_the_reviewers_write() {
+    let env = setup("codex-openai");
+    let w = paused_in_review_with_a_human_file(&env, "H-3");
+    let s2 = script(
+        &env,
+        "h3.json",
+        json!({"reviewer": [turn(vec![approved()])]}),
+    );
+    let (code, err) = toryo(&env, &["resume", "H-3", "--yes", "--fake-agents", &s2], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "H-3").state, St::Completed, "{err}");
+    assert!(!err.contains("policy_violation"), "{err}");
+    let review = stage(&env, "H-3", "review");
+    assert_eq!(review.last().unwrap().status, AttemptStatus::Succeeded);
+    // the human's file is left alone: still there, never committed
+    assert_eq!(
+        std::fs::read_to_string(w.join("review-notes.txt")).unwrap(),
+        "what to look at\n"
+    );
+    let log = git(
+        &w,
+        &["log", "--format=%h", "main..HEAD", "--", "review-notes.txt"],
+    );
+    assert!(log.trim().is_empty(), "{log}");
+}
+
+/// … but the reviewer changing that file during its turn is a write like any other.
+#[test]
+fn ec31_a_reviewer_that_changes_a_file_left_before_its_turn_escalates() {
+    let env = setup("codex-openai");
+    let w = paused_in_review_with_a_human_file(&env, "H-4");
+    let s2 = script(
+        &env,
+        "h4.json",
+        json!({"reviewer": [turn(vec![write("review-notes.txt", "reviewer was here\n"), approved()])]}),
+    );
+    let (code, err) = toryo(&env, &["resume", "H-4", "--yes", "--fake-agents", &s2], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "H-4").state, St::Escalated, "{err}");
+    assert_eq!(
+        reason(&env, "H-4"),
+        "policy_violation: the worktree changed during a read-only stage: [\"review-notes.txt\"]"
+    );
+    assert!(std::fs::read_to_string(w.join("review-notes.txt"))
+        .unwrap()
+        .ends_with("reviewer was here\n"));
 }
 
 /// The Planner likewise: a file it wrote stops the task before the plan gate.

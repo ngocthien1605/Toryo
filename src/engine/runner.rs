@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::checks::{
@@ -40,7 +41,7 @@ use super::state::{GateKind, PipelineEvent as Ev, PipelineState as St};
 use super::store::{self, AttemptEnd, AttemptRow, AttemptStatus, NewAttempt, Store, TaskRow};
 use super::task::{frozen_config, sha256_hex, task_git};
 use super::verify;
-use super::worktree::{rel, Worktree, T_AGENT, T_ATTEMPT, T_NO_CHANGE, T_STAGE, T_TASK};
+use super::worktree::{rel, Worktree, T_AGENT, T_ATTEMPT, T_NO_CHANGE, T_PARTIAL, T_STAGE, T_TASK};
 use crate::agents::adapter::TurnHooks;
 use crate::agents::hub::AgentHub;
 use crate::config::{expand_vars, Billing, CommandSpec, Effective, ProfileKind};
@@ -415,18 +416,21 @@ impl<'a> Engine<'a> {
             return Ok(Flow::Next);
         };
         let stop = self.lock.watch_stop();
-        // EC-01/EC-14: a failed turn never yields a plan; a crash, a timeout, a network error or
-        // an unknown failure is retried with the same prompt (bounded), anything else escalates
+        // EC-01/EC-14: a failed turn never yields a plan; a crash, a network error, an unknown
+        // failure, a timeout or a context overflow runs again as plan §11 says for its class —
+        // resumed or fresh, bounded (F7) — anything else escalates
+        let fresh = plan_prompt(t.feedback.as_deref(), None, &art.join("TASK.md"));
+        let (mut prompt, mut resume) = (prompt, resume);
         let mut last = StageOutcome::default();
-        let mut retries = 0;
+        let mut retries = TurnRetries::default();
         let (r, output) = loop {
-            if retries > 0 && !self.admit_next_turn(&a, &last, 0)? {
+            if retries.total() > 0 && !self.admit_next_turn(&a, &last, 0)? {
                 return Ok(Flow::Next);
             }
             let ask = Ask {
                 prompt: &prompt,
                 resume: resume.clone(),
-                label: match retries {
+                label: match retries.total() {
                     0 => format!("plan-{}", a.attempt),
                     n => format!("plan-{}-{n}", a.attempt),
                 },
@@ -436,13 +440,21 @@ impl<'a> Engine<'a> {
                 Err(flow) => return Ok(flow),
             };
             match ReadOnlyTurn::of(&r) {
-                ReadOnlyTurn::Retry(class) if retries < MAX_TURN_RETRIES => {
-                    retries += 1;
-                    eprintln!("{}", retry_note("planner", class, &r, retries));
-                    last = r;
-                }
-                ReadOnlyTurn::Retry(class) | ReadOnlyTurn::Failed(class) => {
-                    return self.read_only_failed(&a, &r, "planner", class, retries, 0);
+                ReadOnlyTurn::Retry(class) => match retries.next(class) {
+                    Some(how) => {
+                        eprintln!(
+                            "{}",
+                            retry_note("planner", class, &r, how, retries.of(class))
+                        );
+                        (prompt, resume) = how.ask(&r, &prompt, resume.as_deref(), &fresh);
+                        last = r;
+                    }
+                    None => {
+                        return self.read_only_failed(&a, &r, "planner", class, retries.total(), 0)
+                    }
+                },
+                ReadOnlyTurn::Failed(class) => {
+                    return self.read_only_failed(&a, &r, "planner", class, retries.total(), 0);
                 }
                 output @ (ReadOnlyTurn::Output(_) | ReadOnlyTurn::Invalid(_)) => break (r, output),
             }
@@ -817,22 +829,12 @@ impl<'a> Engine<'a> {
     /// that way (a reset would move another branch): nothing is reset and the escalation
     /// reason is returned. Both are recorded as a `policy_violation` event.
     fn head_guard(&self, t: &TaskRow, wt: &Worktree, run: &ImplementRun) -> Result<Option<String>> {
-        let unfinished = unfinished_git_operation(wt)?;
-        let head_ref = wt.head_ref()?;
-        let head = wt.head().ok();
-        let moved = head.as_deref().is_some_and(|h| h != run.head_before);
-        let git = GitAfterTurn {
-            unfinished,
-            head_ref,
-            head,
-            descends_from_base: !moved || wt.contains(&t.base_commit)?,
-        };
-        let (payload, escalation) = match HeadGuard::of(
-            &git,
+        let (payload, escalation) = match HeadGuard::check(
+            wt,
             &t.branch,
             &t.base_commit,
             &run.head_before,
-        ) {
+        )? {
             HeadGuard::Unchanged => return Ok(None),
             HeadGuard::Reset { head } => {
                 eprintln!(
@@ -858,8 +860,9 @@ impl<'a> Engine<'a> {
     /// are kept as a recovery checkpoint (`Toryo-Partial: true`, §8: never verified or
     /// reviewed on its own), the attempt is `failed` with its error class, and a hand-over
     /// note names the partial commit. The stage then runs again from it (`retry`), else the
-    /// task escalates. The commit comes first: after a crash in between, recovery finds it
-    /// by its trailers (§10).
+    /// task escalates. Crash-consistent (F8): the decision is recorded (`FailedTurn`) before
+    /// the commit, so a recovery after a crash before or after the commit ends the attempt
+    /// the same way (§10 finds the commit by its trailers, or makes it).
     fn keep_failed_work(
         &self,
         t: &TaskRow,
@@ -869,36 +872,30 @@ impl<'a> Engine<'a> {
         retry: bool,
     ) -> Result<Flow> {
         let (a, r) = (&run.attempt, &run.result);
-        let sha = wt.commit(
-            &format!(
-                "toryo({}): {} (recovery checkpoint of failed attempt {})",
-                t.id, a.stage, a.attempt
-            ),
-            &[
-                (T_TASK, t.id.clone()),
-                (T_STAGE, a.stage.clone()),
-                (T_ATTEMPT, a.attempt.to_string()),
-                (T_AGENT, a.profile.clone().unwrap_or_default()),
-                (super::worktree::T_PARTIAL, "true".into()),
-            ],
-            false,
-        )?;
-        let kept = format!(
-            "its partial work is kept in the recovery checkpoint {} (Toryo-Partial)",
-            short(&sha)
-        );
-        let escalation = (!retry).then(|| format!("{reason}; {kept}"));
-        match &escalation {
-            Some(why) => eprintln!("!! {why}"),
-            None => eprintln!("!! {reason}; {kept} — the stage runs again from it (once, §11)"),
-        }
-        let note = failed_turn_note(a, r, &sha);
-        let end = AttemptEnd {
+        let failed = FailedTurn {
+            attempt: a.id.clone(),
             error_class: r.error_class.map(|c| format!("{c:?}")),
             error_detail: r.error_detail.clone(),
+            reason,
+            retry,
+        };
+        failed.record(self.store, &t.id)?;
+        crash_point("implement:before_partial_commit");
+        let sha = wt.commit(&FailedTurn::message(t, a), &partial_trailers(t, a), false)?;
+        crash_point("implement:after_partial_commit");
+        let escalation = failed.escalation(&sha);
+        match &escalation {
+            Some(why) => eprintln!("!! {why}"),
+            None => eprintln!(
+                "!! {}; {} — the stage runs again from it (once, §11)",
+                failed.reason,
+                FailedTurn::kept(&sha)
+            ),
+        }
+        let note = failed.note(a, &sha);
+        let end = AttemptEnd {
             external_session_id: r.session_id.clone(),
-            partial_commit: Some(sha),
-            ..Default::default()
+            ..failed.end(&sha)
         };
         let (i, aid) = (self.id.clone(), a.id.clone());
         let from = self.task()?.state;
@@ -919,9 +916,10 @@ impl<'a> Engine<'a> {
     }
 
     /// R49: the next implementer of the chain takes over (sticky), with a hand-over note that
-    /// lists the uncommitted partial changes; with none left (or `--no-fallback`), the task
-    /// pauses. The attempt keeps the turn's real error class and detail (CODE-03: a switch
-    /// after rate-limit retries is not a quota). One transaction.
+    /// names the stage's committed partial work (F9) and lists the uncommitted partial
+    /// changes; with none left (or `--no-fallback`), the task pauses. The attempt keeps the
+    /// turn's real error class and detail (CODE-03: a switch after rate-limit retries is not
+    /// a quota). One transaction.
     fn switch_implementer(
         &self,
         t: &TaskRow,
@@ -935,6 +933,7 @@ impl<'a> Engine<'a> {
             .into_iter()
             .map(|(s, p)| format!("{s} {p}"))
             .collect();
+        let committed = self.committed_partial(wt, &run.attempt)?;
         let next = implementer_at(t, t.implementer_index + 1, self.opts.no_fallback);
         eprintln!(
             "!! implementer {profile}: {reason} → {}",
@@ -942,7 +941,7 @@ impl<'a> Engine<'a> {
                 .map(|n| format!("switching to {n}"))
                 .unwrap_or_else(|| "no fallback left".into())
         );
-        let note = handover_note(profile, &reason, &changed);
+        let note = handover_note(profile, &reason, committed.as_ref(), &changed);
         let (i, aid, idx) = (
             self.id.clone(),
             run.attempt.id.clone(),
@@ -974,6 +973,36 @@ impl<'a> Engine<'a> {
             Ok(())
         })?;
         Ok(Flow::Next)
+    }
+
+    /// F9: the partial work the stage of attempt `a` has committed so far — the latest
+    /// recovery checkpoint of an earlier attempt of the stage (a failed turn's, EC-15, or a
+    /// crash recovery's, §10) that HEAD still contains, and every path the stage changed up
+    /// to it (`<status> <path>`).
+    fn committed_partial(&self, wt: &Worktree, a: &AttemptRow) -> Result<Option<CommittedPartial>> {
+        let i = self.id.clone();
+        let atts = self.store.call(move |tx| store::attempts(tx, &i))?;
+        let stage: Vec<&AttemptRow> = atts
+            .iter()
+            .filter(|x| x.stage == a.stage && x.id != a.id)
+            .collect();
+        let Some(sha) = stage.iter().rev().find_map(|x| x.partial_commit.clone()) else {
+            return Ok(None);
+        };
+        if !wt.contains(&sha)? {
+            return Ok(None);
+        }
+        // where the stage began: the first attempt's HEAD
+        let from = stage
+            .first()
+            .and_then(|x| x.git_head_before.clone())
+            .unwrap_or_else(|| format!("{sha}^"));
+        let paths = wt
+            .changed_between(&from, &sha)?
+            .into_iter()
+            .map(|(s, p)| format!("{s} {p}"))
+            .collect();
+        Ok(Some(CommittedPartial { sha, paths }))
     }
 
     // ── Checkpointing (idempotent via the trailer search, R40) ───────────────────────
@@ -1292,7 +1321,8 @@ impl<'a> Engine<'a> {
         };
         let stop = self.lock.watch_stop();
         let prompt = review_prompt(&head, &t.acceptance_ids, resume.is_some());
-        match self.review_turns(t, &a, &ctx, &stop, prompt, resume)? {
+        let fresh = review_prompt(&head, &t.acceptance_ids, false);
+        match self.review_turns(t, &a, &ctx, &stop, prompt, resume, &fresh)? {
             ReviewTurns::Valid(valid) => self.decide_review(t, &a, &head, valid),
             ReviewTurns::Rejected { last } => {
                 let reason = format!(
@@ -1326,8 +1356,11 @@ impl<'a> Engine<'a> {
     /// The review turn and up to two correction turns in the same session (R22): a review
     /// that fails its schema (EC-25) or the checks (R28) is sent back with the violations.
     /// Every turn is admitted (R41) and checked like any read-only turn. A failed turn never
-    /// yields a review (EC-01): a crash, a timeout, a network error or an unknown failure is
-    /// the same turn again (bounded); only invalid output gets a correction turn (EC-14).
+    /// yields a review (EC-01): a crash, a network error, an unknown failure, a timeout or a
+    /// context overflow runs again as plan §11 says for its class — resumed with the same
+    /// prompt, or fresh with the review prompt `fresh` (F7) — bounded; only invalid output
+    /// gets a correction turn (EC-14).
+    #[allow(clippy::too_many_arguments)]
     fn review_turns(
         &self,
         t: &TaskRow,
@@ -1336,9 +1369,11 @@ impl<'a> Engine<'a> {
         stop: &StopWatch,
         mut prompt: String,
         mut resume: Option<String>,
+        fresh: &str,
     ) -> Result<ReviewTurns> {
         let mut last = StageOutcome::default();
-        let (mut turn, mut corrections, mut retries) = (0, 0, 0);
+        let (mut turn, mut corrections) = (0, 0);
+        let mut retries = TurnRetries::default();
         loop {
             // R41: every turn is admitted, correction turns and retries too
             if turn > 0 && !self.admit_next_turn(a, &last, corrections)? {
@@ -1367,17 +1402,31 @@ impl<'a> Engine<'a> {
                     viol
                 }
                 ReadOnlyTurn::Invalid(why) => vec![why],
-                ReadOnlyTurn::Retry(class) if retries < MAX_TURN_RETRIES => {
-                    retries += 1;
-                    eprintln!("{}", retry_note("reviewer", class, &r, retries));
-                    last = r;
-                    continue; // the same turn again: the same prompt, the same session choice
-                }
-                ReadOnlyTurn::Retry(class) | ReadOnlyTurn::Failed(class) => {
+                ReadOnlyTurn::Retry(class) => match retries.next(class) {
+                    Some(how) => {
+                        eprintln!(
+                            "{}",
+                            retry_note("reviewer", class, &r, how, retries.of(class))
+                        );
+                        // not a correction: resumed with the same prompt, or fresh (§11)
+                        (prompt, resume) = how.ask(&r, &prompt, resume.as_deref(), fresh);
+                        last = r;
+                        continue;
+                    }
+                    None => {
+                        return Ok(ReviewTurns::Failed {
+                            last: r,
+                            class,
+                            retries: retries.total(),
+                            corrections,
+                        })
+                    }
+                },
+                ReadOnlyTurn::Failed(class) => {
                     return Ok(ReviewTurns::Failed {
                         last: r,
                         class,
-                        retries,
+                        retries: retries.total(),
                         corrections,
                     });
                 }
@@ -1490,6 +1539,9 @@ impl<'a> Engine<'a> {
             _ => (&t.reviewer, "review.schema.json"),
         };
         let (hooks, budget_hit) = self.hooks(&a.id, stop, profile)?;
+        // EC-31 (F5): the worktree as the turn finds it — only what changes during the turn
+        // is the read-only role's write, never what a human left there before
+        let before = TreeState::read(&Worktree::new(&self.g, &t.worktree))?;
         let r = self.hub.turn_with(
             OpenSession {
                 profile: profile.clone(),
@@ -1515,7 +1567,7 @@ impl<'a> Engine<'a> {
         if let Some(flow) = self.cut_short(a, &r, budget_hit.load(Ordering::SeqCst))? {
             return Ok(Err(flow));
         }
-        if let Some(flow) = self.after_read_only_turn(t, a, &r, role.as_str())? {
+        if let Some(flow) = self.after_read_only_turn(t, a, &r, role.as_str(), &before)? {
             return Ok(Err(flow));
         }
         Ok(Ok(r))
@@ -1608,15 +1660,17 @@ impl<'a> Engine<'a> {
     }
 
     /// After a Planner/Reviewer turn: quota → `Paused` (no Planner/Reviewer fallback in
-    /// v0.1, R49); a changed protected state → `Escalated`; a changed worktree or a moved
-    /// HEAD → `Escalated` as a policy violation (EC-31: read-only roles write nothing, and
-    /// what one wrote must never reach the next checkpoint under the implementer's name).
+    /// v0.1, R49); a changed protected state → `Escalated`; a worktree that changed during the
+    /// turn (from `before`) or a moved HEAD → `Escalated` as a policy violation (EC-31:
+    /// read-only roles write nothing, and what one wrote must never reach the next checkpoint
+    /// under the implementer's name).
     fn after_read_only_turn(
         &self,
         t: &TaskRow,
         a: &AttemptRow,
         r: &StageOutcome,
         role: &str,
+        before: &TreeState,
     ) -> Result<Option<Flow>> {
         if let Some(
             c @ (ErrorClass::QuotaExceeded | ErrorClass::RateLimited | ErrorClass::Overloaded),
@@ -1649,9 +1703,8 @@ impl<'a> Engine<'a> {
             )?;
             return Ok(Some(Flow::Next));
         }
-        let wt = Worktree::new(&self.g, &t.worktree);
-        let changed: Vec<String> = wt.changed()?.into_iter().map(|c| c.1).collect();
-        if let Some(reason) = read_only_write(a.git_head_before.as_deref(), &wt.head()?, &changed) {
+        let after = TreeState::read(&Worktree::new(&self.g, &t.worktree))?;
+        if let Some(reason) = read_only_write(before, &after) {
             eprintln!("!! {reason}");
             self.end_and(
                 a,
@@ -2140,16 +2193,50 @@ fn fallback_from(t: &TaskRow, prev: Option<&AttemptRow>, profile: &str) -> Optio
     }
 }
 
-/// R49: the hand-over note for the next implementer, with the uncommitted partial changes
-/// (`<status> <path>`).
-fn handover_note(profile: &str, reason: &str, changed: &[String]) -> String {
-    if changed.is_empty() {
-        format!("\n## Hand-over\nThe previous implementer (`{profile}`) stopped before producing any change ({reason}). Start the task from the plan.\n")
-    } else {
-        format!(
+/// The partial work a stage committed so far (F9): its latest recovery checkpoint and the
+/// paths the stage changed up to it (`<status> <path>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommittedPartial {
+    sha: String,
+    paths: Vec<String>,
+}
+
+/// R49: the hand-over note for the next implementer: the partial work the stage already
+/// committed as a recovery checkpoint, if any (F9: the worktree starts from it — never "start
+/// from the plan"), and the uncommitted partial changes (`<status> <path>`).
+fn handover_note(
+    profile: &str,
+    reason: &str,
+    committed: Option<&CommittedPartial>,
+    changed: &[String],
+) -> String {
+    let list = |xs: &[String]| {
+        xs.iter()
+            .map(|x| format!("- `{x}`"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    match (committed, changed.is_empty()) {
+        (None, true) => format!("\n## Hand-over\nThe previous implementer (`{profile}`) stopped before producing any change ({reason}). Start the task from the plan.\n"),
+        (None, false) => format!(
             "\n## Hand-over\nThe previous implementer (`{profile}`) stopped before finishing ({reason}). The worktree contains its UNCOMMITTED partial changes:\n{}\nInspect them, keep what is correct, fix or complete the rest, and finish the task.\n",
-            changed.iter().map(|x| format!("- `{x}`")).collect::<Vec<_>>().join("\n")
-        )
+            list(changed)
+        ),
+        (Some(c), _) => {
+            let mut note = format!(
+                "\n## Hand-over\nThe previous implementer (`{profile}`) stopped before finishing ({reason}). The partial work of this stage so far is committed as the recovery checkpoint {} (trailer `Toryo-Partial: true`) — the worktree starts from it:\n{}\n",
+                short(&c.sha),
+                list(&c.paths)
+            );
+            if !changed.is_empty() {
+                note.push_str(&format!(
+                    "On top of it, the worktree contains UNCOMMITTED partial changes:\n{}\n",
+                    list(changed)
+                ));
+            }
+            note.push_str("Check that work, keep what is correct, fix or complete the rest, and finish the task.\n");
+            note
+        }
     }
 }
 
@@ -2176,21 +2263,120 @@ fn failed_with_changes_before(attempts: &[AttemptRow], stage: &str) -> bool {
     })
 }
 
+/// The trailers of a recovery checkpoint of attempt `a` (§8, R31): found again by the trailer
+/// search of recovery (§10).
+pub(super) fn partial_trailers(t: &TaskRow, a: &AttemptRow) -> Vec<(&'static str, String)> {
+    vec![
+        (T_TASK, t.id.clone()),
+        (T_STAGE, a.stage.clone()),
+        (T_ATTEMPT, a.attempt.to_string()),
+        (T_AGENT, a.profile.clone().unwrap_or_default()),
+        (T_PARTIAL, "true".into()),
+    ]
+}
+
+/// The `events` kind of a [`FailedTurn`].
+pub(super) const FAILED_TURN: &str = "failed_turn_kept";
+
+/// EC-15: a failed Implementer turn whose changes are kept in a recovery checkpoint — what its
+/// attempt records and what follows. Recorded as an event before the checkpoint is committed
+/// (F8): a recovery after a crash in between ends the attempt the same way — `failed` with
+/// the class, the hand-over note, the escalation — so that `failed_with_changes_before` counts
+/// it and a denial or a second failure still escalates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct FailedTurn {
+    /// The attempt id.
+    pub attempt: String,
+    pub error_class: Option<String>,
+    pub error_detail: Option<String>,
+    /// Why: `implementer failed: …`.
+    pub reason: String,
+    /// The stage runs again from the recovery checkpoint (§11: once); else the task escalates.
+    pub retry: bool,
+}
+
+impl FailedTurn {
+    /// Record the decision (one event, before the commit).
+    fn record(&self, store: &Store, task: &str) -> Result<()> {
+        let payload = serde_json::to_value(self)?;
+        let (i, aid) = (task.to_string(), self.attempt.clone());
+        store.call(move |tx| store::event(tx, Some(&i), Some(&aid), FAILED_TURN, &payload))
+    }
+
+    /// The decision recorded for attempt `attempt` of `task`, if its turn failed and left
+    /// changes (the latest, should there be more than one).
+    pub(super) fn recorded(store: &Store, task: &str, attempt: &str) -> Result<Option<Self>> {
+        let (i, aid) = (task.to_string(), attempt.to_string());
+        let events = store.call(move |tx| store::events(tx, &i))?;
+        Ok(events
+            .into_iter()
+            .rev()
+            .filter(|e| e.1 == FAILED_TURN)
+            .filter_map(|e| serde_json::from_value::<Self>(e.2).ok())
+            .find(|f| f.attempt == aid))
+    }
+
+    /// The commit message of the recovery checkpoint of the failed attempt `a`.
+    pub(super) fn message(t: &TaskRow, a: &AttemptRow) -> String {
+        format!(
+            "toryo({}): {} (recovery checkpoint of failed attempt {})",
+            t.id, a.stage, a.attempt
+        )
+    }
+
+    /// Where the work is kept, for the escalation reason and the log.
+    pub(super) fn kept(sha: &str) -> String {
+        format!(
+            "its partial work is kept in the recovery checkpoint {} (Toryo-Partial)",
+            short(sha)
+        )
+    }
+
+    /// The escalation reason when the stage does not run again.
+    pub(super) fn escalation(&self, sha: &str) -> Option<String> {
+        (!self.retry).then(|| format!("{}; {}", self.reason, Self::kept(sha)))
+    }
+
+    /// The hand-over note for the next attempt.
+    pub(super) fn note(&self, a: &AttemptRow, sha: &str) -> String {
+        failed_turn_note(
+            a,
+            self.error_class.as_deref(),
+            self.error_detail.as_deref(),
+            sha,
+        )
+    }
+
+    /// How the attempt ends: `failed` with the turn's class and detail, and its recovery
+    /// checkpoint.
+    pub(super) fn end(&self, sha: &str) -> AttemptEnd {
+        AttemptEnd {
+            error_class: self.error_class.clone(),
+            error_detail: self.error_detail.clone(),
+            partial_commit: Some(sha.to_string()),
+            ..Default::default()
+        }
+    }
+}
+
 /// EC-15: the hand-over note after a failed turn whose changes became the recovery
 /// checkpoint `partial` (the §10 recovery note, for a turn that failed): the class and the
 /// first line of the detail.
-fn failed_turn_note(a: &AttemptRow, r: &StageOutcome, partial: &str) -> String {
-    let detail: String = r
-        .error_detail
-        .as_deref()
+fn failed_turn_note(
+    a: &AttemptRow,
+    class: Option<&str>,
+    detail: Option<&str>,
+    partial: &str,
+) -> String {
+    let detail: String = detail
         .and_then(|d| d.lines().next())
         .unwrap_or("")
         .chars()
         .take(300)
         .collect();
-    let why = match (r.error_class, detail.trim()) {
-        (Some(c), "") => format!("{c:?}"),
-        (Some(c), d) => format!("{c:?}: {d}"),
+    let why = match (class, detail.trim()) {
+        (Some(c), "") => c.to_string(),
+        (Some(c), d) => format!("{c}: {d}"),
         (None, "") => "no error class".to_string(),
         (None, d) => d.to_string(),
     };
@@ -2249,9 +2435,25 @@ struct GitAfterTurn {
     descends_from_base: bool,
 }
 
+impl GitAfterTurn {
+    /// Read the task worktree, against `head_before`, where the turn began.
+    fn read(wt: &Worktree, base: &str, head_before: &str) -> Result<Self> {
+        let unfinished = unfinished_git_operation(wt)?;
+        let head_ref = wt.head_ref()?;
+        let head = wt.head().ok();
+        let moved = head.as_deref().is_some_and(|h| h != head_before);
+        Ok(Self {
+            unfinished,
+            head_ref,
+            head,
+            descends_from_base: !moved || wt.contains(base)?,
+        })
+    }
+}
+
 /// What the HEAD guard does about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum HeadGuard {
+pub(super) enum HeadGuard {
     /// HEAD is where the turn began, on the task branch.
     Unchanged,
     /// The agent committed on the task branch: soft reset to where the turn began.
@@ -2261,6 +2463,19 @@ enum HeadGuard {
 }
 
 impl HeadGuard {
+    /// The guard on the task worktree `wt` of the task branch `branch` (base `base`) for a
+    /// turn that began at `head_before` — after an Implementer turn, and in recovery before
+    /// anything is reset or committed (F4).
+    pub(super) fn check(
+        wt: &Worktree,
+        branch: &str,
+        base: &str,
+        head_before: &str,
+    ) -> Result<Self> {
+        let git = GitAfterTurn::read(wt, base, head_before)?;
+        Ok(Self::of(&git, branch, base, head_before))
+    }
+
     /// §8, in this order: an unfinished operation (R25); HEAD on another branch or detached
     /// (R12: a reset would move that branch, not the task's); a HEAD that does not resolve;
     /// history rewritten below the base (R25); then a moved HEAD is reset.
@@ -2372,9 +2587,88 @@ fn review_problems(review: &Value, acceptance_ids: &[String]) -> Vec<String> {
 
 // ── read-only turns (Planner, Reviewer): pure ────────────────────────────────────────
 
-/// Retries of a failed Planner/Reviewer turn (crash, timeout, network, unknown) before the
-/// task escalates with the turn's class (EC-14, plan §11).
+/// Retries of the turns of one Planner/Reviewer attempt, whatever their classes, before the
+/// task escalates with the last turn's class (EC-14): the largest allowance of a class in
+/// plan §11 ([`class_retries`]), so mixed failures stay bounded too.
 const MAX_TURN_RETRIES: u32 = 2;
+
+/// Plan §11: the retries a failed Planner/Reviewer turn of `class` gets — a crash or a
+/// network error two (resume, then a fresh start), an unknown failure, a timeout or a context
+/// overflow one; anything else none.
+fn class_retries(class: ErrorClass) -> u32 {
+    match class {
+        ErrorClass::ProcessCrashed | ErrorClass::Network => 2,
+        ErrorClass::Unknown | ErrorClass::Timeout | ErrorClass::ContextWindowExceeded => 1,
+        _ => 0,
+    }
+}
+
+/// How a failed Planner/Reviewer turn runs again (plan §11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rerun {
+    /// "Resume within the stage": the failed turn's session, resumed, asked the same again.
+    Resume,
+    /// "A new attempt" / "a new session for the same stage": a fresh session, asked the
+    /// stage's first prompt.
+    Fresh,
+}
+
+impl Rerun {
+    /// The prompt and the session of the turn that runs again after the failed turn `r`,
+    /// which was asked `prompt` in `resume`; `fresh` is the stage's first prompt for a fresh
+    /// session. A turn that never reported a session resumes the one it was asked in.
+    fn ask(
+        self,
+        r: &StageOutcome,
+        prompt: &str,
+        resume: Option<&str>,
+        fresh: &str,
+    ) -> (String, Option<String>) {
+        match self {
+            Self::Resume => (
+                prompt.to_string(),
+                r.session_id.clone().or(resume.map(str::to_string)),
+            ),
+            Self::Fresh => (fresh.to_string(), None),
+        }
+    }
+}
+
+/// Plan §11 for a failed Planner/Reviewer turn of `class`, after `earlier` retries of the
+/// same class and `total` retries of the attempt: a crash or a network error resumes the
+/// stage's session once, then starts it fresh once; an unknown failure is treated like a
+/// crash, once; a timeout and a context overflow start fresh once. `None`: escalate.
+fn rerun(class: ErrorClass, earlier: u32, total: u32) -> Option<Rerun> {
+    if earlier >= class_retries(class) || total >= MAX_TURN_RETRIES {
+        return None;
+    }
+    Some(match class {
+        ErrorClass::ProcessCrashed | ErrorClass::Network if earlier == 0 => Rerun::Resume,
+        ErrorClass::Unknown => Rerun::Resume,
+        _ => Rerun::Fresh,
+    })
+}
+
+/// The retries of one Planner/Reviewer attempt so far: the class of each.
+#[derive(Debug, Clone, Default)]
+struct TurnRetries(Vec<ErrorClass>);
+
+impl TurnRetries {
+    fn total(&self) -> u32 {
+        self.0.len() as u32
+    }
+
+    fn of(&self, class: ErrorClass) -> u32 {
+        self.0.iter().filter(|c| **c == class).count() as u32
+    }
+
+    /// A failed turn of `class`: how it runs again (and count it), or `None` (escalate).
+    fn next(&mut self, class: ErrorClass) -> Option<Rerun> {
+        let how = rerun(class, self.of(class), self.total())?;
+        self.0.push(class);
+        Some(how)
+    }
+}
 
 /// One turn of a read-only role: what is asked, in which session, under which capture label.
 struct Ask<'p> {
@@ -2393,10 +2687,11 @@ enum ReadOnlyTurn {
     /// The turn failed because its output could not be used (no final message, not JSON, too
     /// long: class `InvalidOutput`): invalid output, like a review that fails its checks (R22).
     Invalid(String),
-    /// A crash, a timeout, a network error or an unknown failure: the same turn again.
+    /// A crash, a network error, an unknown failure, a timeout or a context overflow: the turn
+    /// runs again as §11 says for the class ([`rerun`]), else the task escalates.
     Retry(ErrorClass),
-    /// Anything else — a permission denial, a policy refusal, auth, a bad request, a context
-    /// overflow: no blind retry (§11), the task escalates with the class.
+    /// Anything else — a permission denial, a policy refusal, auth, a bad request: no blind
+    /// retry (§11), the task escalates with the class.
     Failed(ErrorClass),
 }
 
@@ -2417,7 +2712,8 @@ impl ReadOnlyTurn {
                 c @ (ErrorClass::ProcessCrashed
                 | ErrorClass::Timeout
                 | ErrorClass::Network
-                | ErrorClass::Unknown),
+                | ErrorClass::Unknown
+                | ErrorClass::ContextWindowExceeded),
             ) => Self::Retry(c),
             None => Self::Retry(ErrorClass::Unknown),
             Some(c) => Self::Failed(c),
@@ -2425,11 +2721,17 @@ impl ReadOnlyTurn {
     }
 }
 
-/// The line printed before a failed read-only turn is run again.
-fn retry_note(role: &str, class: ErrorClass, r: &StageOutcome, retry: u32) -> String {
+/// The line printed before a failed read-only turn runs again: how, and which retry of its
+/// class it is (`n` of [`class_retries`]).
+fn retry_note(role: &str, class: ErrorClass, r: &StageOutcome, how: Rerun, n: u32) -> String {
+    let again = match how {
+        Rerun::Resume => "the same turn again, resuming its session",
+        Rerun::Fresh => "the stage again in a fresh session",
+    };
     format!(
-        "!! {role} turn failed: {class:?} ({}) — the same turn again ({retry}/{MAX_TURN_RETRIES}, EC-14)",
-        r.error_detail.as_deref().unwrap_or("no detail")
+        "!! {role} turn failed: {class:?} ({}) — {again} ({n}/{}, plan §11)",
+        r.error_detail.as_deref().unwrap_or("no detail"),
+        class_retries(class)
     )
 }
 
@@ -2437,29 +2739,112 @@ fn retry_note(role: &str, class: ErrorClass, r: &StageOutcome, retry: u32) -> St
 /// first, as in `InvalidOutput: …` (EC-14).
 fn read_only_failure(role: &str, class: ErrorClass, detail: Option<&str>, retries: u32) -> String {
     let detail = detail.filter(|d| !d.is_empty()).unwrap_or("no detail");
-    if retries == 0 {
-        format!("{class:?}: the {role} turn failed ({detail}); a failed turn is never used and not retried blindly (plan §6.2, §11)")
-    } else {
-        format!("{class:?}: the {role} turn failed ({detail}), also after {retries} retries of the same turn (plan §11)")
+    match retries {
+        0 => format!("{class:?}: the {role} turn failed ({detail}); a failed turn is never used and not retried blindly (plan §6.2, §11)"),
+        1 => format!("{class:?}: the {role} turn failed ({detail}), also after 1 retry (plan §11)"),
+        n => format!("{class:?}: the {role} turn failed ({detail}), also after {n} retries (plan §11)"),
     }
 }
 
-/// EC-31: a read-only role changed the worktree (tracked or untracked, not ignored) or moved
-/// HEAD from where its attempt began — a policy violation (the wording of recovery's check).
-fn read_only_write(head_before: Option<&str>, head: &str, changed: &[String]) -> Option<String> {
+/// The task worktree around a read-only turn (EC-31, F5): HEAD, and every changed path —
+/// tracked or untracked, not ignored — with its status and a hash of its content.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TreeState {
+    /// `None`: HEAD does not resolve.
+    head: Option<String>,
+    /// path → (`git status` code, content hash).
+    entries: BTreeMap<String, (String, String)>,
+}
+
+impl TreeState {
+    fn read(wt: &Worktree) -> Result<Self> {
+        let entries = wt
+            .changed()?
+            .into_iter()
+            .map(|(status, path)| {
+                let hash = content_hash(&wt.path.join(&path));
+                (path, (status, hash))
+            })
+            .collect();
+        Ok(Self {
+            head: wt.head().ok(),
+            entries,
+        })
+    }
+
+    /// The paths that differ from `before`: new, removed, or with another status or content.
+    fn changed_since(&self, before: &TreeState) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(p, e)| before.entries.get(*p) != Some(*e))
+            .map(|(p, _)| p.clone())
+            .collect();
+        paths.extend(
+            before
+                .entries
+                .keys()
+                .filter(|p| !self.entries.contains_key(*p))
+                .cloned(),
+        );
+        paths.sort();
+        paths
+    }
+}
+
+/// A changed path's content, as a comparable string: the SHA-256 of a file's bytes, a link's
+/// target (never followed), or what the path is when it has no bytes to hash (gone, a
+/// directory such as a nested repository, a FIFO or device — never opened, it could block).
+fn content_hash(p: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let md = match std::fs::symlink_metadata(p) {
+        Ok(md) => md,
+        Err(_) => return "absent".into(),
+    };
+    if md.file_type().is_symlink() {
+        let to = std::fs::read_link(p)
+            .map(|t| t.display().to_string())
+            .unwrap_or_default();
+        return format!("link {to}");
+    }
+    if md.is_dir() {
+        return "directory".into();
+    }
+    if !md.is_file() {
+        return "special".into();
+    }
+    let hash = std::fs::File::open(p).and_then(|mut f| {
+        let (mut h, mut buf) = (Sha256::new(), vec![0u8; 1 << 16]);
+        loop {
+            match f.read(&mut buf)? {
+                0 => return Ok(hex::encode(h.finalize())),
+                n => h.update(&buf[..n]),
+            }
+        }
+    });
+    hash.unwrap_or_else(|e| format!("unreadable ({})", e.kind()))
+}
+
+/// EC-31: a read-only role changed the worktree during its turn (tracked or untracked, not
+/// ignored: a path new, gone or different since `before`) or moved HEAD — a policy violation
+/// (the wording of recovery's check). What was already there before the turn is not its
+/// write (F5).
+fn read_only_write(before: &TreeState, after: &TreeState) -> Option<String> {
+    let changed = after.changed_since(before);
     if !changed.is_empty() {
         return Some(format!(
             "policy_violation: the worktree changed during a read-only stage: {changed:?}"
         ));
     }
-    match head_before {
-        Some(before) if before != head => Some(format!(
+    (before.head != after.head).then(|| {
+        let at = |h: &Option<String>| h.as_deref().map(short).unwrap_or("?").to_string();
+        format!(
             "policy_violation: HEAD moved during a read-only stage ({} → {})",
-            short(before),
-            short(head)
-        )),
-        _ => None,
-    }
+            at(&before.head),
+            at(&after.head)
+        )
+    })
 }
 
 /// The plan of a Planner turn that was not retried or escalated: its structured output when
@@ -2742,10 +3127,12 @@ fn claude_implementer_prompt(base: &str) -> String {
 // ── gate decisions (used by `toryo approve` / `reject` and `--yes`) ──────────────────
 
 /// Approve the open gate after re-checking its subject (R32): the plan on disk must still
-/// hash to the approved digest; the final gate's checkpoint must still be the task branch,
-/// with a clean worktree (§11 `approval_mismatch` → `Escalated`, EC-11), and still have a
-/// current passing verify result (else the gate is withdrawn and the checkpoint verified
-/// again, EC-10). A refused approval is an error: nothing was approved.
+/// hash to the approved digest; the final gate's checkpoint must still be the task branch
+/// (§11 `approval_mismatch` → `Escalated`, EC-11) and still have a current passing verify
+/// result (else the gate is withdrawn and the checkpoint verified again, EC-10). Uncommitted
+/// changes in the worktree (an IDE's `.vs/`, `.idea/`) are not part of the checkpoint: a
+/// one-line note, not a refusal (owner decision, F6). A refused approval is an error:
+/// nothing was approved.
 pub fn approve_now(store: &Store, t: &TaskRow, kind: GateKind, expect: Option<&str>) -> Result<()> {
     let gate = t
         .machine
@@ -2772,7 +3159,8 @@ pub fn approve_now(store: &Store, t: &TaskRow, kind: GateKind, expect: Option<&s
             }
         }
         GateKind::Final => {
-            if let Some(reason) = approval_mismatch(t, &gate.subject)? {
+            let g = task_git(&frozen_config(t)?, &t.repo)?;
+            if let Some(reason) = approval_mismatch(&g, t, &gate.subject)? {
                 withdraw_final(
                     store,
                     t,
@@ -2790,6 +3178,9 @@ pub fn approve_now(store: &Store, t: &TaskRow, kind: GateKind, expect: Option<&s
                     short(&gate.subject),
                     t.id
                 );
+            }
+            if let Some(note) = uncommitted_note(&worktree_changes(&g, t), &gate.subject) {
+                eprintln!("{note}");
             }
             Ev::FinalApproved {
                 occurrence: gate.occurrence,
@@ -2857,11 +3248,9 @@ pub fn reject_now(store: &Store, t: &TaskRow, kind: GateKind, reason: &str) -> R
 }
 
 /// §11 `approval_mismatch` (R32, EC-11) of the final gate: the task branch must still point
-/// at the approved checkpoint and the worktree must be clean — what the human merges is what
-/// was verified and reviewed. Returns the escalation reason.
-fn approval_mismatch(t: &TaskRow, checkpoint: &str) -> Result<Option<String>> {
-    let cfg = frozen_config(t)?;
-    let g = task_git(&cfg, &t.repo)?;
+/// at the approved checkpoint — what the human merges is what was verified and reviewed.
+/// Returns the escalation reason.
+fn approval_mismatch(g: &GitCmd, t: &TaskRow, checkpoint: &str) -> Result<Option<String>> {
     let branch = g.output(
         &crate::git::Loc::Discover(t.repo.clone()),
         true,
@@ -2873,33 +3262,48 @@ fn approval_mismatch(t: &TaskRow, checkpoint: &str) -> Result<Option<String>> {
         ],
     )?;
     let at = String::from_utf8_lossy(&branch.stdout).trim().to_string();
-    let changed: Vec<String> = if at == checkpoint {
-        Worktree::new(&g, &t.worktree)
-            .changed()?
-            .into_iter()
-            .map(|c| c.1)
-            .collect()
-    } else {
-        Vec::new()
-    };
-    Ok(mismatch_reason(&t.branch, &at, checkpoint, &changed))
+    Ok(mismatch_reason(&t.branch, &at, checkpoint))
 }
 
 /// The pure half of [`approval_mismatch`]: the branch is at `at` (empty: gone), the approved
-/// checkpoint is `checkpoint`, the worktree has `changed` paths.
-fn mismatch_reason(branch: &str, at: &str, checkpoint: &str, changed: &[String]) -> Option<String> {
-    if at != checkpoint {
+/// checkpoint is `checkpoint`.
+fn mismatch_reason(branch: &str, at: &str, checkpoint: &str) -> Option<String> {
+    (at != checkpoint).then(|| {
         let now = if at.is_empty() {
             "gone".to_string()
         } else {
             format!("at {}", short(at))
         };
-        return Some(format!("approval_mismatch: the branch {branch} is {now}, not at the approved checkpoint {} — nothing was approved (R32)", short(checkpoint)));
+        format!("approval_mismatch: the branch {branch} is {now}, not at the approved checkpoint {} — nothing was approved (R32)", short(checkpoint))
+    })
+}
+
+/// The uncommitted paths in the task worktree at the final approval (best effort: a
+/// worktree that cannot be read has none to note).
+fn worktree_changes(g: &GitCmd, t: &TaskRow) -> Vec<String> {
+    Worktree::new(g, &t.worktree)
+        .changed()
+        .map(|c| c.into_iter().map(|(_, p)| p).collect())
+        .unwrap_or_default()
+}
+
+/// F6 (EC-11, owner decision): uncommitted changes at the final approval — an IDE folder
+/// such as `.vs/` or `.idea/` in the worktree — are no `approval_mismatch`: they are not part
+/// of the approved checkpoint, which is what the branch holds. One line, naming the first
+/// few paths.
+fn uncommitted_note(changed: &[String], checkpoint: &str) -> Option<String> {
+    if changed.is_empty() {
+        return None;
     }
-    if !changed.is_empty() {
-        return Some(format!("approval_mismatch: the worktree has uncommitted changes {changed:?} on top of the approved checkpoint {} — nothing was approved (R32)", short(checkpoint)));
+    const SHOWN: usize = 3;
+    let mut paths = changed[..changed.len().min(SHOWN)].join(", ");
+    if changed.len() > SHOWN {
+        paths.push_str(&format!(", … ({} in all)", changed.len()));
     }
-    None
+    Some(format!(
+        "note: the worktree has uncommitted changes ({paths}) — they are not part of the approved checkpoint {} and stay uncommitted",
+        short(checkpoint)
+    ))
 }
 
 /// Withdraw the open final gate with `e` (`Escalate`, `Reverify`): the approval is refused.
@@ -3345,16 +3749,43 @@ mod tests {
     #[test]
     fn the_hand_over_note_lists_the_partial_changes() {
         assert_eq!(
-            handover_note("codex-openai", "quota exhausted: x", &[]),
+            handover_note("codex-openai", "quota exhausted: x", None, &[]),
             "\n## Hand-over\nThe previous implementer (`codex-openai`) stopped before producing any change (quota exhausted: x). Start the task from the plan.\n"
         );
         assert_eq!(
             handover_note(
                 "codex-openai",
                 "RateLimited after 2 retries",
+                None,
                 &strings(&["?? src/a.ps1", " M src/b.ps1"])
             ),
             "\n## Hand-over\nThe previous implementer (`codex-openai`) stopped before finishing (RateLimited after 2 retries). The worktree contains its UNCOMMITTED partial changes:\n- `?? src/a.ps1`\n- ` M src/b.ps1`\nInspect them, keep what is correct, fix or complete the rest, and finish the task.\n"
+        );
+    }
+
+    /// F9: partial work the stage already committed (a failed turn's or a crash recovery's
+    /// recovery checkpoint) is named — the next implementer never starts over from the plan.
+    #[test]
+    fn the_hand_over_note_names_the_committed_partial_work() {
+        let committed = CommittedPartial {
+            sha: HEAD.into(),
+            paths: strings(&["M src/Calculator.psm1", "A src/Partial.ps1"]),
+        };
+        let head = "\n## Hand-over\nThe previous implementer (`codex-openai`) stopped before finishing (quota exhausted: x). The partial work of this stage so far is committed as the recovery checkpoint 0123456789ab (trailer `Toryo-Partial: true`) — the worktree starts from it:\n- `M src/Calculator.psm1`\n- `A src/Partial.ps1`\n";
+        let tail = "Check that work, keep what is correct, fix or complete the rest, and finish the task.\n";
+        // was: "stopped before producing any change … Start the task from the plan."
+        assert_eq!(
+            handover_note("codex-openai", "quota exhausted: x", Some(&committed), &[]),
+            format!("{head}{tail}")
+        );
+        assert_eq!(
+            handover_note(
+                "codex-openai",
+                "quota exhausted: x",
+                Some(&committed),
+                &strings(&["?? notes.md"])
+            ),
+            format!("{head}On top of it, the worktree contains UNCOMMITTED partial changes:\n- `?? notes.md`\n{tail}")
         );
     }
 

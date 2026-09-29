@@ -64,6 +64,35 @@ impl<'a> Worktree<'a> {
         Ok(self.changed()?.is_empty())
     }
 
+    /// The paths that differ between the commits `from` and `to`: `(status, path)`, the
+    /// status a `diff --name-status` letter (`A`, `M`, `D`, `T`). Rename detection is off, as
+    /// in [`Worktree::changed`].
+    pub fn changed_between(&self, from: &str, to: &str) -> Result<Vec<(String, String)>> {
+        let out = self.g.run(
+            &self.loc,
+            true,
+            &[
+                "diff",
+                "--name-status",
+                "-z",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                from,
+                to,
+            ],
+        )?;
+        let mut fields = out
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).to_string());
+        let mut v = Vec::new();
+        while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
+            v.push((status, path));
+        }
+        Ok(v)
+    }
+
     /// Put protected paths back (tracked → HEAD, new untracked → removed; a link or
     /// junction is removed as a link, never followed). A staged path is unstaged first: the
     /// HEAD guard's soft reset leaves an agent's committed files staged, and a staged new

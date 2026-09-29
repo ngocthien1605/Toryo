@@ -14,6 +14,9 @@
 //!   forbids only a new switch
 //! - EC-17 `toryo stop` during a rate-limit backoff is answered within the R38 bound
 //! - CODE-03 a switch records the turn's real error class and detail
+//! - F9 the hand-over after a switch names the partial work the stage already committed
+//!
+//! Crash consistency of the EC-15 decision (F8) is in `regress_recovery.rs`.
 #![cfg(feature = "m0-kit")]
 
 mod common;
@@ -639,6 +642,73 @@ fn ec15_a_denied_turn_with_changes_escalates_at_once_and_keeps_the_work() {
     let w = wt(&env, "P-8");
     assert_eq!(head_of(&w, "HEAD"), partial);
     assert!(git(&w, &["show", "HEAD:src/Calculator.psm1"]).contains("Divide-Numbers"));
+}
+
+// ── F9: the hand-over after a switch names the committed partial work ─────────────────
+
+/// A failed turn's work is kept in a recovery checkpoint and the stage runs again (EC-15);
+/// the retry runs out of quota: the fallback implementer is told that the stage's work is
+/// committed and the worktree starts from it (was: "stopped before producing any change …
+/// Start the task from the plan", on top of the partial commit).
+#[test]
+fn f9_the_hand_over_after_a_kept_failed_turn_names_the_committed_work() {
+    let env = setup("codex-openai");
+    create(&env, "H-9");
+    let s = script(
+        &env,
+        "h9.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write("src/Calculator.psm1", DIVIDE), fail("Unknown", "the agent died half way")]),
+                turn(vec![fail("QuotaExceeded", "You've hit your usage limit")]),
+            ],
+            "implementer@claude-max": [turn(vec![implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(&env, &["run", "H-9", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "H-9").state, St::Completed, "{err}");
+    let partial = attempt(&env, "H-9/implement/1")
+        .partial_commit
+        .expect("a recovery checkpoint");
+    let p = implementer_prompts(&env, "H-9");
+    assert_eq!(p.len(), 3, "{p:?}");
+    assert!(
+        p[1].contains("## Recovery") && p[1].contains(&partial[..12]),
+        "{}",
+        p[1]
+    );
+    let handover = &p[2];
+    assert!(
+        !handover.contains("stopped before producing any change")
+            && !handover.contains("Start the task from the plan"),
+        "{handover}"
+    );
+    assert!(
+        handover.contains(&format!(
+            "The partial work of this stage so far is committed as the recovery checkpoint {} (trailer `Toryo-Partial: true`) — the worktree starts from it:\n- `M src/Calculator.psm1`\n",
+            &partial[..12]
+        )),
+        "{handover}"
+    );
+    // the fallback started from the partial commit and changed nothing more (R40)
+    let a3 = attempt(&env, "H-9/implement/3");
+    assert_eq!(
+        (
+            a3.profile.as_deref(),
+            a3.git_head_before.as_deref(),
+            a3.checkpoint_kind.as_deref()
+        ),
+        (
+            Some("claude-max"),
+            Some(partial.as_str()),
+            Some("no_change")
+        )
+    );
+    let sw = events(&env, "H-9", "implementer_switch");
+    assert_eq!(sw.len(), 1, "{sw:?}");
 }
 
 // ── EC-16 (was probe_engine_flows::probe_no_fallback_after_a_sticky_switch_pauses) ─────

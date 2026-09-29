@@ -1,6 +1,7 @@
 //! The Implementer path's decisions without the engine (no store, no agents): the HEAD guard
-//! on every exit path (EC-18), a failed turn that left changes (EC-15), `--no-fallback`
-//! after a sticky switch (EC-16) and the interruptible rate-limit backoff (EC-17).
+//! on every exit path (EC-18), a failed turn that left changes (EC-15) and the decision
+//! recovery reads back after a crash (F8), `--no-fallback` after a sticky switch (EC-16) and
+//! the interruptible rate-limit backoff (EC-17).
 
 use super::*;
 use crate::engine::state::Machine;
@@ -381,33 +382,91 @@ fn the_failed_turn_note_names_the_error_and_the_recovery_checkpoint() {
     let long = "x".repeat(400);
     let cases = [
         (
-            outcome(false, Some(C::Unknown), Some("the agent died half way")),
+            Some("Unknown"),
+            Some("the agent died half way"),
             note("Unknown: the agent died half way"),
         ),
-        (outcome(false, Some(C::Timeout), None), note("Timeout")),
-        (
-            outcome(false, Some(C::Timeout), Some("  ")),
-            note("Timeout"),
-        ),
+        (Some("Timeout"), None, note("Timeout")),
+        (Some("Timeout"), Some("  "), note("Timeout")),
         // only the first line of the detail, at most 300 characters
         (
-            outcome(
-                false,
-                Some(C::Network),
-                Some("stream closed\n{\"json\": 1}"),
-            ),
+            Some("Network"),
+            Some("stream closed\n{\"json\": 1}"),
             note("Network: stream closed"),
         ),
         (
-            outcome(false, Some(C::Unknown), Some(&long)),
+            Some("Unknown"),
+            Some(long.as_str()),
             note(&format!("Unknown: {}", "x".repeat(300))),
         ),
-        (outcome(false, None, Some("exit 3")), note("exit 3")),
-        (outcome(false, None, None), note("no error class")),
+        (None, Some("exit 3"), note("exit 3")),
+        (None, None, note("no error class")),
     ];
-    for (r, want) in cases {
-        assert_eq!(failed_turn_note(&a, &r, sha), want, "{r:?}");
+    for (class, detail, want) in cases {
+        assert_eq!(
+            failed_turn_note(&a, class, detail, sha),
+            want,
+            "{class:?} {detail:?}"
+        );
     }
+}
+
+// ── F8: the failed turn's decision survives a crash before the attempt ends ─────────────
+
+#[test]
+fn a_failed_turn_records_what_recovery_needs_to_end_its_attempt_the_same_way() {
+    let a = attempt("implement", 2, AttemptStatus::Running, None);
+    let sha = "5555555555555555555555555555555555555555";
+    let failed = |retry: bool| FailedTurn {
+        attempt: a.id.clone(),
+        error_class: Some("Timeout".into()),
+        error_detail: Some("second".into()),
+        reason: "implementer failed: Some(Timeout) second".into(),
+        retry,
+    };
+    // the event payload round-trips (recovery reads it back)
+    let f = failed(false);
+    let payload = serde_json::to_value(&f).unwrap();
+    assert_eq!(
+        payload,
+        json!({"attempt": "T-1/implement/2", "error_class": "Timeout", "error_detail": "second", "reason": "implementer failed: Some(Timeout) second", "retry": false})
+    );
+    assert_eq!(serde_json::from_value::<FailedTurn>(payload).unwrap(), f);
+    // what the attempt records, whoever ends it: `failed`, the class, the partial commit
+    let end = f.end(sha);
+    assert_eq!(
+        (
+            end.error_class.as_deref(),
+            end.error_detail.as_deref(),
+            end.partial_commit.as_deref(),
+            end.head_after,
+        ),
+        (Some("Timeout"), Some("second"), Some(sha), None)
+    );
+    // the stage runs again, or the task escalates with the kept work named
+    assert_eq!(failed(true).escalation(sha), None);
+    assert_eq!(
+        f.escalation(sha).as_deref(),
+        Some("implementer failed: Some(Timeout) second; its partial work is kept in the recovery checkpoint 555555555555 (Toryo-Partial)")
+    );
+    assert!(f.note(&a, sha).contains(
+        "(T-1/implement/2 by `codex-openai`) failed before it finished (Timeout: second)"
+    ));
+    let t = task(&["codex-openai"], 0);
+    assert_eq!(
+        FailedTurn::message(&t, &a),
+        "toryo(T-1): implement (recovery checkpoint of failed attempt 2)"
+    );
+    assert_eq!(
+        partial_trailers(&t, &a),
+        vec![
+            (T_TASK, "T-1".to_string()),
+            (T_STAGE, "implement".to_string()),
+            (T_ATTEMPT, "2".to_string()),
+            (T_AGENT, "codex-openai".to_string()),
+            (T_PARTIAL, "true".to_string()),
+        ]
+    );
 }
 
 // ── EC-16: --no-fallback after a sticky switch ─────────────────────────────────────────

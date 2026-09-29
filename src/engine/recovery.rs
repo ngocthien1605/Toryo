@@ -6,6 +6,8 @@
 //! protected files or Git metadata escalates before anything else. Step 4 (R34, M6):
 //! artifact reconciliation — staging leftovers removed, orphans moved to `orphans/`, every
 //! registered version re-hashed (`artifact_missing` / `artifact_tampered` → Escalated).
+//! Step 5, writing stage: the Implementer turn's HEAD guard (§8) before any reset, snapshot
+//! or recovery checkpoint (F4); a failed turn whose work was being kept ends as decided (F8).
 
 use crate::git::short;
 use std::path::PathBuf;
@@ -15,11 +17,11 @@ use serde_json::json;
 
 use super::checks::Protected;
 use super::protect;
-use super::runner::writing_stage;
+use super::runner::{partial_trailers, writing_stage, FailedTurn, HeadGuard};
 use super::snapshot;
 use super::state::{PipelineEvent as Ev, PipelineState as St};
 use super::store::{self, AttemptEnd, AttemptRow, AttemptStatus, Store, TaskRow};
-use super::worktree::{Worktree, T_AGENT, T_ATTEMPT, T_PARTIAL, T_STAGE, T_TASK};
+use super::worktree::Worktree;
 use crate::config::{Billing, Effective};
 use crate::git::GitCmd;
 
@@ -263,7 +265,12 @@ impl<'a> Recovery<'a> {
         Ok(notes)
     }
 
-    /// §10 step 5, writing stage.
+    /// §10 step 5, writing stage. The HEAD guard of the Implementer turn (§8; R12, R25) comes
+    /// first (F4): a Git state a soft reset cannot repair — another branch, a detached or
+    /// unresolvable HEAD, an unfinished operation, history rewritten below the base —
+    /// escalates before anything is reset, snapshotted or committed (a reset would move
+    /// another branch, a recovery checkpoint would land on it). A turn that failed and left
+    /// changes ends `failed`, as its owner had decided before it died (F8, EC-15).
     fn recover_writing(
         &self,
         t: &TaskRow,
@@ -271,8 +278,22 @@ impl<'a> Recovery<'a> {
         wt: &Worktree,
         notes: &mut Vec<String>,
     ) -> Result<()> {
+        // without the attempt's HEAD, nothing counts as moved (the violations still count)
+        let before = match &a.git_head_before {
+            Some(h) => h.clone(),
+            None => wt.head().unwrap_or_default(),
+        };
+        let guard = HeadGuard::check(wt, &t.branch, &t.base_commit, &before)?;
+        if let HeadGuard::Violation { kind, reason } = &guard {
+            return self.git_violation(a, kind, reason, notes);
+        }
+        let failed = FailedTurn::recorded(self.store, &t.id, &a.id)?;
         // i. trailer search: the crash may have come after the commit, before the DB update
         if let Some(c) = wt.find_checkpoint(&t.base_commit, &t.id, &a.stage, a.attempt)? {
+            if let (true, Some(f)) = (c.partial, &failed) {
+                // the failed turn's work was committed, the attempt not yet ended (F8)
+                return self.failed_turn(a, f, &c.sha, None, notes);
+            }
             if c.partial {
                 self.finish(
                     a,
@@ -311,16 +332,14 @@ impl<'a> Recovery<'a> {
             }
             return Ok(());
         }
-        // HEAD guard: an agent commit is undone (its changes stay in the tree)
-        if let Some(before) = &a.git_head_before {
-            if wt.head()? != *before && wt.contains(before)? {
-                wt.soft_reset(before)?;
-                notes.push(format!(
-                    "{}: the agent had moved HEAD — soft reset to {}",
-                    a.id,
-                    short(before)
-                ));
-            }
+        // HEAD guard: an agent commit on the task branch is undone (its changes stay in the tree)
+        if let HeadGuard::Reset { .. } = guard {
+            wt.soft_reset(&before)?;
+            notes.push(format!(
+                "{}: the agent had moved HEAD — soft reset to {}",
+                a.id,
+                short(&before)
+            ));
         }
         // ii. clean tree
         if wt.is_clean()? {
@@ -376,7 +395,11 @@ impl<'a> Recovery<'a> {
             ));
             return Ok(());
         }
-        let sha = self.partial_commit(t, a, wt)?;
+        let sha = self.partial_commit(t, a, wt, failed.is_some())?;
+        if let Some(f) = &failed {
+            // the owner died between recording the failed turn and committing its work
+            return self.failed_turn(a, f, &sha, Some(snap_id), notes);
+        }
         self.finish(
             a,
             AttemptStatus::Interrupted,
@@ -393,6 +416,75 @@ impl<'a> Recovery<'a> {
             a.id,
             short(&sha)
         ));
+        Ok(())
+    }
+
+    /// F4: the HEAD guard found a Git state recovery cannot repair. The attempt ends
+    /// `interrupted` with `policy_violation` and the task escalates with the guard's reason —
+    /// nothing was reset, snapshotted or committed, so the human finds the worktree as the
+    /// agent left it.
+    fn git_violation(
+        &self,
+        a: &AttemptRow,
+        kind: &str,
+        reason: &str,
+        notes: &mut Vec<String>,
+    ) -> Result<()> {
+        let (tid, aid) = (a.task_id.clone(), a.id.clone());
+        let payload =
+            json!({"kind": kind, "action": "escalate", "reason": reason, "during": "recovery"});
+        self.store.call(move |tx| {
+            store::event(tx, Some(&tid), Some(&aid), "policy_violation", &payload)
+        })?;
+        self.finish(
+            a,
+            AttemptStatus::Interrupted,
+            AttemptEnd {
+                error_class: Some("policy_violation".into()),
+                error_detail: Some(reason.to_string()),
+                ..Default::default()
+            },
+            Some(Ev::Escalate {
+                reason: reason.to_string(),
+            }),
+            None,
+        )?;
+        notes.push(format!("{}: {reason} — escalated", a.id));
+        Ok(())
+    }
+
+    /// F8 (EC-15): the attempt's turn had failed and left changes, now in the recovery
+    /// checkpoint `sha`: the attempt ends as its owner had decided before it died — `failed`
+    /// with the turn's class, the hand-over note, and the escalation unless the stage runs
+    /// again.
+    fn failed_turn(
+        &self,
+        a: &AttemptRow,
+        f: &FailedTurn,
+        sha: &str,
+        snapshot: Option<String>,
+        notes: &mut Vec<String>,
+    ) -> Result<()> {
+        let escalation = f.escalation(sha);
+        self.finish(
+            a,
+            AttemptStatus::Failed,
+            AttemptEnd {
+                partial_snapshot_id: snapshot,
+                ..f.end(sha)
+            },
+            escalation.clone().map(|reason| Ev::Escalate { reason }),
+            Some(f.note(a, sha)),
+        )?;
+        notes.push(match escalation {
+            Some(why) => format!("{}: {why} — failed, escalated (EC-15)", a.id),
+            None => format!(
+                "{}: {}; {} — failed, the stage runs again from it (EC-15)",
+                a.id,
+                f.reason,
+                FailedTurn::kept(sha)
+            ),
+        });
         Ok(())
     }
 
@@ -433,21 +525,24 @@ impl<'a> Recovery<'a> {
         Ok((id, dir))
     }
 
-    fn partial_commit(&self, t: &TaskRow, a: &AttemptRow, wt: &Worktree) -> Result<String> {
-        wt.commit(
-            &format!(
+    /// A recovery checkpoint of attempt `a` (§8, R31); of a `failed` turn (EC-15), it reads
+    /// like the one its owner would have committed.
+    fn partial_commit(
+        &self,
+        t: &TaskRow,
+        a: &AttemptRow,
+        wt: &Worktree,
+        failed: bool,
+    ) -> Result<String> {
+        let message = if failed {
+            FailedTurn::message(t, a)
+        } else {
+            format!(
                 "toryo({}): {} (recovery checkpoint of attempt {})",
                 t.id, a.stage, a.attempt
-            ),
-            &[
-                (T_TASK, t.id.clone()),
-                (T_STAGE, a.stage.clone()),
-                (T_ATTEMPT, a.attempt.to_string()),
-                (T_AGENT, a.profile.clone().unwrap_or_default()),
-                (T_PARTIAL, "true".into()),
-            ],
-            false,
-        )
+            )
+        };
+        wt.commit(&message, &partial_trailers(t, a), false)
     }
 
     fn escalated_writing_attempt(&self, t: &TaskRow) -> Result<AttemptRow> {
@@ -558,7 +653,7 @@ impl<'a> Recovery<'a> {
         let sha = if wt.is_clean()? {
             None
         } else {
-            Some(self.partial_commit(&t, &a, &wt)?)
+            Some(self.partial_commit(&t, &a, &wt, false)?)
         };
         let note = recovery_note(&a, sha.as_deref());
         let (i, aid, s2) = (id.to_string(), a.id.clone(), sha.clone());
