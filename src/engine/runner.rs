@@ -504,16 +504,10 @@ impl<'a> Engine<'a> {
 
     fn implement(&mut self, t: &TaskRow) -> Result<Flow> {
         let wt = Worktree::new(&self.g, &t.worktree);
+        // `--no-fallback` never takes the current implementer away (EC-16): no implementer
+        // here means the chain was used up
         let Some(profile) = implementer_at(t, t.implementer_index, self.opts.no_fallback) else {
-            let reason = implementer_quota_reason(&format!(
-                "{}{}",
-                t.implementers.join(" → "),
-                if self.opts.no_fallback {
-                    ", --no-fallback"
-                } else {
-                    ""
-                }
-            ));
+            let reason = implementer_quota_reason(&t.implementers.join(" → "));
             self.apply(Ev::Pause { reason })?;
             return Ok(Flow::Next);
         };
@@ -524,18 +518,22 @@ impl<'a> Engine<'a> {
         let Some(run) = self.run_implement_turn(t, &turn, &wt)? else {
             return Ok(Flow::Next); // the task pack failed its hash check: escalated (R34)
         };
-        let outcome = self.interpret_implement(t, &run, &wt)?;
+        let outcome = self.interpret_implement(t, &turn, &run, &wt)?;
         self.retries = outcome.retries_after(self.retries);
         self.decide_implement(t, &turn, &run, &wt, outcome)
     }
 
-    /// The turn's stage, prompt, model, resume and fallback (R48, R49), before admission.
+    /// The turn's stage, prompt, model, resume and fallback (R48, R49), and whether the stage
+    /// already ran again after a failed turn (EC-15), before admission.
     fn prepare_implement(&self, t: &TaskRow, profile: String) -> Result<ImplementTurn> {
         let stage = writing_stage(t.fix_cycle);
         let kind = self.cfg.profile(&profile)?.kind;
-        let prev = {
+        let (prev, failed_before) = {
             let (i, s) = (self.id.clone(), stage.clone());
-            self.store.call(move |tx| store::last_attempt(tx, &i, &s))?
+            self.store.call(move |tx| {
+                let failed = failed_with_changes_before(&store::attempts(tx, &i)?, &s);
+                Ok((store::last_attempt(tx, &i, &s)?, failed))
+            })?
         };
         let prompt = implementer_prompt(t.fix_cycle, t.feedback.as_deref(), t.handoff.as_deref());
         let resume = implementer_resume(prev.as_ref(), kind, &profile);
@@ -559,6 +557,7 @@ impl<'a> Engine<'a> {
             model,
             resume,
             fallback_from,
+            failed_before,
         })
     }
 
@@ -627,21 +626,27 @@ impl<'a> Engine<'a> {
             attempt: a,
             result: r,
             head_before,
-            _stop: stop,
+            stop,
         }))
     }
 
-    /// What the finished turn leads to, in this order: the live budget interrupt or a stop;
-    /// then the implementation report is stored; quota and rate limits (retry, then switch);
-    /// then the HEAD guard, protected state (R35) and the path policy (§8). The HEAD guard
-    /// and the protected-state check do not run when an earlier outcome returns (EC-18).
+    /// What the finished turn leads to, in this order: the HEAD guard, whatever the turn's
+    /// end (EC-18: an agent commit is undone before a stop, a budget interrupt, a retry or a
+    /// switch hands the tree on); the live budget interrupt or a stop; then the
+    /// implementation report is stored; quota and rate limits (retry, then switch); then
+    /// protected state (R35) and the path policy (§8), which also decides what a failed turn
+    /// leads to (EC-15).
     fn interpret_implement(
         &self,
         t: &TaskRow,
+        turn: &ImplementTurn,
         run: &ImplementRun,
         wt: &Worktree,
     ) -> Result<ImplementOutcome> {
         let r = &run.result;
+        if let Some(reason) = self.head_guard(t, wt, run)? {
+            return Ok(ImplementOutcome::GitViolation { reason });
+        }
         if let Some(o) = ImplementOutcome::interrupted(r, run.budget_hit) {
             return Ok(o);
         }
@@ -659,7 +664,6 @@ impl<'a> Engine<'a> {
         if let Some(o) = ImplementOutcome::quota(r, self.retries, retry_base_secs()) {
             return Ok(o);
         }
-        self.head_guard(wt, &run.head_before, &run.attempt)?;
         // R35: untracked/ignored protected files or Git metadata → Escalated, nothing else runs
         if let Some(reason) = self.protected_violation(t, true)? {
             return Ok(ImplementOutcome::ProtectedChanged { reason });
@@ -668,6 +672,7 @@ impl<'a> Engine<'a> {
             r,
             &wt.changed()?,
             &self.protect,
+            turn.failed_before,
         ))
     }
 
@@ -693,12 +698,31 @@ impl<'a> Engine<'a> {
                     wait.as_secs()
                 );
                 self.end(a, AttemptStatus::Failed, r, AttemptEnd::default())?;
-                // a stop request waits for the backoff to end (EC-17)
-                std::thread::sleep(wait);
+                // a stop request cuts the backoff short (EC-17, R38); the run loop then
+                // stops at this stage boundary, before the retry starts
+                if backoff(&run.stop.flag, wait) {
+                    eprintln!("■ stop requested during the backoff: the retry does not start");
+                }
                 Ok(Flow::Next)
             }
             ImplementOutcome::Switch { reason } => {
                 self.switch_implementer(t, &turn.profile, run, wt, reason)
+            }
+            ImplementOutcome::GitViolation { reason } => {
+                eprintln!("!! {reason}");
+                self.end_and(
+                    a,
+                    AttemptStatus::Failed,
+                    r,
+                    AttemptEnd {
+                        error_class: Some("policy_violation".into()),
+                        error_detail: Some(reason.clone()),
+                        ..Default::default()
+                    },
+                    Some(Ev::Escalate { reason }),
+                    None,
+                )?;
+                Ok(Flow::Next)
             }
             ImplementOutcome::ProtectedChanged { reason } => {
                 eprintln!("!! {reason}");
@@ -745,6 +769,10 @@ impl<'a> Engine<'a> {
                 )?;
                 Ok(Flow::Next)
             }
+            ImplementOutcome::FailedWithChanges { reason, retry } => {
+                r.print_summary();
+                self.keep_failed_work(t, run, wt, reason, retry)
+            }
             ImplementOutcome::Done => {
                 let i = self.id.clone();
                 self.end_and(
@@ -762,32 +790,119 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// HEAD guard (§8): agents must not commit. A moved HEAD is soft-reset to where the turn
-    /// began and recorded as a policy violation. Compares the SHA only (EC-18).
-    fn head_guard(&self, wt: &Worktree, head_before: &str, a: &AttemptRow) -> Result<()> {
-        if wt.head()? != head_before {
-            eprintln!(
-                "!! policy_violation: the agent moved HEAD — soft reset to {}",
-                short(head_before)
-            );
-            wt.soft_reset(head_before)?;
-            let (i, aid) = (self.id.clone(), a.id.clone());
-            self.store.call(move |tx| {
-                store::event(
-                    tx,
-                    Some(&i),
-                    Some(&aid),
-                    "policy_violation",
-                    &json!({"kind": "agent commit", "action": "soft reset"}),
-                )
-            })?;
+    /// HEAD guard (§8; R12, R25) after every Implementer turn, whatever its end (EC-18):
+    /// agents must not commit. An agent commit on the task branch is soft-reset to where the
+    /// turn began — its changes stay, uncommitted, so the path policy and the deny check
+    /// before the checkpoint see them. An unfinished Git operation, another branch, a
+    /// detached or unresolvable HEAD, or history rewritten below the base cannot be repaired
+    /// that way (a reset would move another branch): nothing is reset and the escalation
+    /// reason is returned. Both are recorded as a `policy_violation` event.
+    fn head_guard(&self, t: &TaskRow, wt: &Worktree, run: &ImplementRun) -> Result<Option<String>> {
+        let unfinished = unfinished_git_operation(wt)?;
+        let head_ref = wt.head_ref()?;
+        let head = wt.head().ok();
+        let moved = head.as_deref().is_some_and(|h| h != run.head_before);
+        let git = GitAfterTurn {
+            unfinished,
+            head_ref,
+            head,
+            descends_from_base: !moved || wt.contains(&t.base_commit)?,
+        };
+        let (payload, escalation) = match HeadGuard::of(
+            &git,
+            &t.branch,
+            &t.base_commit,
+            &run.head_before,
+        ) {
+            HeadGuard::Unchanged => return Ok(None),
+            HeadGuard::Reset { head } => {
+                eprintln!(
+                    "!! policy_violation: the agent moved HEAD — soft reset to {}",
+                    short(&run.head_before)
+                );
+                wt.soft_reset(&run.head_before)?;
+                let payload = json!({"kind": "agent commit", "action": "soft reset", "head": head, "reset_to": run.head_before});
+                (payload, None)
+            }
+            HeadGuard::Violation { kind, reason } => (
+                json!({"kind": kind, "action": "escalate", "reason": reason}),
+                Some(reason),
+            ),
+        };
+        let (i, aid) = (self.id.clone(), run.attempt.id.clone());
+        self.store
+            .call(move |tx| store::event(tx, Some(&i), Some(&aid), "policy_violation", &payload))?;
+        Ok(escalation)
+    }
+
+    /// EC-15 (R31, §11): the changes of a failed turn never become a normal checkpoint. They
+    /// are kept as a recovery checkpoint (`Toryo-Partial: true`, §8: never verified or
+    /// reviewed on its own), the attempt is `failed` with its error class, and a hand-over
+    /// note names the partial commit. The stage then runs again from it (`retry`), else the
+    /// task escalates. The commit comes first: after a crash in between, recovery finds it
+    /// by its trailers (§10).
+    fn keep_failed_work(
+        &self,
+        t: &TaskRow,
+        run: &ImplementRun,
+        wt: &Worktree,
+        reason: String,
+        retry: bool,
+    ) -> Result<Flow> {
+        let (a, r) = (&run.attempt, &run.result);
+        let sha = wt.commit(
+            &format!(
+                "toryo({}): {} (recovery checkpoint of failed attempt {})",
+                t.id, a.stage, a.attempt
+            ),
+            &[
+                (T_TASK, t.id.clone()),
+                (T_STAGE, a.stage.clone()),
+                (T_ATTEMPT, a.attempt.to_string()),
+                (T_AGENT, a.profile.clone().unwrap_or_default()),
+                (super::worktree::T_PARTIAL, "true".into()),
+            ],
+            false,
+        )?;
+        let kept = format!(
+            "its partial work is kept in the recovery checkpoint {} (Toryo-Partial)",
+            short(&sha)
+        );
+        let escalation = (!retry).then(|| format!("{reason}; {kept}"));
+        match &escalation {
+            Some(why) => eprintln!("!! {why}"),
+            None => eprintln!("!! {reason}; {kept} — the stage runs again from it (once, §11)"),
         }
-        Ok(())
+        let note = failed_turn_note(a, r, &sha);
+        let end = AttemptEnd {
+            error_class: r.error_class.map(|c| format!("{c:?}")),
+            error_detail: r.error_detail.clone(),
+            external_session_id: r.session_id.clone(),
+            partial_commit: Some(sha),
+            ..Default::default()
+        };
+        let (i, aid) = (self.id.clone(), a.id.clone());
+        let from = self.task()?.state;
+        let to = self.store.call(move |tx| {
+            store::finish_attempt(tx, &aid, AttemptStatus::Failed, &end)?;
+            store::set_handoff(tx, &i, Some(&note))?;
+            match escalation {
+                Some(reason) => Ok(Some(
+                    store::transition(tx, &i, Ev::Escalate { reason })?.state(),
+                )),
+                None => Ok(None),
+            }
+        })?;
+        if let Some(to) = to {
+            eprintln!("   [state] {from:?} --escalate--> {to:?}");
+        }
+        Ok(Flow::Next)
     }
 
     /// R49: the next implementer of the chain takes over (sticky), with a hand-over note that
-    /// lists the uncommitted partial changes; with none left, the task pauses. One
-    /// transaction.
+    /// lists the uncommitted partial changes; with none left (or `--no-fallback`), the task
+    /// pauses. The attempt keeps the turn's real error class and detail (CODE-03: a switch
+    /// after rate-limit retries is not a quota). One transaction.
     fn switch_implementer(
         &self,
         t: &TaskRow,
@@ -809,26 +924,22 @@ impl<'a> Engine<'a> {
                 .unwrap_or_else(|| "no fallback left".into())
         );
         let note = handover_note(profile, &reason, &changed);
-        let (i, aid, idx, session) = (
+        let (i, aid, idx) = (
             self.id.clone(),
             run.attempt.id.clone(),
             t.implementer_index + 1,
-            run.result.session_id.clone(),
         );
+        let end = AttemptEnd {
+            error_class: run.result.error_class.map(|c| format!("{c:?}")),
+            error_detail: run.result.error_detail.clone(),
+            external_session_id: run.result.session_id.clone(),
+            ..Default::default()
+        };
         let pause = next.is_none();
         let payload =
             json!({"from": profile, "to": next, "reason": reason, "partial_changes": changed});
         self.store.call(move |tx| {
-            store::finish_attempt(
-                tx,
-                &aid,
-                AttemptStatus::Failed,
-                &AttemptEnd {
-                    error_class: Some("QuotaExceeded".into()),
-                    external_session_id: session,
-                    ..Default::default()
-                },
-            )?;
+            store::finish_attempt(tx, &aid, AttemptStatus::Failed, &end)?;
             store::set_implementer_index(tx, &i, idx)?;
             store::set_handoff(tx, &i, Some(&note))?;
             store::event(tx, Some(&i), Some(&aid), "implementer_switch", &payload)?;
@@ -1673,6 +1784,9 @@ struct ImplementTurn {
     resume: Option<String>,
     /// R49: the implementer this attempt replaces.
     fallback_from: Option<String>,
+    /// An earlier attempt of the stage failed and left changes (EC-15): the stage already
+    /// ran again once, so another such failure escalates (§11).
+    failed_before: bool,
 }
 
 /// A finished Implementer turn and its attempt.
@@ -1683,8 +1797,9 @@ struct ImplementRun {
     head_before: String,
     /// The R41 live interrupt fired during the turn.
     budget_hit: bool,
-    /// The stage's stop poller (R38), kept until the stage ends.
-    _stop: StopWatch,
+    /// The stage's stop poller (R38), kept until the stage ends: a rate-limit backoff
+    /// waits on it (EC-17).
+    stop: StopWatch,
 }
 
 /// What an Implementer turn leads to.
@@ -1698,12 +1813,19 @@ enum ImplementOutcome {
     Retry { retry: u32, wait: Duration },
     /// Out of quota, or still rate limited after the retries: the next implementer (R49).
     Switch { reason: String },
+    /// The HEAD guard found a Git state a soft reset cannot repair (§8; R12, R25):
+    /// escalate, nothing reset (EC-18).
+    GitViolation { reason: String },
     /// Untracked/ignored protected files or Git metadata changed (R35): escalate.
     ProtectedChanged { reason: String },
     /// Protected or denied paths changed (§8): restore them, back to the implementer.
     PathPolicy { paths: Vec<String> },
     /// The turn failed and changed nothing: escalate.
     Failed { reason: String },
+    /// The turn failed but left changes that pass the path policy (EC-15): they become a
+    /// recovery checkpoint (R31), then the stage runs again from it (`retry`) or the task
+    /// escalates.
+    FailedWithChanges { reason: String, retry: bool },
     /// On to the checkpoint.
     Done,
 }
@@ -1749,9 +1871,16 @@ impl ImplementOutcome {
     }
 
     /// After the HEAD guard and the protected-state check: changed protected or denied
-    /// paths → the path policy; a failed turn that changed nothing → escalate; else on to
-    /// the checkpoint — a failed turn that left changes too (EC-15).
-    fn after_checks(r: &StageOutcome, changed: &[(String, String)], protect: &Protected) -> Self {
+    /// paths → the path policy; a failed turn that changed nothing → escalate; a failed turn
+    /// that left changes → a recovery checkpoint of them (EC-15), then the stage runs again
+    /// from it — once (`failed_before`: it already did), and never for a class §11 does not
+    /// retry; else on to the checkpoint.
+    fn after_checks(
+        r: &StageOutcome,
+        changed: &[(String, String)],
+        protect: &Protected,
+        failed_before: bool,
+    ) -> Self {
         let paths: Vec<String> = changed
             .iter()
             .map(|c| c.1.clone())
@@ -1760,16 +1889,22 @@ impl ImplementOutcome {
         if !paths.is_empty() {
             return Self::PathPolicy { paths };
         }
-        if !r.success && changed.is_empty() {
-            return Self::Failed {
-                reason: format!(
-                    "implementer failed: {:?} {}",
-                    r.error_class,
-                    r.error_detail.clone().unwrap_or_default()
-                ),
-            };
+        if r.success {
+            return Self::Done;
         }
-        Self::Done
+        let reason = format!(
+            "implementer failed: {:?} {}",
+            r.error_class,
+            r.error_detail.clone().unwrap_or_default()
+        );
+        if changed.is_empty() {
+            Self::Failed { reason }
+        } else {
+            Self::FailedWithChanges {
+                reason,
+                retry: !failed_before && retried_after_failure(r.error_class),
+            }
+        }
     }
 
     /// Consecutive rate-limit retries after this outcome: a retry counts, a turn cut short
@@ -1783,10 +1918,15 @@ impl ImplementOutcome {
     }
 }
 
-/// The implementer at `index` of the task's chain (R49); with `--no-fallback`, only the
-/// first one — even after a sticky switch (EC-16).
+/// The implementer at `index` of the task's chain (R49). `--no-fallback` forbids a new
+/// switch, not the current implementer: it leaves nothing after `t.implementer_index`, which
+/// may already be a fallback after a sticky switch (EC-16).
 fn implementer_at(t: &TaskRow, index: usize, no_fallback: bool) -> Option<String> {
-    let limit = if no_fallback { 1 } else { t.implementers.len() };
+    let limit = if no_fallback {
+        t.implementer_index + 1
+    } else {
+        t.implementers.len()
+    };
     t.implementers.get(index).filter(|_| index < limit).cloned()
 }
 
@@ -1845,6 +1985,177 @@ fn handover_note(profile: &str, reason: &str, changed: &[String]) -> String {
             "\n## Hand-over\nThe previous implementer (`{profile}`) stopped before finishing ({reason}). The worktree contains its UNCOMMITTED partial changes:\n{}\nInspect them, keep what is correct, fix or complete the rest, and finish the task.\n",
             changed.iter().map(|x| format!("- `{x}`")).collect::<Vec<_>>().join("\n")
         )
+    }
+}
+
+/// EC-15, §11: a failed Implementer turn that left changes runs its stage again from them
+/// — except for a permission denial ("no blind retry"), an auth failure, a bad request or a
+/// policy refusal ("no retry").
+fn retried_after_failure(class: Option<ErrorClass>) -> bool {
+    !matches!(
+        class,
+        Some(
+            ErrorClass::PermissionDenied
+                | ErrorClass::Auth
+                | ErrorClass::BadRequest
+                | ErrorClass::PolicyRefusal
+        )
+    )
+}
+
+/// EC-15, §11: has an attempt of `stage` already failed and left changes (kept in a
+/// recovery checkpoint)? Then the stage already ran again once.
+fn failed_with_changes_before(attempts: &[AttemptRow], stage: &str) -> bool {
+    attempts.iter().any(|a| {
+        a.stage == stage && a.status == AttemptStatus::Failed && a.partial_commit.is_some()
+    })
+}
+
+/// EC-15: the hand-over note after a failed turn whose changes became the recovery
+/// checkpoint `partial` (the §10 recovery note, for a turn that failed): the class and the
+/// first line of the detail.
+fn failed_turn_note(a: &AttemptRow, r: &StageOutcome, partial: &str) -> String {
+    let detail: String = r
+        .error_detail
+        .as_deref()
+        .and_then(|d| d.lines().next())
+        .unwrap_or("")
+        .chars()
+        .take(300)
+        .collect();
+    let why = match (r.error_class, detail.trim()) {
+        (Some(c), "") => format!("{c:?}"),
+        (Some(c), d) => format!("{c:?}: {d}"),
+        (None, "") => "no error class".to_string(),
+        (None, d) => d.to_string(),
+    };
+    format!(
+        "\n## Recovery\nThe previous attempt ({} by `{}`) failed before it finished ({why}). Its uncommitted work was saved as the recovery checkpoint {} (trailer `Toryo-Partial: true`) — the worktree starts from it. Check that work, keep what is correct, fix or complete the rest, and finish the task.\n",
+        a.id,
+        a.profile.as_deref().unwrap_or("?"),
+        short(partial)
+    )
+}
+
+/// The rate-limit backoff (R49): sleeps `wait` unless `stop` — the stage's stop flag, set by
+/// its watcher within a second of `toryo stop` (R38) — is set first. Returns whether it was
+/// (EC-17).
+fn backoff(stop: &AtomicBool, wait: Duration) -> bool {
+    // a wait beyond what `Instant` can represent lasts until the stop
+    let end = std::time::Instant::now().checked_add(wait);
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return true;
+        }
+        let left = end.map_or(Duration::MAX, |e| {
+            e.saturating_duration_since(std::time::Instant::now())
+        });
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(50)));
+    }
+}
+
+/// R25: an unfinished Git operation in the task worktree — a marker of
+/// `Worktree::unfinished_operation`, the `sequencer` of a multi-commit cherry-pick or revert,
+/// or unmerged paths (a conflicting `git stash pop` leaves no marker).
+fn unfinished_git_operation(wt: &Worktree) -> Result<Option<String>> {
+    if let Some(op) = wt.unfinished_operation()? {
+        return Ok(Some(op));
+    }
+    if wt.git_dir()?.join("sequencer").exists() {
+        return Ok(Some("sequencer".into()));
+    }
+    let unmerged = wt.unmerged_paths()?;
+    Ok((!unmerged.is_empty()).then(|| format!("unmerged paths {unmerged:?}")))
+}
+
+/// What the HEAD guard reads after an Implementer turn (§8; R12, R25).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitAfterTurn {
+    /// An unfinished merge, rebase, cherry-pick, revert or bisect, or unmerged paths.
+    unfinished: Option<String>,
+    /// What HEAD points at (`refs/heads/…`); `None` when it is detached.
+    head_ref: Option<String>,
+    /// The commit HEAD resolves to; `None` when it does not resolve.
+    head: Option<String>,
+    /// The task's base commit is an ancestor of HEAD (only read when HEAD moved).
+    descends_from_base: bool,
+}
+
+/// What the HEAD guard does about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HeadGuard {
+    /// HEAD is where the turn began, on the task branch.
+    Unchanged,
+    /// The agent committed on the task branch: soft reset to where the turn began.
+    Reset { head: String },
+    /// Not repairable by a soft reset: the stage fails, the task escalates (`reason`).
+    Violation { kind: &'static str, reason: String },
+}
+
+impl HeadGuard {
+    /// §8, in this order: an unfinished operation (R25); HEAD on another branch or detached
+    /// (R12: a reset would move that branch, not the task's); a HEAD that does not resolve;
+    /// history rewritten below the base (R25); then a moved HEAD is reset.
+    fn of(g: &GitAfterTurn, branch: &str, base: &str, head_before: &str) -> Self {
+        let violation = |kind, what: String, fix: &str| {
+            Self::Violation {
+            kind,
+            reason: format!(
+                "policy_violation: after the Implementer turn {what}; nothing was reset or committed{fix}"
+            ),
+        }
+        };
+        let checkout = format!(" — check out {branch} again first");
+        if let Some(op) = &g.unfinished {
+            return violation(
+                "unfinished git operation",
+                format!("an unfinished Git operation ({op}) is in the task worktree (R25)"),
+                " — finish or abort it first",
+            );
+        }
+        match &g.head_ref {
+            Some(r) if *r == format!("refs/heads/{branch}") => {}
+            Some(r) => {
+                return violation(
+                    "branch changed",
+                    format!("HEAD is on {r}, not on the task branch {branch} (R12)"),
+                    &checkout,
+                )
+            }
+            None => {
+                let at = g.head.as_deref().map(short).unwrap_or("?");
+                return violation(
+                    "detached HEAD",
+                    format!("HEAD is detached at {at}, not on the task branch {branch} (R12)"),
+                    &checkout,
+                );
+            }
+        }
+        let Some(head) = &g.head else {
+            return violation(
+                "unresolved HEAD",
+                format!("the task branch {branch} does not resolve to a commit"),
+                "",
+            );
+        };
+        if head == head_before {
+            return Self::Unchanged;
+        }
+        if !g.descends_from_base {
+            return violation(
+                "history rewritten",
+                format!(
+                    "HEAD {} no longer descends from the task base {} (history rewritten, R25)",
+                    short(head),
+                    short(base)
+                ),
+                "",
+            );
+        }
+        Self::Reset { head: head.clone() }
     }
 }
 
@@ -2293,6 +2604,9 @@ pub fn write_summary(store: &Store, t: &TaskRow) -> Result<PathBuf> {
 }
 
 #[cfg(test)]
+#[path = "runner_implement_tests.rs"]
+mod implement_tests;
+#[cfg(test)]
 mod tests {
     //! The stage decisions without the engine: no store, no git, no agents. The tests that
     //! pin a reviewed defect (EC-xx) say so; fixing the defect means inverting them.
@@ -2464,23 +2778,28 @@ mod tests {
     // ── implement: prepare ──────────────────────────────────────────────────────────
 
     #[test]
-    fn implementer_at_follows_the_chain_and_no_fallback_keeps_the_first() {
-        let t = task_in(&[]);
+    fn implementer_at_follows_the_chain_and_no_fallback_keeps_the_current() {
+        let mut t = task_in(&[]);
+        // (current implementer_index, asked index, --no-fallback, implementer)
         let cases = [
-            (0, false, Some("codex-openai")),
-            (1, false, Some("claude-max")),
-            (2, false, None),
-            (0, true, Some("codex-openai")),
-            // EC-16 (not fixed): after a sticky switch (index 1), --no-fallback leaves no
-            // implementer at all
-            (1, true, None),
-            (2, true, None),
+            (0, 0, false, Some("codex-openai")),
+            (0, 1, false, Some("claude-max")),
+            (0, 2, false, None),
+            (0, 0, true, Some("codex-openai")),
+            // --no-fallback forbids the switch to the next implementer …
+            (0, 1, true, None),
+            (0, 2, true, None),
+            // … but not the current one after a sticky switch (EC-16, was None)
+            (1, 1, true, Some("claude-max")),
+            (1, 2, true, None),
+            (1, 1, false, Some("claude-max")),
         ];
-        for (index, no_fallback, want) in cases {
+        for (current, index, no_fallback, want) in cases {
+            t.implementer_index = current;
             assert_eq!(
                 implementer_at(&t, index, no_fallback).as_deref(),
                 want,
-                "index {index}, no_fallback {no_fallback}"
+                "current {current}, index {index}, no_fallback {no_fallback}"
             );
         }
         let mut one = task_in(&[]);
@@ -2759,8 +3078,16 @@ mod tests {
                     reason: "implementer failed: None ".into(),
                 },
             ),
-            // EC-15 (not fixed): a failed turn that left changes goes on to the checkpoint
-            (&failed, changed(&["src/a.ps1"]), O::Done),
+            // EC-15: a failed turn that left changes never goes on to the checkpoint (was
+            // `Done`): its work becomes a recovery checkpoint and the stage runs again
+            (
+                &failed,
+                changed(&["src/a.ps1"]),
+                O::FailedWithChanges {
+                    reason: "implementer failed: Some(Unknown) exit 1".into(),
+                    retry: true,
+                },
+            ),
             (
                 &ok,
                 changed(&[
@@ -2783,7 +3110,7 @@ mod tests {
         ];
         for (r, changed, want) in cases {
             assert_eq!(
-                ImplementOutcome::after_checks(r, &changed, &protect),
+                ImplementOutcome::after_checks(r, &changed, &protect, false),
                 want,
                 "{changed:?}"
             );

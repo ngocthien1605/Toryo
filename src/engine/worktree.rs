@@ -65,9 +65,12 @@ impl<'a> Worktree<'a> {
     }
 
     /// Put protected paths back (tracked → HEAD, new untracked → removed; a link or
-    /// junction is removed as a link, never followed).
+    /// junction is removed as a link, never followed). A staged path is unstaged first: the
+    /// HEAD guard's soft reset leaves an agent's committed files staged, and a staged new
+    /// file would otherwise count as tracked and stay (EC-18).
     pub fn restore(&self, paths: &[String]) -> Result<()> {
         for p in paths {
+            let _ = self.g.output(&self.loc, false, &["reset", "-q", "--", p]);
             let _ = self
                 .g
                 .output(&self.loc, false, &["checkout", "-q", "HEAD", "--", p]);
@@ -193,6 +196,32 @@ impl<'a> Worktree<'a> {
             }
         }
         Ok(None)
+    }
+
+    /// The ref HEAD points at (`refs/heads/…`); `None` when HEAD is detached (§8 HEAD
+    /// guard, R12: the agent must stay on the task branch).
+    pub fn head_ref(&self) -> Result<Option<String>> {
+        let o = self
+            .g
+            .output(&self.loc, true, &["symbolic-ref", "-q", "HEAD"])?;
+        Ok(o.status
+            .success()
+            .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string()))
+    }
+
+    /// Paths with unresolved conflicts in the index (R25): a conflicting `git stash pop`
+    /// or `checkout -m` leaves them without any operation marker.
+    pub fn unmerged_paths(&self) -> Result<Vec<String>> {
+        let out = self.g.run(
+            &self.loc,
+            true,
+            &["diff", "--name-only", "-z", "--diff-filter=U"],
+        )?;
+        Ok(out
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).to_string())
+            .collect())
     }
 
     /// Soft-reset HEAD to `to` (HEAD guard: agents must not commit).
