@@ -32,3 +32,12 @@ Every entry: what was decided, why, and where. The owner folds these into plan v
   writes the fixture profiles into a machine config and passes it with `--machine-config` (it used to
   pass a missing `none.yaml`). `common::MACHINE_PROFILES` holds the fixture's profiles; tests that add a
   profile edit `env.machine`, tests that change roles or commands still edit `env.config`.
+
+### A2 — `doctor` shows where each profile and role came from (R60)
+
+- `Effective.origins` (`#[serde(skip)]`, so not in the canonical JSON or the hash) records, while
+  merging, `repo`, `machine` or `repo_overridden_by_machine` for every role and `machine` for every
+  profile. A frozen configuration has no origins; `doctor` then says "frozen configuration".
+- `doctor` prints one `info` line per profile and role (`doctor::origin_checks`); in `--json` those
+  checks carry an extra `source` field. Other checks keep their JSON shape (the field is omitted).
+- Toolchains get their origin line in B1, when the machine config can hold them.

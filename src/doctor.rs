@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::{
-    data_dir, expand_vars, resolve_profile_secrets, Billing, Effective, ProfileKind,
+    data_dir, expand_vars, resolve_profile_secrets, Billing, Effective, Origin, ProfileKind,
 };
 use crate::evidence::{self as results, evidence_status, run_version, EvidenceStatus};
 use crate::git::{GitCmd, Loc};
@@ -29,6 +29,9 @@ pub struct Check {
     pub level: Level,
     pub area: String,
     pub message: String,
+    /// Where the checked entry came from (`repo`, `machine`, …; R60), for `--json`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<Origin>,
 }
 
 #[derive(Default)]
@@ -40,8 +43,56 @@ impl Report {
             level,
             area: area.into(),
             message: message.into(),
+            source: None,
         });
     }
+}
+
+/// R60: where each profile and role of the effective configuration came from — profiles only
+/// from the machine config; roles from the repository, the machine, or the repository
+/// overridden by the machine. One `info` line each.
+pub fn origin_checks(cfg: &Effective) -> Vec<Check> {
+    let machine = cfg
+        .machine_path
+        .as_ref()
+        .map(|p| format!(" ({})", p.display()))
+        .unwrap_or_default();
+    let place = |o: Origin| match o {
+        Origin::Repo => format!("the repository config ({})", cfg.repo_path.display()),
+        Origin::Machine => format!("the machine config{machine}"),
+        Origin::RepoOverriddenByMachine => {
+            format!("the repository config, overridden by the machine config{machine}")
+        }
+    };
+    let mut out = Vec::new();
+    for name in cfg.repo.profiles.keys() {
+        let source = cfg.origins.profiles.get(name).copied();
+        out.push(Check {
+            level: Level::Info,
+            area: format!("profile {name}"),
+            message: match source {
+                Some(o) => format!("source: {}", place(o)),
+                None => "source: frozen configuration".into(),
+            },
+            source,
+        });
+    }
+    for (name, role) in &cfg.repo.roles {
+        let source = cfg.origins.roles.get(name).copied();
+        out.push(Check {
+            level: Level::Info,
+            area: format!("role {name}"),
+            message: format!(
+                "profile {} — source: {}",
+                role.profile,
+                source
+                    .map(place)
+                    .unwrap_or_else(|| "frozen configuration".into())
+            ),
+            source,
+        });
+    }
+    out
 }
 
 /// Minimum Claude Code versions for flags the plan relies on (§14).
@@ -155,6 +206,7 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
         ),
     }
     verify_root_check(&mut r, cfg);
+    r.0.extend(origin_checks(cfg));
 
     // Profiles
     let records = results::load();
@@ -638,6 +690,55 @@ fn finish(r: Report, json: bool) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R60 (M9-A2): each profile and role says where it came from, in text and in `--json`;
+    /// the config hash does not depend on it.
+    #[test]
+    fn profiles_and_roles_name_their_source() {
+        let d = tempfile::tempdir().unwrap();
+        let (p, m) = (d.path().join("toryo.yaml"), d.path().join("machine.yaml"));
+        std::fs::write(
+            &p,
+            "version: 1\nproject: { root: r, worktrees_root: w }\nroles:\n  planner: { profile: a }\n  reviewer: { profile: a }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &m,
+            "profiles:\n  a: { kind: claude, billing: subscription, exe: c }\n  b: { kind: codex, billing: subscription, exe: x }\nroles:\n  reviewer: { profile: b }\n  implementer: { profile: b }\n",
+        )
+        .unwrap();
+        let cfg = Effective::load(&p, Some(&m)).unwrap();
+        let checks = origin_checks(&cfg);
+        let get = |area: &str| checks.iter().find(|c| c.area == area).unwrap();
+        assert_eq!(get("profile a").source, Some(Origin::Machine));
+        assert!(get("profile b").message.contains(&m.display().to_string()));
+        assert_eq!(get("role planner").source, Some(Origin::Repo));
+        assert_eq!(get("role implementer").source, Some(Origin::Machine));
+        let r = get("role reviewer");
+        assert_eq!(r.source, Some(Origin::RepoOverriddenByMachine));
+        assert!(
+            r.message.starts_with(
+                "profile b — source: the repository config, overridden by the machine config"
+            ),
+            "{}",
+            r.message
+        );
+        let json = serde_json::to_value(r).unwrap();
+        assert_eq!(json["source"], "repo_overridden_by_machine");
+        // not hashed: the frozen copy has no origins and the same digest
+        let f = Effective::from_frozen(&cfg.canonical_json(), &p).unwrap();
+        assert_eq!(f.sha256(), cfg.sha256());
+        let frozen = origin_checks(&f);
+        assert!(frozen.iter().all(|c| c.source.is_none()));
+        assert!(frozen[0].message.contains("frozen configuration"));
+        // a check without a source keeps the old JSON shape
+        let mut rep = Report::default();
+        rep.add(Level::Ok, "x", "y");
+        assert!(serde_json::to_value(&rep.0[0])
+            .unwrap()
+            .get("source")
+            .is_none());
+    }
 
     #[test]
     fn semver_and_pattern() {

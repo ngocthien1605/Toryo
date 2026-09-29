@@ -210,6 +210,10 @@ repo `toryo.yaml` → `toryo doctor` lại. `toryo spike init-config` giờ ghi 
 và `--machine-out` (phần profile, mặc định `toryo.local.yaml` cạnh `--out`; không bao giờ ghi đè
 file đã có).
 
+`toryo doctor` in nguồn của từng profile và role (dòng `info`): profile luôn từ machine config; role
+có thể từ repo, từ machine, hoặc "repo, bị machine ghi đè". Với `--json`, mỗi dòng này có thêm
+trường `source` (`repo` / `machine` / `repo_overridden_by_machine`).
+
 ### 4.3 Dữ liệu được lưu ở đâu?
 
 `%LOCALAPPDATA%\toryo\` (hoặc `$env:TORYO_DATA_DIR` nếu anh đặt):

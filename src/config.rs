@@ -296,6 +296,36 @@ pub struct MachineConfig {
     pub git: MachineGit,
 }
 
+/// Where an entry of the effective configuration came from (R60, shown by `doctor`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    /// The repository `toryo.yaml`.
+    Repo,
+    /// The machine config.
+    Machine,
+    /// Set in the repository file and replaced by the machine config (roles).
+    RepoOverriddenByMachine,
+}
+
+impl Origin {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Origin::Repo => "repo",
+            Origin::Machine => "machine",
+            Origin::RepoOverriddenByMachine => "repo, overridden by machine",
+        }
+    }
+}
+
+/// The [`Origin`] of each profile and role of an effective configuration. Not part of the
+/// canonical JSON (so not of the config hash); empty for a frozen configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Origins {
+    pub profiles: BTreeMap<String, Origin>,
+    pub roles: BTreeMap<String, Origin>,
+}
+
 /// Effective configuration = repo config with machine overrides applied.
 #[derive(Debug, Clone, Serialize)]
 pub struct Effective {
@@ -305,6 +335,9 @@ pub struct Effective {
     pub repo_path: PathBuf,
     #[serde(skip)]
     pub machine_path: Option<PathBuf>,
+    /// Where each profile and role came from (R60); not hashed.
+    #[serde(skip)]
+    pub origins: Origins,
 }
 
 impl Effective {
@@ -328,6 +361,10 @@ impl Effective {
         }
         let mut trusted_filters = BTreeMap::new();
         let mut used_machine = None;
+        let mut origins = Origins::default();
+        for k in repo.roles.keys() {
+            origins.roles.insert(k.clone(), Origin::Repo);
+        }
         if let Some(mp) = machine_path {
             if mp.exists() {
                 let mt = std::fs::read_to_string(mp)
@@ -335,9 +372,16 @@ impl Effective {
                 let machine: MachineConfig = serde_yaml::from_str(&mt)
                     .with_context(|| format!("parsing {}", mp.display()))?;
                 for (k, v) in machine.roles {
+                    let o = if repo.roles.contains_key(&k) {
+                        Origin::RepoOverriddenByMachine
+                    } else {
+                        Origin::Machine
+                    };
+                    origins.roles.insert(k.clone(), o);
                     repo.roles.insert(k, v);
                 }
                 for (k, v) in machine.profiles {
+                    origins.profiles.insert(k.clone(), Origin::Machine);
                     repo.profiles.insert(k, v);
                 }
                 trusted_filters = machine.git.trusted_filters;
@@ -359,6 +403,7 @@ impl Effective {
             trusted_filters,
             repo_path: repo_path.to_path_buf(),
             machine_path: used_machine,
+            origins,
         };
         eff.validate().with_context(|| match &eff.machine_path {
             Some(m) => format!("{} (with {})", repo_path.display(), m.display()),
@@ -395,6 +440,7 @@ impl Effective {
             trusted_filters: f.trusted_filters,
             repo_path: origin.to_path_buf(),
             machine_path: None,
+            origins: Origins::default(),
         })
     }
 
@@ -886,6 +932,7 @@ policy:
             trusted_filters: BTreeMap::new(),
             repo_path: PathBuf::new(),
             machine_path: None,
+            origins: Origins::default(),
         };
         let (_d, p, m) = write_split(SAMPLE);
         let new = Effective::load(&p, Some(&m)).unwrap();
