@@ -18,6 +18,7 @@ pub mod store;
 pub mod task;
 pub mod untrusted;
 pub mod verify;
+pub mod views;
 pub mod worktree;
 pub mod xpp;
 

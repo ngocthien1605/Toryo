@@ -118,7 +118,12 @@ enum Cmd {
         wait_secs: u64,
     },
     /// Tasks, their state and the next human action.
-    Status { id: Option<String> },
+    Status {
+        id: Option<String>,
+        /// One JSON document on stdout: `{ "tasks": [ … ] }` (schema in the README)
+        #[arg(long)]
+        json: bool,
+    },
     /// 🔒 The token admission cap of a task (R41).
     Budget {
         #[command(subcommand)]
@@ -247,7 +252,7 @@ fn run(cli: Cli) -> Result<i32> {
             drive,
         ),
         Cmd::Stop { id, wait_secs } => engine_cli::stop(id, *wait_secs),
-        Cmd::Status { id } => engine_cli::status(id.as_deref()),
+        Cmd::Status { id, json } => engine_cli::status(id.as_deref(), *json),
         Cmd::Partial { cmd } => engine_cli::partial(cmd),
         Cmd::Context { cmd } => engine_cli::context(cmd),
         Cmd::Budget { cmd } => engine_cli::budget(cmd),

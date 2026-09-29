@@ -9,7 +9,7 @@ Branch `m10/flight-recorder` (from `main` @ `5adf204`). One commit per task.
 - [x] docs: owner verification E1, E7 (M9) — the owner's uncommitted notes, committed alone
 - [x] A1 — `EngineEvent`, sinks, `events.jsonl` flight recorder
 - [x] A2 — the engine's CLI lines rendered from events
-- [ ] B1 — `status --json`, `task show --json`
+- [x] B1 — `status --json`, `task show --json`
 - [ ] B2 — `toryo watch <ID>`
 - [ ] C1 — `prices.toml` + `toryo usage <ID>`
 - [ ] C2 — scripted turns in mixed runs report zero usage
@@ -98,3 +98,22 @@ Branch `m10/flight-recorder` (from `main` @ `5adf204`). One commit per task.
   streaming and `print_summary` (adapters), `↺ recovery: …`, and `drive`'s closing lines
   (`══════════ …`, `final gate — …`, `next:`, `summary:`; the `run_ended` event renders the first and
   `next:` for `watch`, emitted quiet).
+
+## B — Machine-readable and live views (DES-10)
+
+### B1 — `status --json`, `task show --json`
+
+- **Module** `src/engine/views.rs` (pure builders, unit-tested): `task_json(row, TaskFacts)` and
+  `show_json(task, row, attempts, usage, gates, events_file)`. The CLI computes `TaskFacts` (lock probe,
+  frozen config → `compile_only`, next action) once per task in `engine_cli::facts`, which the text
+  `status` now uses too (same output).
+- **Every key is always present**; an absent value is `null` (`budget_tokens`, `active_owner`, an
+  attempt's `profile`/`error_class`/`head_after`/`partial_commit`). The spec's `?` fields were read as
+  "may be empty", and a stable set of keys is easier for a consumer than optional keys.
+- **Additions** beyond the listed fields: `title` in the task object; `attempt` (the number) in each
+  attempt; `requested_at`/`resolved_at` in each gate. `task list --json` prints the `status --json`
+  document (`task list` is `status` without an id).
+- `events_file` is the path of the flight recorder, whether or not it exists yet.
+- Tests: `tests/m10_views.rs` (both documents after a fake run to the final gate, `{ "tasks": [] }`
+  without tasks, a cleaned-up task keeps state and next action), `tests/m9_xpp.rs::
+  json_views_say_compile_only_for_an_xpp_verify`. Schema: README "Following a task (M10)".

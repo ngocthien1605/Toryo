@@ -20,6 +20,7 @@ use toryo::engine::runner::{
 use toryo::engine::snapshot;
 use toryo::engine::store::{self, Store, TaskRow};
 use toryo::engine::task::{self, frozen_config, CreateArgs};
+use toryo::engine::views::{self, TaskFacts};
 use toryo::engine::worktree::Worktree;
 use toryo::engine::{GateKind, PipelineEvent, PipelineState};
 
@@ -75,9 +76,18 @@ pub enum TaskCmd {
         max_fix_cycles: Option<u32>,
     },
     /// All tasks with state and the next human action.
-    List,
+    List {
+        /// One JSON document on stdout (the `status --json` schema)
+        #[arg(long)]
+        json: bool,
+    },
     /// One task: state, stage attempts, gate occurrences.
-    Show { id: String },
+    Show {
+        id: String,
+        /// One JSON document on stdout: the task, its attempts, usage rows, gates, events file
+        #[arg(long)]
+        json: bool,
+    },
     /// The frozen configuration (R35). `--reload` re-reads toryo.yaml + the machine config,
     /// shows the diff and applies it — waiting states only (a gate, Escalated, Paused).
     Config {
@@ -335,9 +345,9 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
             );
             Ok(0)
         }
-        TaskCmd::List => status(None),
+        TaskCmd::List { json } => status(None, *json),
         TaskCmd::Config { id, reload, expect } => task_config(cli, id, *reload, expect.as_deref()),
-        TaskCmd::Show { id } => show(id),
+        TaskCmd::Show { id, json } => show(id, *json),
         TaskCmd::Cleanup { id, force } => {
             let st = store()?;
             let lock = TaskLock::acquire(&st, id)?;
@@ -896,24 +906,57 @@ pub fn stop(id: &str, wait: u64) -> Result<i32> {
     })
 }
 
-pub fn status(id: Option<&str>) -> Result<i32> {
+/// What `status` shows of a task besides its row: the lock owner while another process holds
+/// the lock, compile-only verify (R59), and the next action (the cleaned-up variant once the
+/// worktree and the run store are gone).
+fn facts(t: &TaskRow) -> Result<TaskFacts> {
+    let active_owner = if lock::probe_free(&t.id)? {
+        None
+    } else {
+        Some(t.run_lock_owner.clone().unwrap_or_default())
+    };
+    let next_action = if t.state.is_terminal() && !t.run_store.exists() && !t.worktree.exists() {
+        toryo::engine::runner::cleaned_up_action(t)
+    } else {
+        next_action(t)
+    };
+    Ok(TaskFacts {
+        active_owner,
+        compile_only: task::frozen_config(t).is_ok_and(|c| toryo::engine::xpp::compile_only(&c)),
+        next_action,
+    })
+}
+
+/// Print one JSON document on stdout (`--json`, DES-10).
+fn print_json(v: &serde_json::Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(v)?);
+    Ok(())
+}
+
+pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
     let st = store()?;
     let tasks = match id {
         Some(i) => vec![get(&st, i)?],
         None => st.call(store::list_tasks)?,
     };
+    if json {
+        let list = tasks
+            .iter()
+            .map(|t| Ok(views::task_json(t, &facts(t)?)))
+            .collect::<Result<Vec<_>>>()?;
+        print_json(&serde_json::json!({ "tasks": list }))?;
+        return Ok(0);
+    }
     if tasks.is_empty() {
         println!("no tasks (`toryo task create --file TASK.md`)");
     }
     for t in tasks {
-        let active = if lock::probe_free(&t.id)? {
-            String::new()
-        } else {
-            format!(
-                " · ACTIVE ({})",
-                t.run_lock_owner.clone().unwrap_or_default()
-            )
-        };
+        let f = facts(&t)?;
+        let active = f
+            .active_owner
+            .as_ref()
+            .map(|o| format!(" · ACTIVE ({o})"))
+            .unwrap_or_default();
         println!(
             "{:<14} {:<22} fix {}/{} · tokens {}{}{}{}",
             t.id,
@@ -932,31 +975,67 @@ pub fn status(id: Option<&str>) -> Result<i32> {
             active
         );
         // R59: an X++ verify proves compile level only — say so wherever the state is shown
-        if task::frozen_config(&t).is_ok_and(|c| toryo::engine::xpp::compile_only(&c)) {
+        if f.compile_only {
             println!("               {}", toryo::engine::xpp::COMPILE_ONLY);
         }
-        let next = if t.state.is_terminal() && !t.run_store.exists() && !t.worktree.exists() {
-            toryo::engine::runner::cleaned_up_action(&t)
-        } else {
-            next_action(&t)
-        };
-        println!("               next: {next}");
+        println!("               next: {}", f.next_action);
     }
     Ok(0)
 }
 
-fn show(id: &str) -> Result<i32> {
-    status(Some(id))?;
+/// The usage rows of a task as `task show` prints them.
+fn usage_lines(st: &Store, id: &str) -> Result<Vec<views::UsageLine>> {
+    let i = id.to_string();
+    let rows = st.call(move |tx| store::usage_rows(tx, &i))?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                id,
+                attempt,
+                profile,
+                accounting,
+                budget_tokens,
+                reservation_tokens,
+                reconciled_by,
+                includes_unreported,
+            )| {
+                views::UsageLine {
+                    id,
+                    attempt,
+                    profile,
+                    accounting,
+                    budget_tokens,
+                    reservation_tokens,
+                    reconciled_by,
+                    includes_unreported,
+                }
+            },
+        )
+        .collect())
+}
+
+fn show(id: &str, json: bool) -> Result<i32> {
     let st = store()?;
     let t = get(&st, id)?;
+    let i = id.to_string();
+    let atts = st.call(move |tx| store::attempts(tx, &i))?;
+    let usage = usage_lines(&st, id)?;
+    let i = id.to_string();
+    let ap = st.call(move |tx| store::approvals(tx, &i))?;
+    if json {
+        let task = views::task_json(&t, &facts(&t)?);
+        let events = toryo::engine::flight::events_path(&t);
+        print_json(&views::show_json(task, &t, &atts, &usage, &ap, &events))?;
+        return Ok(0);
+    }
+    status(Some(id), false)?;
     println!(
         "               worktree: {} · branch {} · run store {}",
         t.worktree.display(),
         t.branch,
         t.run_store.display()
     );
-    let i = id.to_string();
-    let atts = st.call(move |tx| store::attempts(tx, &i))?;
     println!("\nstage attempts:");
     for a in atts {
         println!(
@@ -973,30 +1052,31 @@ fn show(id: &str) -> Result<i32> {
                 .unwrap_or_default()
         );
     }
-    let i = id.to_string();
-    let rows = st.call(move |tx| store::usage_rows(tx, &i))?;
-    if !rows.is_empty() {
+    if !usage.is_empty() {
         println!("\nusage (R41; ~ = reservation for a turn with no telemetry):");
-        for (uid, att, prof, acc, budget, res, rec, inc) in rows {
-            let amount = match (acc.as_str(), budget, res) {
+        for u in usage {
+            let amount = match (u.accounting.as_str(), u.budget_tokens, u.reservation_tokens) {
                 ("unknown", _, Some(r)) => format!("~{r}"),
                 (_, Some(b), _) => b.to_string(),
                 _ => "?".into(),
             };
             println!(
-                "  #{uid:<4} {att:<22} {prof:<14} {acc:<11} {amount:>9}{}{}",
-                if inc {
+                "  #{:<4} {:<22} {:<14} {:<11} {amount:>9}{}{}",
+                u.id,
+                u.attempt,
+                u.profile,
+                u.accounting,
+                if u.includes_unreported {
                     "  includes an earlier killed turn"
                 } else {
                     ""
                 },
-                rec.map(|r| format!("  reconciled by #{r}"))
+                u.reconciled_by
+                    .map(|r| format!("  reconciled by #{r}"))
                     .unwrap_or_default()
             );
         }
     }
-    let i = id.to_string();
-    let ap = st.call(move |tx| store::approvals(tx, &i))?;
     if !ap.is_empty() {
         println!("\ngates:");
         for a in ap {

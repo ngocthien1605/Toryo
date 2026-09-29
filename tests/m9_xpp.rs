@@ -777,3 +777,27 @@ fn xpp_build_prints_diagnostics_and_fails() {
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(stdout.contains("✔ build/Ext.Build"), "{stdout}");
 }
+
+/// M10-B1 AC-1: `status --json` and `task show --json` say `compile_only` for an X++ verify.
+#[test]
+fn json_views_say_compile_only_for_an_xpp_verify() {
+    let x = setup_xpp(&["Calc.Build"], "nothing", "Build succeeded.\n", true);
+    let env = &x.env;
+    create(env, "X-J");
+    for args in [
+        vec!["status", "--json"],
+        vec!["status", "X-J", "--json"],
+        vec!["task", "show", "X-J", "--json"],
+    ] {
+        let o = command(env, &args, &[]).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+        let t = if v.get("tasks").is_some() {
+            v["tasks"][0].clone()
+        } else {
+            v
+        };
+        assert_eq!(t["id"], "X-J");
+        assert_eq!(t["compile_only"], true, "{args:?}: {t}");
+    }
+}

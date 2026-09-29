@@ -53,7 +53,7 @@ toryo approve ID --gate plan|final [--expect DIGEST] [--continue]   # 🔒
 toryo reject  ID --gate plan|final --reason "…"                     # 🔒
 toryo resume [ID] [--note "…" | --discard-partial | --keep-partial | --accept-protected-change P …]  # 🔒
 toryo stop ID                                  # ask the running owner to stop (R38)
-toryo status [ID] · toryo task list|show ID|cleanup ID · toryo partial export ID --attempt N --into DIR
+toryo status [ID] [--json] · toryo task list [--json]|show ID [--json]|cleanup ID · toryo partial export ID --attempt N --into DIR
 toryo task config ID [--reload [--expect DIGEST]]   # 🔒 R35: frozen config; reload only in a waiting state
 toryo budget set ID --tokens N | --none             # 🔒 R41: admission cap, then `toryo resume`
 toryo context show ID --stage plan|implement|review [--attempt N] [--profile P]   # §7: what the agent gets
@@ -106,6 +106,33 @@ notes) and `TASK.example.md`. Each file lists its `TODO(owner)` items at the top
 `CARGO_HOME`/`CARGO_TARGET_DIR` in the Low-writable verify folders and `--locked`) in a `tracked` verify checkout.
 Run a stable toryo installed outside the repository (`cargo install --path . --root C:\tools\toryo --locked`),
 never add `.cargo` to Codex's `writable_roots`; details in `docs/HUONG-DAN.md` §7.4.
+
+## Following a task (M10)
+
+**JSON output (DES-10).** `toryo status [ID] --json` (also `toryo task list --json`) and `toryo task show ID --json`
+print one JSON document on stdout and nothing else there. Field names are snake_case; a key is always present
+(`null` when there is no value).
+
+```jsonc
+// status --json
+{ "tasks": [ {
+    "id": "BR-003", "title": "…", "state": "WaitingFinalApproval",   // PipelineState
+    "fix_cycle": 1, "max_fix_cycles": 3,
+    "spent_tokens": 61234, "reserved_tokens": 0, "budget_tokens": null,   // R41; null = no admission cap
+    "active_owner": null,          // "user pid N" while another process holds the task lock
+    "compile_only": false,         // R59: an X++ verify proves compile level only
+    "next_action": "review the branch toryo/BR-003 …"   // what `status` prints after `next:`
+} ] }
+// task show ID --json: the task object above, plus
+{ "worktree": "…", "branch": "toryo/BR-003", "run_store": "…\runs\BR-003",
+  "attempts": [ { "id": "BR-003/implement/1", "stage": "implement", "attempt": 1, "status": "succeeded",
+                  "profile": "codex-openai", "error_class": null, "head_after": "<sha>", "partial_commit": null } ],
+  "usage": [ { "id": 3, "attempt": "BR-003/implement/1", "profile": "codex-openai", "accounting": "exact",
+               "budget_tokens": 51000, "reservation_tokens": null, "reconciled_by": null, "includes_unreported": false } ],
+  "gates": [ { "gate": "plan", "occurrence": 1, "status": "approved", "subject_digest": "…", "reason": null,
+               "requested_at": "…", "resolved_at": "…" } ],
+  "events_file": "…\runs\BR-003\events.jsonl" }
+```
 
 **Hướng dẫn tiếng Việt (flow, cài đặt, cấu hình, thực hành với app mẫu BatchRename): `docs/HUONG-DAN.md`.**
 `spike pipeline` is the single-process reference prototype (R52); it prints a warning and gets no new features — use the engine (`toryo task create` + `toryo run`).
