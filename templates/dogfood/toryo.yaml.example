@@ -1,0 +1,39 @@
+# Toryo on its own repository (M9-D1) — copy to the repository root as `toryo.yaml` and commit it.
+# The profiles stay in the machine config, %USERPROFILE%\.toryo\toryo.local.yaml (R60).
+#
+# TODO(owner):
+#   1. project.root / project.worktrees_root — this repository and a worktree folder beside it.
+#   2. roles — profile names your machine config defines (codex-openai or codex-foundry).
+# Run a stable toryo installed OUTSIDE this repository (HUONG-DAN §7.4): `cargo install --path . --root C:\tools\toryo`.
+version: 1
+project:
+  root: C:\.thien\AgentOrchestrator\toryo                  # TODO(owner) 1
+  worktrees_root: C:\.thien\AgentOrchestrator\toryo-worktrees   # TODO(owner) 1
+  base_branch: main
+
+roles:                                                     # TODO(owner) 2
+  planner:     { profile: claude-max, model: opus }
+  implementer: { profile: codex-openai, fallback: [claude-max] }
+  reviewer:    { profile: claude-max, model: opus }
+
+pipeline:
+  max_fix_cycles: 3
+  budget_tokens: 2000000
+
+policy:
+  deny_paths: ["**/*.pfx", "**/.env*", "bin/**"]           # bin/toryo.exe is the prebuilt binary of the kit
+  protected_paths: ["@verify-scripts", "toryo.yaml", ".toryo/**", "AGENTS.md", "CLAUDE.md", ".claude/**", ".codex/**", ".mcp.json", ".gitattributes", ".githooks/**", "toryo.local.yaml", ".gitmodules", ".github/**"]
+
+verify:
+  checkout: tracked            # keeps the cargo cache and target folder between the runs of a task
+  boundary: low_integrity
+  verify_root: '%LOCALAPPDATA%\toryo-verify'
+  final_clean: true            # the final gate still needs one passing clean run
+
+commands:
+  verify:
+    - { name: rust, program: pwsh, args: [-NoProfile, -File, scripts/verify.ps1], timeout_min: 45 }
+
+timeouts:
+  agent_stall_min: 10
+  agent_stage_max_min: 60

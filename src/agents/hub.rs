@@ -21,6 +21,8 @@ pub struct AgentHub {
     cfg: Arc<Effective>,
     claude_mode: LaunchMode,
     fake: Option<FakeAgentAdapter>,
+    /// The script's `only_profiles`: empty = every profile is fake.
+    fake_only: Vec<String>,
 }
 
 impl AgentHub {
@@ -29,9 +31,13 @@ impl AgentHub {
         claude_mode: LaunchMode,
         fake_script: Option<&Path>,
     ) -> Result<Self> {
-        let fake = match fake_script {
-            Some(p) => Some(FakeAgentAdapter::new(FakeScript::load(p)?)),
-            None => None,
+        let (fake, fake_only) = match fake_script {
+            Some(p) => {
+                let script = FakeScript::load(p)?;
+                let only = script.only_profiles.clone();
+                (Some(FakeAgentAdapter::new(script)), only)
+            }
+            None => (None, Vec::new()),
         };
         Ok(Self {
             rt: tokio::runtime::Builder::new_multi_thread()
@@ -40,6 +46,7 @@ impl AgentHub {
             cfg: Arc::new(cfg.clone()),
             claude_mode,
             fake,
+            fake_only,
         })
     }
 
@@ -52,9 +59,17 @@ impl AgentHub {
         self.fake.as_ref().map(|f| f.calls()).unwrap_or_default()
     }
 
+    /// Whether `profile` runs the fake adapter: a fake script is set and, when it lists
+    /// `only_profiles`, the profile is one of them.
+    pub fn fakes(&self, profile: &str) -> bool {
+        self.fake.is_some()
+            && (self.fake_only.is_empty() || self.fake_only.iter().any(|p| p == profile))
+    }
+
     pub fn adapter(&self, profile: &str) -> Result<Box<dyn AgentAdapter>> {
         let kind = self.cfg.profile(profile)?.kind;
-        Ok(match &self.fake {
+        let fake = self.fake.as_ref().filter(|_| self.fakes(profile));
+        Ok(match fake {
             Some(f) => Box::new(f.for_profile(profile, kind)),
             None => Box::new(CliAdapter::new(
                 self.cfg.clone(),

@@ -106,11 +106,17 @@ fn setup_with(escape: bool, lazy: bool) -> Env {
     std::fs::write(
         &config,
         format!(
-            r#"version: 1
-project:
-  root: {repo}
-  worktrees_root: {wts}
-profiles:
+            "version: 1\nproject:\n  root: {repo}\n  worktrees_root: {wts}\nroles:\n  planner: {{ profile: claude-max }}\n  implementer: {{ profile: codex-foundry }}\n",
+            repo = repo.display(),
+            wts = root.join("wts").display(),
+        ),
+    )
+    .unwrap();
+    // R60: the profiles live in the machine config
+    std::fs::write(
+        root.join("machine.yaml"),
+        format!(
+            r#"profiles:
   claude-max:
     kind: claude
     billing: subscription
@@ -130,12 +136,7 @@ profiles:
     codex:
       windows_sandbox: unelevated
       provider: {{ id: foundry, name: Azure Foundry, base_url: "https://x.openai.azure.com/openai/v1", env_key: AZURE_OPENAI_API_KEY }}
-roles:
-  planner: {{ profile: claude-max }}
-  implementer: {{ profile: codex-foundry }}
 "#,
-            repo = repo.display(),
-            wts = root.join("wts").display(),
             claude = claude.display(),
             codex = codex.display(),
             esc = if escape { "1" } else { "0" },
@@ -158,7 +159,7 @@ fn toryo(env: &Env, args: &[&str]) -> (i32, String, String) {
         .arg("--config")
         .arg(&env.config)
         .arg("--machine-config")
-        .arg(env.root.join("none.yaml"))
+        .arg(env.root.join("machine.yaml"))
         .args(args)
         .env("TORYO_DATA_DIR", &env.data)
         .env("TORYO_E2E_SECRET", "s3cr3t-value-e2e")
@@ -471,7 +472,7 @@ fn toryo_stdin_strict(env: &Env, args: &[&str], input: &str) -> (i32, String) {
         .arg("--config")
         .arg(&env.config)
         .arg("--machine-config")
-        .arg(env.root.join("none.yaml"))
+        .arg(env.root.join("machine.yaml"))
         .args(args)
         .env("TORYO_DATA_DIR", &env.data)
         .env("TORYO_E2E_SECRET", "s3cr3t-value-e2e")
@@ -493,14 +494,16 @@ fn toryo_stdin_strict(env: &Env, args: &[&str], input: &str) -> (i32, String) {
 fn pipeline_plan_gate_fix_cycle_and_approval() {
     let env = setup(false);
     // the fake reviewer asks for changes once (state file), then approves
-    let cfg = std::fs::read_to_string(&env.config).unwrap().replace(
-        "FAKE_DENY: \"\"",
-        &format!(
-            "FAKE_DENY: \"\"\n      FAKE_STATE: \"{}\"",
-            env.root.join("fake-state").display()
-        ),
-    );
-    std::fs::write(&env.config, cfg).unwrap();
+    let cfg = std::fs::read_to_string(env.root.join("machine.yaml"))
+        .unwrap()
+        .replace(
+            "FAKE_DENY: \"\"",
+            &format!(
+                "FAKE_DENY: \"\"\n      FAKE_STATE: \"{}\"",
+                env.root.join("fake-state").display()
+            ),
+        );
+    std::fs::write(env.root.join("machine.yaml"), cfg).unwrap();
     let repo = env.root.join("calc");
     let (code, _, err) = toryo(
         &env,
@@ -706,7 +709,7 @@ fn which_pwsh() -> bool {
 
 fn pipeline_env(quota: bool, review_once: bool) -> (Env, PathBuf) {
     let env = setup(false);
-    let mut cfg = std::fs::read_to_string(&env.config).unwrap();
+    let mut cfg = std::fs::read_to_string(env.root.join("machine.yaml")).unwrap();
     if quota {
         cfg = cfg.replace("FAKE_CODEX_QUOTA: \"0\"", "FAKE_CODEX_QUOTA: \"1\"");
     }
@@ -719,7 +722,7 @@ fn pipeline_env(quota: bool, review_once: bool) -> (Env, PathBuf) {
             ),
         );
     }
-    std::fs::write(&env.config, cfg).unwrap();
+    std::fs::write(env.root.join("machine.yaml"), cfg).unwrap();
     let repo = env.root.join("calc");
     let (code, _, err) = toryo(
         &env,
@@ -953,11 +956,13 @@ fn version_bound_evidence() {
     assert_eq!(last["cli_versions"]["codex-foundry"], "0.200.0", "{last}");
 
     // 4. the Codex CLI is upgraded: its evidence is stale
-    let cfg = std::fs::read_to_string(&env.config).unwrap().replace(
-        "FAKE_ESCAPE: \"0\"",
-        "FAKE_ESCAPE: \"0\"\n      FAKE_VERSION: \"0.201.0\"",
-    );
-    std::fs::write(&env.config, cfg).unwrap();
+    let cfg = std::fs::read_to_string(env.root.join("machine.yaml"))
+        .unwrap()
+        .replace(
+            "FAKE_ESCAPE: \"0\"",
+            "FAKE_ESCAPE: \"0\"\n      FAKE_VERSION: \"0.201.0\"",
+        );
+    std::fs::write(env.root.join("machine.yaml"), cfg).unwrap();
     let (code, err) = run(&["V-3"]);
     assert_ne!(code, 0);
     assert!(

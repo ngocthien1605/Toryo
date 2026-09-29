@@ -22,11 +22,12 @@ Rust implementation of the Toryo plan (**v0.7**). **M0 is done** (the spike kit 
 | `engine::lock` (M3) | R24, R38 | per-task OS file lock (lock-first), lock generation, `toryo stop` protocol |
 | `engine::runner` (M3) | §5.2, R48, R49 | the engine: stages as persisted attempts, gates as approvals, fallback chain, stop polling |
 | `engine::recovery`, `engine::snapshot` (M3) | §10, R31, R39, R40 | crash recovery: trailer-matched checkpoints, recovery snapshots + completion check, partial checkpoints, `--discard-partial` / `--keep-partial`, `partial export` |
-| `engine::context` (M4) | §7, R20, R30 | ProjectContextLoader: global.md → AGENTS.md/CLAUDE.md (Claude only) → `.toryo/context/*.md` → role template → task pack; 40 KB budget per role; stored per attempt with its hash; `context show` |
+| `engine::context` (M4) | §7, R20, R30 | ProjectContextLoader: global.md → AGENTS.md/CLAUDE.md (Claude only) → `.toryo/context/*.md` → role template → task pack (R61: only TASK.md/PLAN.md inline; untrusted files as paths, or `<untrusted_data>` user-prompt blocks for the Claude implementer); 40 KB budget per role; stored per attempt with its hash; `context show` |
 | `engine::protect` (M5) | R35 | protected state compared on the filesystem (incl. ignored files and Git metadata), versioned baselines, `--accept-protected-change`; frozen config + `task config --reload` |
 | `engine::artifacts` (M6) | R34 | immutable artifact versions (staging → publish → one transaction), derived views, reconciliation (orphans, tampered, missing) |
 | `engine::verify` (M6) | R29, R36, R45, R47, R50 | verify checkout of the checkpoint under `verify_root`, Low-IL boundary, explicit `--git-dir`, `verify_mutated_tree` |
 | `engine::decisions` (M7) + usage in `engine::store` | R41, R53 | `DECISIONS.md` (gates, notes, follow-ups); admission budget, cumulative baselines, reservations, Claude live interrupt |
+| `engine::xpp` (M9) | R59 | `tool: xpp`: the five CI/CD packages, the MSBuild argv of Microsoft's hosted X++ build, per-project results, MSBuild diagnostics, `scope: compile`; `toryo xpp build` |
 
 M0 kit modules (ported to the core where M1 needs them, R52):
 
@@ -40,7 +41,7 @@ M0 kit modules (ported to the core where M1 needs them, R52):
 | `agents::codex` | R18, R19, R21, R22 | canonical `-c` argv (identical on resume), JSONL parser, message classifier |
 | `usage` | R21, R41 | disjoint token buckets, cumulative deltas with reset |
 | `git` | R33, R37 | `GitCmd` hardening prefix, `<CANON_DIFF>`, trusted/neutralised filter plan, canaries, pkt-line filter |
-| `config` | §14, R35 | `toryo.yaml` + machine config, canonical hash, Credential Manager secrets |
+| `config` | §14, R35, R59, R60 | `toryo.yaml` + machine config (the only place for profiles and toolchains, R60), verify kinds (`program` or `tool: xpp`), canonical hash, Credential Manager secrets |
 | `doctor` | §15, R51 | environment / profile / repo checks + version-bound evidence; `--canaries` re-runs them |
 | `spike::*` | §17 | the M0 commands (see `docs/M0-RUNBOOK.md`) — cargo feature `m0-kit`, on by default |
 | `spike::pipeline` | §5.2, R28, R40 | prototype workflow on a real repo: plan gate, guards, checkpoints, verify, exact-AC review, fix cycles |
@@ -59,6 +60,9 @@ toryo context show ID --stage plan|implement|review [--attempt N] [--profile P] 
 toryo spike claude-implementer-isolation --profile claude-max   # R49 / V07-VERIFY 4
 toryo spike codex-temp-probe --profile codex-openai             # R46 / V07-VERIFY 2
 toryo doctor [--canaries [--profile P …] [--claude-mode restricted]]   # R51: re-verify after a CLI upgrade
+                                               # (R59) + X++: MSBuild (vswhere proposal), NuGets, UDE version, projects
+toryo xpp build --repo R --project P [--project P …] [--metadata Metadata] [--out D] [--print-only] [--low]
+                                               # R59/R72: the `tool: xpp` build outside a task
 toryo spike job-test | git-canary | lowil-canary
 toryo spike claude-isolation --profile claude-max [--mode restricted|setting-sources|cwd-run-store]
 toryo spike codex-canary --profile codex-foundry
@@ -75,7 +79,7 @@ toryo spike init-fixture | render | diff | report
 
 **Quick start on Windows (no Rust needed):** `bin\toryo.exe` is a prebuilt binary (cross-compiled,
 x86_64-pc-windows-gnu, stripped). One command installs Claude Code if missing, checks the Claude/Codex
-logins, writes `C:\.thien\m0\toryo.yaml`, and runs `doctor`, `job-test`, `git-canary` and the
+logins, writes `C:\.thien\m0\toryo.yaml` plus the profiles in `C:\.thien\m0\toryo.local.yaml`, and runs `doctor`, `job-test`, `git-canary` and the
 end-to-end `smoke` (Claude plans → Codex implements → toryo checkpoints + verifies → Claude reviews):
 
 ```powershell
@@ -83,6 +87,25 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File C:\.thien\AgentOrchestrator\toryo\
 ```
 
 Results land in `C:\.thien\AgentOrchestrator\thien-m0-data\`.
+
+**Configuration (R60).** Agent profiles — the executable, its environment and secrets, the Codex
+sandbox settings — are defined **only** in the machine config (`%USERPROFILE%\.toryo\toryo.local.yaml`,
+or `--machine-config`). A repository `toryo.yaml` that defines `profiles:` or `toolchains:` does not
+load; the error prints the block to move. The repository file names profiles in `roles`. (R59) The X++
+toolchain — MSBuild and the five CI/CD NuGet packages — is `toolchains.xpp` in the machine config; a
+repository verify command names only what to build: `{ name, tool: xpp, metadata, projects, timeout_min }`
+instead of `program`/`args`.
+
+**D365FO starter kit (M9):** `templates/d365fo/` — the repository part (`toryo.yaml.example`: `tool: xpp`,
+ZZZ deny rule, protected build projects), the machine part (`toryo.local.yaml.example`: the Foundry and Max
+profiles, `toolchains.xpp`), `.toryo/context/` policy files (models, naming, labels, build, per-role X++
+notes) and `TASK.example.md`. Each file lists its `TODO(owner)` items at the top; setup steps are in
+`docs/HUONG-DAN.md` §7.3.
+
+**Toryo on Toryo (M9):** `templates/dogfood/toryo.yaml.example` runs `scripts/verify.ps1` (what CI runs, with
+`CARGO_HOME`/`CARGO_TARGET_DIR` in the Low-writable verify folders and `--locked`) in a `tracked` verify checkout.
+Run a stable toryo installed outside the repository (`cargo install --path . --root C:\tools\toryo --locked`),
+never add `.cargo` to Codex's `writable_roots`; details in `docs/HUONG-DAN.md` §7.4.
 
 **Hướng dẫn tiếng Việt (flow, cài đặt, cấu hình, thực hành với app mẫu BatchRename): `docs/HUONG-DAN.md`.**
 `spike pipeline` is the single-process reference prototype (R52); it prints a warning and gets no new features — use the engine (`toryo task create` + `toryo run`).
@@ -133,3 +156,12 @@ BatchRename sample (BR-001, then BR-002 with a real fix cycle), and the real-CLI
 pass — a live budget interrupt of a Claude turn (R64), the fail-closed Codex preflight (R62), and a silent
 Codex command that is not killed as stalled (R66). Acceptance on Windows: `scripts\m8-check.ps1`.
 Next: plan v0.8 §17 (D1–D3, M9). `spike pipeline` stays the behavioural reference (R52).
+
+M9 (`M9_task.md`, branch `m9/d365-ready`) is done in code: trust boundaries — agent profiles and
+toolchains come only from the machine config (R60; `doctor` shows each source) and untrusted task-pack text
+reaches agents only as data (R61); X++ verify on the UDE toolchain — `toolchains.xpp`, `tool: xpp`, per-project
+MSBuild runs with parsed diagnostics, `scope: compile`, `doctor` X++ checks and `toryo xpp build` (R59, proposed
+R72); the D365FO starter kit (`templates/d365fo/`) and the dogfooding kit (`templates/dogfood/`,
+`scripts/verify.ps1`). Still to do by the owner on Windows and the UDE machine: section E of `M9_task.md` (the
+real-CLI canary `scripts\m9-check.ps1 -Canary`, V08-VERIFY 2–4 with `toryo xpp build`, the first real D365FO
+task). Decisions made on the way: `docs/M9-NOTES.md`.

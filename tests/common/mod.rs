@@ -14,10 +14,16 @@ pub const DIVIDE: &str = "\nfunction Divide-Numbers { param($A,$B) if ($B -eq 0)
 pub struct Env {
     pub _tmp: tempfile::TempDir,
     pub root: PathBuf,
+    /// The repository `toryo.yaml` (no profiles, R60).
     pub config: PathBuf,
+    /// The machine config passed with `--machine-config`: the profiles (R60).
+    pub machine: PathBuf,
     pub data: PathBuf,
     pub repo: PathBuf,
 }
+
+/// The fake profiles of the fixture, in the machine config (R60).
+pub const MACHINE_PROFILES: &str = "profiles:\n  claude-max: { kind: claude, billing: subscription, exe: claude-not-installed }\n  codex-openai: { kind: codex, billing: subscription, exe: codex-not-installed }\n";
 
 pub fn setup(implementer: &str) -> Env {
     setup_with(implementer, "")
@@ -30,6 +36,8 @@ pub fn setup_with(implementer: &str, extra: &str) -> Env {
     let repo = root.join("calc");
     let data = root.join("data");
     let config = root.join("toryo.yaml");
+    let machine = root.join("machine.yaml");
+    std::fs::write(&machine, MACHINE_PROFILES).unwrap();
     let fwd = |p: &Path| p.display().to_string().replace('\\', "/");
     std::fs::write(
         &config,
@@ -38,9 +46,6 @@ pub fn setup_with(implementer: &str, extra: &str) -> Env {
 project:
   root: "{repo}"
   worktrees_root: "{wts}"
-profiles:
-  claude-max: {{ kind: claude, billing: subscription, exe: claude-not-installed }}
-  codex-openai: {{ kind: codex, billing: subscription, exe: codex-not-installed }}
 roles:
   planner: {{ profile: claude-max }}
   implementer: {{ profile: {implementer} }}
@@ -65,6 +70,7 @@ commands:
         _tmp: tmp,
         root,
         config,
+        machine,
         data,
         repo,
     };
@@ -87,7 +93,7 @@ pub fn command(env: &Env, args: &[&str], extra: &[(&str, &str)]) -> Command {
     c.arg("--config")
         .arg(&env.config)
         .arg("--machine-config")
-        .arg(env.root.join("none.yaml"))
+        .arg(&env.machine)
         .args(args)
         .env("TORYO_DATA_DIR", &env.data)
         .env("TORYO_RETRY_BASE_SECS", "0")

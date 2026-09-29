@@ -701,9 +701,10 @@ fn git_filter_textconv_canary() {
     let trusted_marker = env.root.join("trusted-filter-ran");
     let exe = env!("CARGO_BIN_EXE_toryo").replace('\\', "/");
     std::fs::write(
-        env.root.join("none.yaml"),
+        &env.machine,
         format!(
-            "git:\n  trusted_filters:\n    lfs:\n      process: \"'{exe}' spike filter-process --marker '{}'\"\n      required: true\n",
+            "{}git:\n  trusted_filters:\n    lfs:\n      process: \"'{exe}' spike filter-process --marker '{}'\"\n      required: true\n",
+            common::MACHINE_PROFILES,
             trusted_marker.display().to_string().replace('\\', "/")
         ),
     )

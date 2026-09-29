@@ -140,13 +140,22 @@ fn config(dir: &Path, exe: &Path) -> Effective {
     std::fs::write(
         &y,
         format!(
-            "version: 1\nproject: {{ root: '{d}', worktrees_root: '{d}/wts' }}\nprofiles:\n  claude-max: {{ kind: claude, billing: subscription, exe: '{e}' }}\n  codex-openai: {{ kind: codex, billing: subscription, exe: '{e}' }}\nroles:\n  planner: {{ profile: claude-max }}\n",
+            "version: 1\nproject: {{ root: '{d}', worktrees_root: '{d}/wts' }}\nroles:\n  planner: {{ profile: claude-max }}\n",
             d = fwd(dir),
+        ),
+    )
+    .unwrap();
+    // R60: the profiles live in the machine config
+    let m = dir.join("machine.yaml");
+    std::fs::write(
+        &m,
+        format!(
+            "profiles:\n  claude-max: {{ kind: claude, billing: subscription, exe: '{e}' }}\n  codex-openai: {{ kind: codex, billing: subscription, exe: '{e}' }}\n",
             e = fwd(exe)
         ),
     )
     .unwrap();
-    Effective::load(&y, None).unwrap()
+    Effective::load(&y, Some(&m)).unwrap()
 }
 
 /// Give the Codex profile these sandbox settings (set in code, past any config-load
@@ -1203,13 +1212,11 @@ mod unix {
             &echo(&[CODEX_START, CODEX_DONE].concat()),
         );
         let fwd = |p: &Path| p.display().to_string().replace('\\', "/");
-        let y = d.path().join("toryo.yaml");
+        let y = d.path().join("machine.yaml");
         std::fs::write(
             &y,
             format!(
-                r#"version: 1
-project: {{ root: '{d}', worktrees_root: '{d}/wts' }}
-profiles:
+                r#"profiles:
   codex-foundry:
     kind: codex
     billing: foundry
@@ -1223,15 +1230,21 @@ profiles:
         model_providers.foundry.request_max_retries: '4'
         sandbox_workspace_write.network_access: 'true'
         sandbox_workspace_write.writable_roots: '["/tmp/toryo-cache"]'
-roles:
-  planner: {{ profile: codex-foundry }}
 "#,
-                d = fwd(d.path()),
                 e = fwd(&exe)
             ),
         )
         .unwrap();
-        let loaded = Effective::load(&y, None).unwrap();
+        let r = d.path().join("toryo.yaml");
+        std::fs::write(
+            &r,
+            format!(
+                "version: 1\nproject: {{ root: '{d}', worktrees_root: '{d}/wts' }}\nroles:\n  planner: {{ profile: codex-foundry }}\n",
+                d = fwd(d.path())
+            ),
+        )
+        .unwrap();
+        let loaded = Effective::load(&r, Some(&y)).unwrap();
         // an in-flight task runs its frozen copy, which is not validated again at load
         let frozen = Effective::from_frozen(&loaded.canonical_json(), &y).unwrap();
         let hub = AgentHub::new(&frozen, LaunchMode::Restricted, None).unwrap();

@@ -1,6 +1,6 @@
 //! `toryo` CLI (plan v0.7 §15): the engine commands (`task`, `run`, `approve`, `reject`,
-//! `resume`, `stop`, `status`, `partial`), `doctor`, `secrets`, and the M0 kit (`spike`,
-//! feature `m0-kit`).
+//! `resume`, `stop`, `status`, `partial`), `doctor`, `secrets`, `xpp build` (M9-B4), and the M0
+//! kit (`spike`, feature `m0-kit`).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -14,6 +14,7 @@ use toryo::config::{default_machine_config_path, Effective};
 mod engine_cli;
 #[cfg(feature = "m0-kit")]
 mod spike_cli;
+mod xpp_cli;
 
 use engine_cli::{BudgetCmd, ContextCmd, DriveArgs, Gate, PartialCmd, ResumeArgs, TaskCmd};
 #[cfg(feature = "m0-kit")]
@@ -133,6 +134,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PartialCmd,
     },
+    /// X++ (D365FO) builds outside a task: `toryo xpp build --print-only` shows what Verify runs.
+    Xpp {
+        #[command(subcommand)]
+        cmd: xpp_cli::XppCmd,
+    },
     /// Windows Credential Manager secrets.
     Secrets {
         #[command(subcommand)]
@@ -245,6 +251,7 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Partial { cmd } => engine_cli::partial(cmd),
         Cmd::Context { cmd } => engine_cli::context(cmd),
         Cmd::Budget { cmd } => engine_cli::budget(cmd),
+        Cmd::Xpp { cmd } => xpp_cli::run(&cli, cmd),
     }
 }
 

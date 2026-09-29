@@ -156,21 +156,29 @@ fn get(store: &Store, id: &str) -> Result<TaskRow> {
 fn hub_for(t: &TaskRow, d: &DriveArgs) -> Result<AgentHub> {
     let cfg = frozen_config(t)?;
     let fake = d.fake_agents.as_deref();
-    if fake.is_none() {
+    // the profiles that run a real CLI: all without a fake script; with one, those outside its
+    // `only_profiles` (a script without the list fakes every profile)
+    let script = fake
+        .map(toryo::agents::fake::FakeScript::load)
+        .transpose()?;
+    let real = |p: &str| script.as_ref().is_none_or(|s| !s.fakes(p));
+    let mut ps: Vec<&str> = vec![&t.planner, &t.reviewer];
+    ps.extend(
+        t.implementers
+            .iter()
+            .skip(t.implementer_index)
+            .map(String::as_str),
+    );
+    ps.retain(|p| real(p));
+    if !ps.is_empty() {
         // R51: isolation evidence must match the CLI versions installed now
-        let mut ps: Vec<&str> = vec![&t.planner, &t.reviewer];
-        ps.extend(
-            t.implementers
-                .iter()
-                .skip(t.implementer_index)
-                .map(String::as_str),
-        );
         let mut bad = toryo::evidence::unverified_profiles(&cfg, &ps)?;
         let imps: Vec<&str> = t
             .implementers
             .iter()
             .skip(t.implementer_index)
             .map(String::as_str)
+            .filter(|p| real(p))
             .collect();
         bad.extend(toryo::evidence::unverified_implementers(&cfg, &imps)?);
         if !bad.is_empty() {
@@ -435,7 +443,8 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
         .unwrap_or(0);
     let verify_changed = serde_json::to_value(&old.repo.commands.verify)?
         != serde_json::to_value(&new.repo.commands.verify)?
-        || serde_json::to_value(&old.repo.verify)? != serde_json::to_value(&new.repo.verify)?;
+        || serde_json::to_value(&old.repo.verify)? != serde_json::to_value(&new.repo.verify)?
+        || toryo::engine::xpp::build_toolchain(&old) != toryo::engine::xpp::build_toolchain(&new); // R59
     let reverify = verify_changed && artifacts::head(&st, &t, "verify-result")?.is_some();
     let invalidated = serde_json::to_vec_pretty(
         &serde_json::json!({"invalidated": true, "reason": "task config --reload changed the verify configuration", "config_sha256": new_sha}),
@@ -871,6 +880,10 @@ pub fn status(id: Option<&str>) -> Result<i32> {
                 .unwrap_or_default(),
             active
         );
+        // R59: an X++ verify proves compile level only — say so wherever the state is shown
+        if task::frozen_config(&t).is_ok_and(|c| toryo::engine::xpp::compile_only(&c)) {
+            println!("               {}", toryo::engine::xpp::COMPILE_ONLY);
+        }
         let next = if t.state.is_terminal() && !t.run_store.exists() && !t.worktree.exists() {
             toryo::engine::runner::cleaned_up_action(&t)
         } else {
@@ -1045,6 +1058,10 @@ pub fn context(cmd: &ContextCmd) -> Result<i32> {
                 }
             );
             print!("{text}");
+            eprintln!(
+                "(the user prompt sent with it — for the Claude implementer with the <untrusted_data> blocks, R61 — is captured in {})",
+                t.captures().display()
+            );
             Ok(if ok { 0 } else { 1 })
         }
         None => {
@@ -1059,6 +1076,12 @@ pub fn context(cmd: &ContextCmd) -> Result<i32> {
                 cx::describe(&c)
             );
             print!("{}", c.text);
+            // R61: what goes into the user prompt instead of the context (Claude implementer)
+            if let Some(d) = c.data_prompt() {
+                print!(
+                    "\n<!-- user prompt part: untrusted task files as data blocks (R61) -->\n{d}"
+                );
+            }
             Ok(0)
         }
     }

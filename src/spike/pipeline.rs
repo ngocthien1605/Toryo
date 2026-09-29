@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use super::fixture;
 use super::render;
 use crate::agents::hub::AgentHub;
-use crate::config::{data_dir, expand_vars, CommandSpec, Effective, ProfileKind};
+use crate::config::{data_dir, expand_vars, CommandKind, CommandSpec, Effective, ProfileKind};
 use crate::domain::{ErrorClass, OpenSession, Role, StageOutcome, TurnInput, TurnLimits};
 use crate::engine::checks::{
     parse_acceptance_ids, resolve_program, review_violations, task_id, verify_commands,
@@ -66,14 +66,17 @@ pub struct PipelineArgs {
 }
 
 fn run_command(hub: &AgentHub, spec: &CommandSpec, cwd: &Path) -> Result<CommandResult> {
-    let program = resolve_program(&expand_vars(&spec.program)?);
+    let CommandKind::Program { program, args } = spec.kind() else {
+        bail!("{}: `spike pipeline` runs only `program` verify commands — `tool: xpp` runs in `toryo run` (R59)", spec.name);
+    };
+    let program = resolve_program(&expand_vars(program)?);
     let mut env = build_env(std::env::vars(), &Default::default(), &Default::default());
     env.insert("NO_COLOR".into(), "1".into());
     hub.block_on(LocalRunner.run(
         RunSpec {
             name: spec.name.clone(),
             program,
-            args: spec.args.clone(),
+            args: args.to_vec(),
             cwd: cwd.to_path_buf(),
             env,
             // Prototype: the verify boundary (R36) is wired in M6 — see HUONG-DAN.md.
@@ -170,6 +173,9 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
         cfg.repo.policy.neutralize_untrusted_filters,
     )?;
     let cmds = verify_commands(cfg, &repo)?;
+    if let Some(c) = cmds.iter().find(|c| c.is_xpp()) {
+        bail!("{}: `spike pipeline` runs only `program` verify commands — `tool: xpp` runs in `toryo run` (R59)", c.name);
+    }
     let mut exact = verify_files(&cmds, &repo);
     if let Ok(rel) = std::path::absolute(&task_path)?.strip_prefix(&repo) {
         exact.push(fwd(rel)); // the task is the contract: agents may not edit it
@@ -613,7 +619,7 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
                     .rev()
                     .collect::<Vec<_>>()
                     .join("\n");
-                results.push(json!({"name": cmd.name, "argv": std::iter::once(cmd.program.clone()).chain(cmd.args.clone()).collect::<Vec<_>>(), "exit": code, "ms": ms, "output_tail": tail}));
+                results.push(json!({"name": cmd.name, "argv": std::iter::once(cmd.program.clone().unwrap_or_default()).chain(cmd.args.clone()).collect::<Vec<_>>(), "exit": code, "ms": ms, "output_tail": tail}));
                 if !ok {
                     break; // stop at first failure (§5.2)
                 }

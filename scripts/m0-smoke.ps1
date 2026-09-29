@@ -5,7 +5,8 @@
 .DESCRIPTION
   1. Installs Claude Code (official installer, https://claude.ai/install.ps1) if it is missing.
   2. Checks Claude login, Codex CLI, Git, PowerShell 7.
-  3. Writes C:\.thien\m0\toryo.yaml for the detected paths (Claude Max + your Codex login).
+  3. Writes C:\.thien\m0\toryo.yaml for the detected paths, and C:\.thien\m0\toryo.local.yaml with the
+     profiles (Claude Max + your Codex login; R60: profiles never go into the repository file).
   4. Runs toryo.exe: doctor, job-test, git-canary, and the end-to-end smoke test
      (Claude plans -> Codex implements -> toryo checkpoints + verifies -> Claude reviews).
   Everything is logged to C:\.thien\AgentOrchestrator\thien-m0-data\ so the results can be read back.
@@ -58,8 +59,8 @@ foreach ($d in ($regPath -split ';')) { if ($d -and ($env:PATH -split ';') -notc
 if (-not (Test-Path $toryo)) { Write-Error "toryo.exe not found at $toryo"; Stop-Transcript | Out-Null; exit 2 }
 & $toryo --version
 $initHelp = & $toryo spike init-config --help 2>&1 | Out-String
-if ($initHelp -notmatch '--lenient') {
-    Write-Error "bin\toryo.exe is older than this script (no --lenient). Re-copy toryo.exe from the latest delivery."
+if ($initHelp -notmatch '--machine-out') {
+    Write-Error "bin\toryo.exe is older than this script (no --machine-out, R60). Re-copy toryo.exe from the latest delivery."
     Stop-Transcript | Out-Null; exit 2
 }
 
@@ -153,31 +154,36 @@ if ((Test-Path $calc) -and -not (Test-Path (Join-Path $calc '.git'))) {
 if (-not (Test-Path (Join-Path $calc '.git'))) { & $toryo spike init-fixture --into $calc --contracts $contracts }
 elseif (-not (Test-Path $contracts)) { & $toryo spike init-fixture --into (Join-Path $m0 ("calc-{0}" -f (Get-Date -Format yyyyMMddHHmmss))) --contracts $contracts }
 $cfgPath = Join-Path $m0 'toryo.yaml'
-$initArgs = @('spike', 'init-config', '--out', $cfgPath, '--project-root', $calc, '--worktrees-root', "$m0\worktrees",
+# R60: the profiles go to a machine config of their own (never the repository file). This one
+# belongs to the smoke run; an earlier one is moved aside (init-config never overwrites it).
+$machPath = Join-Path $m0 'toryo.local.yaml'
+if (Test-Path $machPath) { Move-Item -Path $machPath -Destination "$machPath.$(Get-Date -Format yyyyMMddHHmmss)" }
+$initArgs = @('spike', 'init-config', '--out', $cfgPath, '--machine-out', $machPath, '--project-root', $calc, '--worktrees-root', "$m0\worktrees",
               '--claude-exe', $claudeExe, '--codex-exe', $codexExe, '--codex-config', $codexCfg,
               '--codex-profiles', ($CodexProfiles -join ','), '--lenient')
 if ($gitBash) { $initArgs += @('--git-bash', $gitBash) }
 T @initArgs
 if ($LASTEXITCODE -ne 0) { Write-Error "init-config failed"; Stop-Transcript | Out-Null; exit 6 }
 Copy-Item $cfgPath (Join-Path $dataDir 'toryo.yaml') -Force
+Copy-Item $machPath (Join-Path $dataDir 'toryo.local.yaml') -Force
 
 # ---------------------------------------------------------------- toryo
 Set-Location $m0
 Section "toryo doctor"
-T --config $cfgPath doctor
+T --config $cfgPath --machine-config $machPath doctor
 Section "toryo spike job-test (R23)"
-T --config $cfgPath spike job-test
+T --config $cfgPath --machine-config $machPath spike job-test
 Section "toryo spike git-canary (R33/R37, M0-VERIFY 10)"
-T --config $cfgPath spike git-canary
+T --config $cfgPath --machine-config $machPath spike git-canary
 Section "Codex quick check per profile (one turn each, no edits)"
 $probePrompt = Join-Path $m0 'codex-probe.md'
 Set-Content -Path $probePrompt -Encoding utf8 -Value 'Do not run any command and do not edit any file. Return the JSON object with summary = "ok", and every other field = [].'
 $implSchema = Join-Path $m0 'contracts\schemas\implementation.schema.json'
-$generated = Get-Content $cfgPath -Raw
+$generated = Get-Content $machPath -Raw   # the profiles (R60)
 foreach ($p in $CodexProfiles) {
     if ($generated -notmatch "(?m)^\s+codex-${p}:") { "--- codex-${p}: not configured (see warnings above), skipped ---"; continue }
     "--- codex-$p ---"
-    T --config $cfgPath spike codex --profile "codex-$p" --label "probe-$p" --worktree $calc --prompt-file $probePrompt --schema $implSchema
+    T --config $cfgPath --machine-config $machPath spike codex --profile "codex-$p" --label "probe-$p" --worktree $calc --prompt-file $probePrompt --schema $implSchema
 }
 if (-not $SkipSmoke -and $generated -notmatch "(?m)^\s+codex-${SmokeCodexProfile}:") {
     Write-Warning "codex-$SmokeCodexProfile is not configured; smoke test skipped"
@@ -185,7 +191,7 @@ if (-not $SkipSmoke -and $generated -notmatch "(?m)^\s+codex-${SmokeCodexProfile
 }
 if (-not $SkipSmoke) {
     Section "toryo spike smoke (Claude plans -> Codex [$SmokeCodexProfile] implements -> verify -> Claude reviews)"
-    $smokeArgs = @('--config', $cfgPath, 'spike', 'smoke', '--claude-profile', 'claude-max', '--codex-profile', "codex-$SmokeCodexProfile")
+    $smokeArgs = @('--config', $cfgPath, '--machine-config', $machPath, 'spike', 'smoke', '--claude-profile', 'claude-max', '--codex-profile', "codex-$SmokeCodexProfile")
     if ($ClaudeModel) { $smokeArgs += @('--claude-model', $ClaudeModel) }
     if ($CodexModel)  { $smokeArgs += @('--codex-model', $CodexModel) }
     T @smokeArgs
@@ -193,19 +199,19 @@ if (-not $SkipSmoke) {
 if ($Full) {
     $cx = "codex-$SmokeCodexProfile"
     Section "claude-isolation (M0-VERIFY 1, 2, 7 + R44b)"
-    T --config $cfgPath spike claude-isolation --profile claude-max
+    T --config $cfgPath --machine-config $machPath spike claude-isolation --profile claude-max
     Section "codex-canary (M0-VERIFY 3: sandbox must block outside write, git commit, run-store write)"
-    T --config $cfgPath spike codex-canary --profile $cx
+    T --config $cfgPath --machine-config $machPath spike codex-canary --profile $cx
     Section "codex-project-config (M0-VERIFY 8)"
-    T --config $cfgPath spike codex-project-config --profile $cx
+    T --config $cfgPath --machine-config $machPath spike codex-project-config --profile $cx
     Section "killed-resume Claude (M0-VERIFY 4, 5)"
-    T --config $cfgPath spike killed-resume --profile claude-max
+    T --config $cfgPath --machine-config $machPath spike killed-resume --profile claude-max
     Section "killed-resume Codex (M0-VERIFY 11, 12)"
-    T --config $cfgPath spike killed-resume --profile $cx
+    T --config $cfgPath --machine-config $machPath spike killed-resume --profile $cx
     Section "lowil-canary (M0-VERIFY 9: verify commands at Low integrity)"
-    T --config $cfgPath spike lowil-canary
+    T --config $cfgPath --machine-config $machPath spike lowil-canary
 }
 Section "Report"
-T --config $cfgPath spike report --out (Join-Path $dataDir 'M0-RESULTS.generated.md')
+T --config $cfgPath --machine-config $machPath spike report --out (Join-Path $dataDir 'M0-RESULTS.generated.md')
 Write-Host "`nAll output is in $dataDir" -ForegroundColor Green
 Stop-Transcript | Out-Null

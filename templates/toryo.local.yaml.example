@@ -1,5 +1,56 @@
 # Machine config — lives OUTSIDE every repository: %USERPROFILE%\.toryo\toryo.local.yaml (R35/R37).
-# Selects profiles per machine and holds the ONLY trusted Git filter commands.
+# The ONLY place for agent profiles (R60), the role overrides of this machine, and the ONLY
+# trusted Git filter commands (R37).
+profiles:                                  # R60: never in the repository's toryo.yaml
+  claude-max:                              # personal machine: Claude Max subscription
+    kind: claude
+    billing: subscription                  # R30: every Claude profile runs --restricted --safe-mode
+    exe: C:\Users\toryo\.local\bin\claude.exe
+    version: "2.1.x"                       # doctor: needs >= 2.1.259 (--permission-prompts), >= 2.1.248 (--restricted)
+    env:
+      CLAUDE_CODE_GIT_BASH_PATH: C:\Program Files\Git\bin\bash.exe
+    # secret_env:                          # optional; omit to use the interactive /login of this Windows user
+    #   CLAUDE_CODE_OAUTH_TOKEN: credman:toryo/claude-max-oauth
+
+  claude-foundry:                          # company laptop only
+    kind: claude
+    billing: foundry
+    exe: C:\Users\toryo\.local\bin\claude.exe
+    env:
+      CLAUDE_CODE_USE_FOUNDRY: "1"
+      ANTHROPIC_FOUNDRY_RESOURCE: my-foundry
+      CLAUDE_CODE_GIT_BASH_PATH: C:\Program Files\Git\bin\bash.exe
+    secret_env:
+      ANTHROPIC_FOUNDRY_API_KEY: credman:toryo/foundry-claude
+
+  codex-foundry:
+    kind: codex
+    billing: foundry
+    exe: C:\tools\codex\codex.exe          # or the npm shim, e.g. %APPDATA%\npm\codex.cmd
+    model: gpt-5-codex                     # your Foundry deployment name
+    env:
+      CODEX_HOME: C:\Users\<you>\.toryo\codex-home   # auth + sessions only; config.toml there is ignored
+    secret_env:
+      AZURE_OPENAI_API_KEY: credman:toryo/foundry-openai
+    codex:
+      sandbox_mode: workspace-write
+      windows_sandbox: unelevated          # R18: WITHOUT THIS THE WINDOWS SANDBOX IS OFF
+      model_reasoning_effort: medium
+      provider:
+        id: foundry
+        name: Azure Foundry
+        base_url: https://my-foundry.openai.azure.com/openai/v1
+        env_key: AZURE_OPENAI_API_KEY
+        wire_api: responses
+
+# toolchains:                              # R59/R60: machine facts for `tool:` verify commands; never in the repository
+#   xpp:                                   # X++ (D365FO) on the UDE machine — see templates/d365fo/
+#     msbuild: 'C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe'
+#     nugets: 'D:\D365\cicd-nugets\<release>'   # the five CI/CD NuGet packages, extracted (one folder each)
+#     extra_references: []                 # folders of binary packages the models reference (e.g. ISV)
+#     bp_check: false                      # `true` is refused until xppbp.exe is supported
+#     ude_metadata: '%LOCALAPPDATA%\Microsoft\Dynamics365\<ApplicationVersion>\PackagesLocalDirectory'   # doctor only
+
 roles:
   planner:  { profile: claude-max, model: opus }
   reviewer: { profile: claude-max, model: opus }

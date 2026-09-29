@@ -100,9 +100,19 @@ pub struct FakeScript {
     /// Per-profile usage capabilities instead of the real adapter's (R41 fixtures).
     #[serde(default)]
     pub capabilities: BTreeMap<String, UsageCapabilities>,
+    /// When not empty, only these profiles are fake; every other profile runs its real CLI.
+    /// For checks that script one agent and use the real CLI for another — the injection
+    /// canary scripts the implementer and asks the real reviewer (`scripts/m9-check.ps1`, R61).
+    #[serde(default)]
+    pub only_profiles: Vec<String>,
 }
 
 impl FakeScript {
+    /// Whether `profile` is fake under this script ([`FakeScript::only_profiles`]).
+    pub fn fakes(&self, profile: &str) -> bool {
+        self.only_profiles.is_empty() || self.only_profiles.iter().any(|p| p == profile)
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
