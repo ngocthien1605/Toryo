@@ -139,6 +139,17 @@ enum Cmd {
         #[arg(long)]
         no_follow: bool,
     },
+    /// Tokens per stage × profile × model and the estimated cost (plan §12): prices from
+    /// `%USERPROFILE%\.toryo\prices.toml` (or --prices) for rows billed foundry/api.
+    Usage {
+        id: String,
+        /// One JSON document on stdout
+        #[arg(long)]
+        json: bool,
+        /// The price table (default: %USERPROFILE%\.toryo\prices.toml; none → no estimates)
+        #[arg(long)]
+        prices: Option<PathBuf>,
+    },
     /// 🔒 The token admission cap of a task (R41).
     Budget {
         #[command(subcommand)]
@@ -274,6 +285,7 @@ fn run(cli: Cli) -> Result<i32> {
             from_start,
             no_follow,
         } => engine_cli::watch(id, *json, *from_start, *no_follow),
+        Cmd::Usage { id, json, prices } => engine_cli::usage(id, *json, prices.as_deref()),
         Cmd::Partial { cmd } => engine_cli::partial(cmd),
         Cmd::Context { cmd } => engine_cli::context(cmd),
         Cmd::Budget { cmd } => engine_cli::budget(cmd),

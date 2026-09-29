@@ -700,7 +700,7 @@ impl<'a> Engine<'a> {
             hooks,
         )?;
         crash_point("implement:after_turn");
-        self.usage(&a, &turn.profile, &r)?;
+        self.usage(&a, &turn.profile, &r, turn.model.as_deref())?;
         Ok(Some(ImplementRun {
             budget_hit: budget_hit.load(Ordering::SeqCst),
             attempt: a,
@@ -1693,7 +1693,8 @@ impl<'a> Engine<'a> {
             self.limits(),
             hooks,
         )?;
-        self.usage(a, profile, &r)?;
+        let model = self.role_model(role.as_str());
+        self.usage(a, profile, &r, model.as_deref())?;
         if let Some(flow) = self.cut_short(a, &r, budget_hit.load(Ordering::SeqCst))? {
             return Ok(Err(flow));
         }
@@ -1964,8 +1965,21 @@ impl<'a> Engine<'a> {
 
     /// Record the turn's usage (R41): cumulative adapters store the delta against the
     /// session baseline; a turn that did not complete counts its streamed usage as provisional.
-    fn usage(&self, a: &AttemptRow, profile: &str, r: &StageOutcome) -> Result<()> {
+    /// `requested`: the model the engine asked the adapter for; the row records the one the turn
+    /// ran with (C1).
+    fn usage(
+        &self,
+        a: &AttemptRow,
+        profile: &str,
+        r: &StageOutcome,
+        requested: Option<&str>,
+    ) -> Result<()> {
         let caps = self.hub.capabilities(profile)?;
+        let model = self
+            .cfg
+            .profile(profile)
+            .ok()
+            .and_then(|p| super::usage_report::effective_model(requested, p));
         let mut u = r.usage;
         if let Some(x) = &mut u {
             if !r.success && (r.cancelled || r.timed_out) && x.accounting == Accounting::Exact {
@@ -1996,6 +2010,7 @@ impl<'a> Engine<'a> {
                     attempt: &aid,
                     stage: &stage,
                     profile: &p,
+                    model: model.as_deref(),
                     billing: b,
                     session: sess.as_deref(),
                     cumulative: caps.cumulative_on_resume == Tri::Yes,

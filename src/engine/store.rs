@@ -932,6 +932,9 @@ pub struct UsageIn<'a> {
     pub attempt: &'a str,
     pub stage: &'a str,
     pub profile: &'a str,
+    /// The model the turn ran with (C1): the role's, else the profile's; `None` when neither
+    /// names one (the CLI's default).
+    pub model: Option<&'a str>,
     pub billing: &'a str,
     /// The external session (Codex thread / Claude session) the counters belong to.
     pub session: Option<&'a str>,
@@ -986,8 +989,8 @@ pub fn record_usage_in(tx: &Transaction, u: &UsageIn) -> Result<i64> {
                     .unwrap_or(DEFAULT_UNKNOWN_RESERVATION),
             };
             tx.execute(
-                "INSERT INTO usage (task_id, stage_attempt_id, profile, billing_kind, accounting, reservation_tokens, at) VALUES (?1, ?2, ?3, ?4, 'unknown', ?5, ?6)",
-                params![u.task, u.attempt, u.profile, u.billing, res, at],
+                "INSERT INTO usage (task_id, stage_attempt_id, profile, model, billing_kind, accounting, reservation_tokens, at) VALUES (?1, ?2, ?3, ?4, ?5, 'unknown', ?6, ?7)",
+                params![u.task, u.attempt, u.profile, u.model, u.billing, res, at],
             )?;
             tx.execute(
                 "UPDATE tasks SET reserved_tokens = reserved_tokens + ?2 WHERE id = ?1",
@@ -1044,12 +1047,13 @@ pub fn record_usage_in(tx: &Transaction, u: &UsageIn) -> Result<i64> {
             }
             let budget = delta.budget_tokens(&u.weights) as i64;
             tx.execute(
-                "INSERT INTO usage (task_id, stage_attempt_id, profile, billing_kind, uncached_input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens, budget_tokens, accounting, includes_unreported, at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                "INSERT INTO usage (task_id, stage_attempt_id, profile, model, billing_kind, uncached_input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens, budget_tokens, accounting, includes_unreported, at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     u.task,
                     u.attempt,
                     u.profile,
+                    u.model,
                     u.billing,
                     delta.uncached_input as i64,
                     delta.cache_read as i64,
@@ -1109,6 +1113,7 @@ pub fn record_usage(
             attempt,
             stage: &stage,
             profile,
+            model: None,
             billing,
             session: None,
             cumulative: false,
@@ -1160,6 +1165,39 @@ pub fn usage_rows(
                 r.get(6)?,
                 r.get::<_, i64>(7)? != 0,
             ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(v)
+}
+
+/// The usage rows of a task for `toryo usage` (C1): with the attempt's stage, the recorded model
+/// (NULL before M10: `None`), the four buckets and the vendor-reported cost.
+pub fn usage_detail(tx: &Transaction, task: &str) -> Result<Vec<super::usage_report::UsageRow>> {
+    let mut q = tx.prepare(
+        "SELECT u.id, a.stage, u.profile, u.model, u.billing_kind, COALESCE(u.uncached_input_tokens, 0), COALESCE(u.cache_read_tokens, 0), COALESCE(u.cache_write_tokens, 0), COALESCE(u.output_tokens, 0), u.accounting, u.reservation_tokens, u.reconciled_by, u.vendor_reported_cost_usd
+         FROM usage u JOIN stage_attempts a ON a.id = u.stage_attempt_id WHERE u.task_id = ?1 ORDER BY u.id",
+    )?;
+    let v = q
+        .query_map([task], |r| {
+            let n = |i: usize| r.get::<_, i64>(i).map(|x| x.max(0) as u64);
+            Ok(super::usage_report::UsageRow {
+                id: r.get(0)?,
+                stage: r.get(1)?,
+                profile: r.get(2)?,
+                model: r.get(3)?,
+                billing_kind: r.get(4)?,
+                buckets: Buckets {
+                    uncached_input: n(5)?,
+                    cache_read: n(6)?,
+                    cache_write: n(7)?,
+                    output: n(8)?,
+                    reasoning: None,
+                },
+                accounting: r.get(9)?,
+                reservation_tokens: r.get(10)?,
+                reconciled_by: r.get(11)?,
+                vendor_reported_cost_usd: r.get(12)?,
+            })
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(v)

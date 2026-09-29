@@ -17,6 +17,7 @@ pub mod state;
 pub mod store;
 pub mod task;
 pub mod untrusted;
+pub mod usage_report;
 pub mod verify;
 pub mod views;
 pub mod worktree;

@@ -11,7 +11,7 @@ Branch `m10/flight-recorder` (from `main` @ `5adf204`). One commit per task.
 - [x] A2 — the engine's CLI lines rendered from events
 - [x] B1 — `status --json`, `task show --json`
 - [x] B2 — `toryo watch <ID>`
-- [ ] C1 — `prices.toml` + `toryo usage <ID>`
+- [x] C1 — `prices.toml` + `toryo usage <ID>`
 - [ ] C2 — scripted turns in mixed runs report zero usage
 - [ ] D1 — Windows toast
 - [ ] E1 — docs, morning summary
@@ -153,3 +153,45 @@ Branch `m10/flight-recorder` (from `main` @ `5adf204`). One commit per task.
   the line filter, the stop rule.
 - **Not verified here:** the Unix signal path compiles and runs only on Linux CI (no Linux target on
   this machine; installing one would be a download).
+
+## C — Usage (plan §12)
+
+### C1 — `prices.toml` and `toryo usage <ID>`
+
+- **Module** `src/engine/usage_report.rs` (pure, unit-tested): `parse_prices`/`load_prices`, `report`,
+  `render_text`, `to_json`, and the model resolution (`effective_model`, `configured_model`,
+  `stage_role`). `store::usage_detail` reads the rows (joined with the attempt's stage). `toryo usage ID
+  [--json] [--prices FILE]` needs no lock.
+- **The model is recorded.** `UsageIn.model`; both INSERTs fill `usage.model`. The engine passes the
+  model it asked the adapter for (the role's; for a Codex implementer the role's, else the profile's;
+  none for a Claude implementer — as before M10), and the row records `effective_model`: that, else the
+  profile's `model`, else a `model` in `codex.overrides`. That is the `-m` value, i.e. the Foundry
+  deployment name for a profile with a `codex.provider` block. A turn killed before it reported and
+  recorded by §10 recovery gets the configured model. A row with no model anywhere stays NULL.
+- **Rows written before M10** (`model` NULL): the task's frozen configuration names it —
+  `configured_model(cfg, stage, profile)`, the same rule — else `unknown model` (also for a cleaned-up
+  task whose frozen configuration is gone).
+- **Price table.** Default `%USERPROFILE%\.toryo\prices.toml` (`config::home_dir`), override `--prices`.
+  `version` is required (it is printed with every estimate), `safety_factor` defaults to 1.0 and must be
+  > 0, every model needs all four buckets (a missing price would silently mean $0). Parsed from a
+  `toml::Table` by hand so every error names its key (`models."gpt-6-astra".output`). **No file → no
+  estimates**, also for a `--prices` path that does not exist: the report says `prices: no price table
+  (<path>)`, so a typo is visible. Tests always pass `--prices`: the owner's file is never read.
+- **Report.** One group per stage × profile × model, in order of first appearance. Buckets are the sum of
+  the counted `exact` and `provisional` rows; the three totals stay apart (`exact`, `provis.`, `~unknown`
+  = reservations). Rows with `reconciled_by` are not counted (a later exact row absorbed them, R41); the
+  report says how many. Cost: `—` for `subscription`, `no price` for a model missing from the table
+  (listed again at the end), `no price table` without a table, else `est. $x` = Σ bucket × price / 1e6 ×
+  `safety_factor`. **Reservations are priced as uncached input** and make the label `~est.` — a
+  reservation has no buckets; input is where most tokens go, and output prices would inflate it ×8.
+- **`vendor_reported_cost_usd`** is summed and shown next to the estimate when present — but nothing
+  fills that column today (the Claude adapter parses `total_cost_usd`, `StageOutcome` does not carry it).
+  Open: carry it through `StageOutcome` if the comparison is wanted.
+- **`est_cost_usd` / `price_table_version` stay unused.** Filling them at insert would freeze an estimate
+  made with the prices of that day into the database; computing at report time lets a corrected
+  `prices.toml` fix every past estimate, and the version is printed with it. Worth filling later only if
+  `budget_usd_est` enforcement (out of scope) needs a running total without the table.
+- Tests: unit (bucket sums and the three totals, subscription vs foundry, `no price`, the safety factor,
+  `~est.` with reservations, reconciled rows not counted twice, the vendor cost, the parser's key names,
+  no file); `tests/m10_usage.rs` (a fake run with `usage` steps and a Foundry-billed fake profile: text and
+  `--json` numbers, `no price`, the model on new rows, the NULL fallback, a bad table, no table).

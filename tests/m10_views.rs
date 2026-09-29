@@ -206,11 +206,7 @@ fn watch_prints_the_history_of_a_finished_run() {
         .lines()
         .filter(|l| l.starts_with("   [state]") || l.starts_with("── "))
     {
-        assert!(
-            text.contains(line),
-            "{line:?} missing:
-{text}"
-        );
+        assert!(text.contains(line), "{line:?} missing:\n{text}");
     }
     let quiet = "   [state] Verifying --verify_passed--> Reviewing";
     assert!(text.contains(quiet) && !run_err.contains(quiet));

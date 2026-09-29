@@ -1359,3 +1359,37 @@ pub fn watch(id: &str, json: bool, from_start: bool, no_follow: bool) -> Result<
         }
     }
 }
+
+/// `toryo usage` (C1, plan §12): the task's tokens per stage × profile × model and the estimated
+/// cost from the machine's price table (`--prices`, else `%USERPROFILE%\.toryo\prices.toml`).
+/// Read-only: no lock. Rows written before M10 have no model: the task's frozen configuration
+/// names it (role → profile), else `unknown model`.
+pub fn usage(id: &str, json: bool, prices: Option<&std::path::Path>) -> Result<i32> {
+    use toryo::engine::usage_report as ur;
+    let st = store()?;
+    let t = get(&st, id)?;
+    let cfg = frozen_config(&t).ok();
+    let i = id.to_string();
+    let mut rows = st.call(move |tx| store::usage_detail(tx, &i))?;
+    for r in &mut rows {
+        if r.model.is_none() {
+            r.model = cfg
+                .as_ref()
+                .and_then(|c| ur::configured_model(c, &r.stage, &r.profile));
+        }
+    }
+    let path = prices
+        .map(std::path::Path::to_path_buf)
+        .or_else(ur::default_prices_path);
+    let table = match &path {
+        Some(p) => ur::load_prices(p)?,
+        None => None,
+    };
+    let r = ur::report(&rows, table.as_ref());
+    if json {
+        print_json(&ur::to_json(&r, id, path.as_deref()))?;
+    } else {
+        print!("{}", ur::render_text(&r, id, path.as_deref()));
+    }
+    Ok(0)
+}

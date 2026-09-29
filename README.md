@@ -57,6 +57,7 @@ toryo watch ID [--json] [--from-start] [--no-follow]   # M10: follow events.json
 toryo status [ID] [--json] · toryo task list [--json]|show ID [--json]|cleanup ID · toryo partial export ID --attempt N --into DIR
 toryo task config ID [--reload [--expect DIGEST]]   # 🔒 R35: frozen config; reload only in a waiting state
 toryo budget set ID --tokens N | --none             # 🔒 R41: admission cap, then `toryo resume`
+toryo usage ID [--json] [--prices FILE]            # §12: tokens per stage × profile × model, est. cost
 toryo context show ID --stage plan|implement|review [--attempt N] [--profile P]   # §7: what the agent gets
 toryo spike claude-implementer-isolation --profile claude-max   # R49 / V07-VERIFY 4
 toryo spike codex-temp-probe --profile codex-openai             # R46 / V07-VERIFY 2
@@ -155,6 +156,17 @@ toryo watch ID [--json] [--from-start] [--no-follow]
 the last 20 events (all with `--from-start`), then new ones as they come, rendered as the run prints them, or
 the raw lines with `--json`. It stops by itself 2 s after the last event once the task waits for you, is
 finished, or nobody drives it; Ctrl+C also exits 0.
+
+**Usage and cost (plan §12).** `toryo usage ID [--json] [--prices FILE]` shows the tokens per stage × profile ×
+model in the four buckets, with the `exact`, `provisional` and `~unknown` (reservations for turns with no
+telemetry) totals apart, and an estimated cost for rows billed `foundry` or `api` from the machine's price table
+`%USERPROFILE%\.toryo\prices.toml` (start from `templates/prices.toml.example`; USD per million tokens per bucket,
+`version`, `safety_factor`). Subscription rows show `—`, a model missing from the table `no price`, an estimate that
+includes reservations `~est.`. No table: the report without costs. Every usage row records the model the turn ran
+with (the role's, else the profile's; the Foundry deployment name for a Codex provider profile); rows written
+before M10 take it from the task's frozen configuration. `--json`: `{ task, prices: {path, version, safety_factor},
+rows: [ {stage, profile, model, billing_kind, buckets, exact_tokens, provisional_tokens, reserved_tokens, turns,
+reconciled_rows, est_cost_usd, cost, vendor_reported_cost_usd} ], totals: {…}, no_price: [ {model, profile} ] }`.
 
 **Hướng dẫn tiếng Việt (flow, cài đặt, cấu hình, thực hành với app mẫu BatchRename): `docs/HUONG-DAN.md`.**
 `spike pipeline` is the single-process reference prototype (R52); it prints a warning and gets no new features — use the engine (`toryo task create` + `toryo run`).
