@@ -299,3 +299,18 @@ Every entry: what was decided, why, and where. The owner folds these into plan v
   folder; toryo does not label a folder of the owner's choosing.
 - **ZZZ text** in `10-d365fo-models.md` now matches the deny glob `**/ZZZ/**` (a folder named `ZZZ`), with
   a TODO(owner) to set the real rule in both places.
+
+## First Windows CI run (PR #1) — two test fixes
+
+The first run on `windows-latest` failed in tests only; the product code was not at fault. Both causes were
+reproduced on Linux (a global `core.ignorecase = true` and a Windows-length `TMPDIR`) before the fix, and
+the whole suite passes under those conditions.
+
+- **`tests/m9_xpp.rs` (all 7):** the fixture's `.gitignore` has `build/`, and Git on Windows applies it
+  case-insensitively, so the committed `Projects/Build/*.rnrproj` were ignored ("nothing to commit"). The
+  test projects now live in `Projects/Pkg/`. The same trap can hide a real D365FO build project:
+  `xpp_project_missing` now suggests `git check-ignore -v <path>`, and HUONG-DAN §7.3 step 3 says to check.
+- **`engine::context::tests::untrusted_pack_files_are_listed_never_inlined` (group A):** with a 3 KB
+  budget, the longer Windows temp paths pushed TASK.md/PLAN.md out of the inline budget. The test now
+  checks the default budget (TASK/PLAN inline, untrusted files only as paths) and a 1 KB budget
+  (trimming happens, and no warning names an untrusted file) separately.

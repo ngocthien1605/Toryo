@@ -85,7 +85,9 @@ fn fwd(p: &Path) -> String {
     p.display().to_string().replace('\\', "/")
 }
 
-/// The calculator fixture with committed build projects `Projects/Build/<p>.rnrproj`, the five
+/// The calculator fixture with committed build projects `Projects/Pkg/<p>.rnrproj` (not
+/// `Projects/Build`: the fixture's `.gitignore` has `build/`, which Git on Windows applies
+/// case-insensitively — the same trap a D365FO repository can hold, see HUONG-DAN §7.3), the five
 /// packages under `<root>/nugets`, `toolchains.xpp` in the machine config and a `tool: xpp`
 /// verify command over `projects` (after the fixture's `divide-present` program command when
 /// `with_program`).
@@ -104,12 +106,7 @@ fn setup_xpp_with(
     let env = setup("codex-openai");
     let files: Vec<(String, String)> = projects
         .iter()
-        .map(|p| {
-            (
-                format!("Projects/Build/{p}.rnrproj"),
-                "<Project />\n".into(),
-            )
-        })
+        .map(|p| (format!("Projects/Pkg/{p}.rnrproj"), "<Project />\n".into()))
         .collect();
     let refs: Vec<(&str, &str)> = files
         .iter()
@@ -138,7 +135,7 @@ fn setup_xpp_with(
     .unwrap();
     let list: Vec<String> = projects
         .iter()
-        .map(|p| format!("Projects/Build/{p}.rnrproj"))
+        .map(|p| format!("Projects/Pkg/{p}.rnrproj"))
         .collect();
     let item = format!(
         "{{ name: build, tool: xpp, metadata: src, projects: [{}], timeout_min: 5 }}",
@@ -236,7 +233,7 @@ fn a_passing_xpp_build_passes_verify() {
         assert_eq!(c["kind"], "xpp");
         assert_eq!(c["scope"], "compile");
         assert_eq!(c["exit"], 0);
-        assert_eq!(c["project"], format!("Projects/Build/{stem}.rnrproj"));
+        assert_eq!(c["project"], format!("Projects/Pkg/{stem}.rnrproj"));
         let argv: Vec<&str> = c["argv"]
             .as_array()
             .unwrap()
@@ -272,7 +269,7 @@ fn a_passing_xpp_build_passes_verify() {
     }
     // the build projects are verify files: hashed like verify scripts
     assert!(
-        vr["scripts"]["Projects/Build/Calc.Build.rnrproj"].is_string(),
+        vr["scripts"]["Projects/Pkg/Calc.Build.rnrproj"].is_string(),
         "{vr}"
     );
 }
@@ -352,10 +349,10 @@ fn xpp_gate_integrity() {
     let cfg = toryo::engine::task::frozen_config(&t).unwrap();
     let (_, prot, _) = toryo::engine::runner::task_policy(&t, &cfg).unwrap();
     for p in [
-        "Projects/Build/Calc.Build.rnrproj",
+        "Projects/Pkg/Calc.Build.rnrproj",
         "Directory.Build.props",
         "src/Directory.Build.targets",
-        "Projects/Build/Directory.Build.rsp",
+        "Projects/Pkg/Directory.Build.rsp",
     ] {
         assert!(prot.violates(p), "{p}");
     }
@@ -365,7 +362,7 @@ fn xpp_gate_integrity() {
         json!({
             "planner": [turn(vec![plan()])],
             "implementer": [
-                turn(vec![write("Projects/Build/Calc.Build.rnrproj", "<!-- skip the build -->\n"), implementation()]),
+                turn(vec![write("Projects/Pkg/Calc.Build.rnrproj", "<!-- skip the build -->\n"), implementation()]),
                 turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()]),
             ],
             "reviewer": [turn(vec![approved()])],
@@ -385,7 +382,7 @@ fn xpp_gate_integrity() {
     assert!(a
         .error_detail
         .unwrap()
-        .contains("Projects/Build/Calc.Build.rnrproj"));
+        .contains("Projects/Pkg/Calc.Build.rnrproj"));
     let changed = git(
         &t.worktree,
         &["log", "--name-only", "--format=", "main..HEAD"],
@@ -460,17 +457,13 @@ fn a_broken_xpp_toolchain_refuses_admission_or_escalates() {
     std::fs::rename(&aside, &suite).unwrap();
     // a build project that is not in the base commit — here on disk but not committed
     // (protected: the implementer cannot add it later)
-    std::fs::write(
-        env.repo.join("Projects/Build/Nope.rnrproj"),
-        "<Project />\n",
-    )
-    .unwrap();
+    std::fs::write(env.repo.join("Projects/Pkg/Nope.rnrproj"), "<Project />\n").unwrap();
     let cfg = std::fs::read_to_string(&env.config).unwrap();
     std::fs::write(
         &env.config,
         cfg.replace(
-            "projects: [Projects/Build/Calc.Build.rnrproj]",
-            "projects: [Projects/Build/Calc.Build.rnrproj, Projects/Build/Nope.rnrproj]",
+            "projects: [Projects/Pkg/Calc.Build.rnrproj]",
+            "projects: [Projects/Pkg/Calc.Build.rnrproj, Projects/Pkg/Nope.rnrproj]",
         ),
     )
     .unwrap();
@@ -481,8 +474,8 @@ fn a_broken_xpp_toolchain_refuses_admission_or_escalates() {
     );
     assert_ne!(code, 0);
     assert!(err.contains("xpp_project_missing"), "{err}");
-    assert!(err.contains("project Projects/Build/Nope.rnrproj"), "{err}");
-    std::fs::remove_file(env.repo.join("Projects/Build/Nope.rnrproj")).unwrap();
+    assert!(err.contains("project Projects/Pkg/Nope.rnrproj"), "{err}");
+    std::fs::remove_file(env.repo.join("Projects/Pkg/Nope.rnrproj")).unwrap();
     std::fs::write(&env.config, cfg).unwrap();
     create(env, "X-4");
     let s = script(
@@ -515,7 +508,7 @@ fn a_broken_xpp_toolchain_refuses_admission_or_escalates() {
 #[test]
 fn xpp_diagnostics() {
     let errors = [
-        "{CWD}{SEP}src{SEP}Calculator.xml(12,5): error XPP0101: 'amount' is not declared. [{CWD}{SEP}Projects{SEP}Build{SEP}Calc.Build.rnrproj]",
+        "{CWD}{SEP}src{SEP}Calculator.xml(12,5): error XPP0101: 'amount' is not declared. [{CWD}{SEP}Projects{SEP}Pkg{SEP}Calc.Build.rnrproj]",
         "{CWD}{SEP}src{SEP}Tax.xml(40): error XPP0202: Method calc not found.",
     ];
     let filler: String = (1..=3000)
@@ -651,7 +644,7 @@ fn xpp_build_print_only_prints_the_verify_argv() {
             "--repo",
             &checkout,
             "--project",
-            "Projects/Build/Calc.Build.rnrproj",
+            "Projects/Pkg/Calc.Build.rnrproj",
             "--metadata",
             "src",
             "--out",
@@ -673,7 +666,7 @@ fn xpp_build_print_only_prints_the_verify_argv() {
         stdout.lines().any(|l| l.starts_with(&prefix)),
         "{prefix}\n---\n{stdout}"
     );
-    assert!(stdout.contains("# build/Calc.Build (Projects/Build/Calc.Build.rnrproj)"));
+    assert!(stdout.contains("# build/Calc.Build (Projects/Pkg/Calc.Build.rnrproj)"));
     assert_eq!(built(&x).len(), runs_before, "--print-only builds nothing");
     // --low: Windows only (the Low integrity boundary)
     let low = [
@@ -682,7 +675,7 @@ fn xpp_build_print_only_prints_the_verify_argv() {
         "--repo",
         &checkout,
         "--project",
-        "Projects/Build/Calc.Build.rnrproj",
+        "Projects/Pkg/Calc.Build.rnrproj",
         "--metadata",
         "src",
         "--print-only",
@@ -729,7 +722,7 @@ fn xpp_build_print_only_prints_the_verify_argv() {
 #[test]
 fn xpp_build_prints_diagnostics_and_fails() {
     let errors = [
-        "{CWD}{SEP}src{SEP}Calculator.xml(12,5): error XPP0101: 'amount' is not declared. [{CWD}{SEP}Projects{SEP}Build{SEP}Calc.Build.rnrproj]",
+        "{CWD}{SEP}src{SEP}Calculator.xml(12,5): error XPP0101: 'amount' is not declared. [{CWD}{SEP}Projects{SEP}Pkg{SEP}Calc.Build.rnrproj]",
     ];
     let x = setup_xpp_with(
         &["Calc.Build", "Ext.Build"],
@@ -746,9 +739,9 @@ fn xpp_build_prints_diagnostics_and_fails() {
         "--repo",
         &repo,
         "--project",
-        "Projects/Build/Calc.Build.rnrproj",
+        "Projects/Pkg/Calc.Build.rnrproj",
         "--project",
-        "Projects/Build/Ext.Build.rnrproj",
+        "Projects/Pkg/Ext.Build.rnrproj",
         "--metadata",
         "src",
     ];

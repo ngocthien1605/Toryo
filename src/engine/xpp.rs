@@ -300,7 +300,7 @@ pub fn check_repo(
     }
     if !missing.is_empty() {
         bail!(
-            "{PROJECT_MISSING}: not in {place} — {} (create and commit the build projects first; they are protected, R59)",
+            "{PROJECT_MISSING}: not in {place} — {} (create and commit the build projects first — if they exist, `git check-ignore -v <path>` shows whether .gitignore hides them; they are protected, R59)",
             missing.join(", ")
         );
     }
@@ -1131,7 +1131,7 @@ mod tests {
         );
         assert_eq!(
             e,
-            "xpp_project_missing: not in commit abc of R — b: project P/Missing.rnrproj (create and commit the build projects first; they are protected, R59)"
+            "xpp_project_missing: not in commit abc of R — b: project P/Missing.rnrproj (create and commit the build projects first — if they exist, `git check-ignore -v <path>` shows whether .gitignore hides them; they are protected, R59)"
         );
         assert_eq!(tree_key(".\\P\\Core.Build.rnrproj"), "p/core.build.rnrproj");
         assert_eq!(file_name("build:core/X.Build"), "build-core-X.Build");

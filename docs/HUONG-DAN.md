@@ -672,6 +672,9 @@ Bộ mẫu nằm ở `templates\d365fo\`; mỗi file liệt kê các mục `TODO
 3. **Tạo build project cho từng package**: trong Visual Studio tạo một Finance and Operations project cho mỗi
    package, đặt Model = model của package, lưu thành `Projects\Build\<Package>.Build.rnrproj` (không cần object:
    package luôn được build nguyên gói), commit. Các project này và mọi `Directory.Build.*` được bảo vệ.
+   Kiểm tra `.gitignore` không giấu chúng: `git check-ignore -v Projects\Build\ContosoCore.Build.rnrproj` phải
+   không in gì. Git trên Windows so tên không phân biệt hoa thường, nên một dòng `build/` cũng bỏ qua thư mục
+   `Build\` — khi đó `task create` báo `xpp_project_missing`.
 4. **Tải NuGet CI/CD**: Visual Studio › Tools › Options › Power Platform Tools › General › bật
    *Download Dynamics 365 FnO NuGets for CI/CD*; rồi Tools › *Download Dynamics365 FnO NuGets for CI/CD* đúng
    release UDE đang chạy. Mỗi gói một thư mục trong `toolchains.xpp.nugets`; nếu chỉ có file `.nupkg` thì giải
