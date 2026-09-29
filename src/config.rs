@@ -403,8 +403,10 @@ impl Effective {
 pub const VERIFY_BOUNDARIES: &[&str] = &["low_integrity", "none"];
 /// `verify.checkout` (R29).
 pub const VERIFY_CHECKOUTS: &[&str] = &["clean", "tracked"];
-/// `codex.sandbox_mode`: the plan runs Codex in `workspace-write` only (R18/R19).
-pub const CODEX_SANDBOX_MODES: &[&str] = &["workspace-write"];
+/// `codex.sandbox_mode`: the plan runs Codex in `workspace-write` (R18/R19); `read-only` is
+/// stricter and runs with a warning. Anything else (`danger-full-access`) turns off the
+/// sandbox that R18 requires.
+pub const CODEX_SANDBOX_MODES: &[&str] = &["workspace-write", "read-only"];
 /// `codex.windows_sandbox` (R18).
 pub const CODEX_WINDOWS_SANDBOXES: &[&str] = &["unelevated", "elevated"];
 /// `pipeline.budget_weights` keys: the four token buckets (R41).
@@ -469,8 +471,9 @@ fn problems(repo: &RepoConfig) -> Vec<String> {
             let key = format!("profiles.{name}.codex.windows_sandbox");
             one_of(&mut out, &key, ws, CODEX_WINDOWS_SANDBOXES);
         }
+        let provider = c.provider.as_ref().map(|p| p.id.as_str());
         for k in c.overrides.keys() {
-            if let Some(why) = denied_override(k, c.provider.is_some()) {
+            if let Some(why) = denied_override(k, provider) {
                 out.push(format!("profiles.{name}.codex.overrides.{k}: {why}"));
             }
         }
@@ -478,14 +481,22 @@ fn problems(repo: &RepoConfig) -> Vec<String> {
     out
 }
 
+/// The fields of `codex.provider` that toryo passes as `model_providers.<id>.<field>`.
+const PROVIDER_FIELDS: &[&str] = &["name", "base_url", "env_key", "wire_api"];
+
 /// Why a `codex.overrides` key is refused (ARCH-05), or None. The overrides are passed after
-/// toryo's own `-c` settings and Codex applies the last one, so these keys would re-set the
-/// sandbox (`sandbox*`, `windows.*`), the approval policy or the environment policy.
-/// `model_provider*` is refused when the profile has a `codex.provider` block, which it would
-/// re-set; without one, overrides are how `toryo spike init-config` selects the provider of a
-/// translated Codex profile. The key is taken as Codex reads it: up to the first `=`,
-/// without whitespace or quotes.
-pub fn denied_override(key: &str, has_provider: bool) -> Option<&'static str> {
+/// toryo's own `-c` settings and Codex applies the last one, so exactly these are refused:
+/// what toryo sets itself or what switches the sandbox, approval or environment policy —
+/// `sandbox_mode`, the legacy `sandbox_permissions`, `windows` / `windows.*`,
+/// `approval_policy` and `shell_environment_policy*` (with their sub-keys); and, only when
+/// the profile has a `codex.provider` block (`provider_id`), the selector `model_provider`
+/// and `model_providers.<id>.{name, base_url, env_key, wire_api}` or a table holding them.
+/// Everything else is allowed: `sandbox_workspace_write.*`, the provider's other keys
+/// (`query_params`, `request_max_retries` …), and `model_provider*` without a provider
+/// block, which is how `toryo spike init-config` selects a translated profile's provider.
+/// The key is taken as Codex reads it: up to the first `=`, without whitespace or quotes,
+/// and compared in lower case.
+pub fn denied_override(key: &str, provider_id: Option<&str>) -> Option<&'static str> {
     let k: String = key
         .split('=')
         .next()
@@ -494,18 +505,38 @@ pub fn denied_override(key: &str, has_provider: bool) -> Option<&'static str> {
         .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
         .collect::<String>()
         .to_ascii_lowercase();
-    let is_or_under = |p: &str| k == p || k.starts_with(&format!("{p}."));
-    if k.starts_with("sandbox") || is_or_under("windows") {
+    if ["sandbox_mode", "sandbox_permissions", "windows"]
+        .iter()
+        .any(|p| is_or_under(&k, p))
+    {
         Some("re-sets the sandbox that toryo sets (codex.sandbox_mode / codex.windows_sandbox, R18/R19)")
-    } else if is_or_under("approval_policy") {
+    } else if is_or_under(&k, "approval_policy") {
         Some("re-sets the approval policy of the unattended `codex exec` turn")
     } else if k.starts_with("shell_environment_policy") {
         Some("re-sets the environment of Codex's commands, which toryo builds (R23)")
-    } else if has_provider && k.starts_with("model_provider") {
+    } else if provider_id.is_some_and(|id| resets_provider(&k, id)) {
         Some("re-sets the provider of codex.provider (change it there)")
     } else {
         None
     }
+}
+
+/// `key` is `prefix` or one of its sub-keys (`prefix.…`).
+fn is_or_under(key: &str, prefix: &str) -> bool {
+    key.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
+/// `key` (normalised) re-sets what toryo passes for the provider `id`: the selector, a
+/// field of [`PROVIDER_FIELDS`], or a table holding them.
+fn resets_provider(key: &str, id: &str) -> bool {
+    let table = format!("model_providers.{}", id.to_ascii_lowercase());
+    key == "model_providers"
+        || key == table
+        || is_or_under(key, "model_provider")
+        || PROVIDER_FIELDS
+            .iter()
+            .any(|f| is_or_under(key, &format!("{table}.{f}")))
 }
 
 /// `%USERPROFILE%\.toryo\toryo.local.yaml` (or `~/.toryo/toryo.local.yaml`).
@@ -785,11 +816,31 @@ policy:
             "{e}"
         );
         assert!(
-            e.contains("profiles.codex-foundry.codex.sandbox_mode: `danger-full-access` is not a valid value (valid: workspace-write)"),
+            e.contains("profiles.codex-foundry.codex.sandbox_mode: `danger-full-access` is not a valid value (valid: workspace-write, read-only)"),
             "{e}"
         );
         load_str(&SAMPLE.replace("windows_sandbox: unelevated", "windows_sandbox: elevated"))
             .unwrap();
+        // stricter than workspace-write: loads (the launch preflight warns and runs it)
+        for mode in ["read-only", "workspace-write"] {
+            let yaml = SAMPLE.replace(
+                "windows_sandbox: unelevated",
+                &format!("windows_sandbox: unelevated\n      sandbox_mode: {mode}"),
+            );
+            let cfg = load_str(&yaml).unwrap();
+            let codex = cfg.repo.profiles["codex-foundry"].codex.as_ref().unwrap();
+            assert_eq!(codex.sandbox_mode, mode);
+        }
+        for mode in ["danger-full-access", "workspace_write", "none"] {
+            let e = load_err(&SAMPLE.replace(
+                "windows_sandbox: unelevated",
+                &format!("windows_sandbox: unelevated\n      sandbox_mode: {mode}"),
+            ));
+            assert!(
+                e.contains(&format!("sandbox_mode: `{mode}` is not a valid value")),
+                "{e}"
+            );
+        }
     }
 
     /// A Codex profile without a `codex:` block gets the documented defaults, not an
@@ -801,43 +852,90 @@ policy:
         assert!(d.windows_sandbox.is_none() && d.overrides.is_empty() && d.provider.is_none());
     }
 
-    /// ARCH-05: overrides that would re-set the sandbox, approvals or environment policy.
+    /// ARCH-05: exactly the overrides that re-set what toryo sets or switch the sandbox,
+    /// approval or environment policy are refused; the provider's selector and the fields
+    /// toryo passes for it only with a `codex.provider` block. A key is read as Codex reads
+    /// it (up to `=`, no whitespace or quotes), in any case.
     #[test]
-    fn codex_overrides_cannot_reset_the_sandbox() {
+    fn codex_overrides_refuse_exactly_what_toryo_sets() {
+        let foundry = Some("foundry");
+        let refused = [
+            "sandbox_mode",
+            " sandbox_mode ",
+            "Sandbox_Mode",
+            "sandbox_mode=\"danger-full-access\"#",
+            "sandbox_permissions",
+            "windows",
+            "windows.sandbox",
+            "approval_policy",
+            "approval_policy.reject.sandbox_approval",
+            "shell_environment_policy",
+            "shell_environment_policy.inherit",
+            "shell_environment_policy.set.PATH",
+        ];
+        let refused_with_provider = [
+            "model_provider",
+            "model_providers",
+            "model_providers.foundry",
+            "model_providers.foundry.name",
+            "model_providers.foundry.base_url",
+            "model_providers.\"foundry\".base_url",
+            "model_providers.foundry.env_key",
+            "model_providers.foundry.wire_api",
+        ];
+        let allowed = [
+            "sandbox_workspace_write.network_access",
+            "sandbox_workspace_write.writable_roots",
+            "model_providers.foundry.query_params.api-version",
+            "model_providers.foundry.request_max_retries",
+            "model_providers.foundry.stream_idle_timeout_ms",
+            "model_providers.azure.base_url",
+            "model_reasoning_effort",
+            "model_verbosity",
+            "windows_x",
+            "sandbox",
+        ];
+        for k in refused {
+            assert!(denied_override(k, None).is_some(), "{k}");
+            assert!(denied_override(k, foundry).is_some(), "{k}");
+        }
+        for k in refused_with_provider {
+            assert!(denied_override(k, foundry).is_some(), "{k}");
+            // without a codex.provider block, the provider comes from the overrides
+            // (how `toryo spike init-config` translates a Codex profile)
+            assert_eq!(denied_override(k, None), None, "{k}");
+        }
+        for k in allowed {
+            assert_eq!(denied_override(k, foundry), None, "{k}");
+            assert_eq!(denied_override(k, None), None, "{k}");
+        }
+        // the same at load (SAMPLE's profile has the provider block `foundry`)
         let with = |key: &str| {
             SAMPLE.replace(
                 "windows_sandbox: unelevated",
                 &format!("windows_sandbox: unelevated\n      overrides: {{ '{key}': '\"x\"' }}"),
             )
         };
-        for key in [
+        for k in [
             "sandbox_mode",
-            "sandbox_workspace_write.network_access",
-            "windows.sandbox",
-            "windows",
+            "sandbox_permissions",
             "approval_policy",
-            "shell_environment_policy.inherit",
-            " sandbox_mode ",
-            "sandbox_mode=\"danger-full-access\"#",
             "model_provider",
             "model_providers.foundry.base_url",
         ] {
-            let e = load_err(&with(key));
-            assert!(
-                e.contains("codex.overrides.") && e.contains("re-sets"),
-                "{key}: {e}"
-            );
+            let e = load_err(&with(k));
+            let want = format!("profiles.codex-foundry.codex.overrides.{k}: re-sets");
+            assert!(e.contains(&want), "{k}: {e}");
         }
-        // without a codex.provider block, the provider comes from the overrides (init-config)
+        for k in allowed {
+            load_str(&with(k)).unwrap();
+        }
         let no_provider = with("model_provider").replace(
             "      provider: { id: foundry, name: Azure Foundry, base_url: https://x.openai.azure.com/openai/v1, env_key: AZURE_OPENAI_API_KEY }\n",
             "",
         );
         assert!(!no_provider.contains("provider: {"));
         load_str(&no_provider).unwrap();
-        for key in ["model_reasoning_effort", "model_verbosity", "windows_x"] {
-            load_str(&with(key)).unwrap();
-        }
     }
 
     /// The configuration shape `toryo spike init-config` writes (explicit nulls), as in use.

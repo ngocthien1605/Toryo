@@ -101,28 +101,48 @@ impl CodexLaunch {
         a
     }
 
-    /// Reasons that make a Codex profile unusable (R18). The CLI adapter refuses a turn
-    /// that has any (fail closed, ARCH-05).
-    pub fn preflight(&self) -> Vec<String> {
-        let mut w = Vec::new();
+    /// The launch preflight (R18, ARCH-05): what makes the profile unusable, and what only
+    /// deserves a warning.
+    pub fn check(&self) -> Preflight {
+        let mut p = Preflight::default();
         if cfg!(windows) && self.settings.windows_sandbox.is_none() {
-            w.push("codex.windows_sandbox is not set: on native Windows the sandbox type is None and workspace-write enforces nothing (R18)".into());
+            p.refused.push("codex.windows_sandbox is not set: on native Windows the sandbox type is None and workspace-write enforces nothing (R18)".into());
         }
-        if self.settings.sandbox_mode != "workspace-write" {
-            w.push(format!(
-                "sandbox_mode is `{}`, plan requires workspace-write",
-                self.settings.sandbox_mode
-            ));
-        }
-        // a frozen configuration is not validated again, so check the overrides here too
-        let has_provider = self.settings.provider.is_some();
-        for k in self.settings.overrides.keys() {
-            if let Some(why) = crate::config::denied_override(k, has_provider) {
-                w.push(format!("codex.overrides.{k} {why}"));
+        let mode = &self.settings.sandbox_mode;
+        if mode != "workspace-write" {
+            let why = format!("sandbox_mode is `{mode}`, plan requires workspace-write");
+            // stricter than the plan (nothing is writable): it runs, as it always did
+            if mode == "read-only" {
+                p.warnings.push(why);
+            } else {
+                p.refused.push(why);
             }
         }
-        w
+        // a frozen configuration is not validated again, so check the overrides here too
+        let provider = self.settings.provider.as_ref().map(|v| v.id.as_str());
+        for k in self.settings.overrides.keys() {
+            if let Some(why) = crate::config::denied_override(k, provider) {
+                p.refused.push(format!("codex.overrides.{k} {why}"));
+            }
+        }
+        p
     }
+
+    /// Every preflight reason, refusals first. The M0 spike prints them all as warnings
+    /// and runs anyway; the CLI adapter uses [`CodexLaunch::check`].
+    pub fn preflight(&self) -> Vec<String> {
+        let p = self.check();
+        p.refused.into_iter().chain(p.warnings).collect()
+    }
+}
+
+/// The result of [`CodexLaunch::check`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Preflight {
+    /// The profile is unusable: the CLI adapter refuses the turn (fail closed, ARCH-05).
+    pub refused: Vec<String>,
+    /// Printed as `WARNING: …`; the turn runs (a `read-only` sandbox).
+    pub warnings: Vec<String>,
 }
 
 /// The R21 message table, most specific first, compiled once (CODE-05).
@@ -396,20 +416,67 @@ mod tests {
     }
 
     /// A frozen configuration is not validated again at load, so the launch preflight
-    /// refuses the overrides that config validation refuses (ARCH-05).
+    /// refuses the overrides that config validation refuses (ARCH-05) — and only those.
     #[test]
     fn preflight_refuses_overrides_that_reset_the_sandbox() {
         let mut l = launch();
-        assert!(!l.preflight().iter().any(|w| w.contains("overrides")));
-        l.settings
-            .overrides
-            .insert("sandbox_mode".into(), "\"danger-full-access\"".into());
-        let w = l.preflight();
-        assert!(
-            w.iter()
-                .any(|w| w.contains("codex.overrides.sandbox_mode") && w.contains("sandbox")),
-            "{w:?}"
+        assert_eq!(l.check(), Preflight::default());
+        // the review's configurations that ran before the ARCH-05 checks keep running
+        for (k, v) in [
+            (
+                "model_providers.foundry.query_params.api-version",
+                "\"2025-04-01-preview\"",
+            ),
+            ("model_providers.foundry.request_max_retries", "4"),
+            ("sandbox_workspace_write.network_access", "true"),
+            ("sandbox_workspace_write.writable_roots", "[\"D:/cache\"]"),
+        ] {
+            l.settings.overrides.insert(k.into(), v.into());
+        }
+        assert_eq!(l.check(), Preflight::default());
+        for (k, v) in [
+            ("sandbox_mode", "\"danger-full-access\""),
+            ("model_providers.foundry.base_url", "\"https://elsewhere\""),
+        ] {
+            let mut bad = l.clone();
+            bad.settings.overrides.insert(k.into(), v.into());
+            let p = bad.check();
+            assert!(p.warnings.is_empty(), "{p:?}");
+            assert!(
+                p.refused.len() == 1
+                    && p.refused[0].starts_with(&format!("codex.overrides.{k} re-sets")),
+                "{p:?}"
+            );
+            assert_eq!(bad.preflight(), p.refused);
+        }
+    }
+
+    /// `read-only` is stricter than the plan's workspace-write: a warning, and the turn runs
+    /// (as before the ARCH-05 checks); a weaker or unknown mode is refused.
+    #[test]
+    fn preflight_warns_on_read_only_and_refuses_weaker_modes() {
+        let mut l = launch();
+        l.settings.sandbox_mode = "read-only".into();
+        let want = "sandbox_mode is `read-only`, plan requires workspace-write".to_string();
+        assert_eq!(
+            l.check(),
+            Preflight {
+                refused: vec![],
+                warnings: vec![want.clone()],
+            }
         );
+        assert_eq!(l.preflight(), vec![want]);
+        for mode in ["danger-full-access", "workspace_write", ""] {
+            l.settings.sandbox_mode = mode.into();
+            let p = l.check();
+            assert!(p.warnings.is_empty(), "{mode}: {p:?}");
+            assert_eq!(
+                p.refused,
+                vec![format!(
+                    "sandbox_mode is `{mode}`, plan requires workspace-write"
+                )]
+            );
+        }
     }
 
     #[test]

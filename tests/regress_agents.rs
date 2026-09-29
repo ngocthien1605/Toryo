@@ -9,9 +9,11 @@
 //! | EC-04 Claude classification | `claude_failure_texts_use_word_boundaries`, `claude_structured_fields_decide_before_the_text`, `claude_recovered_api_retry_does_not_decide_the_class`, `claude_retry_decides_only_while_still_retrying` |
 //! | EC-05 live usage | `claude_replay_reports_live_cumulative_usage`, `unix::live_usage_arrives_while_the_claude_turn_runs`, `unix::usage_hook_interrupts_the_claude_turn_mid_turn` |
 //! | EC-06 output is activity | `every_stdout_line_is_activity`, `unix::stall_does_not_fire_while_claude_streams_thinking`, `unix::stall_still_fires_when_the_agent_is_silent` |
+//! | EC-06 a running command is not a stall | `codex_running_commands_are_reported_for_a_process_only`, `unix::codex_stall_waits_for_a_running_command`, `unix::codex_silence_after_a_command_still_stalls`, `unix::codex_command_that_never_ends_is_bounded_by_max`, `unix::codex_stop_request_ends_a_running_command` |
 //! | EC-32 no busy wait | `linux::wait_does_not_spin_after_both_pipes_close` |
 //! | TS-01 fake parity | `fake_denial_then_complete_fails_like_the_real_parser`, `fake_unreadable_replay_file_fails_loudly` |
 //! | ARCH-05 fail-closed preflight | `codex_preflight_refuses_the_turn_without_a_process`, `unix::codex_turn_runs_when_the_preflight_passes` |
+//! | ARCH-05 only what toryo sets is refused | `unix::codex_turn_runs_with_read_only_and_provider_overrides` |
 //! | CODE-07 capture errors | `linux::capture_write_failure_fails_the_turn` |
 
 use std::path::{Path, PathBuf};
@@ -54,6 +56,29 @@ const CODEX_START: &[&str] = &[
 
 fn codex_error(message: &str) -> String {
     json!({"type":"error","message":message}).to_string()
+}
+
+const BUILD: &str = "pwsh -NoProfile -File scripts/build-model.ps1";
+
+/// A Codex `command_execution` item: `item.started`, or `item.completed` with exit 0 (the
+/// shapes of fixtures/captured/codex-*.jsonl).
+fn codex_command(id: &str, completed: bool) -> String {
+    if completed {
+        json!({"type":"item.completed","item":{"id":id,"type":"command_execution","command":BUILD,"aggregated_output":"ok","exit_code":0,"status":"completed"}})
+    } else {
+        json!({"type":"item.started","item":{"id":id,"type":"command_execution","command":BUILD,"aggregated_output":"","exit_code":null,"status":"in_progress"}})
+    }
+    .to_string()
+}
+
+/// A Codex `file_change` item, started or completed.
+fn codex_file_change(id: &str, completed: bool) -> String {
+    let (ty, status) = if completed {
+        ("item.completed", "completed")
+    } else {
+        ("item.started", "in_progress")
+    };
+    json!({"type":ty,"item":{"id":id,"type":"file_change","changes":[{"path":"src/a.psm1","kind":"update"}],"status":status}}).to_string()
 }
 
 fn codex(lines: &[&str], exit: Option<i32>) -> toryo::agents::TurnOutcome {
@@ -531,6 +556,87 @@ fn every_stdout_line_is_activity() {
     );
 }
 
+/// EC-06 (the review of the branch): an agent process reports when a Codex command starts
+/// running (the first of several) and when the last one ends; other items change nothing.
+/// A replay, and so the fake, never reports it, and consumers ignore it.
+#[test]
+fn codex_running_commands_are_reported_for_a_process_only() {
+    let steps = [
+        (CODEX_START[0].to_string(), None),
+        (CODEX_START[1].to_string(), None),
+        (codex_command("i1", false), Some(true)),
+        (codex_command("i2", false), None),
+        (codex_file_change("i3", false), None),
+        (codex_command("i1", true), None),
+        (codex_file_change("i3", true), None),
+        // a completion without its start
+        (codex_command("i9", true), None),
+        (codex_command("i2", true), Some(false)),
+        (codex_command("i4", false), Some(true)),
+        (codex_command("i4", true), Some(false)),
+    ];
+    let mut live = LiveEvents::for_process(ProfileKind::Codex);
+    let mut replayed = LiveEvents::new(ProfileKind::Codex);
+    for (line, want) in &steps {
+        let (running, rest): (Vec<AgentEvent>, Vec<AgentEvent>) = live
+            .feed(line.as_bytes())
+            .into_iter()
+            .partition(|e| matches!(e, AgentEvent::CommandRunning(_)));
+        let want: Vec<AgentEvent> = want
+            .iter()
+            .map(|r| AgentEvent::CommandRunning(*r))
+            .collect();
+        assert_eq!(running, want, "{line}");
+        // everything else is what a replay of the line gives
+        let r = replayed.feed(line.as_bytes());
+        if rest.is_empty() {
+            assert_eq!(r, vec![AgentEvent::Heartbeat], "{line}");
+        } else {
+            assert_eq!(rest, r, "{line}");
+        }
+    }
+    // Claude reports none (its implementer has no shell; its Bash tool has its own timeout)
+    let mut claude = LiveEvents::for_process(ProfileKind::Claude);
+    assert_eq!(
+        claude.feed(codex_command("i1", false).as_bytes()),
+        vec![AgentEvent::Heartbeat]
+    );
+    for f in ["codex-implement.jsonl", "codex-fix.jsonl"] {
+        let text = std::fs::read_to_string(fixture(f)).unwrap();
+        // the recorded real streams: a start and an end per command, one at a time
+        let mut live = LiveEvents::for_process(ProfileKind::Codex);
+        let running: Vec<bool> = text
+            .lines()
+            .flat_map(|l| live.feed(l.as_bytes()))
+            .filter_map(|e| match e {
+                AgentEvent::CommandRunning(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        let commands = text
+            .lines()
+            .filter(|l| l.contains(r#""item.started""#) && l.contains("command_execution"))
+            .count();
+        assert!(commands >= 5, "{f}: {commands}");
+        assert_eq!(running, [true, false].repeat(commands), "{f}");
+        // a replay never reports it
+        let ev = replay(ProfileKind::Codex, &text, Some(0));
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, AgentEvent::CommandRunning(_))),
+            "{f}"
+        );
+    }
+    // consumers see nothing of it
+    let mut o = StageOutcome::default();
+    o.apply(&AgentEvent::CommandRunning(true));
+    o.apply(&AgentEvent::CommandRunning(false));
+    assert_eq!(
+        serde_json::to_value(&o).unwrap(),
+        serde_json::to_value(StageOutcome::default()).unwrap()
+    );
+}
+
 // ── TS-01: the fake follows the real contract ────────────────────────────────────────
 
 #[tokio::test]
@@ -646,7 +752,7 @@ fn codex_preflight_refuses_the_turn_without_a_process() {
     let tmp = tempfile::tempdir().unwrap();
     // spawning this would fail differently (ProcessCrashed, "starting …")
     let exe = tmp.path().join("codex-not-installed");
-    let cfg = with_codex_sandbox(config(tmp.path(), &exe), "read-only", None);
+    let cfg = with_codex_sandbox(config(tmp.path(), &exe), "danger-full-access", None);
     let hub = AgentHub::new(&cfg, LaunchMode::Restricted, None).unwrap();
     let out = hub
         .turn(
@@ -659,7 +765,10 @@ fn codex_preflight_refuses_the_turn_without_a_process() {
     assert_eq!(out.error_class, Some(ErrorClass::PolicyRefusal), "{out:?}");
     let detail = out.error_detail.clone().unwrap();
     assert!(detail.starts_with("preflight: "), "{detail}");
-    assert!(detail.contains("sandbox_mode is `read-only`"), "{detail}");
+    assert!(
+        detail.contains("sandbox_mode is `danger-full-access`"),
+        "{detail}"
+    );
     if cfg!(windows) {
         assert!(detail.contains("windows_sandbox"), "{detail}");
     }
@@ -700,9 +809,10 @@ mod unix {
     use toryo::usage::Accounting;
 
     use super::{
-        config, open, with_codex_sandbox, CODEX_DONE, CODEX_START, INIT, INPUT_JSON_DELTA, RESULT,
-        START_900K, THINKING_DELTA, THINKING_TOKENS,
+        codex_command, codex_file_change, config, open, with_codex_sandbox, CODEX_DONE,
+        CODEX_START, INIT, INPUT_JSON_DELTA, RESULT, START_900K, THINKING_DELTA, THINKING_TOKENS,
     };
+    use toryo::config::Effective;
 
     fn sh_quote(s: &str) -> String {
         format!("'{}'", s.replace('\'', r"'\''"))
@@ -932,6 +1042,227 @@ mod unix {
             outcome.contains("Reconnecting... 1/5"),
             "kept as a warning: {outcome}"
         );
+    }
+
+    /// sh lines that print `lines`, one each.
+    fn echo<S: AsRef<str>>(lines: &[S]) -> String {
+        lines
+            .iter()
+            .map(|l| format!("echo {}\n", sh_quote(l.as_ref())))
+            .collect()
+    }
+
+    /// A hub whose `codex-openai` profile is an sh fake: the turn starts, runs `middle` (sh),
+    /// then prints the final message and `turn.completed`.
+    fn codex_hub(dir: &Path, middle: &str) -> AgentHub {
+        let body = format!("{}{middle}{}", echo(CODEX_START), echo(CODEX_DONE));
+        let exe = fake(dir, "fake-codex.sh", &body);
+        AgentHub::new(&config(dir, &exe), LaunchMode::Restricted, None).unwrap()
+    }
+
+    /// EC-06 (the review of the branch, its probe inverted): `codex exec --json` prints
+    /// nothing between a command's `item.started` and `item.completed`, so a build that
+    /// runs longer than the stall limit is not a stall.
+    #[test]
+    fn codex_stall_waits_for_a_running_command() {
+        let d = tempfile::tempdir().unwrap();
+        let middle = format!(
+            "{}sleep 4\n{}",
+            echo(&[codex_command("item_1", false)]),
+            echo(&[codex_command("item_1", true)])
+        );
+        let hub = codex_hub(d.path(), &middle);
+        let limits = TurnLimits {
+            max: Duration::from_secs(60),
+            stall: Duration::from_millis(1500),
+        };
+        let out = hub
+            .turn(
+                open(d.path(), "codex-openai", Role::Implementer),
+                turn_input("build"),
+                limits,
+            )
+            .unwrap();
+        assert!(!out.timed_out, "{out:?}");
+        assert!(out.success, "{out:?}");
+        assert_eq!(out.tool_activity, 1, "the command, completed");
+        assert_eq!(captured_lines(d.path(), "build"), 6);
+    }
+
+    /// Once the command has ended, silence stalls the turn again, and an open item that is
+    /// not a command (a file change) does not hold the stall limit off.
+    #[test]
+    fn codex_silence_after_a_command_still_stalls() {
+        let d = tempfile::tempdir().unwrap();
+        let middle = format!(
+            "{}sleep 30\n",
+            echo(&[
+                codex_command("item_1", false),
+                codex_command("item_1", true),
+                codex_file_change("item_2", false),
+            ])
+        );
+        let hub = codex_hub(d.path(), &middle);
+        let limits = TurnLimits {
+            max: Duration::from_secs(60),
+            stall: Duration::from_millis(1000),
+        };
+        let t0 = Instant::now();
+        let out = hub
+            .turn(
+                open(d.path(), "codex-openai", Role::Implementer),
+                turn_input("silent"),
+                limits,
+            )
+            .unwrap();
+        assert!(out.timed_out, "{out:?}");
+        assert_eq!(out.error_class, Some(ErrorClass::Timeout));
+        assert_eq!(out.tool_activity, 1, "the command ended before the silence");
+        assert!(t0.elapsed() < Duration::from_secs(20), "{:?}", t0.elapsed());
+    }
+
+    /// A command that never ends is still bounded by the max limit (the stall limit would
+    /// have ended the turn 3 s earlier).
+    #[test]
+    fn codex_command_that_never_ends_is_bounded_by_max() {
+        let d = tempfile::tempdir().unwrap();
+        let middle = format!("{}sleep 30\n", echo(&[codex_command("item_1", false)]));
+        let hub = codex_hub(d.path(), &middle);
+        let limits = TurnLimits {
+            max: Duration::from_secs(5),
+            stall: Duration::from_secs(2),
+        };
+        let t0 = Instant::now();
+        let out = hub
+            .turn(
+                open(d.path(), "codex-openai", Role::Implementer),
+                turn_input("hung"),
+                limits,
+            )
+            .unwrap();
+        let took = t0.elapsed();
+        assert!(out.timed_out && !out.success, "{out:?}");
+        assert_eq!(out.error_class, Some(ErrorClass::Timeout));
+        assert!(
+            out.error_detail.as_deref().unwrap().contains("max 5s"),
+            "{out:?}"
+        );
+        assert!(took >= Duration::from_secs(5), "the max limit: {took:?}");
+        assert!(took < Duration::from_secs(20), "{took:?}");
+    }
+
+    /// A stop request ends the turn while a command runs (and the stall limit did not end
+    /// it first).
+    #[test]
+    fn codex_stop_request_ends_a_running_command() {
+        let d = tempfile::tempdir().unwrap();
+        let middle = format!("{}sleep 30\n", echo(&[codex_command("item_1", false)]));
+        let hub = codex_hub(d.path(), &middle);
+        let flag = Arc::new(AtomicBool::new(false));
+        let f2 = flag.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2500));
+            f2.store(true, Ordering::SeqCst);
+        });
+        let hooks = TurnHooks {
+            cancel: Some(flag),
+            ..Default::default()
+        };
+        let limits = TurnLimits {
+            max: Duration::from_secs(60),
+            stall: Duration::from_secs(1),
+        };
+        let t0 = Instant::now();
+        let out = hub
+            .turn_with(
+                open(d.path(), "codex-openai", Role::Implementer),
+                turn_input("stop"),
+                limits,
+                hooks,
+            )
+            .unwrap();
+        assert!(out.cancelled && !out.timed_out && !out.success, "{out:?}");
+        assert!(
+            t0.elapsed() >= Duration::from_millis(2500),
+            "{:?}",
+            t0.elapsed()
+        );
+        assert!(t0.elapsed() < Duration::from_secs(20), "{:?}", t0.elapsed());
+    }
+
+    /// ARCH-05 follow-up (the review of the branch): a Codex profile that ran before the
+    /// fail-closed checks still runs, also from a task's frozen configuration: a `read-only`
+    /// sandbox (a WARNING, as before) and overrides that do not re-set what toryo sets, next
+    /// to a `codex.provider` block.
+    #[test]
+    fn codex_turn_runs_with_read_only_and_provider_overrides() {
+        let d = tempfile::tempdir().unwrap();
+        let exe = fake(
+            d.path(),
+            "fake-codex.sh",
+            &echo(&[CODEX_START, CODEX_DONE].concat()),
+        );
+        let fwd = |p: &Path| p.display().to_string().replace('\\', "/");
+        let y = d.path().join("toryo.yaml");
+        std::fs::write(
+            &y,
+            format!(
+                r#"version: 1
+project: {{ root: '{d}', worktrees_root: '{d}/wts' }}
+profiles:
+  codex-foundry:
+    kind: codex
+    billing: foundry
+    exe: '{e}'
+    codex:
+      sandbox_mode: read-only
+      windows_sandbox: unelevated
+      provider: {{ id: foundry, name: Azure Foundry, base_url: 'https://f.openai.azure.com/openai/v1', env_key: AZURE_OPENAI_API_KEY }}
+      overrides:
+        model_providers.foundry.query_params.api-version: '"2025-04-01-preview"'
+        model_providers.foundry.request_max_retries: '4'
+        sandbox_workspace_write.network_access: 'true'
+        sandbox_workspace_write.writable_roots: '["/tmp/toryo-cache"]'
+roles:
+  planner: {{ profile: codex-foundry }}
+"#,
+                d = fwd(d.path()),
+                e = fwd(&exe)
+            ),
+        )
+        .unwrap();
+        let loaded = Effective::load(&y, None).unwrap();
+        // an in-flight task runs its frozen copy, which is not validated again at load
+        let frozen = Effective::from_frozen(&loaded.canonical_json(), &y).unwrap();
+        let hub = AgentHub::new(&frozen, LaunchMode::Restricted, None).unwrap();
+        let out = hub
+            .turn(
+                open(d.path(), "codex-foundry", Role::Implementer),
+                turn_input("implement-1"),
+                TurnLimits::default(),
+            )
+            .unwrap();
+        assert!(out.success, "{out:?}");
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(d.path().join("cap/implement-1.meta.json")).unwrap(),
+        )
+        .unwrap();
+        let argv: Vec<&str> = meta["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.as_str())
+            .collect();
+        for want in [
+            r#"sandbox_mode="read-only""#,
+            r#"model_providers.foundry.base_url="https://f.openai.azure.com/openai/v1""#,
+            r#"model_providers.foundry.query_params.api-version="2025-04-01-preview""#,
+            "model_providers.foundry.request_max_retries=4",
+            "sandbox_workspace_write.network_access=true",
+            r#"sandbox_workspace_write.writable_roots=["/tmp/toryo-cache"]"#,
+        ] {
+            assert!(argv.contains(&want), "{want}: {argv:?}");
+        }
     }
 }
 

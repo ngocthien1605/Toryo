@@ -17,7 +17,13 @@ use toml::Value;
 
 use crate::config::{Billing, CodexSettings, Profile, ProfileKind};
 
-/// Keys of a Codex profile that toryo owns or that must not travel.
+/// Keys of a Codex profile that toryo owns or that must not travel. The keys config
+/// validation refuses in `codex.overrides` (`config::denied_override`) are skipped too, so
+/// the generated configuration always loads. Some keys here are valid as overrides written
+/// by hand but are still not copied from an interactive profile, as before the ARCH-05
+/// checks: `sandbox_workspace_write` (its writable roots / network access widen what the
+/// unattended Implementer may do), MCP servers, notify programs, UI and history settings;
+/// `model_providers` travels only as the one provider the profile selects (see below).
 const SKIP_PROFILE_KEYS: &[&str] = &[
     "sandbox_mode",
     "approval_policy",
@@ -122,8 +128,9 @@ pub fn import_codex_profile(
         }
     }
     for (k, v) in prof {
+        // no `codex.provider` block: the provider travels as overrides (see below)
         if SKIP_PROFILE_KEYS.contains(&k.as_str())
-            || crate::config::denied_override(k, false).is_some()
+            || crate::config::denied_override(k, None).is_some()
         {
             warnings.push(format!(
                 "not imported from [profiles.{name}]: `{k}` (toryo sets its own policy)"
@@ -450,7 +457,7 @@ experimental_bearer_token = "sk-should-not-travel"
         let o = &imp.profile.codex.as_ref().unwrap().overrides;
         assert!(
             o.keys()
-                .all(|k| crate::config::denied_override(k, false).is_none()),
+                .all(|k| crate::config::denied_override(k, None).is_none()),
             "{o:?}"
         );
         assert!(!o.contains_key("sandbox_permissions"), "{o:?}");
@@ -461,6 +468,50 @@ experimental_bearer_token = "sk-should-not-travel"
             "{:?}",
             imp.warnings
         );
+    }
+
+    /// Only what validation refuses is dropped on top of SKIP_PROFILE_KEYS: the provider's
+    /// own keys and other settings are imported; `sandbox_workspace_write` (valid as a hand-
+    /// written override) is still not copied from an interactive profile, as before.
+    #[test]
+    fn keys_validation_allows_are_imported_except_the_skip_list() {
+        let cfg = r#"
+[profiles.tuned]
+model_provider = "foundry"
+model_verbosity = "low"
+sandbox_permissions = ["disk-full-read-access"]
+sandbox_workspace_write = { network_access = true }
+
+[model_providers.foundry]
+name = "Foundry"
+base_url = "https://f.openai.azure.com/openai/v1"
+env_key = "AZURE_OPENAI_API_KEY"
+request_max_retries = 4
+query_params = { api-version = "2025-04-01-preview" }
+"#;
+        let imp = import_codex_profile(cfg, "tuned", "codex.cmd", "unelevated").unwrap();
+        let o = &imp.profile.codex.as_ref().unwrap().overrides;
+        for k in [
+            "model_provider",
+            "model_verbosity",
+            "model_providers.foundry.base_url",
+            "model_providers.foundry.request_max_retries",
+            "model_providers.foundry.query_params.api-version",
+        ] {
+            assert!(o.contains_key(k), "{k}: {o:?}");
+        }
+        assert!(
+            !o.keys().any(|k| k.starts_with("sandbox_permissions")
+                || k.starts_with("sandbox_workspace_write")),
+            "{o:?}"
+        );
+        for k in ["sandbox_permissions", "sandbox_workspace_write"] {
+            assert!(
+                imp.warnings.iter().any(|w| w.contains(&format!("`{k}`"))),
+                "{k}: {:?}",
+                imp.warnings
+            );
+        }
     }
 
     #[test]

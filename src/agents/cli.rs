@@ -1,6 +1,7 @@
 //! `ClaudeOneShotAdapter` / `CodexExecAdapter` (plan §6.2, §6.2a, §6.3): one process per
 //! turn, built on the M0 kit's launch lines (`claude`, `codex`), process supervision and
-//! capture (`exec`). Each stdout line is turned into live events as it arrives.
+//! capture (`exec`). Each stdout line is turned into live events as it arrives, including
+//! whether a Codex command is running (`AgentEvent::CommandRunning`, EC-06).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -131,6 +132,7 @@ struct Launch {
     /// The prompt actually sent.
     prompt: String,
     /// Preflight reasons that make the profile unusable: the turn is refused (ARCH-05).
+    /// Preflight warnings (a `read-only` sandbox) are printed by `build` and the turn runs.
     refused: Vec<String>,
 }
 
@@ -192,6 +194,10 @@ impl CliSession {
                     resume_thread: self.external.clone(),
                     extra_args: vec![],
                 };
+                let preflight = l.check();
+                for w in &preflight.warnings {
+                    eprintln!("WARNING: {w}");
+                }
                 // Codex has no system-prompt file flag: the context becomes the prompt preamble (§7).
                 let prompt = match &self.req.context_file {
                     Some(f) => format!("{}\n\n{prompt}", std::fs::read_to_string(f)?),
@@ -200,13 +206,13 @@ impl CliSession {
                 Ok(Launch {
                     args: l.argv(),
                     prompt,
-                    refused: l.preflight(),
+                    refused: preflight.refused,
                 })
             }
         }
     }
 
-    /// ARCH-05: a preflight reason fails the turn closed — no process is spawned. The turn
+    /// ARCH-05: a preflight refusal fails the turn closed — no process is spawned. The turn
     /// ends like any other, with a `PolicyRefusal` and its reasons, and its capture keeps
     /// the prompt and the refused argv.
     fn refuse(&self, label: &str, launch: &Launch) -> Result<TurnOutcome> {
@@ -285,7 +291,7 @@ impl AgentSession for CliSession {
         let label = input.label.clone();
         self.task = Some(tokio::task::spawn_blocking(move || {
             let tx_lines = tx.clone();
-            let mut live = LiveEvents::new(kind);
+            let mut live = LiveEvents::for_process(kind);
             let mut on_line = move |line: &[u8]| {
                 for e in live.feed(line) {
                     let _ = tx_lines.send(e);

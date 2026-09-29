@@ -109,6 +109,13 @@ pub enum AgentEvent {
     /// started item …). Carries nothing: it only proves the agent is alive, so the stall
     /// limit counts output rather than mapped events (EC-06). Consumers ignore it.
     Heartbeat,
+    /// The agent started running a command (`true`, the first one if several run) or the
+    /// last running one ended (`false`). A command prints nothing to the stream until it
+    /// ends (Codex exec reports it only when it starts and when it ends), however long
+    /// it takes (a model build): while one runs, silence is not a stall, so the stall
+    /// limit is suspended; the max limit and stop requests still apply (EC-06). Sent by
+    /// the real CLI adapter only. Consumers ignore it.
+    CommandRunning(bool),
     Retrying {
         attempt: u32,
         delay_ms: u64,
@@ -180,7 +187,8 @@ pub struct TurnLimits {
     /// Whole-turn maximum.
     pub max: Duration,
     /// No event for this long → interrupt (`Timeout`, stalled). Every stdout line of a
-    /// real agent is at least a `Heartbeat`, so this measures silence, not mapped events.
+    /// real agent is at least a `Heartbeat`, so this measures silence, not mapped events;
+    /// it does not run while the agent runs a command (`AgentEvent::CommandRunning`).
     pub stall: Duration,
 }
 
@@ -228,7 +236,8 @@ impl StageOutcome {
             // the latest value replaces the earlier ones: live values are cumulative for
             // the turn and the terminal one is final, so nothing is counted twice
             AgentEvent::Usage(u) => self.usage = Some(*u),
-            AgentEvent::Heartbeat => {}
+            // liveness only: `run_to_completion` reads them for the stall limit
+            AgentEvent::Heartbeat | AgentEvent::CommandRunning(_) => {}
             AgentEvent::Retrying { .. } => self.retries += 1,
             AgentEvent::TurnCompleted {
                 final_text,

@@ -1,6 +1,9 @@
 //! Turning vendor stream lines into `AgentEvent`s (the only place, besides the parsers,
 //! that knows Claude/Codex JSON). Used live by the CLI adapters and by the replay mode of
-//! `FakeAgentAdapter`, so recorded real streams go through exactly the same code.
+//! `FakeAgentAdapter`, so recorded real streams go through exactly the same code (a replay
+//! only leaves out `CommandRunning`, see [`LiveEvents`]).
+
+use std::collections::BTreeSet;
 
 use serde_json::Value;
 
@@ -36,6 +39,11 @@ pub fn line_events(kind: ProfileKind, line: &[u8]) -> Vec<AgentEvent> {
 ///   are cumulative for the turn, so a budget hook can interrupt the turn while it runs
 ///   (R41, EC-05); the terminal `Usage` still carries the final value and replaces them.
 ///   Codex exec reports usage only with `turn.completed` (`live = false`).
+/// * for a running process ([`LiveEvents::for_process`]), `CommandRunning(true)` when a
+///   Codex `command_execution` item starts while none runs and `CommandRunning(false)`
+///   when the last running one completes: `codex exec --json` prints nothing in between,
+///   however long the command takes, so the stall limit is suspended meanwhile (EC-06).
+///   A replay leaves them out: a recorded stream has no silence to bridge.
 /// * a `Heartbeat` for any line that maps to no other event (thinking, tool input, Codex
 ///   `turn.started` / `item.started` / reasoning …), so every stdout line counts as
 ///   activity for the stall limit (EC-06).
@@ -43,14 +51,28 @@ pub struct LiveEvents {
     kind: ProfileKind,
     usage: ProvisionalUsage,
     reported: Option<Buckets>,
+    /// The ids of the Codex commands started and not completed yet in this turn; `None`
+    /// when `CommandRunning` is not reported (replays).
+    commands: Option<BTreeSet<String>>,
 }
 
 impl LiveEvents {
+    /// The events of a recorded stream (replays).
     pub fn new(kind: ProfileKind) -> Self {
         Self {
             kind,
             usage: ProvisionalUsage::default(),
             reported: None,
+            commands: None,
+        }
+    }
+
+    /// The events of a running agent process: also `CommandRunning` (see above). One per
+    /// turn: the running commands are the turn's.
+    pub fn for_process(kind: ProfileKind) -> Self {
+        Self {
+            commands: Some(BTreeSet::new()),
+            ..Self::new(kind)
         }
     }
 
@@ -69,11 +91,37 @@ impl LiveEvents {
                     }));
                 }
             }
+            if let Some(running) = self.command_transition(&v) {
+                out.push(AgentEvent::CommandRunning(running));
+            }
         }
         if out.is_empty() {
             out.push(AgentEvent::Heartbeat);
         }
         out
+    }
+
+    /// `Some(true)` when `v` starts a Codex command while none runs, `Some(false)` when it
+    /// completes the last running one. Commands are told apart by item id (Codex can run
+    /// several at once); a completion without its start changes nothing.
+    fn command_transition(&mut self, v: &Value) -> Option<bool> {
+        let running = self.commands.as_mut()?;
+        let item = &v["item"];
+        let ty = item.get("type").or_else(|| item.get("item_type"));
+        if self.kind != ProfileKind::Codex
+            || ty.and_then(Value::as_str) != Some("command_execution")
+        {
+            return None;
+        }
+        let id = item["id"].as_str().unwrap_or_default();
+        let before = !running.is_empty();
+        match v["type"].as_str() {
+            Some("item.started") => running.insert(id.to_string()),
+            Some("item.completed") => running.remove(id),
+            _ => return None,
+        };
+        let now = !running.is_empty();
+        (now != before).then_some(now)
     }
 }
 
@@ -197,7 +245,8 @@ pub fn terminal_events(o: &TurnOutcome) -> Vec<AgentEvent> {
     out
 }
 
-/// Replay a recorded stream through the real parser: the events a live turn would produce.
+/// Replay a recorded stream through the real parser: the events a live turn would produce,
+/// without `CommandRunning` (all lines arrive at once: no silence to bridge).
 pub fn replay(kind: ProfileKind, stream: &str, exit_code: Option<i32>) -> Vec<AgentEvent> {
     let mut live = LiveEvents::new(kind);
     let mut claude = ClaudeParser::new();

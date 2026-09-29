@@ -7,6 +7,8 @@
 //! - EC-19: `resume --discard-partial` snapshots the worktree again before the reset
 //! - EC-23 / DES-05: `fallback: []` means no fallback; typo'd role keys and enum-like values
 //!   are refused at load
+//! - ARCH-05 (follow-up review of the branch): the Codex checks refuse only what toryo sets
+//!   itself or what switches the sandbox, approval or environment policy
 //! - EC-28: `%ProgramFiles(x86)%` is expanded (or refused), never left in place
 //! - CODE-09: an early error return after taking the task lock clears its owner columns
 //!
@@ -57,6 +59,52 @@ fn ec23_unknown_role_keys_and_enum_values_are_refused() {
         "roles.reviwer: unknown role",
         "verify.boundary: `lowintegrity` is not a valid value (valid: low_integrity, none)",
     ] {
+        assert!(e.contains(want), "{want:?} missing in:\n{e}");
+    }
+}
+
+/// ARCH-05 (the follow-up review's probes, inverted): configurations that loaded before the
+/// checks keep loading — more settings of the `codex.provider`'s provider,
+/// `sandbox_workspace_write.*`, a `read-only` sandbox — while overrides that re-set what toryo
+/// sets and sandbox modes weaker than workspace-write are refused.
+#[test]
+fn arch05_codex_checks_refuse_only_what_toryo_sets() {
+    let codex = |block: &str| {
+        format!(
+            "version: 1\nproject: {{ root: r, worktrees_root: w }}\nprofiles:\n  codex-foundry:\n    kind: codex\n    billing: foundry\n    exe: x\n    codex:\n      windows_sandbox: unelevated\n      provider: {{ id: foundry, name: Foundry, base_url: 'https://f.openai.azure.com/openai/v1', env_key: AZURE_OPENAI_API_KEY }}\n{block}roles:\n  planner: {{ profile: codex-foundry }}\n"
+        )
+    };
+    for block in [
+        "",
+        "      overrides: { 'model_providers.foundry.query_params.api-version': '\"2025-04-01-preview\"', 'model_providers.foundry.request_max_retries': '4' }\n",
+        "      overrides: { 'sandbox_workspace_write.network_access': 'true', 'sandbox_workspace_write.writable_roots': '[\"D:/cache\"]' }\n",
+        "      sandbox_mode: read-only\n",
+    ] {
+        load(&codex(block)).unwrap_or_else(|e| panic!("{block}: {e:#}"));
+    }
+    for (block, want) in [
+        (
+            "      sandbox_mode: danger-full-access\n",
+            "profiles.codex-foundry.codex.sandbox_mode: `danger-full-access` is not a valid value (valid: workspace-write, read-only)",
+        ),
+        (
+            "      overrides: { sandbox_mode: '\"danger-full-access\"' }\n",
+            "profiles.codex-foundry.codex.overrides.sandbox_mode: re-sets the sandbox",
+        ),
+        (
+            "      overrides: { sandbox_permissions: '[\"disk-full-read-access\"]' }\n",
+            "codex.overrides.sandbox_permissions: re-sets the sandbox",
+        ),
+        (
+            "      overrides: { 'model_providers.foundry.base_url': '\"https://elsewhere\"' }\n",
+            "codex.overrides.model_providers.foundry.base_url: re-sets the provider of codex.provider",
+        ),
+        (
+            "      overrides: { model_provider: '\"openai\"' }\n",
+            "codex.overrides.model_provider: re-sets the provider of codex.provider",
+        ),
+    ] {
+        let e = format!("{:#}", load(&codex(block)).expect_err(block));
         assert!(e.contains(want), "{want:?} missing in:\n{e}");
     }
 }

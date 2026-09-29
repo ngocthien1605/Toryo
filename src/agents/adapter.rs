@@ -46,6 +46,9 @@ pub trait AgentSession: Send {
 /// A limit hit interrupts the turn and reports `Timeout` (`timed_out = true`).
 /// Every event is activity for the stall limit; the real adapters send at least a
 /// `Heartbeat` for each line the agent prints, so only silence stalls a turn (EC-06).
+/// While the agent runs a command (`CommandRunning(true)` until `CommandRunning(false)`)
+/// silence is expected and the stall limit does not run; the max limit and a stop request
+/// still end the turn.
 pub async fn run_to_completion(
     session: &mut dyn AgentSession,
     input: TurnInput,
@@ -92,6 +95,17 @@ pub async fn run_to_completion_with(
     };
     let deadline = tokio::time::Instant::now() + limits.max;
     let mut last_event = tokio::time::Instant::now();
+    // EC-06: a running command is silent until it ends, however long it takes
+    let mut command_running = false;
+    // When a limit is hit unless an event comes first: the stall limit counts from the last
+    // event, but not while a command runs; the max limit always counts.
+    let limit_at = |last: tokio::time::Instant, running: bool| {
+        if running {
+            deadline
+        } else {
+            (last + limits.stall).min(deadline)
+        }
+    };
     let mut checked = tokio::time::Instant::now();
     let mut interrupted_at: Option<tokio::time::Instant> = None;
     loop {
@@ -99,9 +113,7 @@ pub async fn run_to_completion_with(
         let mut wait = match interrupted_at {
             // after an interrupt, give the session a moment to deliver its terminal event
             Some(t) => (t + Duration::from_secs(10)).saturating_duration_since(now),
-            None => (last_event + limits.stall)
-                .min(deadline)
-                .saturating_duration_since(now),
+            None => limit_at(last_event, command_running).saturating_duration_since(now),
         };
         if cancel.is_some() && interrupted_at.is_none() {
             wait = wait.min(LIMITS_POLL);
@@ -109,6 +121,9 @@ pub async fn run_to_completion_with(
         let paused = match tokio::time::timeout(wait, session.next_event()).await {
             Ok(Some(e)) => {
                 last_event = tokio::time::Instant::now();
+                if let AgentEvent::CommandRunning(running) = &e {
+                    command_running = *running;
+                }
                 if let (AgentEvent::SessionIdentified(id), Some(f)) = (&e, &hooks.on_session) {
                     f(id);
                 }
@@ -143,7 +158,7 @@ pub async fn run_to_completion_with(
         checked = now;
         if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
             out.cancelled = true;
-        } else if now >= deadline || now >= last_event + limits.stall {
+        } else if now >= limit_at(last_event, command_running) {
             out.timed_out = true;
         } else {
             continue;
