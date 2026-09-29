@@ -28,6 +28,9 @@ Rust implementation of the Toryo plan (**v0.7**). **M0 is done** (the spike kit 
 | `engine::verify` (M6) | R29, R36, R45, R47, R50 | verify checkout of the checkpoint under `verify_root`, Low-IL boundary, explicit `--git-dir`, `verify_mutated_tree` |
 | `engine::decisions` (M7) + usage in `engine::store` | R41, R53 | `DECISIONS.md` (gates, notes, follow-ups); admission budget, cumulative baselines, reservations, Claude live interrupt |
 | `engine::xpp` (M9) | R59 | `tool: xpp`: the five CI/CD packages, the MSBuild argv of Microsoft's hosted X++ build, per-project results, MSBuild diagnostics, `scope: compile`; `toryo xpp build` |
+| `engine::flight` (M10) | ARCH-02 | typed `EngineEvent`s, the recorder (envelope, redaction, sinks), the `events.jsonl` flight recorder, the stderr renderer, `watch`'s tail |
+| `engine::views`, `engine::usage_report` (M10) | DES-10, §12 | the `--json` documents of `status` / `task show`; `toryo usage` and `prices.toml` |
+| `notify` (M10) | — | the toast sink: which events notify, the fixed Windows PowerShell toast script |
 
 M0 kit modules (ported to the core where M1 needs them, R52):
 
@@ -48,7 +51,7 @@ M0 kit modules (ported to the core where M1 needs them, R52):
 
 ```
 toryo task create --file TASK.md [--id ID] [--repo R] [--base B]   # snapshot + frozen config + worktree toryo/<ID>
-toryo run ID                                   # 🔒 runs until a gate / escalation / stop / completion
+toryo run ID [--notify | --no-notify]          # 🔒 runs until a gate / escalation / stop / completion
 toryo approve ID --gate plan|final [--expect DIGEST] [--continue]   # 🔒
 toryo reject  ID --gate plan|final --reason "…"                     # 🔒
 toryo resume [ID] [--note "…" | --discard-partial | --keep-partial | --accept-protected-change P …]  # 🔒
@@ -58,6 +61,7 @@ toryo status [ID] [--json] · toryo task list [--json]|show ID [--json]|cleanup 
 toryo task config ID [--reload [--expect DIGEST]]   # 🔒 R35: frozen config; reload only in a waiting state
 toryo budget set ID --tokens N | --none             # 🔒 R41: admission cap, then `toryo resume`
 toryo usage ID [--json] [--prices FILE]            # §12: tokens per stage × profile × model, est. cost
+toryo notify-test [--dry-run]                      # M10: a sample Windows toast (hidden)
 toryo context show ID --stage plan|implement|review [--attempt N] [--profile P]   # §7: what the agent gets
 toryo spike claude-implementer-isolation --profile claude-max   # R49 / V07-VERIFY 4
 toryo spike codex-temp-probe --profile codex-openai             # R46 / V07-VERIFY 2
@@ -109,6 +113,12 @@ notes) and `TASK.example.md`. Each file lists its `TODO(owner)` items at the top
 Run a stable toryo installed outside the repository (`cargo install --path . --root C:\tools\toryo --locked`),
 never add `.cargo` to Codex's `writable_roots`; details in `docs/HUONG-DAN.md` §7.4.
 
+**Hướng dẫn tiếng Việt (flow, cài đặt, cấu hình, thực hành với app mẫu BatchRename): `docs/HUONG-DAN.md`.**
+`spike pipeline` is the single-process reference prototype (R52); it prints a warning and gets no new features — use the engine (`toryo task create` + `toryo run`).
+
+Start with **`docs/M0-RUNBOOK.md`**. Results go to `docs/M0-RESULTS.md`; findings from building the kit
+are in `docs/M0-FINDINGS.md`.
+
 ## Following a task (M10)
 
 **JSON output (DES-10).** `toryo status [ID] --json` (also `toryo task list --json`) and `toryo task show ID --json`
@@ -126,14 +136,14 @@ print one JSON document on stdout and nothing else there. Field names are snake_
     "next_action": "review the branch toryo/BR-003 …"   // what `status` prints after `next:`
 } ] }
 // task show ID --json: the task object above, plus
-{ "worktree": "…", "branch": "toryo/BR-003", "run_store": "…\runs\BR-003",
+{ "worktree": "…", "branch": "toryo/BR-003", "run_store": "…\\runs\\BR-003",
   "attempts": [ { "id": "BR-003/implement/1", "stage": "implement", "attempt": 1, "status": "succeeded",
                   "profile": "codex-openai", "error_class": null, "head_after": "<sha>", "partial_commit": null } ],
   "usage": [ { "id": 3, "attempt": "BR-003/implement/1", "profile": "codex-openai", "accounting": "exact",
                "budget_tokens": 51000, "reservation_tokens": null, "reconciled_by": null, "includes_unreported": false } ],
   "gates": [ { "gate": "plan", "occurrence": 1, "status": "approved", "subject_digest": "…", "reason": null,
                "requested_at": "…", "resolved_at": "…" } ],
-  "events_file": "…\runs\BR-003\events.jsonl" }
+  "events_file": "…\\runs\\BR-003\\events.jsonl" }
 ```
 
 **The flight recorder (ARCH-02).** Every command that drives a task appends the engine's events to
@@ -168,11 +178,13 @@ before M10 take it from the task's frozen configuration. `--json`: `{ task, pric
 rows: [ {stage, profile, model, billing_kind, buckets, exact_tokens, provisional_tokens, reserved_tokens, turns,
 reconciled_rows, est_cost_usd, cost, vendor_reported_cost_usd} ], totals: {…}, no_price: [ {model, profile} ] }`.
 
-**Hướng dẫn tiếng Việt (flow, cài đặt, cấu hình, thực hành với app mẫu BatchRename): `docs/HUONG-DAN.md`.**
-`spike pipeline` is the single-process reference prototype (R52); it prints a warning and gets no new features — use the engine (`toryo task create` + `toryo run`).
-
-Start with **`docs/M0-RUNBOOK.md`**. Results go to `docs/M0-RESULTS.md`; findings from building the kit
-are in `docs/M0-FINDINGS.md`.
+**Toasts (Windows).** With `notify: { toast: true }` in the machine config (default off; not frozen with a task,
+not hashed) or `--notify` on `run`, `resume` and `approve --continue`, toryo shows a Windows toast when a task
+needs you: a gate opens, the task escalates or pauses, or a run ends `Completed` or `Failed` — title
+`toryo — <ID>`, body the state and the next action (≤ 200 characters). `--no-notify` wins over both. The toast
+is Windows PowerShell 5.1 running a fixed script that reads the title and body from environment variables, so
+agent-written text is never part of a command line or a script; it never blocks or fails the run. Check it with
+`toryo notify-test` (hidden; `--dry-run` builds the toast without showing it). Elsewhere: nothing is shown.
 
 ## Build and test
 
@@ -201,6 +213,10 @@ cargo test --release
 | `tests/regress_implement.rs` | Windows + Linux | the HEAD guard on every exit of an Implementer turn, failed turns with changes kept as a recovery checkpoint, `--no-fallback` after a sticky switch, a stoppable backoff, schema-checked implementation reports |
 | `tests/regress_engine.rs` | Windows + Linux | failed Planner/Reviewer turns never yield a plan or review, §11 retries per class, schema-validated plans and reviews, verify again after a reload, `approval_mismatch`, a refused correction turn, read-only writes |
 | `tests/regress_recovery.rs` | Windows + Linux | crash recovery runs the HEAD guard first; an unfinished Git operation keeps the snapshot path; failed turns that crash stay failed |
+| `tests/m10_events.rs` | Windows + Linux | M10-A1: the flight recorder of a run to the final gate (order, `seq`, generations), typed escalation classes, no secret in the file, an unwritable file |
+| `tests/m10_views.rs` | Windows + Linux | M10-B: `status --json`, `task show --json`, a cleaned-up task; `watch` history, `--json`, a concurrent run followed to the gate, errors, Ctrl+C → exit 0 |
+| `tests/m10_usage.rs` | Windows + Linux | M10-C: `toryo usage` numbers and costs (text and `--json`), `no price`, the model on usage rows and the pre-M10 fallback, bad and missing price tables; scripted turns of a mixed run are exact zero |
+| `tests/m10_notify.rs` | Windows + Linux (`notify-test` Windows only) | M10-D1: toasts at the gates, an escalation and the end, the machine setting and `--notify`/`--no-notify`, `notify-test --dry-run` |
 
 CI (`.github/workflows/ci.yml`) runs `cargo test`, `clippy -D warnings` and the core without the kit
 (`--no-default-features`) on `windows-latest` and `ubuntu-latest`, then builds a release `toryo.exe`.
@@ -226,3 +242,10 @@ R72); the D365FO starter kit (`templates/d365fo/`) and the dogfooding kit (`temp
 `scripts/verify.ps1`). Still to do by the owner on Windows and the UDE machine: section E of `M9_task.md` (the
 real-CLI canary `scripts\m9-check.ps1 -Canary`, V08-VERIFY 2–4 with `toryo xpp build`, the first real D365FO
 task). Decisions made on the way: `docs/M9-NOTES.md`.
+
+M10 (`M10_task.md`, branch `m10/flight-recorder`) is done in code: the engine emits typed events (ARCH-02) —
+recorded per task in `events.jsonl` (the flight recorder) and rendered as the engine's own stderr lines, the same
+text as before; `status --json` / `task show --json` (DES-10); `toryo watch` follows a running task without its
+lock; `toryo usage` with estimated cost from the machine's `prices.toml` (plan §12), and every usage row now
+records its model; scripted turns of a mixed fake/real run cost exact zero; an opt-in Windows toast when a task
+needs the owner. Decisions, deviations and open questions: `docs/M10-NOTES.md`.

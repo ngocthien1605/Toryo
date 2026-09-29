@@ -2,6 +2,64 @@
 
 Every entry: what was decided, why, and where. The owner folds these into plan v0.9.
 
+## Morning summary (2026-09-30)
+
+**All eight tasks are DONE; none PARTIAL, none NOT STARTED.** Branch `m10/flight-recorder`, 9 commits on
+`main` @ `5adf204`, not pushed:
+
+| Commit | Task | State |
+|---|---|---|
+| `ca35047` | docs: owner verification E1, E7 (M9) — your notes, committed alone | — |
+| `e17875c` | A1 — `EngineEvent`, sinks, `events.jsonl` flight recorder | DONE |
+| `bb49186` | A2 — the engine's stderr lines rendered from events (same text) | DONE |
+| `24679d4` | B1 — `status --json`, `task show --json` | DONE |
+| `0f69359` | B2 — `toryo watch <ID>` | DONE |
+| `80ed7a0` | C1 — `prices.toml` + `toryo usage <ID>` | DONE |
+| `87d587d` | C2 — scripted turns of a mixed run report exact zero usage | DONE |
+| `2ca9059` | D1 — Windows toast (`notify:`, `--notify`, `notify-test`) | DONE |
+| (last) | E1 — README, HUONG-DAN §5.8, this summary (the templates came with C1 and D1) | DONE |
+
+**Checks** (§0.2) green before every commit on this machine: `cargo fmt --check`, both `clippy -D warnings`,
+`cargo test --locked`. Tests: **401 passed, 0 failed, 6 ignored** (before M10: 355 passed, 5 ignored; the new
+ignored one shows a real toast). New test files: `tests/m10_events.rs`, `m10_views.rs`, `m10_usage.rs`,
+`m10_notify.rs`, plus unit tests in `engine::flight`, `engine::views`, `engine::usage_report`, `notify`,
+`config`. No real agent was run; the owner's configs and data dirs were not read.
+
+**Deviations from `M10_task.md`** (details in the sections below):
+1. The module is `src/engine/flight.rs`, not `events.rs`: `tests/architecture.rs` (R52) forbids the text
+   `events::` in engine files (it means the vendor module `agents::events`); the test was not weakened.
+2. `RunStarted { owner }`, not `{ generation }`: the envelope already has `generation`, and the flattened
+   event would write the key twice.
+3. `stage_started` for verify is emitted when its header is printed (after the checkout exists); a verify
+   that escalates before that has `stage_finished` only.
+4. The CLI now runs on a thread with an 8 MB stack: adding `watch` made the Windows debug build overflow the
+   1 MB main-thread stack in clap's builder already on `--help` (found in B2, `main::CLI_STACK`).
+5. The stderr engine lines now go through the task's secret redaction too (a reason that carried a profile
+   secret was printed as is before). Otherwise the text is identical — checked against `main`'s binary on
+   the same fake scenarios (335 stderr lines, A2).
+
+**Open questions for you:**
+1. Transitions the CLI never printed (inside `finish_and`, e.g. `Verifying --verify_passed--> Reviewing`)
+   are in `events.jsonl` and in `watch`, still not on the run's stderr (`Envelope.quiet`). Print them too?
+2. With `--yes` and toasts on, the gates still raise toasts although they are approved automatically — as
+   the task says. Suppress toasts under `--yes`?
+3. `vendor_reported_cost_usd` is shown next to the estimate but nothing fills it (the Claude adapter parses
+   `total_cost_usd`, `StageOutcome` does not carry it). Worth carrying?
+4. Reservations are priced as uncached input in the `~est.` cost (C1). Another rule?
+5. CI: `notify_test_builds_the_toast` loads WinRT types in Windows PowerShell on `windows-latest`; if the
+   image cannot, mark it `#[ignore]`. The Unix Ctrl+C path of `watch` compiles only on Linux CI (no Linux
+   target here).
+
+**Try first** (build first: `cargo build --release` — `bin\toryo.exe` is not rebuilt):
+1. `toryo notify-test` — a toast "toryo — notify-test" should appear; if not, allow notifications for
+   "Windows PowerShell" (Settings → System → Notifications). It was run once here: exit 0.
+2. Copy `templates\prices.toml.example` to `%USERPROFILE%\.toryo\prices.toml`, put in your Foundry
+   deployment names and contract prices, then `toryo usage <an existing task>` (older rows show the model
+   from the frozen config).
+3. On the next real task: `toryo run ID --notify` in one window, `toryo watch ID` in another; afterwards
+   `toryo status --json` and `toryo task show ID --json`.
+4. `scripts\m9-check.ps1 -Canary` again: the status line should no longer show `+~400000 reserved` (C2).
+
 ## Progress
 
 Branch `m10/flight-recorder` (from `main` @ `5adf204`). One commit per task.
@@ -14,7 +72,7 @@ Branch `m10/flight-recorder` (from `main` @ `5adf204`). One commit per task.
 - [x] C1 — `prices.toml` + `toryo usage <ID>`
 - [x] C2 — scripted turns in mixed runs report zero usage
 - [x] D1 — Windows toast
-- [ ] E1 — docs, morning summary
+- [x] E1 — docs, morning summary
 
 ## A — Event backbone (ARCH-02)
 
