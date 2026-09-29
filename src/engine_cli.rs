@@ -871,7 +871,12 @@ pub fn status(id: Option<&str>) -> Result<i32> {
                 .unwrap_or_default(),
             active
         );
-        println!("               next: {}", next_action(&t));
+        let next = if t.state.is_terminal() && !t.run_store.exists() && !t.worktree.exists() {
+            toryo::engine::runner::cleaned_up_action(&t)
+        } else {
+            next_action(&t)
+        };
+        println!("               next: {next}");
     }
     Ok(0)
 }

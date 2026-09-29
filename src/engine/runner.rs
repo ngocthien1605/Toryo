@@ -1254,11 +1254,15 @@ impl<'a> Engine<'a> {
                 return Ok(None);
             }
             let ok = res.ok();
+            let exit = match res.exit {
+                Some(code) => format!("exit {code}"),
+                None if res.timed_out => "timed out".to_string(),
+                None => "no exit code".to_string(),
+            };
             eprintln!(
-                "  {} {} (exit {:?}, {:.1}s)",
+                "  {} {} ({exit}, {:.1}s)",
                 if ok { "✔" } else { "✘" },
                 c.name,
-                res.exit,
                 res.duration_ms as f64 / 1000.0
             );
             // R50: LocalRunner strips ANSI (CSI/OSC) from everything it captures
@@ -2127,11 +2131,7 @@ impl ImplementOutcome {
         if r.success {
             return Self::Done;
         }
-        let reason = format!(
-            "implementer failed: {:?} {}",
-            r.error_class,
-            r.error_detail.clone().unwrap_or_default()
-        );
+        let reason = implementer_failed(r.error_class, r.error_detail.as_deref());
         if changed.is_empty() {
             Self::Failed { reason }
         } else {
@@ -2290,6 +2290,16 @@ pub(super) fn partial_trailers(t: &TaskRow, a: &AttemptRow) -> Vec<(&'static str
         (T_AGENT, a.profile.clone().unwrap_or_default()),
         (T_PARTIAL, "true".into()),
     ]
+}
+
+/// Why a failed Implementer turn stops: `implementer failed: <class> — <detail>`, readable in
+/// `status` (no `Some(…)`), and an unknown class or an empty detail left out.
+fn implementer_failed(class: Option<ErrorClass>, detail: Option<&str>) -> String {
+    let class = class.map_or_else(|| "unknown error".to_string(), |c| format!("{c:?}"));
+    match detail.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => format!("implementer failed: {class} — {d}"),
+        None => format!("implementer failed: {class}"),
+    }
 }
 
 /// The `events` kind of a [`FailedTurn`].
@@ -3401,6 +3411,10 @@ pub fn next_action(t: &TaskRow) -> String {
                 format!("{why}\n  → restore the file(s) and `toryo resume {id}`, or `toryo resume {id} --accept-protected-change <path>` (recorded in DECISIONS.md)")
             } else if why.starts_with("recovery_policy_violation") {
                 format!("{why}\n  → `toryo resume {id} --discard-partial` (after a snapshot check) or fix the worktree by hand and `toryo resume {id} --keep-partial`")
+            } else if why.contains("PolicyRefusal") {
+                // R62: the launch was refused before any process started — a configuration
+                // problem, which another turn with the frozen configuration cannot fix
+                format!("{why}\n  → fix the profile in the configuration, `toryo task config {id} --reload`, then `toryo resume {id} --note \"…\"`; or give up: `toryo task cleanup {id}`")
             } else {
                 format!("{why}\n  → `toryo resume {id} --note \"…\"` (another fix cycle), `toryo approve {id} --gate final --force`, or give up: `toryo task cleanup {id}`")
             }
@@ -3416,6 +3430,17 @@ pub fn next_action(t: &TaskRow) -> String {
         St::Failed => format!("failed: {} — `toryo task cleanup {id}`", t.machine.reason().unwrap_or("")),
         s if s.is_running() => format!("`toryo run {id}` (or `toryo resume {id}` after a crash)"),
         _ => format!("`toryo run {id}`"),
+    }
+}
+
+/// What the human does next with a finished task whose worktree and run store `task cleanup`
+/// removed: only its branch is left.
+pub fn cleaned_up_action(t: &TaskRow) -> String {
+    let b = &t.branch;
+    match t.state {
+        St::Completed => format!("done, cleaned up — merge `{b}` yourself if you have not (toryo never merges); `git branch -D {b}` when you no longer need it"),
+        St::Failed => format!("failed, cleaned up — `git branch -D {b}` when you no longer need it"),
+        _ => format!("cancelled, cleaned up — `git branch -D {b}` when you no longer need it"),
     }
 }
 
@@ -3959,14 +3984,14 @@ mod tests {
                 &failed,
                 changed(&[]),
                 O::Failed {
-                    reason: "implementer failed: Some(Unknown) exit 1".into(),
+                    reason: "implementer failed: Unknown — exit 1".into(),
                 },
             ),
             (
                 &bare,
                 changed(&[]),
                 O::Failed {
-                    reason: "implementer failed: None ".into(),
+                    reason: "implementer failed: unknown error".into(),
                 },
             ),
             // EC-15: a failed turn that left changes never goes on to the checkpoint (was
@@ -3975,7 +4000,7 @@ mod tests {
                 &failed,
                 changed(&["src/a.ps1"]),
                 O::FailedWithChanges {
-                    reason: "implementer failed: Some(Unknown) exit 1".into(),
+                    reason: "implementer failed: Unknown — exit 1".into(),
                     retry: true,
                 },
             ),
@@ -4477,6 +4502,10 @@ mod tests {
                 "recovery_policy_violation: partial\n  → `toryo resume T-1 --discard-partial` (after a snapshot check) or fix the worktree by hand and `toryo resume T-1 --keep-partial`".to_string(),
             ),
             (
+                escalated("implementer failed: PolicyRefusal — preflight: codex.windows_sandbox is not set"),
+                "implementer failed: PolicyRefusal — preflight: codex.windows_sandbox is not set\n  → fix the profile in the configuration, `toryo task config T-1 --reload`, then `toryo resume T-1 --note \"…\"`; or give up: `toryo task cleanup T-1`".to_string(),
+            ),
+            (
                 escalated("the reviewer blocked the task"),
                 "the reviewer blocked the task\n  → `toryo resume T-1 --note \"…\"` (another fix cycle), `toryo approve T-1 --gate final --force`, or give up: `toryo task cleanup T-1`".to_string(),
             ),
@@ -4500,6 +4529,39 @@ mod tests {
         assert_eq!(
             next_action(&t),
             "paused (budget): 1100 of 1000 tokens used — `toryo budget set T-1 --tokens N`, then `toryo resume T-1`"
+        );
+        // after `task cleanup` only the branch is left: no cleanup hint any more
+        let done = with(
+            &final_gate,
+            &[Ev::FinalApproved {
+                occurrence: 2,
+                subject: head(),
+            }],
+        );
+        let cleaned = [
+            (done, "done, cleaned up — merge `toryo/T-1` yourself if you have not (toryo never merges); `git branch -D toryo/T-1` when you no longer need it"),
+            (vec![Ev::Cancel], "cancelled, cleaned up — `git branch -D toryo/T-1` when you no longer need it"),
+            (vec![Ev::Fail { error: "boom".into() }], "failed, cleaned up — `git branch -D toryo/T-1` when you no longer need it"),
+        ];
+        for (events, want) in cleaned {
+            let t = task_in(&events);
+            assert_eq!(cleaned_up_action(&t), want, "{:?}", t.state);
+        }
+    }
+
+    #[test]
+    fn a_failed_implementer_reason_names_the_class_without_option_syntax() {
+        assert_eq!(
+            implementer_failed(Some(C::PolicyRefusal), Some("preflight: x")),
+            "implementer failed: PolicyRefusal — preflight: x"
+        );
+        assert_eq!(
+            implementer_failed(Some(C::Timeout), Some("  ")),
+            "implementer failed: Timeout"
+        );
+        assert_eq!(
+            implementer_failed(None, None),
+            "implementer failed: unknown error"
         );
     }
 }

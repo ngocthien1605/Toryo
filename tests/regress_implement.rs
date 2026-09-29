@@ -550,7 +550,7 @@ fn ec15_a_second_failed_turn_with_changes_escalates_and_keeps_the_work() {
     assert_eq!(
         t.machine.reason().unwrap(),
         format!(
-            "implementer failed: Some(Timeout) second; its partial work is kept in the recovery checkpoint {} (Toryo-Partial)",
+            "implementer failed: Timeout — second; its partial work is kept in the recovery checkpoint {} (Toryo-Partial)",
             &p2[..12]
         )
     );
@@ -636,7 +636,7 @@ fn ec15_a_denied_turn_with_changes_escalates_at_once_and_keeps_the_work() {
         .machine
         .reason()
         .unwrap()
-        .starts_with("implementer failed: Some(PermissionDenied) 1 permission denial(s); its partial work is kept in the recovery checkpoint"));
+        .starts_with("implementer failed: PermissionDenied — 1 permission denial(s); its partial work is kept in the recovery checkpoint"));
     // §11: no blind retry after a denial
     assert_eq!(implementer_prompts(&env, "P-8").len(), 1);
     let w = wt(&env, "P-8");

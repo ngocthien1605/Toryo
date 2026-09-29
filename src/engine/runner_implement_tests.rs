@@ -243,7 +243,10 @@ fn a_failed_turn_that_left_changes_runs_its_stage_again_once() {
         Some(C::InvalidOutput),
     ];
     for class in retried {
-        let reason = format!("implementer failed: {class:?} d");
+        let reason = match class {
+            Some(c) => format!("implementer failed: {c:?} — d"),
+            None => "implementer failed: unknown error — d".to_string(),
+        };
         assert_eq!(
             failed(class, false),
             O::FailedWithChanges {
@@ -272,7 +275,7 @@ fn a_failed_turn_that_left_changes_runs_its_stage_again_once() {
         assert_eq!(
             failed(Some(class), false),
             O::FailedWithChanges {
-                reason: format!("implementer failed: Some({class:?}) d"),
+                reason: format!("implementer failed: {class:?} — d"),
                 retry: false
             },
             "{class:?}"
@@ -289,7 +292,7 @@ fn a_failed_turn_that_left_changes_runs_its_stage_again_once() {
                 failed_before
             ),
             O::Failed {
-                reason: "implementer failed: Some(Unknown) d".into()
+                reason: "implementer failed: Unknown — d".into()
             }
         );
         let denied = vec![("??".to_string(), "x/ZZZ/s.txt".to_string())];
@@ -421,7 +424,7 @@ fn a_failed_turn_records_what_recovery_needs_to_end_its_attempt_the_same_way() {
         attempt: a.id.clone(),
         error_class: Some("Timeout".into()),
         error_detail: Some("second".into()),
-        reason: "implementer failed: Some(Timeout) second".into(),
+        reason: "implementer failed: Timeout — second".into(),
         retry,
     };
     // the event payload round-trips (recovery reads it back)
@@ -429,7 +432,7 @@ fn a_failed_turn_records_what_recovery_needs_to_end_its_attempt_the_same_way() {
     let payload = serde_json::to_value(&f).unwrap();
     assert_eq!(
         payload,
-        json!({"attempt": "T-1/implement/2", "error_class": "Timeout", "error_detail": "second", "reason": "implementer failed: Some(Timeout) second", "retry": false})
+        json!({"attempt": "T-1/implement/2", "error_class": "Timeout", "error_detail": "second", "reason": "implementer failed: Timeout — second", "retry": false})
     );
     assert_eq!(serde_json::from_value::<FailedTurn>(payload).unwrap(), f);
     // what the attempt records, whoever ends it: `failed`, the class, the partial commit
@@ -447,7 +450,7 @@ fn a_failed_turn_records_what_recovery_needs_to_end_its_attempt_the_same_way() {
     assert_eq!(failed(true).escalation(sha), None);
     assert_eq!(
         f.escalation(sha).as_deref(),
-        Some("implementer failed: Some(Timeout) second; its partial work is kept in the recovery checkpoint 555555555555 (Toryo-Partial)")
+        Some("implementer failed: Timeout — second; its partial work is kept in the recovery checkpoint 555555555555 (Toryo-Partial)")
     );
     assert!(f.note(&a, sha).contains(
         "(T-1/implement/2 by `codex-openai`) failed before it finished (Timeout: second)"

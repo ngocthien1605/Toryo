@@ -530,7 +530,7 @@ fn f8_a_denied_turn_that_crashed_after_its_partial_commit_still_escalates() {
     let t = task(&env, "D-1");
     assert_eq!(t.state, St::Escalated, "{err}");
     let why = format!(
-        "implementer failed: Some(PermissionDenied) 1 permission denial(s); its partial work is kept in the recovery checkpoint {} (Toryo-Partial)",
+        "implementer failed: PermissionDenied — 1 permission denial(s); its partial work is kept in the recovery checkpoint {} (Toryo-Partial)",
         &partial[..12]
     );
     assert_eq!(
@@ -600,7 +600,7 @@ fn f8_a_crashed_failed_turn_counts_so_the_second_failure_escalates() {
     );
     assert_eq!(code, 86, "{err}");
     assert!(
-        err.contains(&format!("↺ recovery: D-2/implement/1: implementer failed: Some(Unknown) first; its partial work is kept in the recovery checkpoint {} (Toryo-Partial) — failed, the stage runs again from it (EC-15)", &p1[..12])),
+        err.contains(&format!("↺ recovery: D-2/implement/1: implementer failed: Unknown — first; its partial work is kept in the recovery checkpoint {} (Toryo-Partial) — failed, the stage runs again from it (EC-15)", &p1[..12])),
         "{err}"
     );
     let a1 = attempt(&env, "D-2/implement/1");
@@ -628,7 +628,7 @@ fn f8_a_crashed_failed_turn_counts_so_the_second_failure_escalates() {
     assert_eq!(
         reason(&env, "D-2"),
         format!(
-            "implementer failed: Some(Timeout) second; its partial work is kept in the recovery checkpoint {} (Toryo-Partial)",
+            "implementer failed: Timeout — second; its partial work is kept in the recovery checkpoint {} (Toryo-Partial)",
             &p2[..12]
         )
     );
