@@ -363,6 +363,86 @@ pub fn read_lines(text: &str) -> Vec<(String, Value)> {
         .collect()
 }
 
+/// Follows an events file like `tail -f` (B2): each poll returns the complete lines appended
+/// since the last poll; a partial last line waits for its newline. A file that shrank (replaced)
+/// is read again from the start; a missing file has no lines yet.
+#[derive(Debug, Default)]
+pub struct Tail {
+    offset: u64,
+    partial: Vec<u8>,
+}
+
+impl Tail {
+    pub fn poll(&mut self, path: &Path) -> std::io::Result<Vec<String>> {
+        let mut f = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        if f.metadata()?.len() < self.offset {
+            self.offset = 0;
+            self.partial.clear();
+        }
+        f.seek(SeekFrom::Start(self.offset))?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        self.offset += buf.len() as u64;
+        self.partial.extend(buf);
+        Ok(self.complete_lines())
+    }
+
+    fn complete_lines(&mut self) -> Vec<String> {
+        let Some(last) = self.partial.iter().rposition(|b| *b == b'\n') else {
+            return Vec::new();
+        };
+        let rest = self.partial.split_off(last + 1);
+        let done = std::mem::replace(&mut self.partial, rest);
+        String::from_utf8_lossy(&done)
+            .lines()
+            .map(|l| l.trim_end_matches('\r').to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+}
+
+/// How many events `watch` shows of the history without `--from-start`.
+pub const WATCH_HISTORY: usize = 20;
+
+/// The history `watch` prints first: everything, or the last [`WATCH_HISTORY`] lines.
+pub fn history(lines: &[String], from_start: bool) -> &[String] {
+    if from_start {
+        lines
+    } else {
+        &lines[lines.len().saturating_sub(WATCH_HISTORY)..]
+    }
+}
+
+/// What `watch` prints for one line of the file: the line itself (`--json`) or its rendered
+/// text; nothing for a line that is not a JSON object (a damaged line) or, rendered, not an
+/// event this toryo knows.
+pub fn watch_line(line: &str, json: bool) -> Option<String> {
+    let v: Value = serde_json::from_str(line).ok().filter(Value::is_object)?;
+    if json {
+        return Some(line.to_string());
+    }
+    serde_json::from_value::<Envelope>(v)
+        .ok()
+        .map(|e| render(&e))
+}
+
+/// How long `watch` waits without a new event before it stops following a task that is not
+/// moving on its own.
+pub const WATCH_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Does `watch` stop? After [`WATCH_IDLE`] without a new event, when the task waits for a human
+/// (a gate, `Escalated`, `Paused`), is finished, or is in a running state that no process drives
+/// (`active`: another process holds the task lock — a crashed run needs `toryo resume`). A task
+/// that never ran (`New`) is followed until it starts.
+pub fn watch_done(state: St, active: bool, idle: std::time::Duration) -> bool {
+    idle >= WATCH_IDLE
+        && (state.is_waiting() || state.is_terminal() || (state.is_running() && !active))
+}
+
 /// The highest `seq` in an events file (0: none).
 pub fn last_seq(path: &Path) -> u64 {
     let text = std::fs::read(path)
@@ -1054,6 +1134,69 @@ mod tests {
         assert_eq!(seqs, vec![1, 2, 3], "{text}");
         assert!(text.ends_with('\n'));
         assert_eq!(last_seq(&p), 3);
+    }
+
+    #[test]
+    fn the_tail_returns_complete_lines_and_waits_for_a_partial_one() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(EVENTS_FILE);
+        let mut tail = Tail::default();
+        assert!(tail.poll(&p).unwrap().is_empty(), "no file yet");
+        std::fs::write(&p, "{\"seq\":1}\n{\"seq\":2").unwrap();
+        assert_eq!(tail.poll(&p).unwrap(), vec!["{\"seq\":1}"]);
+        assert!(tail.poll(&p).unwrap().is_empty(), "the partial line waits");
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(b"}\r\n{\"seq\":3}\n").unwrap();
+        assert_eq!(tail.poll(&p).unwrap(), vec!["{\"seq\":2}", "{\"seq\":3}"]);
+        // replaced by a shorter file: read again from the start
+        std::fs::write(&p, "{\"seq\":9}\n").unwrap();
+        assert_eq!(tail.poll(&p).unwrap(), vec!["{\"seq\":9}"]);
+    }
+
+    #[test]
+    fn watch_shows_the_last_events_and_renders_or_passes_lines() {
+        let lines: Vec<String> = (1..=25).map(|i| i.to_string()).collect();
+        assert_eq!(history(&lines, true).len(), 25);
+        assert_eq!(history(&lines, false), &lines[5..]);
+        assert_eq!(history(&lines[..3], false).len(), 3);
+        let line = serde_json::to_string(&env(EngineEvent::GateOpened {
+            gate: "plan".into(),
+            occurrence: 1,
+        }))
+        .unwrap();
+        assert_eq!(watch_line(&line, true).as_deref(), Some(line.as_str()));
+        assert_eq!(
+            watch_line(&line, false).as_deref(),
+            Some("   gate open: plan (occurrence 1)")
+        );
+        for bad in ["{\"seq\":2,\"tr", "[1]", "not json"] {
+            assert_eq!(watch_line(bad, true), None, "{bad}");
+        }
+        // a newer event type: kept with --json, not rendered
+        let future =
+            r#"{"v":2,"seq":1,"ts":"t","task":"T","generation":1,"type":"from_the_future"}"#;
+        assert!(watch_line(future, true).is_some());
+        assert_eq!(watch_line(future, false), None);
+    }
+
+    #[test]
+    fn watch_stops_on_a_task_that_does_not_move_on_its_own() {
+        let idle = WATCH_IDLE;
+        let short = std::time::Duration::from_millis(500);
+        assert!(watch_done(St::WaitingPlanApproval, true, idle));
+        assert!(watch_done(St::Completed, false, idle));
+        assert!(watch_done(St::Paused, false, idle));
+        assert!(
+            !watch_done(St::WaitingPlanApproval, false, short),
+            "not idle yet"
+        );
+        assert!(!watch_done(St::Implementing, true, idle), "a run drives it");
+        assert!(
+            watch_done(St::Implementing, false, idle),
+            "nobody drives it"
+        );
+        assert!(!watch_done(St::New, false, idle), "not started yet");
     }
 
     #[test]

@@ -53,6 +53,7 @@ toryo approve ID --gate plan|final [--expect DIGEST] [--continue]   # 🔒
 toryo reject  ID --gate plan|final --reason "…"                     # 🔒
 toryo resume [ID] [--note "…" | --discard-partial | --keep-partial | --accept-protected-change P …]  # 🔒
 toryo stop ID                                  # ask the running owner to stop (R38)
+toryo watch ID [--json] [--from-start] [--no-follow]   # M10: follow events.jsonl (no lock)
 toryo status [ID] [--json] · toryo task list [--json]|show ID [--json]|cleanup ID · toryo partial export ID --attempt N --into DIR
 toryo task config ID [--reload [--expect DIGEST]]   # 🔒 R35: frozen config; reload only in a waiting state
 toryo budget set ID --tokens N | --none             # 🔒 R41: admission cap, then `toryo resume`
@@ -133,6 +134,27 @@ print one JSON document on stdout and nothing else there. Field names are snake_
                "requested_at": "…", "resolved_at": "…" } ],
   "events_file": "…\runs\BR-003\events.jsonl" }
 ```
+
+**The flight recorder (ARCH-02).** Every command that drives a task appends the engine's events to
+`<data_dir>\runs\<ID>\events.jsonl`, one JSON object per line: `{"v":1,"seq":N,"ts":"<RFC 3339>","task":"ID",
+"generation":G,"type":"…", …}` with `type` one of `run_started`, `state_changed` (`from`, `to`, `event`),
+`stage_started` (`stage`, `attempt`, `profile`, `detail`), `stage_finished` (`status`, `error_class`,
+`duration_ms`), `turn_finished` (`profile`, `success`, `usage` = the four buckets + `accounting`, `duration_ms`),
+`checkpoint_created` (`head`, `kind`, `found`), `verify_command` (`name`, `exit`, `timed_out`, `ok`, `duration_ms`),
+`gate_opened` (`gate`, `occurrence`), `budget_warning` (`used`, `cap`), `escalated` (`reason_class`, `reason`),
+`paused` (`reason`), `run_ended` (`state`, `next_action`). `seq` grows across runs; `generation` is the task lock
+generation of the writing command. Reasons are redacted like captures. `task cleanup` removes the file with
+the run store. The engine's own stderr lines (`[state] …`, stage headers, `✔ checkpoint …`, verify commands,
+`!! budget: …`, `!! <escalation reason>`) are rendered from these events.
+
+```
+toryo watch ID [--json] [--from-start] [--no-follow]
+```
+
+`watch` follows the file like `tail -f` — no task lock, so it runs next to `toryo run` in another window:
+the last 20 events (all with `--from-start`), then new ones as they come, rendered as the run prints them, or
+the raw lines with `--json`. It stops by itself 2 s after the last event once the task waits for you, is
+finished, or nobody drives it; Ctrl+C also exits 0.
 
 **Hướng dẫn tiếng Việt (flow, cài đặt, cấu hình, thực hành với app mẫu BatchRename): `docs/HUONG-DAN.md`.**
 `spike pipeline` is the single-process reference prototype (R52); it prints a warning and gets no new features — use the engine (`toryo task create` + `toryo run`).

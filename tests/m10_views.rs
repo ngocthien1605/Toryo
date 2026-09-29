@@ -153,3 +153,232 @@ fn a_cleaned_up_task_is_still_in_status_json() {
         "{next}"
     );
 }
+
+// ── B2: toryo watch ──────────────────────────────────────────────────────────────────
+
+fn events_lines(env: &Env, id: &str) -> Vec<String> {
+    std::fs::read_to_string(task(env, id).run_store.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn watch_prints_the_history_of_a_finished_run() {
+    let env = setup("codex-openai");
+    create(&env, "W-1");
+    let s = script(
+        &env,
+        "w1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, run_err) = toryo(&env, &["run", "W-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{run_err}");
+    let file = events_lines(&env, "W-1");
+    assert!(file.len() > 20, "{}", file.len());
+
+    // AC-1: the whole history, rendered, and exit 0
+    let (code, text, err) = out(&env, &["watch", "W-1", "--from-start", "--no-follow"]);
+    assert_eq!(code, 0, "{err}");
+    for want in [
+        "▶ W-1 — run started (generation",
+        "   [state] New --start--> Planning",
+        "── PLAN (attempt 1, claude-max) ──",
+        "   gate open: plan (occurrence 1)",
+        "── IMPLEMENT (attempt 1, codex-openai) ──",
+        "   turn implement/1 (codex-openai): completed",
+        "✔ checkpoint ",
+        "  ✔ divide-present (exit 0, ",
+        "── REVIEW (attempt 1, claude-max) ──",
+        "   [state] WaitingFinalApproval --final_approved--> Completed",
+        "══════════ W-1: Completed ══════════",
+    ] {
+        assert!(text.contains(want), "{want:?} missing:\n{text}");
+    }
+    // every engine line the run printed is in the history, with the same text; `watch` also
+    // shows the transitions the run never printed (quiet)
+    for line in run_err
+        .lines()
+        .filter(|l| l.starts_with("   [state]") || l.starts_with("── "))
+    {
+        assert!(
+            text.contains(line),
+            "{line:?} missing:
+{text}"
+        );
+    }
+    let quiet = "   [state] Verifying --verify_passed--> Reviewing";
+    assert!(text.contains(quiet) && !run_err.contains(quiet));
+
+    // AC-3: --json prints the file's lines
+    let (code, raw, _) = out(
+        &env,
+        &["watch", "W-1", "--json", "--from-start", "--no-follow"],
+    );
+    assert_eq!(code, 0);
+    let lines: Vec<String> = raw.lines().map(str::to_string).collect();
+    assert_eq!(lines, file);
+    for l in &lines {
+        serde_json::from_str::<Value>(l).unwrap();
+    }
+    // without --from-start: the last 20
+    let (_, raw, _) = out(&env, &["watch", "W-1", "--json", "--no-follow"]);
+    let last: Vec<String> = raw.lines().map(str::to_string).collect();
+    assert_eq!(last, file[file.len() - 20..]);
+
+    // following a finished task stops by itself (2 s without an event)
+    let t = std::time::Instant::now();
+    let (code, _, err) = out(&env, &["watch", "W-1", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(t.elapsed() < std::time::Duration::from_secs(20));
+
+    // a partial last line (a crash mid-write) is skipped
+    let p = task(&env, "W-1").run_store.join("events.jsonl");
+    let mut text = std::fs::read_to_string(&p).unwrap();
+    text.push_str("{\"v\":1,\"seq\":99999,\"ty");
+    std::fs::write(&p, text).unwrap();
+    let (code, raw, _) = out(
+        &env,
+        &["watch", "W-1", "--json", "--from-start", "--no-follow"],
+    );
+    assert_eq!(code, 0);
+    assert_eq!(raw.lines().count(), file.len());
+}
+
+#[test]
+fn watch_errors_on_a_missing_task_or_file() {
+    let env = setup("codex-openai");
+    let (code, _, err) = out(&env, &["watch", "NOPE-1", "--no-follow"]);
+    assert_eq!(code, 2);
+    assert!(err.contains("NOPE-1"), "{err}");
+    create(&env, "W-2"); // never ran: no flight recorder
+    for args in [vec!["watch", "W-2", "--no-follow"], vec!["watch", "W-2"]] {
+        let (code, _, err) = out(&env, &args);
+        assert_eq!(code, 2, "{args:?}");
+        assert!(err.contains("no flight recorder"), "{err}");
+    }
+}
+
+/// AC-2: `watch` follows a run in another process — no lock — and exits on its own at the
+/// plan gate.
+#[test]
+fn watch_follows_a_running_task_and_stops_at_the_gate() {
+    let env = setup("codex-openai");
+    create(&env, "W-3");
+    let delay = json!({"kind": "delay", "ms": 2500});
+    let s = script(
+        &env,
+        "w3.json",
+        json!({
+            "planner": [turn(vec![delay.clone(), plan()])],
+            "implementer": [turn(vec![implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let mut run = spawn(&env, &["run", "W-3", "--fake-agents", &s], "w3-run.log");
+    let p = task(&env, "W-3").run_store.join("events.jsonl");
+    wait_until("the run to start", 60, || p.is_file());
+    let mut watch = command(&env, &["watch", "W-3", "--json", "--from-start"], &[])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let t = std::time::Instant::now();
+    let status = loop {
+        if let Some(s) = watch.try_wait().unwrap() {
+            break s;
+        }
+        if t.elapsed() > std::time::Duration::from_secs(90) {
+            let _ = watch.kill();
+            panic!("watch did not stop on its own");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert!(run.wait().unwrap().success());
+    assert!(status.success());
+    let o = watch.wait_with_output().unwrap();
+    let raw = String::from_utf8_lossy(&o.stdout);
+    let ev: Vec<Value> = raw
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(
+        ev.iter()
+            .any(|e| e["type"] == "gate_opened" && e["gate"] == "plan"),
+        "{raw}"
+    );
+    assert_eq!(ev.last().unwrap()["type"], "run_ended", "{raw}");
+    assert_eq!(task(&env, "W-3").state, St::WaitingPlanApproval);
+    // it saw the run while it happened: the plan stage started before watch was done
+    assert_eq!(raw.lines().collect::<Vec<_>>(), events_lines(&env, "W-3"));
+}
+
+/// Ctrl+C ends `watch` with exit 0 while the task is still running. Windows: CTRL_BREAK to
+/// `watch` in its own process group (Ctrl+C cannot be sent to another group; `watch` treats both
+/// alike); skipped without a console. Unix: SIGINT.
+#[test]
+fn ctrl_c_ends_watch_with_exit_0() {
+    let env = setup("codex-openai");
+    create(&env, "W-4");
+    let s = script(
+        &env,
+        "w4.json",
+        json!({"planner": [turn(vec![hang()])], "implementer": [], "reviewer": []}),
+    );
+    // the hanging run is killed however the test ends
+    struct Killed(std::process::Child);
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _run = Killed(spawn(
+        &env,
+        &["run", "W-4", "--fake-agents", &s],
+        "w4-run.log",
+    ));
+    let p = task(&env, "W-4").run_store.join("events.jsonl");
+    wait_until("the run to start", 60, || p.is_file());
+    let mut c = command(&env, &["watch", "W-4"], &[]);
+    c.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP
+    }
+    let mut watch = c.spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    assert!(watch.try_wait().unwrap().is_none(), "still following");
+    #[cfg(windows)]
+    let sent = unsafe {
+        windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent(1, watch.id()) != 0
+    };
+    #[cfg(unix)]
+    let sent = unsafe { libc::kill(watch.id() as i32, libc::SIGINT) == 0 };
+    #[cfg(not(any(windows, unix)))]
+    let sent = false;
+    if sent {
+        let t = std::time::Instant::now();
+        let status = loop {
+            if let Some(s) = watch.try_wait().unwrap() {
+                break s;
+            }
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(20),
+                "watch ignored the interrupt"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        assert_eq!(status.code(), Some(0));
+    } else {
+        eprintln!("no console to send the interrupt to: skipped");
+        let _ = watch.kill();
+    }
+}

@@ -124,6 +124,21 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Follow a task's flight recorder (`events.jsonl`) like `tail -f` — no task lock needed.
+    /// Stops when the task waits for a human, is finished or nobody drives it (2 s without an
+    /// event), or on Ctrl+C.
+    Watch {
+        id: String,
+        /// The file's JSON lines instead of the rendered text
+        #[arg(long)]
+        json: bool,
+        /// Print the whole history first (default: the last 20 events)
+        #[arg(long)]
+        from_start: bool,
+        /// Print the history and exit
+        #[arg(long)]
+        no_follow: bool,
+    },
     /// 🔒 The token admission cap of a task (R41).
     Budget {
         #[command(subcommand)]
@@ -253,6 +268,12 @@ fn run(cli: Cli) -> Result<i32> {
         ),
         Cmd::Stop { id, wait_secs } => engine_cli::stop(id, *wait_secs),
         Cmd::Status { id, json } => engine_cli::status(id.as_deref(), *json),
+        Cmd::Watch {
+            id,
+            json,
+            from_start,
+            no_follow,
+        } => engine_cli::watch(id, *json, *from_start, *no_follow),
         Cmd::Partial { cmd } => engine_cli::partial(cmd),
         Cmd::Context { cmd } => engine_cli::context(cmd),
         Cmd::Budget { cmd } => engine_cli::budget(cmd),
@@ -266,7 +287,26 @@ fn exit_status(code: i32) -> u8 {
     u8::try_from(code).unwrap_or(1)
 }
 
+/// The stack of the thread that runs the CLI: clap's derived builder for the whole command tree
+/// needs more than the 1 MB main-thread stack of a Windows debug build (M10 added `watch` and the
+/// build overflowed on `--help`).
+const CLI_STACK: usize = 8 << 20;
+
 fn main() -> ExitCode {
+    match std::thread::Builder::new()
+        .name("toryo".into())
+        .stack_size(CLI_STACK)
+        .spawn(cli_main)
+    {
+        Ok(h) => h.join().unwrap_or_else(|_| ExitCode::from(101)),
+        Err(e) => {
+            eprintln!("error: cannot start the CLI thread: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn cli_main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli) {
         Ok(code) => ExitCode::from(exit_status(code)),

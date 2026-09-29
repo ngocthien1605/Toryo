@@ -10,7 +10,7 @@ Branch `m10/flight-recorder` (from `main` @ `5adf204`). One commit per task.
 - [x] A1 — `EngineEvent`, sinks, `events.jsonl` flight recorder
 - [x] A2 — the engine's CLI lines rendered from events
 - [x] B1 — `status --json`, `task show --json`
-- [ ] B2 — `toryo watch <ID>`
+- [x] B2 — `toryo watch <ID>`
 - [ ] C1 — `prices.toml` + `toryo usage <ID>`
 - [ ] C2 — scripted turns in mixed runs report zero usage
 - [ ] D1 — Windows toast
@@ -117,3 +117,39 @@ Branch `m10/flight-recorder` (from `main` @ `5adf204`). One commit per task.
 - Tests: `tests/m10_views.rs` (both documents after a fake run to the final gate, `{ "tasks": [] }`
   without tasks, a cleaned-up task keeps state and next action), `tests/m9_xpp.rs::
   json_views_say_compile_only_for_an_xpp_verify`. Schema: README "Following a task (M10)".
+
+### B2 — `toryo watch <ID>`
+
+- `toryo watch ID [--json] [--from-start] [--no-follow]` prints on **stdout**: the history (the last 20
+  events, or all with `--from-start`), then new events every ~500 ms — rendered with A2's renderer
+  (`flight::render`: the CLI's own lines for the events it prints, a line for the others, e.g.
+  `   turn implement/1 (codex-openai): completed · 125 tokens, exact (0.1s)`) or, with `--json`, the
+  file's lines unchanged.
+- **Reader** `flight::Tail`: remembers the offset, returns complete lines only (a partial last line
+  waits for its newline), starts over when the file shrank. A line that is not a JSON object is skipped;
+  with the renderer, so is an event type this toryo does not know (it is kept with `--json`).
+- **No task lock, not even a probe.** `status` checks activity with `lock::probe_free`, which takes the
+  OS lock for an instant — a `toryo run` starting at that instant would be refused with `task_active`.
+  `watch` polls every 500 ms, so it decides "somebody drives the task" from the recorded lock owner in
+  the store (its PID and creation time alive, `store::identity_alive`), never from the lock.
+- **When it stops** (`flight::watch_done`): 2 s without a new event and the task waits for a human (a
+  gate, `Escalated`, `Paused`), is finished, or is in a running state that no live process drives (a
+  crashed run: `toryo resume`). A `New` task is followed until it starts. `--no-follow` exits after the
+  history. Ctrl+C exits 0: a console control handler on Windows (`SetConsoleCtrlHandler`,
+  `windows-sys` feature `Win32_System_Console`, no new crate), SIGINT on Unix (`libc::signal`); the loop
+  checks the flag every 50 ms.
+- **Errors.** An unknown task is the store's error (exit 2). No `events.jsonl` is an error
+  ("no flight recorder … the task has not run since M10, or `task cleanup` removed its run store"),
+  except while a live process drives the task (the file appears with its first event).
+- **Stack size (found on the way).** Adding the `watch` subcommand made the debug binary overflow the
+  1 MB main-thread stack on Windows already in `--help` (clap's derived builder for the whole command
+  tree; `main` was just under the limit). `main` now runs the CLI on a thread with an 8 MB stack
+  (`CLI_STACK`). No behaviour change otherwise (exit codes, the task-active code, panics → 101).
+- Tests: `tests/m10_views.rs` — the whole history after a finished run (rendered and `--json` equal to
+  the file, the last 20, follow mode stops by itself, a partial last line), errors, a concurrent `run`
+  with a 2.5 s `delay` followed to the plan gate (AC-2), and Ctrl+C → exit 0 (Windows: CTRL_BREAK to the
+  child's own process group, since Ctrl+C cannot be sent to another group and `watch` treats both alike;
+  a mutation without the handler fails it with `STATUS_CONTROL_C_EXIT`). Unit: the tail, the history,
+  the line filter, the stop rule.
+- **Not verified here:** the Unix signal path compiles and runs only on Linux CI (no Linux target on
+  this machine; installing one would be a download).

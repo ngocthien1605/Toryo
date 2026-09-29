@@ -1258,3 +1258,104 @@ pub fn partial(cmd: &PartialCmd) -> Result<i32> {
         }
     }
 }
+
+/// Ctrl+C during `watch`: set, not killed, so `watch` exits 0.
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Route Ctrl+C to [`INTERRUPTED`] (no new crate: the console handler on Windows, SIGINT on
+/// Unix).
+fn catch_ctrl_c() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+        unsafe extern "system" fn handler(kind: u32) -> windows_sys::Win32::Foundation::BOOL {
+            // CTRL_C_EVENT, CTRL_BREAK_EVENT; anything else (close, logoff) as usual
+            if kind <= 1 {
+                INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+                return 1;
+            }
+            0
+        }
+        // SAFETY: registers a handler that only stores to an atomic
+        unsafe {
+            SetConsoleCtrlHandler(Some(handler), 1);
+        }
+    }
+    #[cfg(unix)]
+    {
+        extern "C" fn handler(_: libc::c_int) {
+            INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        // SAFETY: the handler only stores to an atomic (async-signal-safe)
+        unsafe {
+            libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
+        }
+    }
+}
+
+/// Sleep `d` in short steps; true when Ctrl+C was pressed.
+fn interrupted_during(d: Duration) -> bool {
+    let end = std::time::Instant::now() + d;
+    while std::time::Instant::now() < end {
+        if INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Does a live process drive the task? From the recorded lock owner (its PID and creation
+/// time), never by taking the lock: a probe could refuse a `toryo run` starting at that moment.
+fn driven(st: &Store, id: &str) -> Result<bool> {
+    let i = id.to_string();
+    let owner = st.call(move |tx| store::lock_owner(tx, &i))?;
+    Ok(
+        matches!(owner, Some((_, _, Some(pid), Some(created))) if store::identity_alive(pid, &created)),
+    )
+}
+
+/// `toryo watch` (B2): the task's flight recorder like `tail -f`, without the task lock. The
+/// history first (the last 20 events, or all with `from_start`), then new events every ~500 ms,
+/// rendered or (`json`) as the file's lines, until the task stops moving on its own
+/// (`flight::watch_done`) or Ctrl+C.
+pub fn watch(id: &str, json: bool, from_start: bool, no_follow: bool) -> Result<i32> {
+    use toryo::engine::flight::{self, Tail};
+    let st = store()?;
+    let t = get(&st, id)?;
+    let path = flight::events_path(&t);
+    if !path.is_file() && (no_follow || !driven(&st, id)?) {
+        bail!(
+            "{id}: no flight recorder at {} — the task has not run since M10, or `task cleanup` removed its run store",
+            path.display()
+        );
+    }
+    catch_ctrl_c();
+    let show = |line: &str| {
+        if let Some(text) = flight::watch_line(line, json) {
+            println!("{text}");
+        }
+    };
+    let mut tail = Tail::default();
+    for line in flight::history(&tail.poll(&path)?, from_start) {
+        show(line);
+    }
+    if no_follow {
+        return Ok(0);
+    }
+    let mut last = std::time::Instant::now();
+    loop {
+        if interrupted_during(Duration::from_millis(500)) {
+            return Ok(0);
+        }
+        let new = tail.poll(&path)?;
+        if !new.is_empty() {
+            last = std::time::Instant::now();
+            new.iter().for_each(|l| show(l));
+        }
+        let state = get(&st, id)?.state;
+        if flight::watch_done(state, driven(&st, id)?, last.elapsed()) {
+            return Ok(0);
+        }
+    }
+}
