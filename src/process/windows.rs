@@ -39,9 +39,6 @@ use windows_sys::Win32::Security::{
     PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT,
     TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
 };
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
@@ -459,9 +456,11 @@ fn low_integrity_token() -> Result<Owned> {
             &label as *const _ as *const c_void,
             size,
         );
+        // read the error before LocalFree, which may overwrite GetLastError (CODE-10)
+        let err = (ok == 0).then(|| last_error("SetTokenInformation(TokenIntegrityLevel=Low)"));
         LocalFree(sid as _);
-        if ok == 0 {
-            return Err(last_error("SetTokenInformation(TokenIntegrityLevel=Low)"));
+        if let Some(e) = err {
+            return Err(e);
         }
         Ok(dup)
     }
@@ -601,8 +600,10 @@ pub fn set_low_label(dir: &Path) -> Result<()> {
         let mut defaulted: BOOL = 0;
         let mut sacl: *mut ACL = null_mut();
         if GetSecurityDescriptorSacl(sd, &mut present, &mut sacl, &mut defaulted) == 0 {
+            // read the error before LocalFree, which may overwrite GetLastError (CODE-10)
+            let e = last_error("GetSecurityDescriptorSacl");
             LocalFree(sd as _);
-            return Err(last_error("GetSecurityDescriptorSacl"));
+            return Err(e);
         }
         let path = wide(dir.as_os_str());
         let rc = SetNamedSecurityInfoW(
@@ -631,26 +632,4 @@ pub fn set_low_label(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Open NUL for reading (kept for callers that need an explicit empty stdin).
-#[allow(dead_code)]
-fn open_nul() -> Result<Owned> {
-    let name = wide(OsStr::new("NUL"));
-    // SAFETY: valid, NUL-terminated name.
-    unsafe {
-        let h = CreateFileW(
-            name.as_ptr(),
-            FILE_GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            null(),
-            OPEN_EXISTING,
-            0,
-            null_mut(),
-        );
-        if h == INVALID_HANDLE_VALUE {
-            return Err(last_error("CreateFileW(NUL)"));
-        }
-        Ok(Owned(h))
-    }
 }

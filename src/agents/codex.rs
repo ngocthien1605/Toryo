@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
+use regex::Regex;
 use serde_json::Value;
 
 use super::{CommandExec, ErrorClass, TurnOutcome};
@@ -99,7 +101,8 @@ impl CodexLaunch {
         a
     }
 
-    /// Warnings that make a Codex profile unusable (R18).
+    /// Reasons that make a Codex profile unusable (R18). The CLI adapter refuses a turn
+    /// that has any (fail closed, ARCH-05).
     pub fn preflight(&self) -> Vec<String> {
         let mut w = Vec::new();
         if cfg!(windows) && self.settings.windows_sandbox.is_none() {
@@ -115,20 +118,30 @@ impl CodexLaunch {
     }
 }
 
-/// R21: exec errors carry only `message`; classify by text.
-pub fn classify_message(msg: &str) -> ErrorClass {
-    let table: &[(&str, ErrorClass)] = &[
+/// The R21 message table, most specific first, compiled once (CODE-05).
+static CODEX_MESSAGES: LazyLock<Vec<(Regex, ErrorClass)>> = LazyLock::new(|| {
+    [
         (
             r"(?i)context window|context_length|maximum context",
             ErrorClass::ContextWindowExceeded,
         ),
+        // Exhaustion in words a vendor sends even with a 429 status (OpenAI
+        // `insufficient_quota`: "You exceeded your current quota …", Codex "You've hit
+        // your usage limit").
         (
-            r"(?i)usage limit|quota|insufficient_quota|billing",
+            r"(?i)usage limit|insufficient_?quota|exceeded your current quota",
             ErrorClass::QuotaExceeded,
         ),
+        // EC-03: the status and "rate limit" before the generic quota words. An Azure
+        // throttle ("429 … exceeded token rate limit … https://aka.ms/oai/quotaincrease")
+        // is transient; read as quota it would switch the implementer for good (R49).
         (
             r"(?i)\b429\b|rate.?limit|too many requests",
             ErrorClass::RateLimited,
+        ),
+        (
+            r"(?i)\bquota\b|quota_?exceeded|\bbilling\b",
+            ErrorClass::QuotaExceeded,
         ),
         (
             r"(?i)\b(401|403)\b|unauthori[sz]ed|forbidden|invalid api key|authentication",
@@ -146,13 +159,18 @@ pub fn classify_message(msg: &str) -> ErrorClass {
             r"(?i)\b400\b|invalid_request|bad request|model .*not found",
             ErrorClass::BadRequest,
         ),
-    ];
-    for (re, class) in table {
-        if regex::Regex::new(re).expect("regex").is_match(msg) {
-            return *class;
-        }
-    }
-    ErrorClass::Unknown
+    ]
+    .into_iter()
+    .map(|(re, class)| (Regex::new(re).expect("regex"), class))
+    .collect()
+});
+
+/// R21: exec errors carry only `message`; classify by text.
+pub fn classify_message(msg: &str) -> ErrorClass {
+    CODEX_MESSAGES
+        .iter()
+        .find(|(re, _)| re.is_match(msg))
+        .map_or(ErrorClass::Unknown, |(_, class)| *class)
 }
 
 #[derive(Default)]
@@ -163,7 +181,12 @@ pub struct CodexParser {
     last_agent_message: Option<String>,
     completed_usage: Option<Value>,
     turn_completed: bool,
+    /// `turn.failed`: the only failure a turn reports about itself.
     failed: Option<String>,
+    /// Top-level `error` lines. Most are notices the CLI recovers from ("Reconnecting...
+    /// 1/5 (stream disconnected before completion)"); a fatal one is followed by
+    /// `turn.failed` (EC-02).
+    errors: Vec<String>,
     items: Vec<String>,
     commands: Vec<CommandExec>,
     unknown_types: BTreeMap<String, u32>,
@@ -264,14 +287,12 @@ impl CodexParser {
                         .to_string(),
                 )
             }
-            "error" => {
-                self.failed = Some(
-                    v.get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("error")
-                        .to_string(),
-                )
-            }
+            "error" => self.errors.push(
+                v.get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("error")
+                    .to_string(),
+            ),
             other => *self.unknown_types.entry(other.to_string()).or_default() += 1,
         }
     }
@@ -293,16 +314,28 @@ impl CodexParser {
             // No live usage in exec mode (R41): a turn without turn.completed is UNKNOWN, never 0.
             o.accounting = Accounting::Unknown;
         }
+        // EC-02: the outcome is decided after the stream: only `turn.failed`, or no
+        // `turn.completed`, fails the turn. `error` lines are kept as warnings.
+        o.warnings = self.errors.clone();
         if let Some(msg) = &self.failed {
             o.error_class = Some(classify_message(msg));
             o.error_detail = Some(msg.clone());
             return o;
         }
         if !self.turn_completed {
-            o.error_class = Some(ErrorClass::ProcessCrashed);
-            o.error_detail = Some(format!(
-                "no turn.completed / turn.failed (exit {process_exit:?})"
-            ));
+            // the stream ended early: the last `error` line, if any, is the best cause
+            match self.errors.last() {
+                Some(msg) => {
+                    o.error_class = Some(classify_message(msg));
+                    o.error_detail = Some(msg.clone());
+                }
+                None => {
+                    o.error_class = Some(ErrorClass::ProcessCrashed);
+                    o.error_detail = Some(format!(
+                        "no turn.completed / turn.failed (exit {process_exit:?})"
+                    ));
+                }
+            }
             return o;
         }
         match &self.last_agent_message {

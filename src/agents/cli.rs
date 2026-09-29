@@ -9,17 +9,20 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
+use serde_json::json;
 use tokio::sync::mpsc;
 
 use super::adapter::{AgentAdapter, AgentSession, TurnId};
 use super::claude::{ClaudeLaunch, LaunchMode};
 use super::codex::CodexLaunch;
-use super::events::{line_events, terminal_events};
+use super::events::{terminal_events, LiveEvents};
 use super::exec::{run_turn_with, TurnOpts};
+use super::TurnOutcome;
 use crate::config::{expand_vars, Effective, Profile, ProfileKind};
 use crate::domain::{
     AgentEvent, AgentHealth, ErrorClass, OpenSession, Role, Tri, TurnInput, UsageCapabilities,
 };
+use crate::usage::{Accounting, Buckets};
 
 /// A real CLI adapter for one profile.
 pub struct CliAdapter {
@@ -47,7 +50,8 @@ impl CliAdapter {
 
 pub fn capabilities(kind: ProfileKind) -> UsageCapabilities {
     match kind {
-        // Claude: stream events carry usage; per-run on --resume (M0-VERIFY 4, R48).
+        // Claude: stream events carry usage, forwarded as provisional `Usage` events while
+        // the turn runs (`LiveEvents`); per-run on --resume (M0-VERIFY 4, R48).
         ProfileKind::Claude => UsageCapabilities {
             live: true,
             terminal: true,
@@ -120,9 +124,18 @@ struct CliSession {
     done: bool,
 }
 
+/// One turn's launch, as `CliSession::build` decided it.
+struct Launch {
+    /// argv without the program.
+    args: Vec<String>,
+    /// The prompt actually sent.
+    prompt: String,
+    /// Preflight reasons that make the profile unusable: the turn is refused (ARCH-05).
+    refused: Vec<String>,
+}
+
 impl CliSession {
-    /// argv (without the program) and the prompt actually sent.
-    fn build(&self, prompt: &str) -> Result<(Vec<String>, String)> {
+    fn build(&self, prompt: &str) -> Result<Launch> {
         let exe = PathBuf::from(expand_vars(&self.profile.exe)?);
         let model = self
             .req
@@ -151,7 +164,11 @@ impl CliSession {
                 l.model = model;
                 l.resume = self.external.clone();
                 let (_cwd, args) = l.argv();
-                Ok((args, prompt.to_string()))
+                Ok(Launch {
+                    args,
+                    prompt: prompt.to_string(),
+                    refused: Vec::new(),
+                })
             }
             ProfileKind::Codex => {
                 let schema_path = match &self.req.schema {
@@ -175,17 +192,42 @@ impl CliSession {
                     resume_thread: self.external.clone(),
                     extra_args: vec![],
                 };
-                for w in l.preflight() {
-                    eprintln!("WARNING: {w}");
-                }
                 // Codex has no system-prompt file flag: the context becomes the prompt preamble (§7).
                 let prompt = match &self.req.context_file {
                     Some(f) => format!("{}\n\n{prompt}", std::fs::read_to_string(f)?),
                     None => prompt.to_string(),
                 };
-                Ok((l.argv(), prompt))
+                Ok(Launch {
+                    args: l.argv(),
+                    prompt,
+                    refused: l.preflight(),
+                })
             }
         }
+    }
+
+    /// ARCH-05: a preflight reason fails the turn closed — no process is spawned. The turn
+    /// ends like any other, with a `PolicyRefusal` and its reasons, and its capture keeps
+    /// the prompt and the refused argv.
+    fn refuse(&self, label: &str, launch: &Launch) -> Result<TurnOutcome> {
+        let mut o = TurnOutcome::empty();
+        o.error_class = Some(ErrorClass::PolicyRefusal);
+        o.error_detail = Some(format!("preflight: {}", launch.refused.join("; ")));
+        // Nothing ran, so nothing was used. A provisional zero rather than an exact one:
+        // only exact rows move a resumed session's cumulative baseline (R41), and no
+        // reservation is held for a turn that never started.
+        o.usage = Some(Buckets::default());
+        o.accounting = Accounting::Provisional;
+        let dir = &self.req.capture_dir;
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join(format!("{label}.prompt.md")), &launch.prompt)?;
+        std::fs::write(
+            dir.join(format!("{label}.outcome.json")),
+            serde_json::to_vec_pretty(
+                &json!({ "outcome": o, "exit": null, "refused_argv": launch.args }),
+            )?,
+        )?;
+        Ok(o)
     }
 
     fn cwd(&self) -> PathBuf {
@@ -213,11 +255,19 @@ impl AgentSession for CliSession {
         if let Some(t) = self.task.take() {
             let _ = t.await;
         }
-        let (args, prompt) = self.build(&input.prompt)?;
+        let launch = self.build(&input.prompt)?;
         let (tx, rx) = mpsc::unbounded_channel();
         self.rx = Some(rx);
         self.done = false;
         self.cancel.store(false, Ordering::SeqCst);
+        if !launch.refused.is_empty() {
+            for e in terminal_events(&self.refuse(&input.label, &launch)?) {
+                let _ = tx.send(e);
+            }
+            self.turns += 1;
+            return Ok(self.turns);
+        }
+        let Launch { args, prompt, .. } = launch;
         let kind = self.profile.kind;
         let profile_name = self.profile_name.clone();
         let profile = self.profile.clone();
@@ -235,8 +285,9 @@ impl AgentSession for CliSession {
         let label = input.label.clone();
         self.task = Some(tokio::task::spawn_blocking(move || {
             let tx_lines = tx.clone();
+            let mut live = LiveEvents::new(kind);
             let mut on_line = move |line: &[u8]| {
-                for e in line_events(kind, line) {
+                for e in live.feed(line) {
                     let _ = tx_lines.send(e);
                 }
             };

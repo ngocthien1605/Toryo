@@ -4,12 +4,12 @@
 
 use serde_json::Value;
 
-use super::claude::{classify_api_error, ClaudeParser};
+use super::claude::{classify_api_error, ClaudeParser, ProvisionalUsage};
 use super::codex::CodexParser;
 use super::TurnOutcome;
 use crate::config::ProfileKind;
 use crate::domain::{AgentEvent, ErrorClass, TokenUsage};
-use crate::usage::{Accounting, CodexSubsets};
+use crate::usage::{Accounting, Buckets, CodexSubsets};
 
 fn short(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
@@ -19,12 +19,65 @@ fn short(s: &str, n: usize) -> String {
     }
 }
 
-/// Live events for one stream line (non-terminal events only; the terminal ones come from
-/// the parser's final outcome, see `terminal_events`).
+/// The events one stream line maps to on its own (non-terminal events only; the terminal
+/// ones come from the parser's final outcome, see `terminal_events`). A running turn uses
+/// [`LiveEvents`], which adds live usage and heartbeats.
 pub fn line_events(kind: ProfileKind, line: &[u8]) -> Vec<AgentEvent> {
-    let Ok(v) = serde_json::from_slice::<Value>(line) else {
-        return Vec::new();
-    };
+    match serde_json::from_slice::<Value>(line) {
+        Ok(v) => value_events(kind, &v),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The live events of one turn, line by line (used for real turns and for replays alike):
+/// [`line_events`], plus
+/// * for Claude, a provisional `Usage` whenever the turn's usage so far changes
+///   (`message_start` / `message_delta` / `assistant`, merged per message id). The values
+///   are cumulative for the turn, so a budget hook can interrupt the turn while it runs
+///   (R41, EC-05); the terminal `Usage` still carries the final value and replaces them.
+///   Codex exec reports usage only with `turn.completed` (`live = false`).
+/// * a `Heartbeat` for any line that maps to no other event (thinking, tool input, Codex
+///   `turn.started` / `item.started` / reasoning …), so every stdout line counts as
+///   activity for the stall limit (EC-06).
+pub struct LiveEvents {
+    kind: ProfileKind,
+    usage: ProvisionalUsage,
+    reported: Option<Buckets>,
+}
+
+impl LiveEvents {
+    pub fn new(kind: ProfileKind) -> Self {
+        Self {
+            kind,
+            usage: ProvisionalUsage::default(),
+            reported: None,
+        }
+    }
+
+    /// The events of the next stdout line: at least one.
+    pub fn feed(&mut self, line: &[u8]) -> Vec<AgentEvent> {
+        let mut out = Vec::new();
+        if let Ok(v) = serde_json::from_slice::<Value>(line) {
+            out = value_events(self.kind, &v);
+            if self.kind == ProfileKind::Claude && self.usage.observe(&v) {
+                let now = self.usage.buckets();
+                if now.is_some() && now != self.reported {
+                    self.reported = now;
+                    out.push(AgentEvent::Usage(TokenUsage {
+                        buckets: now,
+                        accounting: Accounting::Provisional,
+                    }));
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push(AgentEvent::Heartbeat);
+        }
+        out
+    }
+}
+
+fn value_events(kind: ProfileKind, v: &Value) -> Vec<AgentEvent> {
     let mut out = Vec::new();
     match kind {
         ProfileKind::Claude => match v["type"].as_str() {
@@ -146,11 +199,12 @@ pub fn terminal_events(o: &TurnOutcome) -> Vec<AgentEvent> {
 
 /// Replay a recorded stream through the real parser: the events a live turn would produce.
 pub fn replay(kind: ProfileKind, stream: &str, exit_code: Option<i32>) -> Vec<AgentEvent> {
+    let mut live = LiveEvents::new(kind);
     let mut claude = ClaudeParser::new();
     let mut codex = CodexParser::new();
     let mut out = Vec::new();
     for line in stream.lines().filter(|l| !l.trim().is_empty()) {
-        out.extend(line_events(kind, line.as_bytes()));
+        out.extend(live.feed(line.as_bytes()));
         match kind {
             ProfileKind::Claude => claude.feed_line(line.as_bytes()),
             ProfileKind::Codex => codex.feed_line(line.as_bytes()),

@@ -102,7 +102,13 @@ pub enum AgentEvent {
         tool: String,
         detail: String,
     },
+    /// The turn's usage so far. Live adapters send provisional, cumulative-for-the-turn
+    /// values while the turn runs (R41); the terminal one is the turn's final usage.
     Usage(TokenUsage),
+    /// The agent printed a line that maps to no other event (thinking, tool input, a
+    /// started item …). Carries nothing: it only proves the agent is alive, so the stall
+    /// limit counts output rather than mapped events (EC-06). Consumers ignore it.
+    Heartbeat,
     Retrying {
         attempt: u32,
         delay_ms: u64,
@@ -128,6 +134,12 @@ impl AgentEvent {
             AgentEvent::TurnCompleted { .. } | AgentEvent::TurnFailed { .. }
         )
     }
+}
+
+/// Plan §6.2: any permission denial fails the turn (`PermissionDenied`). The failure
+/// detail every adapter reports for it, real or fake.
+pub fn permission_denials_detail(count: usize) -> String {
+    format!("{count} permission denial(s)")
 }
 
 /// How to open (or resume) an agent session for one stage.
@@ -167,7 +179,8 @@ pub struct TurnInput {
 pub struct TurnLimits {
     /// Whole-turn maximum.
     pub max: Duration,
-    /// No event for this long → interrupt (`Timeout`, stalled).
+    /// No event for this long → interrupt (`Timeout`, stalled). Every stdout line of a
+    /// real agent is at least a `Heartbeat`, so this measures silence, not mapped events.
     pub stall: Duration,
 }
 
@@ -212,7 +225,10 @@ impl StageOutcome {
             AgentEvent::PermissionDenied { tool, detail } => {
                 self.permission_denials.push((tool.clone(), detail.clone()))
             }
+            // the latest value replaces the earlier ones: live values are cumulative for
+            // the turn and the terminal one is final, so nothing is counted twice
             AgentEvent::Usage(u) => self.usage = Some(*u),
+            AgentEvent::Heartbeat => {}
             AgentEvent::Retrying { .. } => self.retries += 1,
             AgentEvent::TurnCompleted {
                 final_text,

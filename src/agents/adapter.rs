@@ -44,6 +44,8 @@ pub trait AgentSession: Send {
 
 /// Run one turn to its terminal event, enforcing the stall and max limits.
 /// A limit hit interrupts the turn and reports `Timeout` (`timed_out = true`).
+/// Every event is activity for the stall limit; the real adapters send at least a
+/// `Heartbeat` for each line the agent prints, so only silence stalls a turn (EC-06).
 pub async fn run_to_completion(
     session: &mut dyn AgentSession,
     input: TurnInput,
@@ -51,6 +53,9 @@ pub async fn run_to_completion(
 ) -> Result<StageOutcome> {
     run_to_completion_with(session, input, limits, TurnHooks::default()).await
 }
+
+/// How often a stop request and the max limit are checked while a turn runs.
+const LIMITS_POLL: Duration = Duration::from_millis(200);
 
 /// Called with the external session id as soon as it is known.
 pub type SessionHook = Arc<dyn Fn(&str) + Send + Sync>;
@@ -87,6 +92,7 @@ pub async fn run_to_completion_with(
     };
     let deadline = tokio::time::Instant::now() + limits.max;
     let mut last_event = tokio::time::Instant::now();
+    let mut checked = tokio::time::Instant::now();
     let mut interrupted_at: Option<tokio::time::Instant> = None;
     loop {
         let now = tokio::time::Instant::now();
@@ -98,9 +104,9 @@ pub async fn run_to_completion_with(
                 .saturating_duration_since(now),
         };
         if cancel.is_some() && interrupted_at.is_none() {
-            wait = wait.min(Duration::from_millis(200));
+            wait = wait.min(LIMITS_POLL);
         }
-        match tokio::time::timeout(wait, session.next_event()).await {
+        let paused = match tokio::time::timeout(wait, session.next_event()).await {
             Ok(Some(e)) => {
                 last_event = tokio::time::Instant::now();
                 if let (AgentEvent::SessionIdentified(id), Some(f)) = (&e, &hooks.on_session) {
@@ -114,6 +120,7 @@ pub async fn run_to_completion_with(
                 if terminal {
                     break;
                 }
+                false
             }
             Ok(None) => {
                 if out.error_class.is_none() && !out.success {
@@ -122,20 +129,27 @@ pub async fn run_to_completion_with(
                 }
                 break;
             }
-            Err(_) if interrupted_at.is_none() => {
-                let now = tokio::time::Instant::now();
-                if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
-                    out.cancelled = true;
-                } else if now >= deadline || now >= last_event + limits.stall {
-                    out.timed_out = true;
-                } else {
-                    continue;
-                }
-                interrupted_at = Some(now);
-                let _ = session.interrupt().await;
-            }
-            Err(_) => break,
+            Err(_) if interrupted_at.is_some() => break,
+            Err(_) => true,
+        };
+        // The limits are checked whenever the stream pauses and, while events keep coming,
+        // every LIMITS_POLL: a stream that never pauses (every line an agent prints is at
+        // least a heartbeat) must not hold off a stop request or the max limit.
+        let now = tokio::time::Instant::now();
+        let due = paused || now >= checked + LIMITS_POLL;
+        if interrupted_at.is_some() || !due {
+            continue;
         }
+        checked = now;
+        if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+            out.cancelled = true;
+        } else if now >= deadline || now >= last_event + limits.stall {
+            out.timed_out = true;
+        } else {
+            continue;
+        }
+        interrupted_at = Some(now);
+        let _ = session.interrupt().await;
     }
     if out.timed_out || out.cancelled {
         out.success = false;

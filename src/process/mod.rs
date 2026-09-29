@@ -180,20 +180,27 @@ impl Running {
         let mut exited_at: Option<Instant> = None;
         let mut lingering_killed = false;
         loop {
-            match self.rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(Some((is_err, bytes))) => {
-                    last_output = Instant::now();
-                    on_chunk(if is_err {
-                        Chunk::Stderr(bytes)
-                    } else {
-                        Chunk::Stdout(bytes)
-                    });
+            if self.open_streams == 0 {
+                // EC-32: both pipes are closed but the root still runs. Nothing can arrive
+                // any more (the channel would report `Disconnected` at once, a busy loop):
+                // poll the exit and the limits at a steady pace instead.
+                std::thread::sleep(Duration::from_millis(50));
+            } else {
+                match self.rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(Some((is_err, bytes))) => {
+                        last_output = Instant::now();
+                        on_chunk(if is_err {
+                            Chunk::Stderr(bytes)
+                        } else {
+                            Chunk::Stdout(bytes)
+                        });
+                    }
+                    Ok(None) => {
+                        self.open_streams = self.open_streams.saturating_sub(1);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => self.open_streams = 0,
                 }
-                Ok(None) => {
-                    self.open_streams = self.open_streams.saturating_sub(1);
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => self.open_streams = 0,
             }
             let exited = self.child.try_exit_code()?.is_some();
             if exited && self.open_streams == 0 {
@@ -298,7 +305,6 @@ pub fn label_low(dirs: &[PathBuf]) -> Result<()> {
     }
 }
 
-/// Quote one argument for a Windows command line (CommandLineToArgvW rules).
 /// Remove ANSI escape sequences (CSI / OSC) from captured tool output. pwsh colours
 /// warnings even with NO_COLOR set (M0 run); stored artifacts must be plain text.
 pub fn strip_ansi(s: &str) -> String {
@@ -310,6 +316,7 @@ pub fn strip_ansi(s: &str) -> String {
     re.replace_all(s, "").into_owned()
 }
 
+/// Quote one argument for a Windows command line (CommandLineToArgvW rules).
 pub fn quote_windows_arg(arg: &str) -> String {
     if !arg.is_empty()
         && !arg

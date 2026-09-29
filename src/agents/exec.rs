@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::agents::claude::ClaudeParser;
 use crate::agents::codex::CodexParser;
-use crate::agents::{LineSplitter, TurnOutcome};
+use crate::agents::{ErrorClass, LineSplitter, TurnOutcome};
 use crate::config::{resolve_profile_secrets, Profile, ProfileKind};
 use crate::process::env::{build_env, non_secret_view, validate_provider_selection};
 use crate::process::redact::{Redactions, Secret};
@@ -54,6 +54,63 @@ pub struct TurnRun {
     pub run_dir: PathBuf,
     pub argv: Vec<String>,
     pub argv_sha256: String,
+}
+
+/// One capture file of a turn's stream. Captures are evidence and replay fixtures (R42,
+/// §16), so a failed write is never ignored (CODE-07): the first error is kept, nothing
+/// more is written (the file stays an intact prefix of the stream, never one with a hole),
+/// and the turn is failed once it has ended.
+struct Capture {
+    file: std::fs::File,
+    name: String,
+    written: u64,
+    error: Option<String>,
+}
+
+impl Capture {
+    fn create(path: &Path) -> Result<Self> {
+        Ok(Self {
+            file: std::fs::File::create(path)
+                .with_context(|| format!("creating {}", path.display()))?,
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            written: 0,
+            error: None,
+        })
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        if self.error.is_some() {
+            return;
+        }
+        match self.file.write_all(bytes) {
+            Ok(()) => self.written += bytes.len() as u64,
+            Err(e) => {
+                self.error = Some(format!(
+                    "writing {} failed after {} bytes: {e}",
+                    self.name, self.written
+                ))
+            }
+        }
+    }
+}
+
+/// A turn whose capture is incomplete fails; a turn that failed anyway keeps its class
+/// (the implementer fallback keys on it) and gets the capture error added to its detail.
+fn fail_on_capture_errors(outcome: &mut TurnOutcome, errors: Vec<String>) {
+    if errors.is_empty() {
+        return;
+    }
+    let note = format!("capture incomplete: {}", errors.join("; "));
+    outcome.protocol_errors.push(note.clone());
+    outcome.success = false;
+    outcome.error_class.get_or_insert(ErrorClass::Unknown);
+    outcome.error_detail = Some(match outcome.error_detail.take() {
+        Some(d) if !d.is_empty() => format!("{d}; {note}"),
+        _ => note,
+    });
 }
 
 /// Build the child environment for a profile (R23) and the redaction set (R42).
@@ -163,8 +220,8 @@ pub fn run_turn_with(
         stdin: Some(prompt.as_bytes().to_vec()),
         boundary: Boundary::None,
     };
-    let mut out_file = std::fs::File::create(run_dir.join(format!("{label}.stdout.jsonl")))?;
-    let mut err_file = std::fs::File::create(run_dir.join(format!("{label}.stderr.txt")))?;
+    let mut out_file = Capture::create(&run_dir.join(format!("{label}.stdout.jsonl")))?;
+    let mut err_file = Capture::create(&run_dir.join(format!("{label}.stderr.txt")))?;
     let running = spawn(&spec, &red).with_context(|| format!("starting {}", program.display()))?;
     let mut splitter = LineSplitter::new(LineSplitter::DEFAULT_CAP);
     let mut claude = ClaudeParser::new();
@@ -192,7 +249,7 @@ pub fn run_turn_with(
     };
     let exit = running.wait(wait, |c| match c {
         Chunk::Stdout(b) => {
-            let _ = out_file.write_all(&b);
+            out_file.write(&b);
             for line in splitter.push(&b) {
                 if echo {
                     echo_line(kind, &line);
@@ -204,9 +261,7 @@ pub fn run_turn_with(
                 }
             }
         }
-        Chunk::Stderr(b) => {
-            let _ = err_file.write_all(&b);
-        }
+        Chunk::Stderr(b) => err_file.write(&b),
     })?;
     if let Some(rest) = splitter.finish() {
         on_line(&rest);
@@ -220,6 +275,13 @@ pub fn run_turn_with(
         ProfileKind::Codex => codex.finish(exit.code, CodexSubsets::default()),
     };
     outcome.oversized_lines = splitter.oversized;
+    fail_on_capture_errors(
+        &mut outcome,
+        [out_file.error, err_file.error]
+            .into_iter()
+            .flatten()
+            .collect(),
+    );
     // Text rebuilt from separate delta events was never contiguous in the byte stream, so the
     // stream redactor could not see a secret split across two deltas: redact derived fields too.
     outcome.final_text = red.redact_str(&outcome.final_text);
@@ -303,6 +365,9 @@ pub fn print_summary(r: &TurnRun) {
     );
     if !o.protocol_errors.is_empty() {
         eprintln!("protocol errors  : {:?}", o.protocol_errors);
+    }
+    if !o.warnings.is_empty() {
+        eprintln!("warnings         : {:?}", o.warnings);
     }
     eprintln!("captured in      : {}", r.run_dir.display());
     if let Some(s) = &o.structured {

@@ -2,11 +2,14 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
+use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
 
 use super::{ErrorClass, TurnOutcome};
+use crate::domain::permission_denials_detail;
 use crate::usage::{claude_buckets, Accounting, Buckets};
 
 /// Launch mode under test in M0 (R30 preferred + the two §6.2 fallbacks).
@@ -185,6 +188,82 @@ fn drop_flags(args: Vec<String>, drop: &[String]) -> Vec<String> {
     out
 }
 
+/// Provisional usage of one turn (R17, R41). `message_start` / `message_delta` stream events
+/// and `assistant` messages carry usage that is cumulative per message, so the turn's usage
+/// so far is the maximum of each counter per message id, summed over the messages. The
+/// parser keeps it for a turn killed before its `result`; the live `Usage` events of a
+/// running turn come from it too (EC-05).
+#[derive(Debug, Clone, Default)]
+pub struct ProvisionalUsage {
+    per_message: BTreeMap<String, Value>,
+    /// `message_delta` carries no id: it belongs to the last `message_start`.
+    current: Option<String>,
+}
+
+impl ProvisionalUsage {
+    /// Fold one parsed stream line in; `true` when the line carried usage.
+    pub fn observe(&mut self, v: &Value) -> bool {
+        match v.get("type").and_then(Value::as_str) {
+            Some("stream_event") => {
+                let e = v.get("event").unwrap_or(&Value::Null);
+                match e.get("type").and_then(Value::as_str) {
+                    Some("message_start") => {
+                        let m = e.get("message").unwrap_or(&Value::Null);
+                        let Some(id) = m.get("id").and_then(Value::as_str) else {
+                            return false;
+                        };
+                        self.current = Some(id.to_string());
+                        m.get("usage")
+                            .is_some_and(|u| self.merge(id.to_string(), u))
+                    }
+                    Some("message_delta") => match (self.current.clone(), e.get("usage")) {
+                        (Some(id), Some(u)) => self.merge(id, u),
+                        _ => false,
+                    },
+                    _ => false,
+                }
+            }
+            Some("assistant") => {
+                let m = v.get("message").unwrap_or(&Value::Null);
+                match (m.get("id").and_then(Value::as_str), m.get("usage")) {
+                    (Some(id), Some(u)) => self.merge(id.to_string(), u),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Keep the maximum seen value per counter for one message (deltas are cumulative per message).
+    fn merge(&mut self, id: String, u: &Value) -> bool {
+        let entry = self
+            .per_message
+            .entry(id)
+            .or_insert_with(|| Value::Object(Default::default()));
+        if let (Some(dst), Some(src)) = (entry.as_object_mut(), u.as_object()) {
+            for (k, v) in src {
+                if let Some(n) = v.as_u64() {
+                    let cur = dst.get(k).and_then(Value::as_u64).unwrap_or(0);
+                    dst.insert(k.clone(), Value::from(cur.max(n)));
+                }
+            }
+        }
+        true
+    }
+
+    /// The turn's usage so far; `None` before the first usage-carrying line.
+    pub fn buckets(&self) -> Option<Buckets> {
+        if self.per_message.is_empty() {
+            return None;
+        }
+        let mut total = Buckets::default();
+        for u in self.per_message.values() {
+            total.add(&claude_buckets(u));
+        }
+        Some(total)
+    }
+}
+
 /// Stream parser following the zeroshot transcript rules adopted in R17.
 #[derive(Default)]
 pub struct ClaudeParser {
@@ -194,13 +273,16 @@ pub struct ClaudeParser {
     malformed: u32,
     ignored_types: BTreeMap<String, u32>,
     retries: Vec<Value>,
+    /// The CLI was retrying when the stream last spoke: an `api_retry` with no API answer
+    /// (`message_start` / `assistant`) after it (EC-04).
+    retry_pending: bool,
+    /// The failed API call's category on the latest `assistant` message (SDK `error`).
+    assistant_error: Option<String>,
     protocol_errors: Vec<String>,
     init: Option<Value>,
     text: String,
     tools: Vec<String>,
-    /// provisional usage per message id
-    provisional: BTreeMap<String, Value>,
-    current_msg: Option<String>,
+    usage: ProvisionalUsage,
 }
 
 impl ClaudeParser {
@@ -240,32 +322,25 @@ impl ClaudeParser {
         match ty.as_str() {
             "system" => match v.get("subtype").and_then(Value::as_str) {
                 Some("init") => self.init = Some(v.clone()),
-                Some("api_retry") => self.retries.push(v.clone()),
+                Some("api_retry") => {
+                    self.retries.push(v.clone());
+                    self.retry_pending = true;
+                }
                 _ => {}
             },
-            "stream_event" => self.stream_event(v.get("event").unwrap_or(&Value::Null)),
+            "stream_event" => self.stream_event(&v),
             "assistant" => self.assistant(&v),
             "result" => self.terminal = Some(v),
             other => *self.ignored_types.entry(other.to_string()).or_default() += 1,
         }
     }
 
-    fn stream_event(&mut self, e: &Value) {
+    fn stream_event(&mut self, v: &Value) {
+        self.usage.observe(v);
+        let e = v.get("event").unwrap_or(&Value::Null);
         match e.get("type").and_then(Value::as_str) {
-            Some("message_start") => {
-                let m = e.get("message").unwrap_or(&Value::Null);
-                if let Some(id) = m.get("id").and_then(Value::as_str) {
-                    self.current_msg = Some(id.to_string());
-                    if let Some(u) = m.get("usage") {
-                        self.merge_usage(id.to_string(), u);
-                    }
-                }
-            }
-            Some("message_delta") => {
-                if let (Some(id), Some(u)) = (self.current_msg.clone(), e.get("usage")) {
-                    self.merge_usage(id, u);
-                }
-            }
+            // the API answered: an earlier api_retry has recovered
+            Some("message_start") => self.retry_pending = false,
             Some("content_block_delta") => {
                 if let Some(t) = e.pointer("/delta/text").and_then(Value::as_str) {
                     self.text.push_str(t);
@@ -288,37 +363,10 @@ impl ClaudeParser {
     }
 
     fn assistant(&mut self, v: &Value) {
-        let m = v.get("message").unwrap_or(&Value::Null);
-        if let (Some(id), Some(u)) = (m.get("id").and_then(Value::as_str), m.get("usage")) {
-            self.merge_usage(id.to_string(), u);
-        }
-    }
-
-    /// Keep the maximum seen value per counter for one message (deltas are cumulative per message).
-    fn merge_usage(&mut self, id: String, u: &Value) {
-        let entry = self
-            .provisional
-            .entry(id)
-            .or_insert_with(|| Value::Object(Default::default()));
-        if let (Some(dst), Some(src)) = (entry.as_object_mut(), u.as_object()) {
-            for (k, v) in src {
-                if let Some(n) = v.as_u64() {
-                    let cur = dst.get(k).and_then(Value::as_u64).unwrap_or(0);
-                    dst.insert(k.clone(), Value::from(cur.max(n)));
-                }
-            }
-        }
-    }
-
-    fn provisional_buckets(&self) -> Option<Buckets> {
-        if self.provisional.is_empty() {
-            return None;
-        }
-        let mut total = Buckets::default();
-        for u in self.provisional.values() {
-            total.add(&claude_buckets(u));
-        }
-        Some(total)
+        self.usage.observe(v);
+        self.retry_pending = false;
+        // the latest message decides: an error on an earlier message is not the turn's
+        self.assistant_error = v.get("error").and_then(Value::as_str).map(str::to_string);
     }
 
     pub fn finish(self, process_exit: Option<i32>) -> TurnOutcome {
@@ -338,12 +386,16 @@ impl ClaudeParser {
             ));
             o.retryable = !self.retries.is_empty();
             o.final_text = self.text.clone();
-            if let Some(b) = self.provisional_buckets() {
+            if let Some(b) = self.usage.buckets() {
                 o.usage = Some(b);
                 o.accounting = Accounting::Provisional;
             }
-            if let Some(c) = self.last_retry_class() {
-                o.error_class = Some(c);
+            // EC-04: the retry category names the cause only if the CLI was still retrying
+            // when the stream ended; a retry the API recovered from is not why it died
+            if self.retry_pending {
+                if let Some(c) = self.last_retry_class() {
+                    o.error_class = Some(c);
+                }
             }
             return o;
         };
@@ -369,30 +421,25 @@ impl ClaudeParser {
             o.usage = Some(claude_buckets(u));
             o.raw_usage = Some(u.clone());
             o.accounting = Accounting::Exact;
-        } else if let Some(b) = self.provisional_buckets() {
+        } else if let Some(b) = self.usage.buckets() {
             o.usage = Some(b);
             o.accounting = Accounting::Provisional;
         }
         if !o.success {
-            o.error_detail = Some(match r.get("result") {
+            let detail = match r.get("result") {
                 Some(Value::String(s)) if !s.is_empty() => s.clone(),
                 _ => match r.get("errors") {
                     Some(e) if !e.is_null() => e.to_string(),
                     _ => format!("Claude result {subtype}"),
                 },
-            });
-            o.error_class = Some(self.last_retry_class().unwrap_or(match subtype {
-                "error_max_turns" => ErrorClass::InvalidOutput,
-                _ => classify_text(o.error_detail.as_deref().unwrap_or("")),
-            }));
+            };
+            o.error_class = Some(self.failure_class(r, &detail));
+            o.error_detail = Some(detail);
         } else if !o.permission_denials.is_empty() {
             // Plan §6.2: any denial fails the stage.
             o.success = false;
             o.error_class = Some(ErrorClass::PermissionDenied);
-            o.error_detail = Some(format!(
-                "{} permission denial(s)",
-                o.permission_denials.len()
-            ));
+            o.error_detail = Some(permission_denials_detail(o.permission_denials.len()));
         }
         if self.after_terminal > 0 {
             o.protocol_errors.push(format!(
@@ -409,9 +456,56 @@ impl ClaudeParser {
             r.get("error").and_then(Value::as_str).unwrap_or(""),
         ))
     }
+
+    /// EC-04: the class of a failed `result`, from structured fields first — the result
+    /// `subtype`, then the failed API call's category (the latest `assistant` message's
+    /// `error`) or HTTP status (`api_error_status`) — and from the text only without them.
+    /// A category or a status cannot tell a context overflow or an exhausted quota from
+    /// any other bad request or throttle (a subscription usage limit comes as a 429), so
+    /// the text refines those two. An `api_retry` never decides once a result arrived.
+    fn failure_class(&self, r: &Value, detail: &str) -> ErrorClass {
+        if r.get("subtype").and_then(Value::as_str) == Some("error_max_turns") {
+            return ErrorClass::InvalidOutput;
+        }
+        let text = classify_text(detail);
+        let structured = self
+            .assistant_error
+            .as_deref()
+            .map(classify_api_error)
+            .filter(|c| *c != ErrorClass::Unknown)
+            .or_else(|| {
+                r.get("api_error_status")
+                    .and_then(Value::as_u64)
+                    .and_then(status_class)
+            });
+        match structured {
+            Some(ErrorClass::BadRequest | ErrorClass::RateLimited)
+                if matches!(
+                    text,
+                    ErrorClass::ContextWindowExceeded | ErrorClass::QuotaExceeded
+                ) =>
+            {
+                text
+            }
+            Some(c) => c,
+            None => text,
+        }
+    }
 }
 
-/// `system/api_retry.error` categories (plan §6.2).
+/// HTTP status of a failed API call (`api_error_status` of the result).
+fn status_class(status: u64) -> Option<ErrorClass> {
+    Some(match status {
+        429 => ErrorClass::RateLimited,
+        500 | 502 | 503 | 504 | 529 => ErrorClass::Overloaded,
+        401 | 403 => ErrorClass::Auth,
+        400 | 404 | 413 | 422 => ErrorClass::BadRequest,
+        _ => return None,
+    })
+}
+
+/// `system/api_retry.error` categories (plan §6.2); the `assistant` message's `error` uses
+/// the same names.
 pub fn classify_api_error(category: &str) -> ErrorClass {
     match category {
         "rate_limit" => ErrorClass::RateLimited,
@@ -426,31 +520,59 @@ pub fn classify_api_error(category: &str) -> ErrorClass {
     }
 }
 
-fn classify_text(s: &str) -> ErrorClass {
-    let l = s.to_ascii_lowercase();
-    // Subscription / API exhaustion (e.g. "Claude AI usage limit reached|<reset>",
-    // "Credit balance is too low") — the implementer fallback keys on this class.
-    if [
-        "usage limit",
-        "limit reached",
-        "quota",
-        "credit balance",
-        "billing",
-        "extra usage",
+/// Failure texts of a Claude `result`, most specific first (EC-04). Status codes need word
+/// boundaries: "403" must not match inside "214030 tokens".
+static CLAUDE_TEXT: LazyLock<Vec<(Regex, ErrorClass)>> = LazyLock::new(|| {
+    [
+        // the `-p` result text "Prompt is too long", "…: context window exceeded", "Context
+        // limit reached · /compact or /clear to continue" (not the quota "limit reached")
+        (
+            r"(?i)prompt is too long|context[ _-]?(?:window|length|limit)|maximum context",
+            ErrorClass::ContextWindowExceeded,
+        ),
+        // Exhaustion (the implementer fallback keys on it, R49), in words the API sends
+        // even with a 429 status: "Claude AI usage limit reached|<reset>", "Credit
+        // balance is too low".
+        (
+            r"(?i)usage limit|hit your limit|credit balance|billing[ _]error|account[ _]on[ _]hold|extra usage|insufficient_?quota|exceeded your current quota",
+            ErrorClass::QuotaExceeded,
+        ),
+        // throttling, before the generic words below: "429 rate limit reached" is transient
+        (
+            r"(?i)\b429\b|rate[ _-]?limit|too many requests",
+            ErrorClass::RateLimited,
+        ),
+        // "5-hour limit reached", "Opus weekly limit reached"
+        (
+            r"(?i)limit reached|\bquota\b|quota_?exceeded|\bbilling\b",
+            ErrorClass::QuotaExceeded,
+        ),
+        // "Invalid API key · Please run /login", "OAuth token has expired", 401 / 403
+        (
+            r"(?i)\b40[13]\b|invalid[ _]api[ _]key|/login\b|\blog ?in\b|auth|forbidden",
+            ErrorClass::Auth,
+        ),
+        // "API Error: 529 Overloaded", "500 Internal server error"
+        (
+            r"(?i)\b529\b|overloaded|\b50[0234]\b|server[ _]error",
+            ErrorClass::Overloaded,
+        ),
+        // the earlier broad rule, last: "context" with "window" or "too long" anywhere
+        (
+            r"(?is)context.*(?:window|too long)|(?:window|too long).*context",
+            ErrorClass::ContextWindowExceeded,
+        ),
     ]
-    .iter()
-    .any(|k| l.contains(k))
-    {
-        ErrorClass::QuotaExceeded
-    } else if l.contains("rate limit") || l.contains("429") {
-        ErrorClass::RateLimited
-    } else if l.contains("auth") || l.contains("401") || l.contains("403") || l.contains("log in") {
-        ErrorClass::Auth
-    } else if l.contains("context") && (l.contains("window") || l.contains("too long")) {
-        ErrorClass::ContextWindowExceeded
-    } else {
-        ErrorClass::Unknown
-    }
+    .into_iter()
+    .map(|(re, class)| (Regex::new(re).expect("regex"), class))
+    .collect()
+});
+
+fn classify_text(s: &str) -> ErrorClass {
+    CLAUDE_TEXT
+        .iter()
+        .find(|(re, _)| re.is_match(s))
+        .map_or(ErrorClass::Unknown, |(_, class)| *class)
 }
 
 #[cfg(test)]

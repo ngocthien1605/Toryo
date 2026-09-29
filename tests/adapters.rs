@@ -272,6 +272,9 @@ async fn fake_failure_classes_and_limits() {
         .await
         .unwrap();
     assert_eq!(o.permission_denials.len(), 1);
+    // like the real adapters, any denial fails the turn (TS-01)
+    assert!(!o.success, "{o:?}");
+    assert_eq!(o.error_class, Some(ErrorClass::PermissionDenied));
     // no turn left → a clear failure, never a hang
     let o = run_to_completion(s.as_mut(), input("review-extra"), limits)
         .await

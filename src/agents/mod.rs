@@ -43,6 +43,9 @@ pub struct TurnOutcome {
     pub accounting: Accounting,
     pub vendor_cost_usd: Option<f64>,
     pub protocol_errors: Vec<String>,
+    /// Error notices the agent printed (Codex `error` lines, e.g. "Reconnecting... 1/5"),
+    /// diagnostics only: the turn's own end decides the outcome (EC-02).
+    pub warnings: Vec<String>,
     pub malformed_lines: u32,
     pub oversized_lines: u32,
     pub tool_activity: Vec<String>,
@@ -68,6 +71,7 @@ impl TurnOutcome {
             accounting: Accounting::Unknown,
             vendor_cost_usd: None,
             protocol_errors: Vec::new(),
+            warnings: Vec::new(),
             malformed_lines: 0,
             oversized_lines: 0,
             tool_activity: Vec::new(),

@@ -17,7 +17,8 @@ use super::adapter::{AgentAdapter, AgentSession, TurnId};
 use super::events::replay;
 use crate::config::ProfileKind;
 use crate::domain::{
-    AgentEvent, AgentHealth, ErrorClass, OpenSession, TokenUsage, TurnInput, UsageCapabilities,
+    permission_denials_detail, AgentEvent, AgentHealth, ErrorClass, OpenSession, TokenUsage,
+    TurnInput, UsageCapabilities,
 };
 use crate::usage::{Accounting, Buckets};
 
@@ -50,6 +51,8 @@ pub enum FakeStep {
         #[serde(default)]
         output: u64,
     },
+    /// A permission denial. Like with the real adapters, any denial fails the turn: a later
+    /// `complete` ends it as `PermissionDenied`, keeping its payload (plan §6.2).
     Deny {
         tool: String,
         #[serde(default)]
@@ -70,7 +73,8 @@ pub enum FakeStep {
     Crash,
     /// Never answers again (until interrupted) — for stall/timeout tests.
     Hang,
-    /// Replay a recorded stream (`claude` or `codex` JSONL) through the real parsers.
+    /// Replay a recorded stream (`claude` or `codex` JSONL) through the real parsers. A file
+    /// that cannot be read fails the turn with a detail naming it.
     Replay {
         agent: String,
         file: PathBuf,
@@ -203,6 +207,7 @@ impl AgentAdapter for FakeAgentAdapter {
             turns: 0,
             announced: false,
             env: Default::default(),
+            denials: 0,
         }))
     }
 
@@ -233,6 +238,8 @@ struct FakeSession {
     announced: bool,
     /// The current turn's environment (`$TEMP/…` in `write_file` paths, R46).
     env: std::collections::BTreeMap<String, String>,
+    /// Permission denials in the current turn: any fails it (TS-01).
+    denials: usize,
 }
 
 #[async_trait]
@@ -294,6 +301,7 @@ impl AgentSession for FakeSession {
         }
         self.done = false;
         self.hang = false;
+        self.denials = 0;
         self.turns += 1;
         self.env = input.env.clone();
         Ok(self.turns)
@@ -363,10 +371,19 @@ impl AgentSession for FakeSession {
                     }))
                 }
                 FakeStep::Deny { tool, detail } => {
-                    return Some(AgentEvent::PermissionDenied { tool, detail })
+                    self.denials += 1;
+                    return Some(AgentEvent::PermissionDenied { tool, detail });
                 }
                 FakeStep::Complete { text, structured } => {
                     self.done = true;
+                    if self.denials > 0 {
+                        // like the real parser: the payload stays, for diagnostics only
+                        return Some(AgentEvent::TurnFailed {
+                            class: ErrorClass::PermissionDenied,
+                            detail: permission_denials_detail(self.denials),
+                            structured,
+                        });
+                    }
                     return Some(AgentEvent::TurnCompleted {
                         final_text: text,
                         structured,
@@ -386,8 +403,10 @@ impl AgentSession for FakeSession {
                 }
                 FakeStep::Hang => self.hang = true,
                 FakeStep::Emit(e) => {
-                    if let AgentEvent::SessionIdentified(id) = &*e {
-                        self.external = Some(id.clone());
+                    match &*e {
+                        AgentEvent::SessionIdentified(id) => self.external = Some(id.clone()),
+                        AgentEvent::PermissionDenied { .. } => self.denials += 1,
+                        _ => {}
                     }
                     if e.is_terminal() {
                         self.done = true;
@@ -404,7 +423,21 @@ impl AgentSession for FakeSession {
                     } else {
                         ProfileKind::Claude
                     };
-                    let text = std::fs::read_to_string(&file).unwrap_or_default();
+                    let text = match std::fs::read_to_string(&file) {
+                        Ok(t) => t,
+                        // a script error, not a scenario: never an empty stream (a "crash")
+                        Err(e) => {
+                            self.done = true;
+                            return Some(AgentEvent::TurnFailed {
+                                class: ErrorClass::Unknown,
+                                detail: format!(
+                                    "fake script: cannot read the replay file {}: {e}",
+                                    file.display()
+                                ),
+                                structured: None,
+                            });
+                        }
+                    };
                     let events = replay(kind, &text, exit_code.or(Some(0)));
                     for e in events.into_iter().rev() {
                         self.pending.push_front(FakeStep::from_event(e));
