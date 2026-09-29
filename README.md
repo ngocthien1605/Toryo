@@ -110,6 +110,13 @@ cargo test --release
 | `tests/redaction.rs` | Windows + Linux | `redaction_split_boundaries` (C9/R42) |
 | `tests/architecture.rs` | Windows + Linux | no vendor types outside the adapters |
 | `tests/git_canary.rs` | Windows + Linux | Git hook/filter/textconv canaries on the real `git` |
+| `tests/engine_scenarios.rs` | Windows + Linux | the prototype's scenarios on the engine: final-gate rejection, max fix cycles, the re-plan bound, unlimited human plan rejections, blocked review, partial-AC correction, the fallback chain exhausted, task-id reuse |
+| `tests/regress_agents.rs` | Windows + Linux (sh-fake cases Unix only) | code review 2026-09-29, agents: outcomes decided after the stream (Codex notices), error classification, live Claude usage, output and running Codex commands count as liveness, fake/real parity, fail-closed Codex preflight, capture errors |
+| `tests/regress_policy.rs` | Windows + Linux (link cases Unix only) | protected paths (entries, links, case, verify programs, pre-upgrade baselines), snapshots of links and nested repos, repo `include`/`includeIf` (R37), the AC parser, rename sources |
+| `tests/regress_cli.rs` | Windows + Linux | config validation at load (roles, values, `codex.overrides`), `fallback: []`, crash-safe `task config --reload`, a snapshot before `--discard-partial`, `doctor` version pins, lock/store hardening |
+| `tests/regress_implement.rs` | Windows + Linux | the HEAD guard on every exit of an Implementer turn, failed turns with changes kept as a recovery checkpoint, `--no-fallback` after a sticky switch, a stoppable backoff, schema-checked implementation reports |
+| `tests/regress_engine.rs` | Windows + Linux | failed Planner/Reviewer turns never yield a plan or review, §11 retries per class, schema-validated plans and reviews, verify again after a reload, `approval_mismatch`, a refused correction turn, read-only writes |
+| `tests/regress_recovery.rs` | Windows + Linux | crash recovery runs the HEAD guard first; an unfinished Git operation keeps the snapshot path; failed turns that crash stay failed |
 
 CI (`.github/workflows/ci.yml`) runs `cargo test`, `clippy -D warnings` and the core without the kit
 (`--no-default-features`) on `windows-latest` and `ubuntu-latest`, then builds a release `toryo.exe`.

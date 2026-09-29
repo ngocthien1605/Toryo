@@ -156,6 +156,7 @@ profiles:                                 # "tài khoản" để chạy agent
 roles:                                    # role → profile
   planner:     { profile: claude-max }
   implementer: { profile: codex-openai, fallback: [claude-max] }   # hết quota → Claude làm thay
+                                          # `fallback: []` = không có agent dự phòng; không ghi `fallback` = dùng profile của planner
   reviewer:    { profile: claude-max }
 # --- tuỳ chọn, thêm tay khi cần ---
 commands:
@@ -163,7 +164,8 @@ commands:
     - { name: build, program: pwsh, args: [-NoProfile, -NonInteractive, -File, scripts/build.ps1], timeout_min: 10 }
     - { name: test,  program: pwsh, args: [-NoProfile, -NonInteractive, -File, scripts/test.ps1],  timeout_min: 20 }
 policy:
-  protected_paths: ["docs/**", "*.lock"]  # thêm các file agent không được sửa (glob)
+  protected_paths: ["docs/**", "*.lock"]  # thêm các file agent không được sửa (glob, không phân biệt hoa thường;
+                                          # script verify — cả `program` lẫn `args` — luôn được bảo vệ)
   deny_paths: ["**/ZZZ/**"]               # M5: không bao giờ được plan / sửa / commit (không phân biệt hoa thường)
 verify:                                   # M6
   boundary: low_integrity                 # mặc định; `none` = chạy verify không cách ly (luôn ghi rõ "not isolated")
@@ -541,7 +543,15 @@ Khi có lệnh build/test X++ chạy không tương tác trên dev VM, chỉ c�
 | Triệu chứng | Cách xử lý |
 |---|---|
 | `worktree … already exists` / `branch toryo/<ID> already exists` | Dùng `--id BR-001b`, hoặc chạy 2 lệnh dọn dẹp in ở cuối lần trước |
-| `TASK.md has no AC-<n>: items` | Cần heading `## Acceptance criteria` và dòng `- AC-1: …` |
+| `TASK.md has no AC-<n>: items` | Cần heading `## Acceptance criteria` và dòng `- AC-1: …` (hoặc `1. AC-1: …`). Heading con `###` trong mục này vẫn được; id nằm trong khối code bị bỏ qua. `AC-01` là lỗi — viết `AC-1` |
+| Lỗi khi load config: `unknown role …` / `not a valid value (valid: …)` | Sửa `toryo.yaml`: role chỉ gồm `planner`, `implementer`, `reviewer`; giá trị hợp lệ có trong thông báo |
+| `codex.overrides.<key> re-sets …` | Bỏ key đó khỏi `codex.overrides`: Toryo tự đặt sandbox, approval, môi trường và provider (dùng `codex.sandbox_mode`, `codex.windows_sandbox`, `codex.provider`) |
+| Lượt Codex bị từ chối: `PolicyRefusal` — `preflight: …` | Profile Codex thiếu `windows_sandbox: unelevated` (hoặc `sandbox_mode` không an toàn). Toryo không chạy Codex khi sandbox không được bật (trước đây chỉ cảnh báo); `toryo doctor` nêu cùng lỗi |
+| `approval_mismatch` khi `approve --gate final` | Branch `toryo/<ID>` có commit mới sau checkpoint đã duyệt → task chuyển Escalated. Đưa branch về checkpoint, hoặc `toryo resume ID --note "…"` để review lại. (File chưa commit trong worktree, ví dụ `.vs\`, chỉ được ghi chú, không chặn) |
+| `approve --gate final` báo `has no current passing verify result` (final gate bị rút lại) | Cấu hình verify đã đổi sau lần verify cuối (`task config --reload`) → `toryo run ID` để verify lại checkpoint rồi mới duyệt |
+| `policy_violation: the worktree changed during a read-only stage` | Có file mới/bị sửa trong worktree **trong lúc** planner/reviewer chạy (trừ `.vs\`, `.idea\`). Đừng sửa worktree khi review đang chạy; xem file được nêu, rồi `toryo resume ID --note "…"` |
+| `policy_violation: after the Implementer turn …` (branch khác, HEAD detached, merge dở…) | Agent đã chuyển branch / để lại thao tác Git dở → làm theo gợi ý trong thông báo (checkout lại `toryo/<ID>`, abort merge), rồi `toryo resume ID --note "…"` |
+| Planner/Reviewer lỗi `ProcessCrashed` / `Timeout` / `Network` | Toryo tự chạy lại theo §11 (crash: resume rồi phiên mới; timeout, context window: phiên mới một lần), sau đó mới Escalated với đúng lỗi. Bị từ chối quyền (`PermissionDenied`) thì Escalated ngay |
 | `untrusted_git_filter` | Repo dùng Git LFS/filter → khai báo `git.trusted_filters` trong machine config |
 | Plan lỗi `ProcessCrashed` / không có JSON | `claude` chưa login hoặc hết quota → chạy `claude` một lần để kiểm tra; xem `plan-1.stderr.txt` |
 | Codex báo hết quota / rate limit | Toryo tự chuyển sang agent dự phòng (mục 5.1). Nếu tất cả đều hết: đợi reset, hoặc thêm `--implementer-fallback codex-foundry,claude-max` |
