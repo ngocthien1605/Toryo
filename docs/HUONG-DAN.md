@@ -1,4 +1,4 @@
-# Hướng dẫn sử dụng Toryo (M0 kit · M1 adapter · M2 state machine · M3 engine + recovery · M4–M7)
+# Hướng dẫn sử dụng Toryo (M0 kit · M1 adapter · M2 state machine · M3 engine + recovery · M4–M7 · M8 E2E)
 
 > **Toryo (棟梁 — tōryō)** = "thợ cả": người chỉ huy đội thợ, không tự đục đẽo mà giao việc, kiểm tra từng mối nối
 > và nghiệm thu từng giai đoạn. Tên cũ của tool là `thien` (đổi ngày 2026-09-28, plan v0.7 R55).
@@ -393,6 +393,30 @@ protected, reload config, budget) và các **issue không chặn** của review 
 Ở final gate Toryo in lại các issue này, và nhắc nếu **cùng hãng** vừa code vừa review (ví dụ Claude làm thay
 Codex rồi Claude review).
 
+### 5.6 M8 — nghiệm thu E2E trên CLI thật (`scripts\m8-check.ps1`)
+
+Giống **chạy thử nghiệm thu cả dây chuyền** trước khi bàn giao: một lệnh chạy lại toàn bộ luồng thật, không
+copy/paste, trên repo mẫu mới tạo (repo của anh không bị đụng tới). Tốn token thật (~1,5 triệu, khoảng 15–20 phút).
+
+```powershell
+pwsh -NoProfile -File C:\.thien\AgentOrchestrator\toryo\scripts\m8-check.ps1            # đầy đủ
+pwsh -NoProfile -File C:\.thien\AgentOrchestrator\toryo\scripts\m8-check.ps1 -SkipV08   # chỉ phần demo
+```
+
+| Bước | Kiểm tra |
+|---|---|
+| 1 | `doctor` 0 FAIL |
+| 2 | Calculator `CALC-001` → Completed → merge → test pass |
+| 3 | BatchRename `BR-001` → Completed → merge → test pass |
+| 4 | `BR-002`: plan gate → final gate → **reject** có yêu cầu thật → vòng fix → final gate → Completed → merge → test BR-001 + BR-002 pass |
+| 5a | R64: budget 2000 → lượt Claude bị **ngắt giữa chừng** → `Paused(Budget)`; nâng budget → `resume` chạy tiếp |
+| 5b | R62: profile Codex thiếu `windows_sandbox` → **không khởi chạy Codex**, `Escalated PolicyRefusal`, gợi ý `task config --reload` |
+| 5c | R66: `agent_stall_min: 1` + lệnh Codex im lặng ~150 s → **không bị kill** vì stall, task Completed |
+| 6 | `task cleanup` các task; `status` không còn nhắc cleanup |
+
+Kết thúc in bảng PASS/FAIL; exit code `1` nếu có FAIL. Repo mẫu và log ở `C:\.thien\m8-check\<Tag>\`.
+Chạy lại sau mỗi lần nâng cấp toryo.exe hoặc Claude Code/Codex (sau `toryo doctor --canaries`).
+
 ---
 
 ## 6. Thực hành: dự án mẫu **BatchRename** (PowerShell module)
@@ -546,7 +570,7 @@ Khi có lệnh build/test X++ chạy không tương tác trên dev VM, chỉ c�
 | `TASK.md has no AC-<n>: items` | Cần heading `## Acceptance criteria` và dòng `- AC-1: …` (hoặc `1. AC-1: …`). Heading con `###` trong mục này vẫn được; id nằm trong khối code bị bỏ qua. `AC-01` là lỗi — viết `AC-1` |
 | Lỗi khi load config: `unknown role …` / `not a valid value (valid: …)` | Sửa `toryo.yaml`: role chỉ gồm `planner`, `implementer`, `reviewer`; giá trị hợp lệ có trong thông báo |
 | `codex.overrides.<key> re-sets …` | Bỏ key đó khỏi `codex.overrides`: Toryo tự đặt sandbox, approval, môi trường và provider (dùng `codex.sandbox_mode`, `codex.windows_sandbox`, `codex.provider`) |
-| Lượt Codex bị từ chối: `PolicyRefusal` — `preflight: …` | Profile Codex thiếu `windows_sandbox: unelevated` (hoặc `sandbox_mode` không an toàn). Toryo không chạy Codex khi sandbox không được bật (trước đây chỉ cảnh báo); `toryo doctor` nêu cùng lỗi |
+| Lượt Codex bị từ chối: `PolicyRefusal` — `preflight: …` | Profile Codex thiếu `windows_sandbox: unelevated` (hoặc `sandbox_mode` không an toàn). Toryo không chạy Codex khi sandbox không được bật (trước đây chỉ cảnh báo); `toryo doctor` nêu cùng lỗi. Sửa profile trong config, rồi `toryo task config ID --reload` và `toryo resume ID --note "…"` (config của task bị đóng băng, nên chỉ sửa file thì chưa đủ) |
 | `approval_mismatch` khi `approve --gate final` | Branch `toryo/<ID>` có commit mới sau checkpoint đã duyệt → task chuyển Escalated. Đưa branch về checkpoint, hoặc `toryo resume ID --note "…"` để review lại. (File chưa commit trong worktree, ví dụ `.vs\`, chỉ được ghi chú, không chặn) |
 | `approve --gate final` báo `has no current passing verify result` (final gate bị rút lại) | Cấu hình verify đã đổi sau lần verify cuối (`task config --reload`) → `toryo run ID` để verify lại checkpoint rồi mới duyệt |
 | `policy_violation: the worktree changed during a read-only stage` | Có file mới/bị sửa trong worktree **trong lúc** planner/reviewer chạy (trừ `.vs\`, `.idea\`). Đừng sửa worktree khi review đang chạy; xem file được nêu, rồi `toryo resume ID --note "…"` |

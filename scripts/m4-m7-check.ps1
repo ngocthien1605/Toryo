@@ -30,7 +30,7 @@
 param(
     [string]$Task = 'BR-004',
     [string]$Repo = 'C:\.thien\AgentOrchestrator\demo\batch-rename',
-    [string]$Config = $(if ($env:TORYO_CONFIG) { $env:TORYO_CONFIG } else { 'C:\.thien\m0\thien.yaml' }),
+    [string]$Config = $(if ($env:TORYO_CONFIG) { $env:TORYO_CONFIG } else { 'C:\.thien\m0\toryo.yaml' }),
     [string]$ClaudeProfile = 'claude-max',
     [string]$CodexProfile = 'codex-openai',
     [switch]$SkipCanaries,

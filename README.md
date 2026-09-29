@@ -127,4 +127,9 @@ M0–M7 are done: adapters (M1), state machine (M2), SQLite store + lock + crash
 ProjectContextLoader (M4), protected-state snapshot + frozen config + implementer fallback pauses (M5),
 immutable artifacts + verify checkout under `verify_root` with the Low-IL boundary (M6), usage accounting,
 admission budget and `DECISIONS.md` (M7). Real-agent validation on Windows: `scripts\m4-m7-check.ps1`.
-Next: M8 (`doctor` extras, usage report, logs). `spike pipeline` stays the behavioural reference (R52).
+
+M8 (E2E MVP) is done: the demo flow runs with no copy/paste on the calculator fixture and on the
+BatchRename sample (BR-001, then BR-002 with a real fix cycle), and the real-CLI checks of V08-VERIFY 5
+pass — a live budget interrupt of a Claude turn (R64), the fail-closed Codex preflight (R62), and a silent
+Codex command that is not killed as stalled (R66). Acceptance on Windows: `scripts\m8-check.ps1`.
+Next: plan v0.8 §17 (D1–D3, M9). `spike pipeline` stays the behavioural reference (R52).

@@ -17,7 +17,7 @@
 #>
 param(
     [string]$Task = 'BR-003',
-    [string]$Config = $(if ($env:TORYO_CONFIG) { $env:TORYO_CONFIG } else { 'C:\.thien\m0\thien.yaml' }),
+    [string]$Config = $(if ($env:TORYO_CONFIG) { $env:TORYO_CONFIG } else { 'C:\.thien\m0\toryo.yaml' }),
     [int]$DelaySeconds = 3,
     [string]$Reason = 'Undo-Rename should output one object per restored file (OldName, NewName), like Rename-ByPattern does, and a test should check it'
 )
