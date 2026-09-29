@@ -112,10 +112,8 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     let g = task_git(cfg, &repo)?;
     // R36/R45 admission: the verify boundary must be available before anything is created
     super::verify::probe(cfg)?;
-    // R59 admission: a `tool: xpp` command needs MSBuild and the five CI/CD packages here, and
-    // its metadata folder and (protected) projects in the repository
+    // R59 admission: a `tool: xpp` command needs MSBuild and the five CI/CD packages here
     super::xpp::for_config(cfg)?;
-    super::xpp::check_repo(cfg, &repo)?;
     let repol = Loc::Discover(repo.clone());
     if !g
         .output(&repol, true, &["rev-parse", "--git-dir"])?
@@ -133,6 +131,23 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         true,
         &["rev-parse", &format!("{base_ref}^{{commit}}")],
     )?;
+    // R59 admission: its metadata folder and (protected) build projects are in the base commit
+    if super::xpp::compile_only(cfg) {
+        let listing = g.run(&repol, true, &["ls-tree", "-r", "-z", "--name-only", &base])?;
+        let mut tree = std::collections::HashMap::new();
+        for f in listing.split(|b| *b == 0).filter(|f| !f.is_empty()) {
+            let f = super::xpp::tree_key(&String::from_utf8_lossy(f));
+            let mut dir = f.as_str();
+            while let Some((parent, _)) = dir.rsplit_once('/') {
+                tree.insert(parent.to_string(), true);
+                dir = parent;
+            }
+            tree.insert(f, false);
+        }
+        let place = format!("commit {} of {}", crate::git::short(&base), repo.display());
+        let kind_of = |p: &str| tree.get(&super::xpp::tree_key(p)).copied();
+        super::xpp::check_repo(cfg, &place, &kind_of)?;
+    }
     let t = id.clone();
     if store.call(move |tx| Ok(store::get_task(tx, &t).is_ok()))? {
         bail!("task {id} already exists (`toryo task show {id}`)");

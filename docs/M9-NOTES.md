@@ -276,16 +276,25 @@ Every entry: what was decided, why, and where. The owner folds these into plan v
   compiler package, `ref\net40` in the four others (`xpp::marker`) — else "has no … folder — a partly
   extracted package?". The NuGet cache layout `<id>\<version>\` resolves to its only version folder.
 - **Admission checks the repository** (`xpp::check_repo`, class `xpp_project_missing`): every `tool: xpp`
-  command's metadata folder and projects must exist in the repository at `task create` — they are
-  protected, so a missing one would fail every verify and burn fix cycles.
+  command's metadata folder and projects must exist **in the task's base commit** (`git ls-tree -r` of the
+  base, compared case-insensitively like Windows) at `task create` — they are protected, so a missing or
+  uncommitted one would fail every verify and burn fix cycles.
+- **A property value never ends in a separator** (it would escape the closing quote in the response
+  file): trailing separators are stripped and a root becomes `C:\.` / `/.` (e.g. `--out D:\`).
+- **Response-file names** use only letters, digits, `.`, `_`, `-` (`xpp::file_name`), whatever the
+  command's `name` holds; the same for the logs of `toryo xpp build`.
+- **`%` in a path:** MSBuild expands `%VAR%` inside response files (an unknown variable is MSB1060), so a
+  folder name with `%` in it would break the build. Rare; not handled.
 - **`task config --reload`** verifies again only when the build toolchain changes
   (`xpp::build_toolchain`: nothing for a program-only task, `ude_metadata` ignored).
 - **Gate integrity** also covers `<project>.user` (a verify file) and `<project folder>/obj/**` (a protected
   glob): MSBuild imports both.
-- **`VSLANG=1033`** is added to the environment of every MSBuild run (verify and `xpp build`): English
-  messages for the parser and the fixer. Not solved: MSBuild on .NET Framework writes redirected output in
-  the OEM code page; non-ASCII text (a Japanese path or message) can arrive as replacement characters —
-  check in V08-VERIFY 2; a UTF-8 file logger (`-flp:…;Encoding=UTF-8`) is the fix if needed.
+- **`DOTNET_CLI_UI_LANGUAGE=en-US` and `VSLANG=1033`** are added to the environment of every MSBuild run
+  (verify and `xpp build`): English messages for the parser and the fixer. msbuild.exe documents
+  `DOTNET_CLI_UI_LANGUAGE` (17.7+) and switches its console output to UTF-8 when it is set, which is what
+  toryo decodes; older MSBuild writes redirected output in the OEM code page, so non-ASCII text (a
+  Japanese path or message) could arrive as replacement characters — check in V08-VERIFY 2; a UTF-8 file
+  logger (`-flp:…;Encoding=UTF-8`) is the fallback.
 - **`toryo xpp build --low --out …`** is refused: at Low IL the output must go to the Low-labelled scratch
   folder; toryo does not label a folder of the owner's choosing.
 - **ZZZ text** in `10-d365fo-models.md` now matches the deny glob `**/ZZZ/**` (a folder named `ZZZ`), with

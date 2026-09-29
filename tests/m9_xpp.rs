@@ -458,7 +458,13 @@ fn a_broken_xpp_toolchain_refuses_admission_or_escalates() {
     );
 
     std::fs::rename(&aside, &suite).unwrap();
-    // a build project that is not in the repository (protected: the implementer cannot add it)
+    // a build project that is not in the base commit — here on disk but not committed
+    // (protected: the implementer cannot add it later)
+    std::fs::write(
+        env.repo.join("Projects/Build/Nope.rnrproj"),
+        "<Project />\n",
+    )
+    .unwrap();
     let cfg = std::fs::read_to_string(&env.config).unwrap();
     std::fs::write(
         &env.config,
@@ -476,6 +482,7 @@ fn a_broken_xpp_toolchain_refuses_admission_or_escalates() {
     assert_ne!(code, 0);
     assert!(err.contains("xpp_project_missing"), "{err}");
     assert!(err.contains("project Projects/Build/Nope.rnrproj"), "{err}");
+    std::fs::remove_file(env.repo.join("Projects/Build/Nope.rnrproj")).unwrap();
     std::fs::write(&env.config, cfg).unwrap();
     create(env, "X-4");
     let s = script(

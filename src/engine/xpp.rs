@@ -41,9 +41,11 @@ pub const DEFAULT_TIMEOUT_MIN: u64 = 90;
 /// The error class of a toolchain that cannot be used (a missing MSBuild or package).
 pub const UNAVAILABLE: &str = "xpp_toolchain_unavailable";
 
-/// Added to the verify environment of an MSBuild run: English messages, whatever language pack
-/// Visual Studio has — the diagnostics parser and the fixer read them.
-pub const ENV: [(&str, &str); 1] = [("VSLANG", "1033")];
+/// Added to the verify environment of an MSBuild run: English messages whatever language pack
+/// Visual Studio has — the diagnostics parser and the fixer read them. `DOTNET_CLI_UI_LANGUAGE`
+/// is the variable msbuild.exe documents (17.7+; it also switches the console output to UTF-8,
+/// which toryo decodes); `VSLANG` covers older builds.
+pub const ENV: [(&str, &str); 2] = [("DOTNET_CLI_UI_LANGUAGE", "en-US"), ("VSLANG", "1033")];
 
 /// What `status`, `task show` and the final gate say about a compile-only verify (R59).
 pub const COMPILE_ONLY: &str = "verify: compile only (X++: no DB sync, no unit tests)";
@@ -274,31 +276,45 @@ pub fn for_config(cfg: &Effective) -> Result<Option<Toolchain>> {
 pub const PROJECT_MISSING: &str = "xpp_project_missing";
 
 /// Admission (`task create`): every `tool: xpp` command's metadata folder and projects exist
-/// in `repo`. The projects are protected (the implementer cannot add them later), so a missing
-/// one would fail every verify.
-pub fn check_repo(cfg: &Effective, repo: &Path) -> Result<()> {
+/// in `place` (the task's base commit). `kind_of(path)` says what a repository path is there:
+/// `Some(true)` a folder, `Some(false)` a file, `None` nothing. The projects are protected (the
+/// implementer cannot add them later), so a missing one would fail every verify.
+pub fn check_repo(
+    cfg: &Effective,
+    place: &str,
+    kind_of: &dyn Fn(&str) -> Option<bool>,
+) -> Result<()> {
     let mut missing = Vec::new();
     for c in &cfg.repo.commands.verify {
         let CommandKind::Xpp { metadata, projects } = c.kind() else {
             continue;
         };
-        if !join_rel(repo, metadata).is_dir() {
+        if kind_of(metadata) != Some(true) {
             missing.push(format!("{}: metadata folder {metadata}", c.name));
         }
         for p in projects {
-            if !join_rel(repo, p).is_file() {
+            if kind_of(p) != Some(false) {
                 missing.push(format!("{}: project {p}", c.name));
             }
         }
     }
     if !missing.is_empty() {
         bail!(
-            "{PROJECT_MISSING}: not in {} — {} (create and commit the build projects first; they are protected, R59)",
-            repo.display(),
+            "{PROJECT_MISSING}: not in {place} — {} (create and commit the build projects first; they are protected, R59)",
             missing.join(", ")
         );
     }
     Ok(())
+}
+
+/// A repository path as `git ls-tree` prints it, lower case: `/` separators, no `./`, no
+/// trailing `/` — how [`check_repo`]'s lookup compares paths (Windows is case-insensitive).
+pub fn tree_key(p: &str) -> String {
+    p.split(['/', '\\'])
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+        .to_lowercase()
 }
 
 /// `rel` (with `/` or `\`) below `base`.
@@ -308,13 +324,14 @@ pub fn join_rel(base: &Path, rel: &str) -> PathBuf {
         .fold(base.to_path_buf(), |p, c| p.join(c))
 }
 
-/// A path as an MSBuild property value: without trailing separators (a root such as `C:\`
-/// or `/` keeps its own).
+/// A path as an MSBuild property value: never ending in a separator, which would escape the
+/// closing quote in the response file (`"D:\"`) — trailing separators are stripped and a root
+/// (`C:\`, `/`) becomes `C:\.`, `/.`.
 fn value(p: &Path) -> String {
     let s = p.display().to_string();
     let trimmed = s.trim_end_matches(['\\', '/']);
     if trimmed.is_empty() || trimmed.ends_with(':') {
-        s
+        format!("{s}.")
     } else {
         trimmed.to_string()
     }
@@ -405,6 +422,19 @@ pub fn invocation(args: &[String], rsp: &Path) -> (Vec<String>, String) {
     (command, response)
 }
 
+/// `name` as a file name on any system: letters, digits, `.`, `_` and `-`; anything else `-`.
+pub fn file_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 /// The runs of `c`, in project order, each with its response file in `rsp_dir` (a folder the
 /// build itself cannot write: the verify folder of the task, not the Low-labelled `build`);
 /// `None` for a program command.
@@ -429,7 +459,7 @@ pub fn runs(
                     .unwrap_or_else(|| file.to_string());
                 let name = format!("{}/{stem}", c.name);
                 let args = argv(tc, checkout, metadata, p, out);
-                let rsp = rsp_dir.join(format!("xpp-{}.rsp", name.replace('/', "-")));
+                let rsp = rsp_dir.join(format!("xpp-{}.rsp", file_name(&name)));
                 let (command, response) = invocation(&args, &rsp);
                 Run {
                     name,
@@ -1079,6 +1109,34 @@ mod tests {
         assert!(build_toolchain(&load(xpp, "a")).is_some());
     }
 
+    /// Admission looks the metadata folder and the projects up in the base commit (a lookup,
+    /// here a set), case-insensitively; a file named like the folder does not count.
+    #[test]
+    fn the_repository_must_hold_the_metadata_and_the_projects() {
+        let d = tempfile::tempdir().unwrap();
+        let (p, m) = (d.path().join("t.yaml"), d.path().join("m.yaml"));
+        std::fs::write(&p, "version: 1\nproject: { root: r, worktrees_root: w }\ncommands:\n  verify:\n    - { name: b, tool: xpp, metadata: Metadata, projects: [P/Core.Build.rnrproj, P/Missing.rnrproj] }\n").unwrap();
+        std::fs::write(&m, "toolchains:\n  xpp: { msbuild: m, nugets: n }\n").unwrap();
+        let cfg = Effective::load(&p, Some(&m)).unwrap();
+        let tree: std::collections::BTreeMap<&str, bool> = [
+            ("metadata", true),
+            ("p", true),
+            ("p/core.build.rnrproj", false),
+        ]
+        .into();
+        let kind = |x: &str| tree.get(tree_key(x).as_str()).copied();
+        let e = format!(
+            "{:#}",
+            check_repo(&cfg, "commit abc of R", &kind).unwrap_err()
+        );
+        assert_eq!(
+            e,
+            "xpp_project_missing: not in commit abc of R — b: project P/Missing.rnrproj (create and commit the build projects first; they are protected, R59)"
+        );
+        assert_eq!(tree_key(".\\P\\Core.Build.rnrproj"), "p/core.build.rnrproj");
+        assert_eq!(file_name("build:core/X.Build"), "build-core-X.Build");
+    }
+
     #[test]
     fn a_powershell_line_quotes_every_element() {
         assert_eq!(
@@ -1091,10 +1149,10 @@ mod tests {
     }
 
     #[test]
-    fn a_property_value_keeps_a_root_but_not_a_trailing_separator() {
-        assert_eq!(value(Path::new("/")), "/");
+    fn a_property_value_never_ends_in_a_separator() {
+        assert_eq!(value(Path::new("/")), "/.");
         assert_eq!(value(Path::new("/a/b/")), "/a/b");
-        assert_eq!(value(Path::new("C:\\")), "C:\\");
+        assert_eq!(value(Path::new("C:\\")), "C:\\.");
         assert_eq!(value(Path::new("C:\\x\\\\")), "C:\\x");
     }
 }

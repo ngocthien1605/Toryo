@@ -237,7 +237,7 @@ pub fn run(cli: &Cli, cmd: &XppCmd) -> Result<i32> {
         ))?;
         let log = scratch
             .join("logs")
-            .join(format!("{}.log", r.name.replace('/', "-")));
+            .join(format!("{}.log", xpp::file_name(&r.name)));
         std::fs::write(&log, &res.output)?;
         let d = xpp::diagnostics(&res.output, &checkout);
         let ended = match (res.exit, res.timed_out) {
