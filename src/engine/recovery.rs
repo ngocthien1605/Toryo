@@ -267,10 +267,12 @@ impl<'a> Recovery<'a> {
 
     /// §10 step 5, writing stage. The HEAD guard of the Implementer turn (§8; R12, R25) comes
     /// first (F4): a Git state a soft reset cannot repair — another branch, a detached or
-    /// unresolvable HEAD, an unfinished operation, history rewritten below the base —
-    /// escalates before anything is reset, snapshotted or committed (a reset would move
-    /// another branch, a recovery checkpoint would land on it). A turn that failed and left
-    /// changes ends `failed`, as its owner had decided before it died (F8, EC-15).
+    /// unresolvable HEAD, history rewritten below the base — escalates before anything is
+    /// reset, snapshotted or committed (a reset would move another branch, a recovery
+    /// checkpoint would land on it). An unfinished operation keeps recovery's own path: no
+    /// reset during it, a snapshot, `recovery_policy_violation` (so `resume --discard-partial`
+    /// can clear it). A turn that failed and left changes ends `failed`, as its owner had
+    /// decided before it died (F8, EC-15).
     fn recover_writing(
         &self,
         t: &TaskRow,
@@ -283,7 +285,7 @@ impl<'a> Recovery<'a> {
             Some(h) => h.clone(),
             None => wt.head().unwrap_or_default(),
         };
-        let guard = HeadGuard::check(wt, &t.branch, &t.base_commit, &before)?;
+        let guard = HeadGuard::check_refs(wt, &t.branch, &t.base_commit, &before)?;
         if let HeadGuard::Violation { kind, reason } = &guard {
             return self.git_violation(a, kind, reason, notes);
         }
@@ -332,8 +334,9 @@ impl<'a> Recovery<'a> {
             }
             return Ok(());
         }
-        // HEAD guard: an agent commit on the task branch is undone (its changes stay in the tree)
-        if let HeadGuard::Reset { .. } = guard {
+        // HEAD guard: an agent commit on the task branch is undone (its changes stay in the
+        // tree) — never during an unfinished operation, which the snapshot path below handles
+        if let (HeadGuard::Reset { .. }, None) = (&guard, wt.unfinished_operation()?) {
             wt.soft_reset(&before)?;
             notes.push(format!(
                 "{}: the agent had moved HEAD — soft reset to {}",

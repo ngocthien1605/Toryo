@@ -584,3 +584,46 @@ fn an_ide_state_folder_created_during_a_read_only_turn_is_not_a_write() {
     assert!(read_only_write(&before, &other).is_some());
     assert!(!ide_state(".vsix/a") && ide_state(".vs") && ide_state(".idea\\x"));
 }
+
+/// Visual Studio puts `.vs/` next to the `.sln`, often below the worktree root in a D365FO
+/// repository: an IDE folder at any depth is not a read-only role's write.
+#[test]
+fn an_ide_state_folder_at_any_depth_is_not_a_write() {
+    let h = "a".repeat(40);
+    let before = tree(Some(&h), &[]);
+    let nested = tree(
+        Some(&h),
+        &[
+            (
+                "Projects/ContosoModel/.vs/ContosoModel/v17/.suo",
+                "??",
+                "v1",
+            ),
+            ("src\\Tools\\.idea\\workspace.xml", "??", "i1"),
+        ],
+    );
+    assert_eq!(read_only_write(&before, &nested), None);
+    assert!(ide_state("a/b/.VS/c") && !ide_state("a/.vsx/c") && !ide_state("docs/vs/c"));
+}
+
+/// A planner turn retried in a new session (plan §11) names the plan being revised; without
+/// a revision (or without a plan yet) it is the stage's first prompt.
+#[test]
+fn a_fresh_plan_revision_names_the_plan_being_revised() {
+    let (plan, task) = (Path::new("R/PLAN.md"), Path::new("R/TASK.md"));
+    let feedback = "The human reviewer rejected the plan. Reason: smaller\nCreate the plan again, revised to address this.";
+    let p = plan_fresh_prompt(Some(feedback), Some(plan), task);
+    assert!(p.starts_with(feedback), "{p}");
+    assert!(
+        p.contains(&plan.display().to_string()) && p.contains(&task.display().to_string()),
+        "{p}"
+    );
+    assert_eq!(
+        plan_fresh_prompt(Some(feedback), None, task),
+        plan_prompt(Some(feedback), None, task)
+    );
+    assert_eq!(
+        plan_fresh_prompt(None, Some(plan), task),
+        plan_prompt(None, None, task)
+    );
+}

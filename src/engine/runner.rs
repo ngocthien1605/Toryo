@@ -419,7 +419,11 @@ impl<'a> Engine<'a> {
         // EC-01/EC-14: a failed turn never yields a plan; a crash, a network error, an unknown
         // failure, a timeout or a context overflow runs again as plan §11 says for its class —
         // resumed or fresh, bounded (F7) — anything else escalates
-        let fresh = plan_prompt(t.feedback.as_deref(), None, &art.join("TASK.md"));
+        let fresh = plan_fresh_prompt(
+            t.feedback.as_deref(),
+            Some(art.join("PLAN.md")).filter(|p| p.is_file()).as_deref(),
+            &art.join("TASK.md"),
+        );
         let (mut prompt, mut resume) = (prompt, resume);
         let mut last = StageOutcome::default();
         let mut retries = TurnRetries::default();
@@ -1981,6 +1985,19 @@ fn plan_prompt(feedback: Option<&str>, prev: Option<AttemptStatus>, task_md: &Pa
     }
 }
 
+/// The prompt of a planner turn retried in a new session (plan §11): a revision cannot rely
+/// on the session that saw the plan, so it names where the plan being revised is.
+fn plan_fresh_prompt(feedback: Option<&str>, plan_md: Option<&Path>, task_md: &Path) -> String {
+    match (feedback, plan_md) {
+        (Some(f), Some(plan)) => format!(
+            "{f}\nThis is a new session: the plan being revised is in {}, the task in {}.",
+            plan.display(),
+            task_md.display()
+        ),
+        _ => plan_prompt(feedback, None, task_md),
+    }
+}
+
 /// The plan's `files_likely_involved` (checked against the path policy at plan time).
 fn plan_files(plan: &Value) -> Vec<String> {
     plan["files_likely_involved"]
@@ -2476,6 +2493,21 @@ impl HeadGuard {
         Ok(Self::of(&git, branch, base, head_before))
     }
 
+    /// The guard for recovery (F4): the same, except that an unfinished operation is left to
+    /// recovery's own path — snapshot first, `recovery_policy_violation`, so that
+    /// `resume --discard-partial` can clear it — while another branch, a detached or
+    /// unresolvable HEAD and rewritten history still escalate before anything is touched.
+    pub(super) fn check_refs(
+        wt: &Worktree,
+        branch: &str,
+        base: &str,
+        head_before: &str,
+    ) -> Result<Self> {
+        let mut git = GitAfterTurn::read(wt, base, head_before)?;
+        git.unfinished = None;
+        Ok(Self::of(&git, branch, base, head_before))
+    }
+
     /// §8, in this order: an unfinished operation (R25); HEAD on another branch or detached
     /// (R12: a reset would move that branch, not the task's); a HEAD that does not resolve;
     /// history rewritten below the base (R25); then a moved HEAD is reset.
@@ -2851,11 +2883,13 @@ fn read_only_write(before: &TreeState, after: &TreeState) -> Option<String> {
     })
 }
 
-/// An IDE's own state folder (Visual Studio `.vs/`, JetBrains `.idea/`): an IDE opened on the
-/// task worktree creates it at any time, so it is never a read-only role's write.
+/// An IDE's own state folder (Visual Studio `.vs/`, JetBrains `.idea/`) at any depth — Visual
+/// Studio puts `.vs/` next to the `.sln`, often under `Projects/<Model>/` in a D365FO repo: an
+/// IDE opened on the task worktree creates it at any time, so it is never a read-only role's
+/// write.
 fn ide_state(path: &str) -> bool {
-    let first = path.split(['/', '\\']).next().unwrap_or_default();
-    first.eq_ignore_ascii_case(".vs") || first.eq_ignore_ascii_case(".idea")
+    path.split(['/', '\\'])
+        .any(|c| c.eq_ignore_ascii_case(".vs") || c.eq_ignore_ascii_case(".idea"))
 }
 
 /// The plan of a Planner turn that was not retried or escalated: its structured output when

@@ -3,10 +3,11 @@
 //! `resume` recovers the task.
 //!
 //! - F4 (EC-18, R12, R25) recovery runs the HEAD guard of the Implementer turn before anything
-//!   else: another branch, a detached HEAD, an unfinished Git operation or history rewritten
-//!   below the base escalates with nothing reset, snapshotted or committed — the teammate's
-//!   branch the agent committed on keeps its commits; an agent commit on the task branch is
-//!   still undone and its work kept in a recovery checkpoint, as before
+//!   else: another branch, a detached HEAD or history rewritten below the base escalates with
+//!   nothing reset, snapshotted or committed — the teammate's branch the agent committed on
+//!   keeps its commits; an agent commit on the task branch is still undone and its work kept
+//!   in a recovery checkpoint, as before; an unfinished Git operation keeps recovery's own path
+//!   (no reset during it, a snapshot, `recovery_policy_violation`, `--discard-partial` clears it)
 //! - F8 (EC-15) a crash while a failed turn's work is being kept (before or after its recovery
 //!   checkpoint is committed) ends the attempt as its owner decided: `failed` with the turn's
 //!   class, counted as a failed turn, and a denial or a second failure still escalates
@@ -296,7 +297,7 @@ fn f4_recovery_never_resets_or_commits_on_the_branch_the_agent_switched_to() {
 /// reset, snapshotted or committed.
 #[test]
 fn f4_recovery_escalates_an_unrepairable_git_state_with_nothing_reset() {
-    for how in ["detached", "merge", "rewritten"] {
+    for how in ["detached", "rewritten"] {
         let env = setup("codex-openai");
         let id = format!("G-{how}");
         create(&env, &id);
@@ -315,19 +316,6 @@ fn f4_recovery_escalates_an_unrepairable_git_state_with_nothing_reset() {
                 format!("HEAD is detached at {}, not on the task branch toryo/{id} (R12); nothing was reset or committed — check out toryo/{id} again first", &base[..12]),
                 base.clone(),
             ),
-            // a merge in progress, and a commit on the task branch (was: soft reset during
-            // the merge, snapshot, `recovery_policy_violation`)
-            "merge" => {
-                let agent = commit_of(&env, &w, &base, Some(&base), &[("src/Calculator.psm1", &work)], "agent");
-                (
-                    vec![
-                        put(&branch, &format!("{agent}\n")),
-                        put(&gd.join("MERGE_HEAD"), &format!("{base}\n")),
-                    ],
-                    "an unfinished Git operation (MERGE_HEAD) is in the task worktree (R25); nothing was reset or committed — finish or abort it first".to_string(),
-                    agent,
-                )
-            }
             // the task branch at a commit that does not descend from the base (was: a
             // recovery checkpoint on top of it)
             _ => {
@@ -367,6 +355,85 @@ fn f4_recovery_escalates_an_unrepairable_git_state_with_nothing_reset() {
             "{how}: the work stays in the worktree"
         );
     }
+}
+
+/// An unfinished Git operation (a merge in progress) and an agent commit on the task branch:
+/// no soft reset during the merge (was: reset, then snapshot), a snapshot, and the escalation
+/// `resume --discard-partial` can clear (not the HEAD guard's `policy_violation`, which only
+/// `resume --note` — a new fix cycle — could leave).
+#[test]
+fn f4_an_unfinished_operation_keeps_the_recovery_snapshot_path() {
+    let env = setup("codex-openai");
+    let id = "G-merge";
+    create(&env, id);
+    let w = wt(&env, id);
+    let base = rev(&w, "HEAD");
+    let branch = env.repo.join(format!(".git/refs/heads/toryo/{id}"));
+    assert!(branch.is_file(), "a loose ref");
+    let gd = git_dir(&w);
+    let work = with_divide(&w, &base);
+    let agent = commit_of(
+        &env,
+        &w,
+        &base,
+        Some(&base),
+        &[("src/Calculator.psm1", &work)],
+        "agent",
+    );
+    crash_after_the_turn(
+        &env,
+        id,
+        vec![
+            write("src/Calculator.psm1", DIVIDE),
+            put(&branch, &format!("{agent}\n")),
+            put(&gd.join("MERGE_HEAD"), &format!("{base}\n")),
+            implementation(),
+        ],
+    );
+    let (code, err) = run_after_the_crash(&env, id);
+    assert_eq!(code, 1, "{err}");
+    let t = task(&env, id);
+    assert_eq!(t.state, St::Escalated, "{err}");
+    let why = reason(&env, id);
+    assert!(
+        why.starts_with("recovery_policy_violation: the interrupted attempt G-merge/implement/1 left an unfinished Git operation (MERGE_HEAD)"),
+        "{why}"
+    );
+    let a = attempt(&env, &format!("{id}/implement/1"));
+    assert_eq!(a.status, AttemptStatus::Interrupted);
+    assert!(a.partial_snapshot_id.is_some(), "snapshot first (R39)");
+    assert_eq!(
+        rev(&w, &format!("refs/heads/toryo/{id}")),
+        agent,
+        "no reset during the merge"
+    );
+    assert!(partial_commits(&w).is_empty(), "nothing committed");
+    // the way out that recovery_policy_violation offers: discard (hard reset, merge cleared)
+    let s = script(
+        &env,
+        "discard.json",
+        json!({
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            id,
+            "--discard-partial",
+            "--yes",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, id).state, St::Completed, "{err}");
+    assert!(!gd.join("MERGE_HEAD").exists(), "the merge is gone");
+    let history = git(&w, &["log", "--format=%H", "main..HEAD"]);
+    assert!(!history.contains(&agent), "{history}");
 }
 
 /// A moved HEAD on the task branch keeps the recovery it had: the agent commit is undone, its
