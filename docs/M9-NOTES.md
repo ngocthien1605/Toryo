@@ -166,3 +166,37 @@ Every entry: what was decided, why, and where. The owner folds these into plan v
   printed by `status` (so also by `task show`), is the first final-gate note (end of `run`, SUMMARY.md).
   Decided from the **frozen configuration** (a `tool: xpp` command exists), not from the latest
   `VERIFY_RESULT.json`: a task that has not verified yet already shows what its verify will prove.
+
+### B4 — `doctor` X++ checks and `toryo xpp build` (proposed **R72**)
+
+- **`doctor::xpp_checks(cfg, root, vswhere)`** (area `xpp`), only when a verify command is `tool: xpp`:
+  MSBuild is a file, else FAIL with the path `vswhere -latest -products * -requires
+  Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe` finds as a proposal (the file is never
+  written); the five packages resolve (B2 message on failure) and their versions are listed; with
+  `ude_metadata`, `bin\InstalledVersion.json` is read as text and every `x.y.z.w` value in it counts
+  (`doctor::four_part_versions`) — the platform version (the compiler package's, else
+  Platform.DevALM.BuildXpp's) among them is OK, otherwise WARN; an unreadable file, a file without such a
+  value, or packages without a version are INFO; each `extra_references` folder exists (WARN if not); each
+  command's `metadata` folder and projects exist under `project.root` (FAIL if not). `vswhere` is a
+  parameter so the tests mock it; the real one runs only when `%ProgramFiles(x86)%\Microsoft Visual
+  Studio\Installer\vswhere.exe` exists.
+- **`toryo xpp build`** (`src/xpp_cli.rs`) — proposed **R72**: *"The `tool: xpp` build can be run outside a
+  task (`toryo xpp build`): the same toolchain resolution, argv, verify environment and diagnostics, with
+  no worktree, lock or database; `--print-only` prints the argv, `--low` builds at Low IL from a copy. It
+  exists to prove the X++ build on the UDE machine (V08-VERIFY 2, 3) before a task relies on it."*
+  - Reads only the **machine config** (`--machine-config` or the default) for `toolchains.xpp`;
+    `verify_root` comes from the repository config when one loads, else its default.
+  - Scratch folder `<verify_root>\xpp-build\<repo folder name>\` with `build\xpp` (default `--out`),
+    `cache`, `tmp`, `home` (the verify environment of B2) and `logs\build-<stem>.log` (the full output).
+  - Without `--low` MSBuild reads the repository in place and runs with the owner's rights
+    (`Boundary::None`), like Visual Studio. With `--low` (Windows only; refused elsewhere) the
+    `metadata` folder and the project **files** are copied to `…\src`, the scratch folders get the Low
+    label, and MSBuild runs at Low IL — closest to a verify checkout without a worktree. `Directory.Build.*`
+    files are not copied.
+  - `--print-only` prints, per project, `# build/<stem> (<project>)` and one PowerShell line
+    (`xpp::powershell_line`: `& 'msbuild' 'arg' …`, `'` doubled); it needs no MSBuild and builds nothing.
+    An absolute `--repo`/`--out` is used as given, so the printed argv equals the one in
+    `VERIFY_RESULT.json` for the same folders (test `xpp_build_print_only_prints_the_verify_argv`).
+  - Output: one `✔/✘ build/<stem> (exit n, s) — e error(s), w warning(s) — full output: <log>` line per
+    project, then the parsed errors; stops at the first failure; exit 1 on failure, 0 when all build.
+  - `--timeout-min` (default 90) covers all projects.

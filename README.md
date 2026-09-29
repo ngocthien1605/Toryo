@@ -27,6 +27,7 @@ Rust implementation of the Toryo plan (**v0.7**). **M0 is done** (the spike kit 
 | `engine::artifacts` (M6) | R34 | immutable artifact versions (staging → publish → one transaction), derived views, reconciliation (orphans, tampered, missing) |
 | `engine::verify` (M6) | R29, R36, R45, R47, R50 | verify checkout of the checkpoint under `verify_root`, Low-IL boundary, explicit `--git-dir`, `verify_mutated_tree` |
 | `engine::decisions` (M7) + usage in `engine::store` | R41, R53 | `DECISIONS.md` (gates, notes, follow-ups); admission budget, cumulative baselines, reservations, Claude live interrupt |
+| `engine::xpp` (M9) | R59 | `tool: xpp`: the five CI/CD packages, the MSBuild argv of Microsoft's hosted X++ build, per-project results, MSBuild diagnostics, `scope: compile`; `toryo xpp build` |
 
 M0 kit modules (ported to the core where M1 needs them, R52):
 
@@ -59,6 +60,9 @@ toryo context show ID --stage plan|implement|review [--attempt N] [--profile P] 
 toryo spike claude-implementer-isolation --profile claude-max   # R49 / V07-VERIFY 4
 toryo spike codex-temp-probe --profile codex-openai             # R46 / V07-VERIFY 2
 toryo doctor [--canaries [--profile P …] [--claude-mode restricted]]   # R51: re-verify after a CLI upgrade
+                                               # (R59) + X++: MSBuild (vswhere proposal), NuGets, UDE version, projects
+toryo xpp build --repo R --project P [--project P …] [--metadata Metadata] [--out D] [--print-only] [--low]
+                                               # R59/R72: the `tool: xpp` build outside a task
 toryo spike job-test | git-canary | lowil-canary
 toryo spike claude-isolation --profile claude-max [--mode restricted|setting-sources|cwd-run-store]
 toryo spike codex-canary --profile codex-foundry

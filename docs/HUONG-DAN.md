@@ -257,6 +257,20 @@ mới tới 40 dòng cuối. Vì verify local chỉ chứng minh mức compile (
 `toryo status`, `toryo task show` và final gate đều ghi: `verify: compile only (X++: no DB sync, no unit tests)`
 — giống build pipeline của LCS/Azure DevOps: xanh nghĩa là compile được, chưa phải đã test.
 
+**Kiểm tra trước khi giao task X++:**
+
+```powershell
+toryo doctor          # thêm các dòng `xpp`: MSBuild (thiếu thì đề xuất đường dẫn vswhere tìm được — anh tự sửa file),
+                      # 5 gói NuGet + version, version UDE (bin\InstalledVersion.json) so với gói platform
+                      # (khác nhau → WARN), metadata và từng project có trong repo không
+toryo xpp build --repo D:\D365-Git --project Projects\Build\ContosoCore.Build.rnrproj --print-only
+                      # in đúng lệnh MSBuild mà Verify sẽ chạy (dòng PowerShell, dán chạy tay được)
+toryo xpp build --repo D:\D365-Git --project Projects\Build\ContosoCore.Build.rnrproj
+                      # build thật, ngoài task (không worktree, không lock, không DB): in lỗi đã tách,
+                      # log đầy đủ ở <verify_root>\xpp-build\<repo>\logs; exit 1 khi lỗi
+toryo xpp build … --low   # như trên nhưng ở Low integrity, từ bản copy Metadata + project (V08-VERIFY 3)
+```
+
 ### 4.3 Dữ liệu được lưu ở đâu?
 
 `%LOCALAPPDATA%\toryo\` (hoặc `$env:TORYO_DATA_DIR` nếu anh đặt):

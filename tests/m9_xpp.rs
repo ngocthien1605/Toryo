@@ -547,3 +547,168 @@ fn xpp_diagnostics() {
         "{block}"
     );
 }
+
+/// Run `toryo …` for a test env; returns (exit code, stdout, stderr).
+fn run_out(env: &Env, args: &[&str]) -> (i32, String, String) {
+    let o = command(env, args, &[]).output().unwrap();
+    (
+        o.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&o.stdout).to_string(),
+        String::from_utf8_lossy(&o.stderr).to_string(),
+    )
+}
+
+/// M9-B4 AC-2: `toryo xpp build --print-only` prints the argv Verify ran (B2) for the same
+/// inputs — the verify checkout as the repository, its output folder — and builds nothing.
+#[test]
+fn xpp_build_print_only_prints_the_verify_argv() {
+    let x = setup_xpp(&["Calc.Build"], "nothing", "Build succeeded.\n", false);
+    let env = &x.env;
+    create(env, "X-7");
+    let s = script(
+        env,
+        "x7.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(env, &["run", "X-7", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    let vr = verify_result(env, "X-7");
+    let argv: Vec<String> = vr["commands"][0]["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap().to_string())
+        .collect();
+    let checkout = vr["verify_checkout"].as_str().unwrap().to_string();
+    let out = argv
+        .iter()
+        .find_map(|a| a.strip_prefix("/p:OutputDirectory="))
+        .unwrap()
+        .to_string();
+    let runs_before = built(&x).len();
+    let (code, stdout, stderr) = run_out(
+        env,
+        &[
+            "xpp",
+            "build",
+            "--repo",
+            &checkout,
+            "--project",
+            "Projects/Build/Calc.Build.rnrproj",
+            "--metadata",
+            "src",
+            "--out",
+            &out,
+            "--print-only",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let line = toryo::engine::xpp::powershell_line(Path::new(&argv[0]), &argv[1..]);
+    assert!(stdout.contains(&line), "{line}\n---\n{stdout}");
+    assert!(stdout.contains("# build/Calc.Build (Projects/Build/Calc.Build.rnrproj)"));
+    assert_eq!(built(&x).len(), runs_before, "--print-only builds nothing");
+    // --low: Windows only (the Low integrity boundary)
+    let low = [
+        "xpp",
+        "build",
+        "--repo",
+        &checkout,
+        "--project",
+        "Projects/Build/Calc.Build.rnrproj",
+        "--metadata",
+        "src",
+        "--print-only",
+        "--low",
+    ];
+    let (code, stdout, stderr) = run_out(env, &low);
+    if cfg!(windows) {
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.contains("# --low: builds a copy of src"), "{stdout}");
+    } else {
+        assert_ne!(code, 0);
+        assert!(stderr.contains("--low needs Windows"), "{stderr}");
+    }
+    // paths outside the repository are refused
+    let (code, _, stderr) = run_out(
+        env,
+        &[
+            "xpp",
+            "build",
+            "--repo",
+            &checkout,
+            "--project",
+            "../x.rnrproj",
+            "--print-only",
+        ],
+    );
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("--project `../x.rnrproj` may not contain `..`"),
+        "{stderr}"
+    );
+}
+
+/// M9-B4 AC-3: with the fake MSBuild, `toryo xpp build` prints the parsed diagnostics (paths
+/// relative to the repository) and exits non-zero on failure; the full output is kept in a log.
+#[test]
+fn xpp_build_prints_diagnostics_and_fails() {
+    let errors = [
+        "{CWD}{SEP}src{SEP}Calculator.xml(12,5): error XPP0101: 'amount' is not declared. [{CWD}{SEP}Projects{SEP}Build{SEP}Calc.Build.rnrproj]",
+    ];
+    let x = setup_xpp_with(
+        &["Calc.Build", "Ext.Build"],
+        "Calc.Build",
+        "  compiling…\nBuild FAILED.\n",
+        &errors,
+        false,
+    );
+    let env = &x.env;
+    let repo = env.repo.display().to_string();
+    let args = [
+        "xpp",
+        "build",
+        "--repo",
+        &repo,
+        "--project",
+        "Projects/Build/Calc.Build.rnrproj",
+        "--project",
+        "Projects/Build/Ext.Build.rnrproj",
+        "--metadata",
+        "src",
+    ];
+    let (code, stdout, stderr) = run_out(env, &args);
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("✘ build/Calc.Build (exit 1")
+            && stdout.contains("1 error(s), 0 warning(s)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  src/Calculator.xml(12,5): error XPP0101: 'amount' is not declared."),
+        "{stdout}"
+    );
+    assert_eq!(
+        built(&x),
+        ["Calc.Build.rnrproj"],
+        "stops at the first failure"
+    );
+    let log = stdout
+        .split("full output: ")
+        .nth(1)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap();
+    assert!(std::fs::read_to_string(log.trim())
+        .unwrap()
+        .contains("Build FAILED."));
+    // the fixed tree builds both projects and exits 0
+    std::fs::write(env.repo.join("src").join("FIXED"), "1").unwrap();
+    let (code, stdout, stderr) = run_out(env, &args);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("✔ build/Ext.Build"), "{stdout}");
+}

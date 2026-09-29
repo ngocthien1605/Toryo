@@ -766,7 +766,7 @@ fn verify_command_problems(
 
 /// Why `p` is not a relative path inside the repository, or None: empty, absolute, rooted,
 /// with a drive, or with a `..` segment.
-fn not_a_repo_path(p: &str) -> Option<&'static str> {
+pub fn not_a_repo_path(p: &str) -> Option<&'static str> {
     let t = p.trim();
     if t.is_empty() {
         return Some("is empty");

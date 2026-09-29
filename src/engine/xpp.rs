@@ -526,6 +526,16 @@ pub fn feedback_errors(d: &Diagnostics) -> String {
     )
 }
 
+/// `program` and `args` as one PowerShell line to paste (`& 'C:\…\MSBuild.exe' '…' …`):
+/// every element single-quoted, a `'` doubled.
+pub fn powershell_line(program: &Path, args: &[String]) -> String {
+    let q = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    std::iter::once(format!("& {}", q(&program.display().to_string())))
+        .chain(args.iter().map(|a| q(a)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// True when a configuration's verify is compile level only (it has a `tool: xpp` command).
 pub fn compile_only(cfg: &Effective) -> bool {
     cfg.repo.commands.verify.iter().any(CommandSpec::is_xpp)
@@ -797,6 +807,17 @@ mod tests {
         assert_eq!((d.errors.len(), d.errors_total), (DIAGNOSTICS_MAX, 70));
         assert!(feedback_errors(&d).ends_with("  - … and 20 more\n"));
         assert_eq!(feedback_errors(&Diagnostics::default()), "");
+    }
+
+    #[test]
+    fn a_powershell_line_quotes_every_element() {
+        assert_eq!(
+            powershell_line(
+                Path::new("C:/VS/MSBuild.exe"),
+                &["C:/r/x.rnrproj".into(), "/p:A=it's;b".into()]
+            ),
+            "& 'C:/VS/MSBuild.exe' 'C:/r/x.rnrproj' '/p:A=it''s;b'"
+        );
     }
 
     #[test]

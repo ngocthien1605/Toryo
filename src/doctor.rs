@@ -393,7 +393,10 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
 
     // Repository (project.root)
     match expand_vars(&cfg.repo.project.root) {
-        Ok(root) => repo_checks(&mut r, cfg, Path::new(&root), gc.ok()),
+        Ok(root) => {
+            repo_checks(&mut r, cfg, Path::new(&root), gc.ok());
+            r.0.extend(xpp_checks(cfg, Path::new(&root), &vswhere_msbuild));
+        }
         Err(e) => r.add(Level::Fail, "repo", format!("{e:#}")),
     }
 
@@ -678,6 +681,201 @@ fn repo_checks(r: &mut Report, cfg: &Effective, root: &Path, gc: Option<GitCmd>)
     }
 }
 
+/// The MSBuild that `vswhere` finds (the latest Visual Studio with the MSBuild component), or
+/// None — `doctor` proposes it, never writes it (R59).
+fn vswhere_msbuild() -> Option<PathBuf> {
+    let pf = std::env::var_os("ProgramFiles(x86)")?;
+    let vswhere = Path::new(&pf)
+        .join("Microsoft Visual Studio")
+        .join("Installer")
+        .join("vswhere.exe");
+    if !vswhere.is_file() {
+        return None;
+    }
+    let out = std::process::Command::new(vswhere)
+        .args([
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.Component.MSBuild",
+            "-find",
+            r"MSBuild\**\Bin\MSBuild.exe",
+        ])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Every `x.y.z.w` value of the UDE's `bin\InstalledVersion.json`, read tolerantly: the file's
+/// keys are not documented, so any four-part version counts.
+pub fn four_part_versions(text: &str) -> Vec<String> {
+    let re = regex::Regex::new(r"\b\d+\.\d+\.\d+\.\d+\b").expect("version regex");
+    let mut v: Vec<String> = Vec::new();
+    for m in re.find_iter(text) {
+        if !v.iter().any(|x| x == m.as_str()) {
+            v.push(m.as_str().to_string());
+        }
+    }
+    v
+}
+
+/// R59: the X++ toolchain of a configuration with a `tool: xpp` verify command — MSBuild
+/// (with the path `vswhere` finds as a proposal when it is missing), the five CI/CD packages and
+/// their versions, the UDE metadata version against the platform packages', the extra
+/// references, and each command's metadata folder and projects in the repository (`root`).
+/// Nothing when no verify command is `tool: xpp`.
+pub fn xpp_checks(
+    cfg: &Effective,
+    root: &Path,
+    vswhere: &dyn Fn() -> Option<PathBuf>,
+) -> Vec<Check> {
+    use crate::config::CommandKind;
+    use crate::engine::xpp;
+    let mut r = Report::default();
+    let area = "xpp";
+    let cmds: Vec<_> = cfg
+        .repo
+        .commands
+        .verify
+        .iter()
+        .filter(|c| c.is_xpp())
+        .collect();
+    if cmds.is_empty() {
+        return r.0;
+    }
+    let Some(x) = &cfg.toolchains.xpp else {
+        r.add(
+            Level::Fail,
+            area,
+            "a `tool: xpp` verify command but no toolchains.xpp in the machine config (R59)",
+        );
+        return r.0;
+    };
+    let machine = cfg
+        .machine_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "the machine config".into());
+    match expand_vars(&x.msbuild).map(PathBuf::from) {
+        Ok(m) if m.is_file() => r.add(Level::Ok, area, format!("MSBuild {}", m.display())),
+        Ok(m) => {
+            let proposal = match vswhere() {
+                Some(p) => format!(" — vswhere finds {}: set toolchains.xpp.msbuild to it in {machine} (toryo never changes the file)", p.display()),
+                None => " — vswhere finds none: install the MSBuild component of Visual Studio 2022".into(),
+            };
+            r.add(
+                Level::Fail,
+                area,
+                format!("MSBuild not found: {}{proposal}", m.display()),
+            );
+        }
+        Err(e) => r.add(Level::Fail, area, format!("toolchains.xpp.msbuild: {e:#}")),
+    }
+    let packages = expand_vars(&x.nugets).and_then(|n| xpp::resolve_packages(Path::new(&n)));
+    let platform = match packages {
+        Ok(p) => {
+            let short = |id: &str| {
+                id.trim_start_matches("Microsoft.Dynamics.AX.")
+                    .trim_end_matches(".DevALM.BuildXpp")
+                    .to_string()
+            };
+            r.add(
+                Level::Ok,
+                area,
+                format!(
+                    "CI/CD packages: {}",
+                    p.iter()
+                        .map(|k| format!(
+                            "{} {}",
+                            short(&k.id),
+                            k.version.as_deref().unwrap_or("(no version)")
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+            p[0].version.clone().or_else(|| p[1].version.clone())
+        }
+        Err(e) => {
+            r.add(Level::Fail, area, format!("{e:#}"));
+            None
+        }
+    };
+    if let Some(ude) = &x.ude_metadata {
+        let file =
+            expand_vars(ude).map(|u| Path::new(&u).join("bin").join("InstalledVersion.json"));
+        let read = file
+            .as_ref()
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|f| std::fs::read_to_string(f).map_err(|e| format!("{}: {e}", f.display())));
+        match (read.map(|t| four_part_versions(&t)), platform) {
+            (Err(e), _) => r.add(Level::Info, area, format!("UDE version not read ({e}): no version check")),
+            (Ok(v), _) if v.is_empty() => r.add(Level::Info, area, "UDE InstalledVersion.json holds no x.y.z.w version: no version check"),
+            (Ok(_), None) => r.add(Level::Info, area, "the platform packages have no version: no version check"),
+            (Ok(v), Some(p)) if v.contains(&p) => r.add(Level::Ok, area, format!("UDE metadata version {} = the platform packages' {p}", v.join(", "))),
+            (Ok(v), Some(p)) => r.add(Level::Warn, area, format!("UDE metadata version {} ≠ the platform packages' {p} — Microsoft's pages disagree on whether other NuGet versions are safe; prefer the NuGets of the release the UDE runs", v.join(", "))),
+        }
+    }
+    for e in &x.extra_references {
+        match expand_vars(e).map(PathBuf::from) {
+            Ok(p) if p.is_dir() => {
+                r.add(Level::Ok, area, format!("extra reference {}", p.display()))
+            }
+            Ok(p) => r.add(
+                Level::Warn,
+                area,
+                format!("extra reference not found: {}", p.display()),
+            ),
+            Err(err) => r.add(
+                Level::Fail,
+                area,
+                format!("toolchains.xpp.extra_references: {err:#}"),
+            ),
+        }
+    }
+    for c in cmds {
+        let CommandKind::Xpp { metadata, projects } = c.kind() else {
+            continue;
+        };
+        let meta = xpp::join_rel(root, metadata);
+        if meta.is_dir() {
+            r.add(
+                Level::Ok,
+                area,
+                format!("{}: metadata {}", c.name, meta.display()),
+            );
+        } else {
+            r.add(
+                Level::Fail,
+                area,
+                format!("{}: metadata folder not found: {}", c.name, meta.display()),
+            );
+        }
+        for p in projects {
+            let f = xpp::join_rel(root, p);
+            if f.is_file() {
+                r.add(Level::Ok, area, format!("{}: project {p}", c.name));
+            } else {
+                r.add(
+                    Level::Fail,
+                    area,
+                    format!(
+                        "{}: project not found in the repository: {}",
+                        c.name,
+                        f.display()
+                    ),
+                );
+            }
+        }
+    }
+    r.0
+}
+
 fn finish(r: Report, json: bool) -> Result<i32> {
     let worst = r.0.iter().map(|c| c.level).max().unwrap_or(Level::Ok);
     if json {
@@ -754,6 +952,138 @@ mod tests {
             .unwrap()
             .get("source")
             .is_none());
+    }
+
+    /// A repository with `Metadata/` and one build project, the five packages (version
+    /// 7.0.7198.40), an MSBuild file and a UDE metadata folder whose InstalledVersion.json is
+    /// `installed` (none when `None`). Returns the loaded configuration and the repo root.
+    fn xpp_fixture(d: &Path, installed: Option<&str>) -> (Effective, PathBuf, PathBuf) {
+        let fwd = |p: &Path| p.display().to_string().replace('\\', "/");
+        let repo = d.join("repo");
+        std::fs::create_dir_all(repo.join("Metadata")).unwrap();
+        std::fs::create_dir_all(repo.join("Projects").join("Build")).unwrap();
+        std::fs::write(
+            repo.join("Projects/Build/Core.Build.rnrproj"),
+            "<Project />",
+        )
+        .unwrap();
+        let nugets = d.join("nugets");
+        for id in crate::engine::xpp::PACKAGES {
+            std::fs::create_dir_all(nugets.join(format!("{id}.7.0.7198.40"))).unwrap();
+        }
+        let msbuild = d.join("MSBuild.exe");
+        std::fs::write(&msbuild, "").unwrap();
+        let ude = d.join("PackagesLocalDirectory");
+        std::fs::create_dir_all(ude.join("bin")).unwrap();
+        if let Some(text) = installed {
+            std::fs::write(ude.join("bin").join("InstalledVersion.json"), text).unwrap();
+        }
+        let (p, m) = (d.join("toryo.yaml"), d.join("machine.yaml"));
+        std::fs::write(&p, format!("version: 1\nproject: {{ root: \"{}\", worktrees_root: w }}\nroles:\n  planner: {{ profile: a }}\ncommands:\n  verify:\n    - {{ name: build, tool: xpp, metadata: Metadata, projects: [Projects/Build/Core.Build.rnrproj] }}\n", fwd(&repo))).unwrap();
+        std::fs::write(&m, format!("profiles:\n  a: {{ kind: claude, billing: subscription, exe: c }}\ntoolchains:\n  xpp:\n    msbuild: \"{}\"\n    nugets: \"{}\"\n    ude_metadata: \"{}\"\n", fwd(&msbuild), fwd(&nugets), fwd(&ude))).unwrap();
+        (Effective::load(&p, Some(&m)).unwrap(), repo, msbuild)
+    }
+
+    fn lines(checks: &[Check]) -> Vec<String> {
+        checks
+            .iter()
+            .map(|c| format!("{:?} {}", c.level, c.message))
+            .collect()
+    }
+
+    /// M9-B4 AC-1: each branch of the X++ checks, on temp folders, with a mocked vswhere.
+    #[test]
+    fn xpp_checks_cover_msbuild_packages_versions_and_projects() {
+        let none = || None;
+        // found, versions equal
+        let d = tempfile::tempdir().unwrap();
+        let (cfg, repo, msbuild) = xpp_fixture(
+            d.path(),
+            Some(r#"{"InstalledVersion":"7.0.7198.40","App":"10.0.2015.16"}"#),
+        );
+        let l = lines(&xpp_checks(&cfg, &repo, &none));
+        assert!(l.iter().all(|x| x.starts_with("Ok ")), "{l:#?}");
+        assert!(l.iter().any(|x| x.contains("CI/CD packages: Platform.CompilerPackage 7.0.7198.40, Platform 7.0.7198.40, Application1 7.0.7198.40")), "{l:#?}");
+        assert!(l.iter().any(|x| x.contains("UDE metadata version 7.0.7198.40, 10.0.2015.16 = the platform packages' 7.0.7198.40")), "{l:#?}");
+        assert!(l
+            .iter()
+            .any(|x| x.contains("build: project Projects/Build/Core.Build.rnrproj")));
+
+        // MSBuild missing: vswhere's path is proposed, never written
+        std::fs::remove_file(&msbuild).unwrap();
+        let vs = || Some(PathBuf::from(r"C:\VS\MSBuild\Current\Bin\MSBuild.exe"));
+        let l = lines(&xpp_checks(&cfg, &repo, &vs));
+        let f = l
+            .iter()
+            .find(|x| x.starts_with("Fail MSBuild not found"))
+            .unwrap();
+        assert!(f.contains(r"vswhere finds C:\VS\MSBuild\Current\Bin\MSBuild.exe: set toolchains.xpp.msbuild to it"), "{f}");
+        let l = lines(&xpp_checks(&cfg, &repo, &none));
+        assert!(l.iter().any(|x| x.contains("vswhere finds none")), "{l:#?}");
+
+        // versions differ → WARN; unreadable or without a version → INFO
+        let d = tempfile::tempdir().unwrap();
+        let (cfg, repo, _) = xpp_fixture(d.path(), Some(r#"{"PlatformVersion":"7.0.7300.1"}"#));
+        let c = xpp_checks(&cfg, &repo, &none);
+        let w = c.iter().find(|c| c.level == Level::Warn).unwrap();
+        assert!(
+            w.message
+                .contains("UDE metadata version 7.0.7300.1 ≠ the platform packages' 7.0.7198.40"),
+            "{}",
+            w.message
+        );
+        let d = tempfile::tempdir().unwrap();
+        let (cfg, repo, _) = xpp_fixture(d.path(), None);
+        let l = lines(&xpp_checks(&cfg, &repo, &none));
+        assert!(
+            l.iter().any(|x| x.starts_with("Info UDE version not read")),
+            "{l:#?}"
+        );
+        let d = tempfile::tempdir().unwrap();
+        let (cfg, repo, _) = xpp_fixture(d.path(), Some("{ not json"));
+        let l = lines(&xpp_checks(&cfg, &repo, &none));
+        assert!(
+            l.iter()
+                .any(|x| x.starts_with("Info UDE InstalledVersion.json holds no")),
+            "{l:#?}"
+        );
+
+        // a missing package, project and metadata folder fail
+        std::fs::remove_dir_all(
+            d.path()
+                .join("nugets")
+                .join(format!("{}.7.0.7198.40", crate::engine::xpp::PACKAGES[2])),
+        )
+        .unwrap();
+        std::fs::remove_file(repo.join("Projects/Build/Core.Build.rnrproj")).unwrap();
+        std::fs::remove_dir_all(repo.join("Metadata")).unwrap();
+        let l = lines(&xpp_checks(&cfg, &repo, &none));
+        for want in [
+            "Fail xpp_toolchain_unavailable",
+            "Fail build: metadata folder not found",
+            "Fail build: project not found in the repository",
+        ] {
+            assert!(l.iter().any(|x| x.starts_with(want)), "{want}: {l:#?}");
+        }
+
+        // no tool: xpp command → no X++ checks
+        let d = tempfile::tempdir().unwrap();
+        let (p, m) = (d.path().join("toryo.yaml"), d.path().join("machine.yaml"));
+        std::fs::write(&p, "version: 1\nproject: { root: r, worktrees_root: w }\n").unwrap();
+        std::fs::write(&m, "toolchains:\n  xpp: { msbuild: m, nugets: n }\n").unwrap();
+        let cfg = Effective::load(&p, Some(&m)).unwrap();
+        assert!(xpp_checks(&cfg, d.path(), &none).is_empty());
+    }
+
+    #[test]
+    fn installed_versions_are_read_tolerantly() {
+        assert_eq!(
+            four_part_versions(
+                r#"{"a":"7.0.7198.40","b":"10.0.2015.16","c":"7.0.7198.40","d":"1.2.3"}"#
+            ),
+            ["7.0.7198.40", "10.0.2015.16"]
+        );
+        assert!(four_part_versions("").is_empty());
     }
 
     #[test]
