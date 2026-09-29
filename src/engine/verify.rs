@@ -319,15 +319,16 @@ pub fn script_hashes(files: &[String], co: &Checkout) -> BTreeMap<String, String
         .collect()
 }
 
-/// `task cleanup`: remove the checkout and its directories.
-pub fn cleanup(g: &GitCmd, t: &TaskRow, cfg: &Effective) -> Result<()> {
+/// `task cleanup`: remove the checkout and its directories. Without the frozen configuration
+/// (`cfg` None, EC-12) only a recorded checkout is found.
+pub fn cleanup(g: &GitCmd, t: &TaskRow, cfg: Option<&Effective>) -> Result<()> {
     let rec: Option<Checkout> = std::fs::read(record_path(t))
         .ok()
         .and_then(|x| serde_json::from_slice(&x).ok());
     let base = rec
         .as_ref()
         .map(|c| c.base.clone())
-        .unwrap_or_else(|| verify_root(cfg).join(&t.id));
+        .or_else(|| cfg.map(|c| verify_root(c).join(&t.id)));
     if let Some(c) = rec {
         let fwd = c.dir.display().to_string().replace('\\', "/");
         let _ = g.output(
@@ -336,7 +337,7 @@ pub fn cleanup(g: &GitCmd, t: &TaskRow, cfg: &Effective) -> Result<()> {
             &["worktree", "remove", "--force", &fwd],
         );
     }
-    if base.exists() {
+    if let Some(base) = base.filter(|b| b.exists()) {
         std::fs::remove_dir_all(&base).with_context(|| format!("removing {}", base.display()))?;
     }
     let _ = g.output(

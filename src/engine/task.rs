@@ -76,6 +76,14 @@ pub fn task_git(cfg: &Effective, repo: &Path) -> Result<GitCmd> {
     Ok(g)
 }
 
+/// Git for `task cleanup` when the frozen configuration cannot be read (EC-12): no trusted
+/// filter, so every filter driver the repository defines or references is neutralised (R37).
+pub fn cleanup_git(repo: &Path) -> Result<GitCmd> {
+    let mut g = default_gitcmd()?;
+    g.filters = g.plan_filters(repo, &Default::default(), true)?;
+    Ok(g)
+}
+
 pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> {
     let repo = std::path::absolute(&a.repo)?;
     let file = if a.file.is_absolute() || a.file.exists() {
@@ -254,13 +262,35 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
 
 /// The frozen configuration of a task (R35).
 pub fn frozen_config(t: &TaskRow) -> Result<Effective> {
-    let text = std::fs::read_to_string(t.artifacts().join("config.json"))
-        .with_context(|| format!("reading the frozen config of {}", t.id))?;
-    if sha256_hex(text.as_bytes()) != t.config_sha256 {
+    let (path, text) = frozen_config_text(t)?;
+    Effective::from_frozen(&text, &path)
+}
+
+/// The exact frozen bytes of a task's configuration and the file they were read from: the
+/// immutable `config` version whose SHA-256 is `tasks.config_sha256` (R34/R35, EC-12). Neither
+/// the view `runstore/config.json` nor the artifact head is trusted to be the one in force, so a
+/// reload that stopped before it switched the hash leaves the old configuration in force. Run
+/// stores from before the immutable versions (M6) only have the view; it is used when its
+/// SHA-256 matches.
+pub fn frozen_config_text(t: &TaskRow) -> Result<(PathBuf, String)> {
+    let found = match super::artifacts::find_by_sha(t, "config", "json", &t.config_sha256)? {
+        Some(v) => Some(v),
+        None => {
+            let view = t.artifacts().join("config.json");
+            std::fs::read(&view)
+                .ok()
+                .filter(|b| sha256_hex(b) == t.config_sha256)
+                .map(|b| (view, b))
+        }
+    };
+    let Some((path, bytes)) = found else {
         bail!(
-            "artifact_tampered: config.json of {} does not match tasks.config_sha256 (R27/R35)",
-            t.id
+            "artifact_tampered: no version of config.json of {} matches tasks.config_sha256 {} (R27/R35)",
+            t.id,
+            crate::git::short(&t.config_sha256)
         );
-    }
-    Effective::from_frozen(&text, &t.artifacts().join("config.json"))
+    };
+    let text = String::from_utf8(bytes)
+        .with_context(|| format!("the frozen config of {} is not UTF-8", t.id))?;
+    Ok((path, text))
 }

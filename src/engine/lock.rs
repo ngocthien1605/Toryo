@@ -49,12 +49,14 @@ pub fn owner_label() -> String {
     format!("{} pid {}", store::whoami(), std::process::id())
 }
 
-/// A held task lock. Dropping it releases the OS lock.
+/// A held task lock. Dropping it clears the owner columns (like [`TaskLock::release`], CODE-09:
+/// an early `?` return never leaves them set) and releases the OS lock.
 pub struct TaskLock {
     _file: File,
     pub task: String,
     pub generation: i64,
     store: Store,
+    released: bool,
 }
 
 impl TaskLock {
@@ -103,6 +105,7 @@ impl TaskLock {
             task: task.to_string(),
             generation,
             store: store.clone(),
+            released: false,
         })
     }
 
@@ -157,9 +160,24 @@ impl TaskLock {
     }
 
     /// Clear the owner columns; the OS lock goes when `self` drops.
-    pub fn release(self) {
+    pub fn release(mut self) {
+        self.clear_owner();
+    }
+
+    /// Clear the owner columns of this generation, once.
+    fn clear_owner(&mut self) {
+        if std::mem::replace(&mut self.released, true) {
+            return;
+        }
         let (t, g) = (self.task.clone(), self.generation);
         let _ = self.store.call(move |tx| store::release_lock(tx, &t, g));
+    }
+}
+
+impl Drop for TaskLock {
+    fn drop(&mut self) {
+        // the owner columns first: the OS lock (`_file`) is released after this, with the fields
+        self.clear_owner();
     }
 }
 

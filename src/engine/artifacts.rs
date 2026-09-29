@@ -16,7 +16,7 @@ use crate::git::short;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use rusqlite::OptionalExtension;
+use rusqlite::{OptionalExtension, Transaction};
 
 use super::store::{self, Store, TaskRow};
 use super::task::sha256_hex;
@@ -85,6 +85,57 @@ pub fn put(
     bytes: &[u8],
     view: Option<&str>,
 ) -> Result<Version> {
+    let p = publish(store, t, attempt, logical, ext, kind, bytes)?;
+    // 3. one transaction: row + head
+    let v = {
+        let p = p.clone();
+        store.call(move |tx| register(tx, &p))?
+    };
+    p.committed();
+    if let Some(view) = view {
+        write_view(t, view, bytes)?;
+    }
+    Ok(v)
+}
+
+/// A version published by [`publish`] (steps 1–2 of the module doc) and not yet registered:
+/// until [`register`] commits it, it is an orphan for reconciliation.
+#[derive(Debug, Clone)]
+pub struct Published {
+    task: String,
+    attempt: Option<String>,
+    logical: String,
+    kind: String,
+    version: u32,
+    /// Run-store relative, `/`-separated.
+    rel: String,
+    path: PathBuf,
+    sha256: String,
+    size: u64,
+}
+
+impl Published {
+    /// The crash point after the transaction that registered this version.
+    pub fn committed(&self) {
+        super::runner::crash_point(&format!(
+            "artifact:{}@{}:after_commit",
+            self.logical, self.version
+        ));
+    }
+}
+
+/// Steps 1–2 of the module doc: stage `bytes` durably, then publish them as the next version
+/// of `logical` (never overwriting). [`register`] is step 3, in the caller's transaction, so
+/// several versions and other state can commit together (`task config --reload`, EC-12).
+pub fn publish(
+    store: &Store,
+    t: &TaskRow,
+    attempt: Option<&str>,
+    logical: &str,
+    ext: &str,
+    kind: &str,
+    bytes: &[u8],
+) -> Result<Published> {
     use std::io::Write;
     let version = next_version(store, t, logical)?;
     let sha = sha256_hex(bytes);
@@ -120,37 +171,86 @@ pub fn put(
     }
     sync_dir(&dir);
     super::runner::crash_point(&format!("artifact:{logical}@{version}:after_publish"));
-    // 3. one transaction: row + head
-    let (tid, aid, l, k, r, s2, size) = (
-        t.id.clone(),
-        attempt.map(str::to_string),
-        logical.to_string(),
-        kind.to_string(),
-        rel(t, &path),
-        sha.clone(),
-        bytes.len() as u64,
-    );
-    let id = store.call(move |tx| {
-        store::register_artifact(tx, &tid, aid.as_deref(), &l, &k, &r, &s2, size)
-    })?;
-    if !id.ends_with(&format!("/{version}")) {
-        bail!("artifact {id}: expected version {version} (concurrent writer?)");
-    }
-    super::runner::crash_point(&format!("artifact:{logical}@{version}:after_commit"));
-    if let Some(v) = view {
-        let p = t.artifacts().join(v);
-        if let Some(d) = p.parent() {
-            std::fs::create_dir_all(d)?;
-        }
-        std::fs::write(&p, bytes)?;
+    Ok(Published {
+        task: t.id.clone(),
+        attempt: attempt.map(str::to_string),
+        logical: logical.to_string(),
+        kind: kind.to_string(),
+        version,
+        rel: rel(t, &path),
+        path,
+        sha256: sha,
+        size: bytes.len() as u64,
+    })
+}
+
+/// Step 3 of the module doc, in the caller's transaction: the `artifacts` row + the head.
+pub fn register(tx: &Transaction, p: &Published) -> Result<Version> {
+    let id = store::register_artifact(
+        tx,
+        &p.task,
+        p.attempt.as_deref(),
+        &p.logical,
+        &p.kind,
+        &p.rel,
+        &p.sha256,
+        p.size,
+    )?;
+    if !id.ends_with(&format!("/{}", p.version)) {
+        bail!(
+            "artifact {id}: expected version {} (concurrent writer?)",
+            p.version
+        );
     }
     Ok(Version {
         id,
-        logical: logical.to_string(),
-        version,
-        path,
-        sha256: sha,
+        logical: p.logical.clone(),
+        version: p.version,
+        path: p.path.clone(),
+        sha256: p.sha256.clone(),
     })
+}
+
+/// (Re)write the derived view `view` (run-store root relative) — for humans, never evidence.
+pub fn write_view(t: &TaskRow, view: &str, bytes: &[u8]) -> Result<()> {
+    let p = t.artifacts().join(view);
+    if let Some(d) = p.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    std::fs::write(&p, bytes)?;
+    Ok(())
+}
+
+/// The published version of `logical` whose content has SHA-256 `sha256`, newest first, read
+/// and hash-checked; None if there is none. Version files are content-addressed
+/// (`<version>-<sha12>.<ext>`), so this needs no store (it serves [`super::task::frozen_config`]).
+pub fn find_by_sha(
+    t: &TaskRow,
+    logical: &str,
+    ext: &str,
+    sha256: &str,
+) -> Result<Option<(PathBuf, Vec<u8>)>> {
+    let suffix = format!("-{}.{ext}", short(sha256));
+    let mut found: Vec<(u32, PathBuf)> = match std::fs::read_dir(root(t).join(logical)) {
+        Ok(rd) => rd
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                let version = name.strip_suffix(&suffix)?.parse().ok()?;
+                Some((version, e.path()))
+            })
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e).with_context(|| format!("listing the {logical} versions")),
+    };
+    found.sort_by_key(|f| std::cmp::Reverse(f.0));
+    for (_, path) in found {
+        match std::fs::read(&path) {
+            Ok(bytes) if sha256_hex(&bytes) == sha256 => return Ok(Some((path, bytes))),
+            _ => {}
+        }
+    }
+    Ok(None)
 }
 
 /// The head version of `logical`, if any (no hash check).

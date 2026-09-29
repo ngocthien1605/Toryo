@@ -481,17 +481,34 @@ impl<'a> Recovery<'a> {
     }
 
     /// `toryo resume --discard-partial` (R31/R39): only after the snapshot completion check,
-    /// reset to the attempt's `git_head_before` and start attempt n+1 from a clean tree.
+    /// and after a **new** snapshot of the worktree as it is now (EC-19: edits made since the
+    /// recovery snapshot are kept too), reset to the attempt's `git_head_before` and start
+    /// attempt n+1 from a clean tree. The new snapshot becomes the attempt's, so `toryo partial
+    /// export` restores what was discarded.
     pub fn discard_partial(&self, id: &str) -> Result<String> {
         let t = self.task(id)?;
         let a = self.escalated_writing_attempt(&t)?;
         let wt = Worktree::new(self.g, &t.worktree);
-        let dir = self.snapshot_dir(&t, &a)?;
-        snapshot::completion_check(&wt, &dir)?; // snapshot_incomplete → no reset
+        let first = self.snapshot_dir(&t, &a)?;
+        snapshot::completion_check(&wt, &first)?; // snapshot_incomplete → no reset
         let before = a
             .git_head_before
             .clone()
             .context("the attempt has no git_head_before")?;
+        let (snap, dir) = self.snapshot(&t, &a, &wt)?;
+        snapshot::completion_check(&wt, &dir)?;
+        let (aid, s) = (a.id.clone(), snap);
+        self.store.call(move |tx| {
+            store::finish_attempt(
+                tx,
+                &aid,
+                AttemptStatus::Interrupted,
+                &AttemptEnd {
+                    partial_snapshot_id: Some(s),
+                    ..Default::default()
+                },
+            )
+        })?;
         wt.hard_reset_and_clean(&before)?;
         let note = format!(
             "\n## Recovery\nThe interrupted attempt {} was discarded after a policy violation (its files are kept in snapshot {}; `toryo partial export` restores them). Start from the plan.\n",

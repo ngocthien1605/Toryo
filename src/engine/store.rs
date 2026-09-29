@@ -4,6 +4,7 @@
 //! [`Store::call`]. Other processes open their own store; SQLite WAL + `busy_timeout`
 //! serialise writers across processes.
 
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -149,6 +150,14 @@ pub fn default_db_path() -> PathBuf {
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 
+/// The text of a panic payload (`panic!` with a literal or a formatted message).
+fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "(no message)".into())
+}
+
 /// Handle to the store actor. Cloning shares the same actor thread.
 #[derive(Clone)]
 pub struct Store {
@@ -218,7 +227,12 @@ impl Store {
             .name("toryo-store".into())
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
-                    job(&mut conn);
+                    // CODE-09: a panicking job must not end the actor (`call` reports it to
+                    // its caller); a transaction it left open is rolled back
+                    let _ = panic::catch_unwind(AssertUnwindSafe(|| job(&mut conn)));
+                    if !conn.is_autocommit() {
+                        let _ = conn.execute_batch("ROLLBACK");
+                    }
                 }
             })?;
         Ok(Store {
@@ -231,7 +245,8 @@ impl Store {
         &self.path
     }
 
-    /// Run `f` in one transaction on the actor thread; commit if it returns `Ok`.
+    /// Run `f` in one transaction on the actor thread; commit if it returns `Ok`. A panic in
+    /// `f` rolls the transaction back and is returned as an error (the actor keeps serving).
     pub fn call<T, F>(&self, f: F) -> Result<T>
     where
         T: Send + 'static,
@@ -239,13 +254,14 @@ impl Store {
     {
         let (rtx, rrx) = mpsc::channel();
         let job: Job = Box::new(move |conn: &mut Connection| {
-            let res = (|| {
+            let res = panic::catch_unwind(AssertUnwindSafe(|| {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let v = f(&tx)?;
                 tx.commit()?;
                 Ok(v)
-            })();
+            }))
+            .unwrap_or_else(|p| Err(anyhow!("store job panicked: {}", panic_message(&*p))));
             let _ = rtx.send(res);
         });
         self.tx
@@ -882,7 +898,6 @@ pub fn finish_attempt(
     Ok(())
 }
 
-/// Update the external session id as soon as it is known (so a crash can still resume it).
 /// The SHA-256 of the context an attempt received (§7).
 pub fn set_attempt_context(tx: &Transaction, id: &str, sha256: &str) -> Result<()> {
     tx.execute(
@@ -892,6 +907,7 @@ pub fn set_attempt_context(tx: &Transaction, id: &str, sha256: &str) -> Result<(
     Ok(())
 }
 
+/// Update the external session id as soon as it is known (so a crash can still resume it).
 pub fn set_attempt_session(tx: &Transaction, id: &str, session: &str) -> Result<()> {
     tx.execute(
         "UPDATE stage_attempts SET external_session_id = ?2 WHERE id = ?1",
@@ -1517,6 +1533,34 @@ mod tests {
             "a request never reaches a newer owner"
         );
         assert_eq!(s.call(move |tx| pending_stop(tx, "T-2", g2)).unwrap(), None);
+    }
+
+    /// CODE-09: a panic inside a job is the caller's error; its writes roll back and the actor
+    /// keeps serving (before: every later call failed with "store actor stopped").
+    #[test]
+    fn a_panicking_job_is_an_error_and_the_actor_survives() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open(&d.path().join("t.db")).unwrap();
+        let e = s
+            .call(|tx| -> Result<()> {
+                insert_task(tx, &new_task("T-P"))?;
+                panic!("boom in a store job")
+            })
+            .unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("store job panicked") && msg.contains("boom in a store job"),
+            "{msg}"
+        );
+        assert!(
+            s.call(|tx| get_task(tx, "T-P")).is_err(),
+            "the panicking job's insert was rolled back"
+        );
+        s.call(|tx| insert_task(tx, &new_task("T-P"))).unwrap();
+        assert_eq!(
+            s.call(|tx| get_task(tx, "T-P")).unwrap().state,
+            PipelineState::New
+        );
     }
 
     #[test]

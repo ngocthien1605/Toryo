@@ -248,17 +248,38 @@ fn run(cli: Cli) -> Result<i32> {
     }
 }
 
+/// The process exit status for `code`. A code that does not fit a `u8` (negative, or 256 and
+/// up) is a failure (1), never a truncated value such as 256 → 0 (CODE-08).
+fn exit_status(code: i32) -> u8 {
+    u8::try_from(code).unwrap_or(1)
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli) {
-        Ok(code) => ExitCode::from(code as u8),
+        Ok(code) => ExitCode::from(exit_status(code)),
         Err(e) => {
             if let Some(a) = e.downcast_ref::<toryo::engine::lock::TaskActive>() {
                 eprintln!("task_active: {a}");
-                return ExitCode::from(toryo::engine::lock::EXIT_TASK_ACTIVE as u8);
+                return ExitCode::from(exit_status(toryo::engine::lock::EXIT_TASK_ACTIVE));
             }
             eprintln!("error: {e:#}");
             ExitCode::from(2)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exit_status;
+
+    #[test]
+    fn exit_codes_that_do_not_fit_a_byte_are_failures() {
+        assert_eq!(exit_status(0), 0);
+        assert_eq!(exit_status(3), 3);
+        assert_eq!(exit_status(255), 255);
+        for code in [256, 512, 1000, -1, i32::MIN, i32::MAX] {
+            assert_eq!(exit_status(code), 1, "{code}");
         }
     }
 }

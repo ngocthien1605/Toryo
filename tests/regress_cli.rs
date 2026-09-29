@@ -1,11 +1,17 @@
-//! Regression tests for the configuration fixes of the 2026-09-29 review (the review's
-//! probes, inverted):
+//! Regression tests for the CLI / configuration / recovery / store fixes of the 2026-09-29
+//! review (the review's probes, inverted):
 //!
+//! - EC-12: a crash inside `task config --reload` leaves the old configuration in force (the
+//!   frozen config is the immutable version whose SHA-256 is `tasks.config_sha256`, never the
+//!   view), the reload can be repeated, and `task cleanup` works without a readable config
+//! - EC-19: `resume --discard-partial` snapshots the worktree again before the reset
 //! - EC-23 / DES-05: `fallback: []` means no fallback; typo'd role keys and enum-like values
 //!   are refused at load
 //! - EC-28: `%ProgramFiles(x86)%` is expanded (or refused), never left in place
+//! - CODE-09: an early error return after taking the task lock clears its owner columns
 //!
-//! EC-27 (`doctor` version pin) is a unit test next to the private code (`doctor.rs`).
+//! EC-27 (`doctor` version pin), CODE-08 (exit status) and the store actor half of CODE-09
+//! are unit tests next to the private code (`doctor.rs`, `main.rs`, `engine/store.rs`).
 
 #[cfg(feature = "m0-kit")]
 mod common;
@@ -70,6 +76,11 @@ fn ec28_parenthesised_variable_names_are_expanded_or_refused() {
 #[cfg(feature = "m0-kit")]
 mod e2e {
     use super::common::*;
+    use serde_json::{json, Value};
+    use std::path::Path;
+    use std::time::Duration;
+    use toryo::engine::store::{self, AttemptStatus, Store};
+    use toryo::engine::PipelineState as St;
 
     /// (exit code, stdout, stderr)
     fn toryo_out(env: &Env, args: &[&str]) -> (i32, String, String) {
@@ -79,6 +90,287 @@ mod e2e {
             String::from_utf8_lossy(&o.stdout).to_string(),
             String::from_utf8_lossy(&o.stderr).to_string(),
         )
+    }
+
+    fn tail(s: &str) -> &str {
+        s.lines().last().unwrap_or("")
+    }
+
+    /// Run `id` until its implementer hangs after `ready()`, then kill the owner.
+    fn kill_during_implement(env: &Env, id: &str, steps: Vec<Value>, ready: impl Fn() -> bool) {
+        let s = script(
+            env,
+            "hang.json",
+            json!({ "planner": [turn(vec![plan()])], "implementer": [turn(steps)] }),
+        );
+        let mut child = spawn(env, &["run", id, "--yes", "--fake-agents", &s], "hang.log");
+        let (data, i) = (env.data.clone(), id.to_string());
+        wait_until("the implementer to write and hang", 90, || {
+            let st = Store::open(&data.join("toryo.db")).unwrap();
+            let i = i.clone();
+            let running = st
+                .call(move |tx| store::last_attempt(tx, &i, "implement"))
+                .ok()
+                .flatten()
+                .is_some_and(|a| a.status == AttemptStatus::Running);
+            running && ready()
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    fn contains(p: &Path, needle: &str) -> bool {
+        std::fs::read_to_string(p).is_ok_and(|s| s.contains(needle))
+    }
+
+    /// Every file under `dir` whose bytes contain `needle`.
+    fn files_with(dir: &Path, needle: &str, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                files_with(&p, needle, out);
+            } else if std::fs::read(&p).is_ok_and(|b| String::from_utf8_lossy(&b).contains(needle))
+            {
+                out.push(p);
+            }
+        }
+    }
+
+    /// EC-12 (probe `e_reload_crash_bricks_the_task`, inverted): a crash between publishing the
+    /// new versions and switching `tasks.config_sha256` leaves the old configuration in force;
+    /// run / show / cleanup keep working and the reload can simply be repeated.
+    #[test]
+    fn ec12_reload_crash_leaves_the_old_config_in_force() {
+        let env = setup("codex-openai");
+        create(&env, "E-1");
+        let s = script(
+            &env,
+            "e1.json",
+            json!({
+                "planner": [turn(vec![plan()])],
+                "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+                "reviewer": [turn(vec![approved()])],
+            }),
+        );
+        let (code, err) = toryo(&env, &["run", "E-1", "--fake-agents", &s], &[]);
+        assert_eq!(code, 0, "{err}");
+        let (code, err) = toryo(
+            &env,
+            &[
+                "approve",
+                "E-1",
+                "--gate",
+                "plan",
+                "--continue",
+                "--fake-agents",
+                &s,
+            ],
+            &[],
+        );
+        assert_eq!(code, 0, "{err}");
+        let before = task(&env, "E-1");
+        assert_eq!(before.state, St::WaitingFinalApproval);
+        let cfg = std::fs::read_to_string(&env.config).unwrap().replacen(
+            "  verify:\n",
+            "  verify:\n    - { name: extra, program: git, args: [\"status\"] }\n",
+            1,
+        );
+        std::fs::write(&env.config, cfg).unwrap();
+        let (code, err) = toryo(
+            &env,
+            &["task", "config", "E-1", "--reload"],
+            &[(
+                "TORYO_TEST_CRASH_AT",
+                "artifact:verify-result@2:before_publish",
+            )],
+        );
+        assert_eq!(code, 86, "precondition: the crash hook fired: {err}");
+        let t = task(&env, "E-1");
+        assert_eq!(
+            t.config_sha256, before.config_sha256,
+            "the hash never moved"
+        );
+        assert_eq!(t.state, St::WaitingFinalApproval);
+        // the old configuration is still the task's: no artifact_tampered anywhere
+        let (code, out, err) = toryo_out(&env, &["task", "config", "E-1"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(!out.contains("\"extra\""), "the old config is shown: {out}");
+        let (code, err) = toryo(&env, &["run", "E-1", "--fake-agents", &s], &[]);
+        assert_eq!(code, 0, "run after the crash: {err}");
+        assert!(!err.contains("artifact_tampered"), "{err}");
+        assert_eq!(task(&env, "E-1").state, St::WaitingFinalApproval);
+        // the reload is repeated and applies
+        let (code, err) = toryo(&env, &["task", "config", "E-1", "--reload"], &[]);
+        assert_eq!(code, 0, "{err}");
+        let t = task(&env, "E-1");
+        assert_ne!(t.config_sha256, before.config_sha256);
+        assert_eq!(t.state, St::Verifying, "the final gate was withdrawn");
+        let vr: Value = serde_json::from_slice(
+            &std::fs::read(t.artifacts().join("VERIFY_RESULT.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(vr["invalidated"], json!(true), "{vr}");
+        let (code, out, err) = toryo_out(&env, &["task", "config", "E-1"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(
+            out.contains("\"extra\""),
+            "the new config is in force: {out}"
+        );
+        let (code, err) = toryo(&env, &["task", "cleanup", "E-1", "--force"], &[]);
+        assert_eq!(code, 0, "cleanup: {}", tail(&err));
+        let t = task(&env, "E-1");
+        assert_eq!(t.state, St::Cancelled);
+        assert!(!t.worktree.exists() && !t.run_store.exists());
+    }
+
+    /// EC-12: `task cleanup` works when no version of the frozen configuration can be read
+    /// (everything else still refuses such a task).
+    #[test]
+    fn ec12_cleanup_works_without_a_readable_config() {
+        let env = setup("codex-openai");
+        create(&env, "C-1");
+        let t = task(&env, "C-1");
+        let mut tampered = vec![t.artifacts().join("config.json")];
+        for e in std::fs::read_dir(t.artifacts().join("artifacts/config"))
+            .unwrap()
+            .flatten()
+        {
+            tampered.push(e.path());
+        }
+        assert!(tampered.len() >= 2, "{tampered:?}");
+        for p in &tampered {
+            std::fs::write(p, "{\"tampered\": true}").unwrap();
+        }
+        let s = script(&env, "c1.json", json!({ "planner": [turn(vec![plan()])] }));
+        let (code, err) = toryo(&env, &["run", "C-1", "--fake-agents", &s], &[]);
+        assert_eq!(code, 2, "{err}");
+        assert!(err.contains("artifact_tampered"), "{err}");
+        let (code, err) = toryo(&env, &["task", "cleanup", "C-1", "--force"], &[]);
+        assert_eq!(code, 0, "{err}");
+        assert!(
+            err.contains("WARNING") && err.contains("artifact_tampered"),
+            "{err}"
+        );
+        let t = task(&env, "C-1");
+        assert_eq!(t.state, St::Cancelled);
+        assert!(!t.worktree.exists(), "the worktree is removed");
+        assert!(!t.run_store.exists(), "the run store is removed");
+        assert!(
+            !git(&env.repo, &["worktree", "list"]).contains("C-1"),
+            "and unregistered"
+        );
+    }
+
+    /// EC-19 (probe `d_discard_partial_loses_post_snapshot_edits`, inverted): the discard takes a
+    /// new snapshot first, so what the human wrote after the recovery snapshot survives in it
+    /// and `partial export` restores it.
+    #[test]
+    fn ec19_discard_partial_snapshots_the_worktree_first() {
+        let env = setup("codex-openai");
+        create(&env, "D-1");
+        let w = wt(&env, "D-1");
+        let (wt1, wt2) = (w.clone(), w.clone());
+        kill_during_implement(
+            &env,
+            "D-1",
+            vec![
+                write("TASK.md", "- AC-9: sneaky\n"),
+                write("src/Calculator.psm1", DIVIDE),
+                hang(),
+            ],
+            move || {
+                contains(&wt1.join("TASK.md"), "AC-9")
+                    && contains(&wt2.join("src/Calculator.psm1"), "Divide-Numbers")
+            },
+        );
+        let (_, err) = toryo(&env, &["resume", "D-1"], &[]);
+        let t = task(&env, "D-1");
+        assert_eq!(
+            t.state,
+            St::Escalated,
+            "precondition (recovery escalates on the TASK.md edit): {err}"
+        );
+        // the human repairs the tree by hand and writes new work, then decides to discard
+        git(&w, &["checkout", "--", "TASK.md"]);
+        std::fs::create_dir_all(w.join("notes")).unwrap();
+        std::fs::write(
+            w.join("notes/human-design.md"),
+            "HUMAN-WORK-7f3a: two hours of notes\n",
+        )
+        .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(w.join("src/Calculator.psm1"))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, b"\n# HUMAN-EDIT-7f3a\n"))
+            .unwrap();
+        let s2 = script(
+            &env,
+            "d2.json",
+            json!({
+                "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+                "reviewer": [turn(vec![approved()])],
+            }),
+        );
+        let (code, err) = toryo(
+            &env,
+            &[
+                "resume",
+                "D-1",
+                "--discard-partial",
+                "--yes",
+                "--fake-agents",
+                &s2,
+            ],
+            &[],
+        );
+        assert_eq!(code, 0, "{err}");
+        assert!(err.contains("discarded"), "{err}");
+        assert_eq!(task(&env, "D-1").state, St::Completed, "{err}");
+        assert!(
+            !w.join("notes/human-design.md").exists(),
+            "the discard reset the tree"
+        );
+        let snaps = t.run_store.join("artifacts/partial/implement-1");
+        let versions = std::fs::read_dir(&snaps)
+            .unwrap()
+            .flatten()
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+            .count();
+        assert_eq!(versions, 2, "a new snapshot was taken before the discard");
+        let mut found = Vec::new();
+        files_with(&snaps, "7f3a", &mut found);
+        assert!(
+            found.iter().any(|p| p.ends_with("notes/human-design.md"))
+                && found.iter().any(|p| p.ends_with("src/Calculator.psm1")),
+            "the snapshot holds the human's bytes: {found:?}"
+        );
+        // `partial export` restores what was discarded
+        let into = env.root.join("exported");
+        let (code, err) = toryo(
+            &env,
+            &[
+                "partial",
+                "export",
+                "D-1",
+                "--attempt",
+                "1",
+                "--stage",
+                "implement",
+                "--into",
+                into.to_str().unwrap(),
+            ],
+            &[],
+        );
+        assert_eq!(code, 0, "{err}");
+        assert!(contains(
+            &into.join("notes/human-design.md"),
+            "HUMAN-WORK-7f3a"
+        ));
+        assert!(contains(
+            &into.join("src/Calculator.psm1"),
+            "HUMAN-EDIT-7f3a"
+        ));
     }
 
     /// EC-23 end to end: the frozen chain of a task follows `fallback: []`; a typo'd role key
@@ -123,5 +415,20 @@ mod e2e {
                 .any(|l| l.starts_with("[FAIL] config") && l.contains("invalid configuration")),
             "{out}"
         );
+    }
+
+    /// CODE-09: a command that fails after taking the task lock (here `task config --reload` in
+    /// a non-waiting state) leaves no owner behind in the store.
+    #[test]
+    fn code09_an_early_error_clears_the_lock_owner() {
+        let env = setup("codex-openai");
+        create(&env, "L-1");
+        let (code, err) = toryo(&env, &["task", "config", "L-1", "--reload"], &[]);
+        assert_eq!(code, 2, "{err}");
+        assert!(err.contains("only in a waiting state"), "{err}");
+        let t = task(&env, "L-1");
+        assert_eq!(t.lock_generation, 1, "the lock was taken");
+        assert_eq!(t.run_lock_owner, None, "and its owner cleared");
+        assert_eq!(t.run_lock_at, None);
     }
 }

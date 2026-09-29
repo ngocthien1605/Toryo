@@ -320,9 +320,19 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
                 let i = id.clone();
                 st.call(move |tx| store::transition(tx, &i, PipelineEvent::Cancel).map(|_| ()))?;
             }
-            let cfg = frozen_config(&t)?;
-            let g = task::task_git(&cfg, &t.repo)?;
-            toryo::engine::verify::cleanup(&g, &t, &cfg)?;
+            // EC-12: a task whose frozen configuration cannot be read can still be removed
+            let cfg = match frozen_config(&t) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!("WARNING: {e:#} — cleaning up without it (every repository filter driver neutralised)");
+                    None
+                }
+            };
+            let g = match &cfg {
+                Some(c) => task::task_git(c, &t.repo)?,
+                None => task::cleanup_git(&t.repo)?,
+            };
+            toryo::engine::verify::cleanup(&g, &t, cfg.as_ref())?;
             if t.worktree.exists() {
                 let w = t.worktree.display().to_string().replace('\\', "/");
                 g.run(
@@ -347,11 +357,12 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
 }
 
 fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Result<i32> {
+    use toryo::engine::artifacts;
     use toryo::engine::task::sha256_hex;
     let st = store()?;
     if !reload {
         let t = get(&st, id)?;
-        let text = std::fs::read_to_string(t.artifacts().join("config.json"))?;
+        let (_, text) = task::frozen_config_text(&t)?;
         eprintln!(
             "{id}: frozen configuration, digest {}",
             short(&t.config_sha256)
@@ -365,7 +376,8 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     if !t.state.is_waiting() {
         bail!("{id} is {:?}: `task config --reload` only in a waiting state (a gate, Escalated, Paused)", t.state);
     }
-    let old = frozen_config(&t)?;
+    let (old_path, old_text) = task::frozen_config_text(&t)?;
+    let old = toryo::config::Effective::from_frozen(&old_text, &old_path)?;
     let new = load_config(cli)?;
     let new_text = new.canonical_json();
     let new_sha = sha256_hex(new_text.as_bytes());
@@ -388,7 +400,7 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
         dir.join(format!("{n}-old-{}.json", short(&t.config_sha256))),
         dir.join(format!("{n}-new-{}.json", short(&new_sha))),
     );
-    std::fs::write(&a, pretty(&old.canonical_json())?)?;
+    std::fs::write(&a, pretty(&old_text)?)?;
     std::fs::write(&b, pretty(&new_text)?)?;
     let g = task::task_git(&new, &t.repo)?; // R37 admission under the new machine config
     let out = g.output(
@@ -424,7 +436,13 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     let verify_changed = serde_json::to_value(&old.repo.commands.verify)?
         != serde_json::to_value(&new.repo.commands.verify)?
         || serde_json::to_value(&old.repo.verify)? != serde_json::to_value(&new.repo.verify)?;
-    toryo::engine::artifacts::put(
+    let reverify = verify_changed && artifacts::head(&st, &t, "verify-result")?.is_some();
+    let invalidated = serde_json::to_vec_pretty(
+        &serde_json::json!({"invalidated": true, "reason": "task config --reload changed the verify configuration", "config_sha256": new_sha}),
+    )?;
+    // EC-12: publish the new versions first — a crash up to the commit below leaves orphans
+    // and the old configuration in force, and the reload can simply be repeated …
+    let config_v = artifacts::publish(
         &st,
         &t,
         None,
@@ -432,30 +450,14 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
         "json",
         "config",
         new_text.as_bytes(),
-        Some("config.json"),
     )?;
-    let mut notes = vec![format!(
-        "configuration {} → {} (diff: {})",
-        short(&t.config_sha256),
-        short(&new_sha),
-        b.display()
-    )];
-    let reverify =
-        verify_changed && toryo::engine::artifacts::head(&st, &t, "verify-result")?.is_some();
-    if reverify {
-        let inv = serde_json::json!({"invalidated": true, "reason": "task config --reload changed the verify configuration", "config_sha256": new_sha});
-        toryo::engine::artifacts::put(
-            &st,
-            &t,
-            None,
-            "verify-result",
-            "json",
-            "verify_result",
-            &serde_json::to_vec_pretty(&inv)?,
-            Some("VERIFY_RESULT.json"),
-        )?;
-        notes.push("the verify configuration changed: VERIFY_RESULT.json invalidated".into());
-    }
+    let verify_v = reverify
+        .then(|| {
+            let (l, k) = ("verify-result", "verify_result");
+            artifacts::publish(&st, &t, None, l, "json", k, &invalidated)
+        })
+        .transpose()?;
+    // … then one transaction registers them and switches tasks.config_sha256 (R34/R35)
     let (i, sha, im, pl, rv) = (
         id.to_string(),
         new_sha.clone(),
@@ -465,7 +467,12 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     );
     let to_verify = reverify && t.state == PipelineState::WaitingFinalApproval;
     let payload = serde_json::json!({"from": t.config_sha256, "to": new_sha, "verify_changed": verify_changed});
+    let (cv, vv) = (config_v.clone(), verify_v.clone());
     st.call(move |tx| {
+        artifacts::register(tx, &cv)?;
+        if let Some(v) = &vv {
+            artifacts::register(tx, v)?;
+        }
         store::set_config(tx, &i, &sha, &pl, &im, &rv, idx)?;
         store::event(tx, Some(&i), None, "config_reloaded", &payload)?;
         if to_verify {
@@ -473,6 +480,19 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
         }
         Ok(())
     })?;
+    config_v.committed();
+    artifacts::write_view(&t, "config.json", new_text.as_bytes())?;
+    let mut notes = vec![format!(
+        "configuration {} → {} (diff: {})",
+        short(&t.config_sha256),
+        short(&new_sha),
+        b.display()
+    )];
+    if let Some(v) = &verify_v {
+        v.committed();
+        artifacts::write_view(&t, "VERIFY_RESULT.json", &invalidated)?;
+        notes.push("the verify configuration changed: VERIFY_RESULT.json invalidated".into());
+    }
     if to_verify {
         notes.push("the final gate was withdrawn: the checkpoint is verified again".into());
     }
