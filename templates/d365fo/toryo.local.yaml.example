@@ -24,6 +24,8 @@ profiles:
   claude-foundry:                           # company laptop: approved Foundry models
     kind: claude
     billing: foundry
+    # `toryo usage` prices it by its model: set `model: <deployment>` (as named in prices.toml) —
+    # a Claude implementer runs with, and records, the profile's model only (M10-R3)
     exe: C:\Users\<you>\.local\bin\claude.exe            # TODO(owner) 1
     version: "2.1.x"
     env:

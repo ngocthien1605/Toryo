@@ -78,7 +78,7 @@ Review fixes (`M10-review-fixes.md`, 2026-09-30):
 
 - [x] R1 — `run_ended` on every exit of a drive; `watch` always terminates
 - [x] R2 — `turn_finished.usage` is what the store recorded
-- [ ] R3 — `toryo usage` does not look complete when it is not
+- [x] R3 — `toryo usage` does not look complete when it is not
 - [ ] R4 — toast hardening
 - [ ] R5 — escalation reasons on stderr: keep, pin, document
 - [ ] R6 — cheap Low fixes
@@ -372,3 +372,25 @@ toast test stays; review item 5 — the new `!! reason` lines stay (R5).
 - Test `tests/m10_events.rs::turn_usage_in_events_is_what_the_store_recorded`: a Codex reviewer with a
   correction turn (cumulative 3300 → 4400): events 3300 and 1100 = the rows; the planner turn without
   usage shows `reserved_tokens: 200000`. Before the fix: `[3300, 4400]`.
+
+### R3 — `toryo usage` does not look complete when it is not
+
+- **Incomplete total:** `Report.est_complete` — `false` when a group billed per token has no price
+  (the text total then reads `est. $x + no price (N groups)`, JSON `totals.est_complete: false`,
+  `totals.unpriced_groups: N`), `true` when every such group is priced, `null` when nothing was
+  estimated.
+- **Group key** is stage × profile × model × **billing kind**: a reload that changes a profile's
+  `billing:` never mixes a subscription row into a priced group.
+- `no_price` lists each (model, profile) once, in order of first appearance (`dedup()` only removed
+  neighbours).
+- `includes_unreported` is read by `store::usage_detail`, carried per group (JSON
+  `rows[].includes_unreported`), and makes that group's estimate `~est.` (it holds killed turns' tokens
+  whose split into buckets is unknown).
+- Header: `exact`/`provisional` are raw token counts; `~unknown` reservations are budget tokens
+  (weighted by `pipeline.budget_weights`), priced as uncached input (owner decision Q4).
+- Templates (`toryo.local.yaml.example`, the d365fo one) and README: a `claude-foundry` profile needs
+  `model:` to be priced — a Claude implementer runs with, and records, the profile's model only.
+- Unit tests (`engine::usage_report::tests::r3_*`): priced + unpriced api groups → `est_complete:
+  false` and the marker (and `true`/`null`); two billing kinds → two groups; four unpriced groups of
+  one model → listed once; an `includes_unreported` row → `~est.`. Before the fix the grouping and
+  listing tests fail and the others do not compile (the fields are new).

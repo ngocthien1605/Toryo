@@ -188,6 +188,8 @@ pub struct UsageRow {
     /// A later exact row absorbed this one (R41): it no longer counts.
     pub reconciled_by: Option<i64>,
     pub vendor_reported_cost_usd: Option<f64>,
+    /// The exact row also holds killed turns' tokens of its session (R41).
+    pub includes_unreported: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -243,6 +245,9 @@ pub struct Group {
     pub turns: u32,
     /// Rows absorbed by a later exact row: shown, not counted.
     pub reconciled: u32,
+    /// A counted row includes killed turns' tokens (`includes_unreported`): the estimate is
+    /// approximate (`~est.`).
+    pub includes_unreported: bool,
     pub vendor_cost_usd: Option<f64>,
     pub cost: Cost,
 }
@@ -256,8 +261,13 @@ pub struct Report {
     /// The sum of the estimates (`None`: nothing was estimated).
     pub est_usd: Option<f64>,
     pub est_with_reservations: bool,
+    /// `false`: some groups billed per token have no price, so `est_usd` leaves them out;
+    /// `None` when nothing was estimated (R3).
+    pub est_complete: Option<bool>,
+    /// How many groups billed per token have no price.
+    pub unpriced_groups: usize,
     pub vendor_cost_usd: Option<f64>,
-    /// (model, profile) of the rows billed per token whose model has no price.
+    /// (model, profile) of the rows billed per token whose model has no price, each once.
     pub no_price: Vec<(String, String)>,
     pub price_version: Option<String>,
     pub safety_factor: Option<f64>,
@@ -278,13 +288,15 @@ fn priced(b: &Buckets, p: &Price) -> f64 {
 /// The report of a task's usage rows (in row order; groups in order of first appearance).
 pub fn report(rows: &[UsageRow], prices: Option<&Prices>) -> Report {
     let mut groups: Vec<Group> = Vec::new();
-    // (group index) → (uncached-priced reservation tokens)
     for r in rows {
         let model = r.model.clone().unwrap_or_else(|| UNKNOWN_MODEL.into());
-        let i = match groups
-            .iter()
-            .position(|g| g.stage == r.stage && g.profile == r.profile && g.model == model)
-        {
+        // R3: a group never mixes billing kinds (a profile's `billing:` can change on reload)
+        let i = match groups.iter().position(|g| {
+            g.stage == r.stage
+                && g.profile == r.profile
+                && g.model == model
+                && g.billing_kind == r.billing_kind
+        }) {
             Some(i) => i,
             None => {
                 groups.push(Group {
@@ -298,6 +310,7 @@ pub fn report(rows: &[UsageRow], prices: Option<&Prices>) -> Report {
                     reserved: 0,
                     turns: 0,
                     reconciled: 0,
+                    includes_unreported: false,
                     vendor_cost_usd: None,
                     cost: Cost::Subscription,
                 });
@@ -310,6 +323,7 @@ pub fn report(rows: &[UsageRow], prices: Option<&Prices>) -> Report {
             continue;
         }
         g.turns += 1;
+        g.includes_unreported |= r.includes_unreported;
         if let Some(v) = r.vendor_reported_cost_usd {
             g.vendor_cost_usd = Some(g.vendor_cost_usd.unwrap_or(0.0) + v);
         }
@@ -338,7 +352,11 @@ pub fn report(rows: &[UsageRow], prices: Option<&Prices>) -> Report {
                 None => Cost::NoTable,
                 Some(p) => match p.models.get(&g.model) {
                     None => {
-                        no_price.push((g.model.clone(), g.profile.clone()));
+                        // each (model, profile) once, in order of first appearance
+                        let key = (g.model.clone(), g.profile.clone());
+                        if !no_price.contains(&key) {
+                            no_price.push(key);
+                        }
                         Cost::NoPrice
                     }
                     Some(price) => {
@@ -349,14 +367,14 @@ pub fn report(rows: &[UsageRow], prices: Option<&Prices>) -> Report {
                         Cost::Est {
                             usd: (priced(&g.buckets, price) + priced(&reserved, price))
                                 * p.safety_factor,
-                            with_reservations: g.reserved > 0,
+                            with_reservations: g.reserved > 0 || g.includes_unreported,
                         }
                     }
                 },
             }
         };
     }
-    no_price.dedup();
+    let unpriced_groups = groups.iter().filter(|g| g.cost == Cost::NoPrice).count();
     let estimated: Vec<&Group> = groups.iter().filter(|g| g.cost.usd().is_some()).collect();
     let vendor: Vec<f64> = groups.iter().filter_map(|g| g.vendor_cost_usd).collect();
     Report {
@@ -374,6 +392,8 @@ pub fn report(rows: &[UsageRow], prices: Option<&Prices>) -> Report {
                 }
             )
         }),
+        est_complete: (!estimated.is_empty()).then_some(unpriced_groups == 0),
+        unpriced_groups,
         vendor_cost_usd: (!vendor.is_empty()).then(|| vendor.iter().sum()),
         no_price,
         price_version: prices.map(|p| p.version.clone()),
@@ -397,7 +417,7 @@ fn vendor(v: Option<f64>) -> String {
 /// The text of `toryo usage`. `table`: where the price table was looked for.
 pub fn render_text(r: &Report, task: &str, table: Option<&Path>) -> String {
     let mut s = format!(
-        "usage of {task} (plan §12) — tokens per stage × profile × model; exact | provisional | ~unknown (reservations for turns with no telemetry) are kept apart\n\n{:<11} {:<16} {:<22} {:>10} {:>10} {:>10} {:>9} {:>10} {:>9} {:>10}  cost\n",
+        "usage of {task} (plan §12) — tokens per stage × profile × model; exact | provisional | ~unknown are kept apart\nexact and provisional are raw token counts (the four buckets); ~unknown are reservations for turns with no telemetry, in budget tokens (weighted by pipeline.budget_weights), priced as uncached input\n\n{:<11} {:<16} {:<22} {:>10} {:>10} {:>10} {:>9} {:>10} {:>9} {:>10}  cost\n",
         "stage", "profile", "model", "uncached", "cache rd", "cache wr", "output", "exact", "provis.", "~unknown"
     );
     for g in &r.groups {
@@ -429,6 +449,11 @@ pub fn render_text(r: &Report, task: &str, table: Option<&Path>) -> String {
         }
         .label(),
         None => "—".into(),
+    };
+    // R3: a total that leaves out groups billed per token says so
+    let total_cost = match r.est_complete {
+        Some(false) => format!("{total_cost} + no price ({} groups)", r.unpriced_groups),
+        _ => total_cost,
     };
     s.push_str(&format!(
         "{:<11} {:<16} {:<22} {:>10} {:>10} {:>10} {:>9} {:>10} {:>9} {:>10}  {total_cost}{}\n",
@@ -487,6 +512,7 @@ pub fn to_json(r: &Report, task: &str, table: Option<&Path>) -> Value {
             "reserved_tokens": g.reserved,
             "turns": g.turns,
             "reconciled_rows": g.reconciled,
+            "includes_unreported": g.includes_unreported,
             "est_cost_usd": g.cost.usd(),
             "cost": g.cost.label(),
             "vendor_reported_cost_usd": g.vendor_cost_usd,
@@ -496,6 +522,8 @@ pub fn to_json(r: &Report, task: &str, table: Option<&Path>) -> Value {
             "provisional_tokens": r.provisional,
             "reserved_tokens": r.reserved,
             "est_cost_usd": r.est_usd,
+            "est_complete": r.est_complete,
+            "unpriced_groups": r.unpriced_groups,
             "includes_reservations": r.est_with_reservations,
             "vendor_reported_cost_usd": r.vendor_cost_usd,
         },
@@ -813,6 +841,177 @@ output = 10
         assert_eq!(r.vendor_cost_usd, Some(0.9));
         let text = render_text(&r, "T", None);
         assert!(text.contains("est. $1.2000  (vendor $0.9000)"), "{text}");
+    }
+
+    #[test]
+    fn r3_an_estimate_that_leaves_out_unpriced_groups_says_so() {
+        let prices = parse_prices(TABLE).unwrap();
+        let rows = vec![
+            row(
+                1,
+                "implement",
+                "codex-foundry",
+                "gpt-6-astra",
+                "foundry",
+                "exact",
+                [1_000_000, 0, 0, 0],
+            ),
+            row(
+                2,
+                "review",
+                "claude-api",
+                "sonnet-x",
+                "api",
+                "exact",
+                [10, 0, 0, 1],
+            ),
+            row(
+                3,
+                "plan",
+                "claude-api",
+                "sonnet-x",
+                "api",
+                "exact",
+                [10, 0, 0, 1],
+            ),
+        ];
+        let r = report(&rows, Some(&prices));
+        assert_eq!((r.est_complete, r.unpriced_groups), (Some(false), 2));
+        let total = render_text(&r, "T", None)
+            .lines()
+            .find(|l| l.starts_with("total"))
+            .unwrap()
+            .to_string();
+        assert!(
+            total.contains("est. $1.5000 + no price (2 groups)"),
+            "{total}"
+        );
+        assert_eq!(to_json(&r, "T", None)["totals"]["est_complete"], false);
+        // all priced: complete; nothing estimated: null
+        let r = report(&rows[..1], Some(&prices));
+        assert_eq!(r.est_complete, Some(true));
+        assert!(!render_text(&r, "T", None).contains("+ no price"));
+        let r = report(&rows[1..], Some(&prices));
+        assert_eq!(r.est_complete, None);
+        assert!(to_json(&r, "T", None)["totals"]["est_complete"].is_null());
+    }
+
+    #[test]
+    fn r3_a_group_never_mixes_billing_kinds() {
+        let rows = vec![
+            row(
+                1,
+                "implement",
+                "codex-x",
+                "m",
+                "subscription",
+                "exact",
+                [10, 0, 0, 0],
+            ),
+            row(
+                2,
+                "implement",
+                "codex-x",
+                "m",
+                "api",
+                "exact",
+                [20, 0, 0, 0],
+            ),
+        ];
+        let r = report(&rows, None);
+        assert_eq!(r.groups.len(), 2);
+        assert_eq!(
+            (r.groups[0].billing_kind.as_str(), r.groups[0].exact),
+            ("subscription", 10)
+        );
+        assert_eq!(
+            (r.groups[1].billing_kind.as_str(), r.groups[1].exact),
+            ("api", 20)
+        );
+    }
+
+    #[test]
+    fn r3_an_unpriced_model_is_listed_once() {
+        let prices = parse_prices(TABLE).unwrap();
+        let rows = vec![
+            row(
+                1,
+                "plan",
+                "codex-api",
+                "gpt-x",
+                "api",
+                "exact",
+                [1, 0, 0, 0],
+            ),
+            row(
+                2,
+                "implement",
+                "codex-api",
+                "gpt-x",
+                "api",
+                "exact",
+                [1, 0, 0, 0],
+            ),
+            row(
+                3,
+                "review",
+                "codex-api",
+                "gpt-x",
+                "api",
+                "exact",
+                [1, 0, 0, 0],
+            ),
+            row(
+                4,
+                "implement",
+                "codex-foundry",
+                "gpt-6-astra",
+                "foundry",
+                "exact",
+                [1, 0, 0, 0],
+            ),
+            row(
+                5,
+                "fix-1",
+                "codex-api",
+                "gpt-x",
+                "api",
+                "exact",
+                [1, 0, 0, 0],
+            ),
+        ];
+        let r = report(&rows, Some(&prices));
+        assert_eq!(
+            r.no_price,
+            vec![("gpt-x".to_string(), "codex-api".to_string())]
+        );
+        assert_eq!(r.unpriced_groups, 4);
+    }
+
+    #[test]
+    fn r3_a_row_with_killed_turns_makes_the_estimate_approximate() {
+        let prices = parse_prices(TABLE).unwrap();
+        let mut a = row(
+            1,
+            "implement",
+            "codex-foundry",
+            "gpt-6-astra",
+            "foundry",
+            "exact",
+            [0, 0, 0, 1_000],
+        );
+        a.includes_unreported = true;
+        let r = report(&[a], Some(&prices));
+        assert!(r.groups[0].includes_unreported);
+        assert!(
+            r.groups[0].cost.label().starts_with("~est."),
+            "{:?}",
+            r.groups[0].cost
+        );
+        let j = to_json(&r, "T", None);
+        assert_eq!(j["rows"][0]["includes_unreported"], true);
+        assert_eq!(j["totals"]["includes_reservations"], true);
+        assert!(render_text(&r, "T", None).contains("budget tokens"));
     }
 
     #[test]

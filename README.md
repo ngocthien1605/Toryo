@@ -172,10 +172,14 @@ model in the four buckets, with the `exact`, `provisional` and `~unknown` (reser
 telemetry) totals apart, and an estimated cost for rows billed `foundry` or `api` from the machine's price table
 `%USERPROFILE%\.toryo\prices.toml` (start from `templates/prices.toml.example`; USD per million tokens per bucket,
 `version`, `safety_factor`). Subscription rows show `—`, a model missing from the table `no price`, an estimate that
-includes reservations `~est.`. No table: the report without costs. Every usage row records the model the turn ran
+includes reservations or killed turns' tokens `~est.`; a total that leaves out unpriced per-token groups says
+`+ no price (N groups)` (`totals.est_complete: false`). Groups are stage × profile × model × billing kind.
+`exact`/`provisional` are raw token counts; reservations are budget tokens (weighted by `pipeline.budget_weights`),
+priced as uncached input. A `claude-foundry` profile needs `model:` to be priced: a Claude implementer runs with,
+and records, the profile's model only. No table: the report without costs. Every usage row records the model the turn ran
 with (the role's, else the profile's; the Foundry deployment name for a Codex provider profile); rows written
 before M10 take it from the task's frozen configuration. `--json`: `{ task, prices: {path, version, safety_factor},
-rows: [ {stage, profile, model, billing_kind, buckets, exact_tokens, provisional_tokens, reserved_tokens, turns,
+rows: [ {stage, profile, model, billing_kind, buckets, exact_tokens, provisional_tokens, reserved_tokens, turns, includes_unreported,
 reconciled_rows, est_cost_usd, cost, vendor_reported_cost_usd} ], totals: {…}, no_price: [ {model, profile} ] }`.
 
 **Toasts (Windows).** With `notify: { toast: true }` in the machine config (default off; not frozen with a task,

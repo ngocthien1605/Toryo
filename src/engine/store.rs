@@ -1201,7 +1201,7 @@ pub fn usage_rows(
 /// (NULL before M10: `None`), the four buckets and the vendor-reported cost.
 pub fn usage_detail(tx: &Transaction, task: &str) -> Result<Vec<super::usage_report::UsageRow>> {
     let mut q = tx.prepare(
-        "SELECT u.id, a.stage, u.profile, u.model, u.billing_kind, COALESCE(u.uncached_input_tokens, 0), COALESCE(u.cache_read_tokens, 0), COALESCE(u.cache_write_tokens, 0), COALESCE(u.output_tokens, 0), u.accounting, u.reservation_tokens, u.reconciled_by, u.vendor_reported_cost_usd
+        "SELECT u.id, a.stage, u.profile, u.model, u.billing_kind, COALESCE(u.uncached_input_tokens, 0), COALESCE(u.cache_read_tokens, 0), COALESCE(u.cache_write_tokens, 0), COALESCE(u.output_tokens, 0), u.accounting, u.reservation_tokens, u.reconciled_by, u.vendor_reported_cost_usd, u.includes_unreported
          FROM usage u JOIN stage_attempts a ON a.id = u.stage_attempt_id WHERE u.task_id = ?1 ORDER BY u.id",
     )?;
     let v = q
@@ -1224,6 +1224,7 @@ pub fn usage_detail(tx: &Transaction, task: &str) -> Result<Vec<super::usage_rep
                 reservation_tokens: r.get(10)?,
                 reconciled_by: r.get(11)?,
                 vendor_reported_cost_usd: r.get(12)?,
+                includes_unreported: r.get::<_, i64>(13)? != 0,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
