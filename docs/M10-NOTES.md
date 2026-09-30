@@ -72,8 +72,9 @@ review item 5 — the new `!! reason` lines stay, as a uniform rule (R5).
 - `vendor_reported_cost_usd` is still never filled (Q3: later).
 - The Unix paths (`watch`'s SIGINT handler, the non-Windows notify stubs) compile
   and run only on Linux CI — no Linux target on this machine.
-- `notify_test_builds_the_toast` and `the_real_script_takes_hostile_text_as_data` load WinRT types in
-  Windows PowerShell on `windows-latest` (Q5: you watch the first CI run).
+- **Q5 answered (PR #2 CI, run #15):** `notify_test_builds_the_toast` and
+  `the_real_script_takes_hostile_text_as_data` load WinRT types in Windows PowerShell on
+  `windows-latest` and both pass there — no `#[ignore]` needed.
 - Not tested (not practical): the error printed before the toast wait (R8.5 — only the timing changes) and
   the `notify-test` failure text (R8.7 — needs a failing script).
 - Transitions made by CLI commands outside the engine (recovery, resume) still get their escalation class
@@ -371,9 +372,9 @@ Review fixes, round 3 (`M10-review-fixes-3.md`):
   `--notify`, machine setting, `--no-notify` wins, no toast for a plain `approve`, the gates and the
   completed run with `--yes`, an escalation's body; `notify-test --dry-run` exits 0 on Windows — runs in
   CI too, no desktop needed; the real toast is `#[ignore]`d: `cargo test --test m10_notify -- --ignored`).
-- **Open:** `notify_test_builds_the_toast` runs Windows PowerShell and loads WinRT types in CI
-  (`windows-latest`). It passed here; if the CI image cannot load them, mark that test `#[ignore]`
-  like the real-toast one — it is the only M10 test that needs more than the Rust toolchain and Git.
+- **Resolved (Q5):** `notify_test_builds_the_toast` runs Windows PowerShell and loads WinRT types in CI
+  (`windows-latest`). It passed here and on PR #2's CI, so it stays un-ignored — it is the only M10
+  test that needs more than the Rust toolchain and Git.
 
 ## Review fixes (2026-09-30)
 
