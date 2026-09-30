@@ -364,7 +364,8 @@ impl EventSink for StderrSink {
 
     fn emit(&self, e: &Envelope) -> Result<()> {
         if !e.quiet {
-            eprintln!("{}", render(e));
+            // R9: a closed stderr is an error of this sink (reported once), never a panic
+            writeln!(std::io::stderr(), "{}", render(e))?;
         }
         Ok(())
     }
@@ -878,7 +879,13 @@ impl Recorder {
         for (s, reported) in self.sinks.iter().zip(&self.reported) {
             if let Err(err) = s.emit(&env) {
                 if !reported.swap(true, Ordering::SeqCst) {
-                    eprintln!("!! {}: {err:#} — the run continues without it", s.name());
+                    // R9: never `eprintln!` here: it panics when stderr is gone, and a panic
+                    // while `RunEndGuard` unwinds would abort the process
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "!! {}: {err:#} — the run continues without it",
+                        s.name()
+                    );
                 }
             }
         }
@@ -1459,6 +1466,29 @@ mod tests {
         }
     }
 
+    /// R9: an event emitted while a panic unwinds (what `RunEndGuard` does), through a sink that
+    /// fails, is reported without a second panic — which would abort the process. (Before R9 the
+    /// report used `eprintln!`, which panics only when stderr is gone: not reproducible here, so
+    /// this test guards the path rather than failing first.)
+    #[test]
+    fn a_failing_sink_while_unwinding_does_not_panic_again() {
+        struct EmitOnDrop(Recorder);
+        impl Drop for EmitOnDrop {
+            fn drop(&mut self) {
+                self.0.emit(EngineEvent::BudgetWarning { used: 1, cap: 2 });
+            }
+        }
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = EmitOnDrop(
+                Recorder::new("T", 1, 0, Redactions::empty())
+                    .with(Box::new(Broken))
+                    .with(Box::new(StderrSink)),
+            );
+            panic!("the first panic");
+        }));
+        assert!(res.is_err(), "the first panic is the only one");
+    }
+
     /// R7: the recorder redacts before it shortens. A secret that starts just before the
     /// 400-character cut used to lose its tail to the cut and its prefix stayed in the file.
     #[test]
@@ -1514,15 +1544,94 @@ mod tests {
                         at.pop();
                     }
                 }
+                // R9: arrays too (`#<index>` in the path)
+                Value::Array(a) => {
+                    for (i, x) in a.iter().enumerate() {
+                        at.push(format!("#{i}"));
+                        string_paths(x, at, out);
+                        at.pop();
+                    }
+                }
                 _ => {}
             }
         }
         fn set(v: &mut Value, path: &[String]) {
             match path.split_first() {
                 None => *v = Value::String(format!("before {SECRET} after")),
-                Some((k, rest)) => set(&mut v[k.as_str()], rest),
+                Some((k, rest)) => {
+                    match k.strip_prefix('#').and_then(|i| i.parse::<usize>().ok()) {
+                        Some(i) => set(&mut v[i], rest),
+                        None => set(&mut v[k.as_str()], rest),
+                    }
+                }
             }
         }
+        /// R9: an exhaustive match that names every field (no `..`, no wildcard): a new variant
+        /// or a new field does not compile until it is added here — and to `all` below, with
+        /// every `Option<String>` as `Some`.
+        fn fields_named(e: &EngineEvent) -> &'static str {
+            use EngineEvent as E;
+            match e {
+                E::RunStarted { owner: _ } => "run_started",
+                E::StateChanged {
+                    from: _,
+                    to: _,
+                    event: _,
+                } => "state_changed",
+                E::StageStarted {
+                    stage: _,
+                    attempt: _,
+                    profile: _,
+                    detail: _,
+                } => "stage_started",
+                E::StageFinished {
+                    stage: _,
+                    attempt: _,
+                    status: _,
+                    error_class: _,
+                    duration_ms: _,
+                } => "stage_finished",
+                E::TurnFinished {
+                    stage: _,
+                    attempt: _,
+                    profile: _,
+                    success: _,
+                    usage: _,
+                    reserved_tokens: _,
+                    duration_ms: _,
+                } => "turn_finished",
+                E::CheckpointCreated {
+                    head: _,
+                    kind: _,
+                    found: _,
+                } => "checkpoint_created",
+                E::VerifyCommand {
+                    name: _,
+                    exit: _,
+                    timed_out: _,
+                    ok: _,
+                    duration_ms: _,
+                } => "verify_command",
+                E::GateOpened {
+                    gate: _,
+                    occurrence: _,
+                } => "gate_opened",
+                E::BudgetWarning { used: _, cap: _ } => "budget_warning",
+                E::Escalated {
+                    reason_class: _,
+                    reason: _,
+                } => "escalated",
+                E::Paused { reason: _ } => "paused",
+                E::RunEnded {
+                    state: _,
+                    next_action: _,
+                    from: _,
+                    error: _,
+                } => "run_ended",
+            }
+        }
+        /// The number of arms of `fields_named`.
+        const VARIANTS: usize = 12;
         let all = vec![
             EngineEvent::RunStarted { owner: "o".into() },
             EngineEvent::StateChanged {
@@ -1584,8 +1693,15 @@ mod tests {
                 error: Some("e".into()),
             },
         ];
-        let kinds: std::collections::BTreeSet<&str> = all.iter().map(|e| e.kind()).collect();
-        assert_eq!(kinds.len(), 12, "every variant, once");
+        let kinds: std::collections::BTreeSet<&str> = all.iter().map(fields_named).collect();
+        assert_eq!(
+            kinds.len(),
+            VARIANTS,
+            "every variant of `fields_named` has a sample"
+        );
+        for e in &all {
+            assert_eq!(fields_named(e), e.kind());
+        }
         let c = Collect::default();
         let r = Recorder::new(
             "T",

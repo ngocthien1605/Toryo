@@ -254,14 +254,17 @@ pub fn is_alive(p: ProcId) -> bool {
             p.pid,
         );
         if h.is_null() {
-            // M10-R7: an elevated or other-user process refuses these rights but exists — it
-            // must still count as alive (a run shown `ACTIVE`, not a dead owner)
+            // M10-R7: an elevated toryo of the same user refuses SYNCHRONIZE but grants the
+            // limited query right: check its creation time with that right alone
             if GetLastError() != ERROR_ACCESS_DENIED {
                 return false;
             }
             let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, p.pid);
             if h.is_null() {
-                return GetLastError() == ERROR_ACCESS_DENIED; // exists, cannot be inspected
+                // M10-R9: refused even that — not a toryo of this user (a same-user process,
+                // elevated or not, grants it), e.g. a SYSTEM process that got a dead owner's
+                // reused PID: not alive, or `watch` and `status` would see it `ACTIVE` forever
+                return false;
             }
             let _o = Owned(h);
             if creation_time_of(h) != Some(p.created) {
@@ -683,10 +686,15 @@ impl Detached {
 /// value, an empty name, or `=` in a name after its first character (Windows keeps
 /// `=C:`-style names).
 pub fn check_spawn_input(
+    program: &Path,
     args: &[String],
     env: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> Result<()> {
     const NUL: char = '\0';
+    // R9: the program path too
+    if program.as_os_str().encode_wide().any(|c| c == 0) {
+        bail!("the program path holds a NUL character: {program:?}");
+    }
     if let Some(a) = args.iter().find(|a| a.contains(NUL)) {
         bail!("an argument holds a NUL character: {a:?}");
     }
@@ -705,11 +713,27 @@ pub fn check_spawn_input(
     Ok(())
 }
 
+/// The order of two environment variable names in a Windows environment block (R9): an ordinal,
+/// case-insensitive comparison of the UTF-16 names — `CompareStringOrdinal(a, b, TRUE)`, what
+/// std's `EnvKey` uses — not a Rust uppercase of a lossy string (`ß` → `SS`, `ﬀ` → `FF`).
+pub fn env_name_order(a: &OsStr, b: &OsStr) -> std::cmp::Ordering {
+    use windows_sys::Win32::Globalization::CompareStringOrdinal;
+    let (a, b): (Vec<u16>, Vec<u16>) = (a.encode_wide().collect(), b.encode_wide().collect());
+    // SAFETY: both slices live across the call; lengths are given explicitly
+    let r =
+        unsafe { CompareStringOrdinal(a.as_ptr(), a.len() as i32, b.as_ptr(), b.len() as i32, 1) };
+    match r {
+        1 => std::cmp::Ordering::Less,
+        3 => std::cmp::Ordering::Greater,
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
 /// Windows environment block from `OsString` pairs (non-Unicode values kept): sorted by name,
 /// case-insensitively, UTF-16, double-NUL terminated.
 fn env_block_os(env: &[(std::ffi::OsString, std::ffi::OsString)]) -> Vec<u16> {
     let mut pairs: Vec<&(std::ffi::OsString, std::ffi::OsString)> = env.iter().collect();
-    pairs.sort_by_key(|(k, _)| k.to_string_lossy().to_uppercase());
+    pairs.sort_by(|a, b| env_name_order(&a.0, &b.0));
     let mut out = Vec::new();
     for (k, v) in pairs {
         out.extend(k.encode_wide());
@@ -731,7 +755,7 @@ pub fn spawn_detached(
     args: &[String],
     env: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> Result<Detached> {
-    check_spawn_input(args, env)?;
+    check_spawn_input(program, args, env)?;
     let mut cmdline = quote_windows_arg(&program.to_string_lossy());
     for a in args {
         cmdline.push(' ');
@@ -827,7 +851,7 @@ mod alive_tests {
     /// (PID 4) refuses them to a non-elevated test run; an elevated run can open it and the test
     /// has nothing to show (it says so).
     #[test]
-    fn a_process_that_refuses_access_is_alive() {
+    fn access_denied_is_decided_by_the_limited_right() {
         const SYSTEM: u32 = 4;
         // SAFETY: FFI; handles closed by Owned.
         let created = unsafe {
@@ -844,16 +868,34 @@ mod alive_tests {
             assert_eq!(GetLastError(), ERROR_ACCESS_DENIED);
             let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, SYSTEM);
             if h.is_null() {
-                0
+                None
             } else {
                 let o = Owned(h);
-                creation_time_of(o.0).unwrap_or(0)
+                creation_time_of(o.0)
             }
         };
-        assert!(is_alive(ProcId {
-            pid: SYSTEM,
-            created
-        }));
+        match created {
+            // the limited right is granted: the creation time decides (R7)
+            Some(created) => {
+                assert!(is_alive(ProcId {
+                    pid: SYSTEM,
+                    created
+                }));
+                assert!(!is_alive(ProcId {
+                    pid: SYSTEM,
+                    created: created + 1
+                }));
+            }
+            // M10-R9: refused even the limited right — like a SYSTEM process that reused a dead
+            // owner's PID: not alive, whatever the creation time
+            None => {
+                eprintln!("the System process refuses the limited right too");
+                assert!(!is_alive(ProcId {
+                    pid: SYSTEM,
+                    created: 0
+                }));
+            }
+        }
     }
 }
 
@@ -871,23 +913,50 @@ mod spawn_input_tests {
             ("=C:".into(), r"C:\".into()),
         ];
         assert!(
-            check_spawn_input(&["-Command".into()], &ok).is_ok(),
+            check_spawn_input(Path::new("p"), &["-Command".into()], &ok).is_ok(),
             "`=C:` names are fine"
         );
         let nul = String::from_utf8(vec![b'a', 0, b'b']).unwrap();
-        assert!(check_spawn_input(std::slice::from_ref(&nul), &ok).is_err());
+        assert!(check_spawn_input(Path::new("p"), std::slice::from_ref(&nul), &ok).is_err());
         for bad in [
             vec![(OsString::from(nul.as_str()), OsString::from("v"))],
             vec![(OsString::from("K"), OsString::from(nul.as_str()))],
             vec![(OsString::from(""), OsString::from("v"))],
             vec![(OsString::from("A=B"), OsString::from("v"))],
         ] {
-            assert!(check_spawn_input(&[], &bad).is_err(), "{bad:?}");
+            assert!(
+                check_spawn_input(Path::new("p"), &[], &bad).is_err(),
+                "{bad:?}"
+            );
         }
         let p = std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe");
         assert!(
-            spawn_detached(&p, &[nul], &ok).is_err(),
+            spawn_detached(&p, std::slice::from_ref(&nul), &ok).is_err(),
             "checked before CreateProcessW"
+        );
+        // R9: a NUL in the program path too
+        assert!(check_spawn_input(Path::new(&nul), &[], &ok).is_err());
+    }
+
+    /// M10-R9: environment names are ordered like std's `EnvKey` — ordinal, case-insensitive on
+    /// UTF-16 (`CompareStringOrdinal`), not by a Rust uppercase (`ß` → `SS`, `ﬀ` → `FF`).
+    #[test]
+    fn environment_names_sort_ordinally_ignoring_case() {
+        let mut names: Vec<OsString> = ["ﬀX", "😀X", "ßX", "SSA", "path", "PATH2", "Path"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        names.sort_by(|a, b| env_name_order(a, b));
+        let got: Vec<String> = names
+            .iter()
+            .map(|n| n.to_string_lossy().into_owned())
+            .collect();
+        // `path` and `Path` compare equal (a stable sort keeps their order); U+00DF < the
+        // emoji's high surrogate U+D83D < U+FB00
+        assert_eq!(got, ["path", "Path", "PATH2", "SSA", "ßX", "😀X", "ﬀX"]);
+        assert_eq!(
+            env_name_order(OsStr::new("abc"), OsStr::new("ABC")),
+            std::cmp::Ordering::Equal
         );
     }
 }

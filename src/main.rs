@@ -316,12 +316,7 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Xpp { cmd } => xpp_cli::run(&cli, cmd),
         Cmd::NotifyTest { dry_run } => {
             let code = toryo::notify::test_toast(*dry_run)?;
-            match (code, *dry_run) {
-                (0, false) => eprintln!("a toast was shown: \"toryo — notify-test\" (if you see none, check Windows notification settings for Windows PowerShell)"),
-                (0, true) => eprintln!("the toast was built (dry run: not shown)"),
-                (124, _) => eprintln!("the toast script did not finish in 10 s and was stopped"),
-                (c, _) => eprintln!("the toast script failed (exit {c}) — e.g. Constrained Language Mode (AppLocker/WDAC) or notifications disabled for Windows PowerShell"),
-            }
+            eprintln!("{}", toryo::notify::test_message(code, *dry_run));
             Ok(if code == 0 { 0 } else { 1 })
         }
     }

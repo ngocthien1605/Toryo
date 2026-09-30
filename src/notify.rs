@@ -204,8 +204,27 @@ $null = $text.Item(1).AppendChild($xml.CreateTextNode([string]$env:TORYO_TOAST_B
 $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 if ($env:TORYO_TOAST_DRY_RUN -eq '1') { exit 0 }
 $app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show($toast)
+$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app)
+if ($notifier.Setting.ToString() -ne 'Enabled') { exit 5 }
+$notifier.Show($toast)
 "#;
+
+/// The toast script's exit code when notifications are disabled for Windows PowerShell (R9): a
+/// blocked toast does not make `Show()` fail, so the script checks `Setting` first.
+pub const EXIT_DISABLED: i32 = 5;
+
+/// What `toryo notify-test` says for the script's exit code (R9: the real cause, not a guess).
+pub fn test_message(code: i32, dry_run: bool) -> String {
+    match (code, dry_run) {
+        (0, false) => "a toast was shown: \"toryo — notify-test\" (if you see none, check Focus assist / Do not disturb)".into(),
+        (0, true) => "the toast was built (dry run: not shown)".into(),
+        (EXIT_DISABLED, _) => "notifications are disabled for Windows PowerShell (Settings → System → Notifications) — toryo's toasts use its identity".into(),
+        (124, _) => "the toast script did not finish in 10 s and was stopped".into(),
+        (c, _) => format!(
+            "the toast script failed (exit {c}) — e.g. Constrained Language Mode (AppLocker/WDAC)"
+        ),
+    }
+}
 
 /// What the toaster starts: the program, its (constant) arguments, and the variables that carry
 /// the toast.
@@ -610,6 +629,33 @@ mod tests {
             assert!(!SCRIPT.contains(bad), "{bad}");
         }
         assert!(a.program.ends_with("powershell.exe"));
+    }
+
+    /// R9: blocked notifications do not make `Show()` fail — the script checks `Setting` before
+    /// it (after the dry-run exit, so a dry run does not depend on the desktop's settings) and
+    /// exits 5; `notify-test` names that cause.
+    #[test]
+    fn notify_test_tells_disabled_notifications_apart() {
+        let dry = SCRIPT.find("TORYO_TOAST_DRY_RUN").unwrap();
+        let check = SCRIPT
+            .find("$notifier.Setting.ToString() -ne 'Enabled'")
+            .unwrap();
+        let show = SCRIPT.find("$notifier.Show($toast)").unwrap();
+        assert!(dry < check && check < show, "{SCRIPT}");
+        assert!(SCRIPT.contains(&format!("{{ exit {EXIT_DISABLED} }}")));
+        assert!(test_message(EXIT_DISABLED, false).contains("notifications are disabled"));
+        assert!(test_message(EXIT_DISABLED, false).contains("Settings → System → Notifications"));
+        let other = test_message(1, false);
+        assert!(
+            other.contains("exit 1") && other.contains("Constrained Language Mode"),
+            "{other}"
+        );
+        assert!(
+            !other.contains("disabled"),
+            "no guess at the cause: {other}"
+        );
+        assert!(test_message(0, true).contains("the toast was built"));
+        assert!(test_message(124, false).contains("10 s"));
     }
 
     /// R4: `-Command` takes the script as one argument; it must need no quoting of its own.

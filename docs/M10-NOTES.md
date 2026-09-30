@@ -2,9 +2,9 @@
 
 Every entry: what was decided, why, and where. The owner folds these into plan v0.9.
 
-## Morning summary (2026-09-30, after both rounds of review fixes)
+## Morning summary (2026-09-30, after three rounds of review fixes)
 
-**M10, review fixes R1–R6 and round 2 (R7, R8) are DONE; nothing PARTIAL.** Branch
+**M10, review fixes R1–R6, round 2 (R7, R8) and round 3 (R9) are DONE; nothing PARTIAL.** Branch
 `m10/flight-recorder` on `main` @ `5adf204`, not pushed.
 
 | Commit | Task | State |
@@ -19,10 +19,12 @@ Every entry: what was decided, why, and where. The owner folds these into plan v
 | `e27b1f5` | R6 — typed classes, fail-closed redaction, `seq`, recovery events, no lock probe, read-only store | DONE |
 | `047a12d` | docs: review fixes in README, HUONG-DAN §5.8 and this summary | DONE |
 | `52101e0` | R7 — round 2, events and engine (recovery duplicate, redact-then-cut, reject reason, `watch` rule, panic guard, `seq`, coverage test, `is_alive`) | DONE |
-| (last) | R8 — round 2, usage and notify (`est_complete`, flags, `spawn_detached` checks, private `Toast`, title cut) | DONE |
+| `45c60b1` | R8 — round 2, usage and notify | DONE |
+| (last) | R9 — round 3: a stale owner is not alive, `no price table` total, exhaustive coverage test, no panic while unwinding, `notify-test` cause, ordinal env order | DONE |
 
 **Checks** (§0.2) green before every commit on this machine: `cargo fmt --check`, both `clippy -D warnings`,
-`cargo test --locked`. Tests: **437 passed, 0 failed, 6 ignored** — 426 / 6 at `047a12d` (before round 2),
+`cargo test --locked`. Tests: **441 passed, 0 failed, 6 ignored** — 437 / 6 at `45c60b1` (before round 3),
+426 / 6 at `047a12d` (before round 2),
 401 / 6 at `de85374` (before the fixes), 355 / 5 before M10. Each fix has a test that fails before it, except where the commit says why not
 (new API that does not compile before, and the lock-probe race of R6, which is not practical to reproduce).
 No real agent was run; your configs and data dirs were not read. One real toast was shown here to check
@@ -56,6 +58,17 @@ review item 5 — the new `!! reason` lines stay, as a uniform rule (R5).
    group is unpriced, also without an estimate (R8).
 
 **Open:**
+- **Elevated-`status` check (R9.1), not done unattended:** this session is not elevated and UAC prompts for
+  consent. To check by hand: in an **elevated** PowerShell, with a temp `TORYO_DATA_DIR` and temp
+  `--config`/`--machine-config` (e.g. the ones `tests/common` writes), `toryo task create …` and `toryo run
+  <ID> --fake-agents <script with a {"kind":"delay","ms":120000} planner step>`; meanwhile, in a normal
+  PowerShell with the same `TORYO_DATA_DIR`, `toryo status <ID>` must show ` · ACTIVE (…)` and
+  `toryo status <ID> --json` a non-null `active_owner`. Expected: the elevated process grants
+  `PROCESS_QUERY_LIMITED_INFORMATION` to its own user, so the creation-time path decides.
+- **M11 — Ctrl+C on `toryo run`** kills the process with the default console handler: no `run_ended`, no
+  toast, the owner row stays (pre-existing). Route Ctrl+C on drive commands to the stop path (R38) later.
+- **M11 — R7.1's microsecond window:** a hard kill between `record_usage_in` and its `turn_finished`
+  leaves no event for that usage row (recovery skips rows that existed before it ran).
 - `vendor_reported_cost_usd` is still never filled (Q3: later).
 - The Unix paths (`watch`'s SIGINT handler, the non-Windows notify stubs) compile
   and run only on Linux CI — no Linux target on this machine.
@@ -105,6 +118,10 @@ Review fixes, round 2 (`M10-review-fixes-2.md`):
 
 - [x] R7 — events and engine
 - [x] R8 — usage and notify
+
+Review fixes, round 3 (`M10-review-fixes-3.md`):
+
+- [x] R9 — stale owner vs "access denied", docs behind R8, cheap Lows
 
 ## A — Event backbone (ARCH-02)
 
@@ -604,3 +621,50 @@ From `M10-review-fixes-2.md` (re-review of R1–R6 at `047a12d`).
    script).
 8. **Title length:** `Toast::new` shortens the title to 200 characters like the body (unit assertion in
    `the_body_is_capped`).
+
+### Round 3
+
+From `M10-review-fixes-3.md` (re-review of R7/R8 at `45c60b1`; last round before merge).
+
+#### R9
+
+1. **A stale owner no longer looks alive.** `is_alive`: when `OpenProcess(QUERY_LIMITED | SYNCHRONIZE)`
+   is refused, it retries with `PROCESS_QUERY_LIMITED_INFORMATION` alone and checks the creation time
+   (an elevated toryo of the same user grants that right); if **that** is refused too, the process is
+   **not alive** — a toryo owner runs as the same user, so a process refusing even the limited right is
+   someone else's (e.g. a SYSTEM process that reused a hard-killed owner's PID), which made `watch` hang and
+   `status` show `ACTIVE` forever. The PID-4 test (`access_denied_is_decided_by_the_limited_right`) adapts:
+   on this machine the System process refuses both rights → now "not alive" (it was "alive"); where the
+   limited right is granted, the creation time decides (a wrong one → not alive).
+   **Elevated-`status` check: not done.** This session runs at Medium integrity (not elevated) and UAC
+   prompts for consent (`ConsentPromptBehaviorAdmin = 5`): starting an elevated `toryo run` needs a click on
+   the UAC dialog, which cannot be done unattended (and toryo must not bypass UAC). Moved to Open with the
+   procedure.
+2. **Docs behind R8:** README and HUONG-DAN §5.8 list the `totals` fields of `toryo usage --json`
+   (`exact_tokens`, `provisional_tokens`, `reserved_tokens`, `est_cost_usd`, `est_complete`,
+   `unpriced_groups`, `includes_reservations`, `includes_unreported`, `vendor_reported_cost_usd`) and the
+   total's text forms. `Report.est_complete`'s doc comment is corrected. **New:** with per-token groups and
+   no price table the total reads `no price table` (it read `—`, the subscription label); unit test
+   `r9_no_price_table_is_said_in_the_total`.
+3. **The redaction coverage test fails for a new variant or field:** `fields_named` is an exhaustive
+   `match` over `EngineEvent` that names every field (no wildcard, no `..`) — a new variant or field does
+   not compile until it is added there; the samples must cover all its arms (`VARIANTS`), every
+   `Option<String>` is `Some`, and the string walker descends into arrays too.
+4. **No second panic while unwinding:** `Recorder::dispatch` reports a sink failure with
+   `let _ = writeln!(std::io::stderr(), …)`, and `StderrSink` writes with `writeln!(…)?` (a closed stderr is
+   that sink's error, reported once) — `eprintln!` panics when stderr is gone, and a panic during
+   `RunEndGuard`'s unwinding would abort. Test `a_failing_sink_while_unwinding_does_not_panic_again` guards
+   the path (it cannot fail first: stderr is present in tests).
+5. **`notify-test` tells the real cause:** blocked notifications do not make `Show()` fail, so the script
+   now reads `$notifier.Setting` after the dry-run exit and exits `5` (`notify::EXIT_DISABLED`) when it is
+   not `Enabled`; `notify::test_message` maps 5 to "notifications are disabled for Windows PowerShell
+   (Settings → System → Notifications)" and other codes to "the toast script failed (exit N) — e.g.
+   Constrained Language Mode (AppLocker/WDAC)". The drive path stays fire-and-forget (the exit code is not
+   read). The constant-command-line and no-double-quote tests stay green; new unit test
+   `notify_test_tells_disabled_notifications_apart`. Checked here: `notify-test` exit 0 (notifications are
+   enabled on this machine), `--dry-run` exit 0.
+6. **Environment block order:** `process::windows::env_name_order` = `CompareStringOrdinal(a, b, TRUE)` on
+   the UTF-16 names (std's `EnvKey`), `windows-sys` feature `Win32_Globalization` (no new crate). Test
+   `environment_names_sort_ordinally_ignoring_case` (`path`/`Path` equal, `SSA` < `ßX` < emoji < `ﬀX`; the
+   old Rust uppercase put `ﬀX` first as `FFX`).
+7. **`check_spawn_input` also rejects a NUL in the program path** (new first parameter).

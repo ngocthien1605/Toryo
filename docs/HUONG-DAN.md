@@ -585,8 +585,13 @@ USD / 1 triệu token cho từng bucket của từng model (tên model = `model:
 với profile Codex có `codex.provider` là **tên deployment Foundry**), `version` (in kèm mọi ước tính) và
 `safety_factor` (nhân thêm cho an toàn). Dòng subscription hiện `—`; model chưa có giá hiện `no price` và được
 liệt kê cuối báo cáo; ước tính có cả phần giữ chỗ (turn không báo token) hoặc token của turn bị kill hiện
-`~est.`. Nếu còn nhóm tính tiền theo token chưa có giá, dòng tổng ghi thêm `+ no price (N groups)` (JSON
-`totals.est_complete: false`) — con số ước tính khi đó **chưa đủ**. `exact`/`provisional` là số token thô;
+`~est.`. Dòng tổng nói rõ phần còn thiếu: `est. $x + no price (N groups)` khi một số nhóm tính tiền theo
+token chưa có giá — con số ước tính khi đó **chưa đủ**; `no price (N groups)` khi không nhóm nào có giá;
+`no price table` khi có nhóm tính tiền theo token mà không có file giá; `—` chỉ khi không có gì tính tiền theo
+token. JSON `totals`: `exact_tokens`, `provisional_tokens`, `reserved_tokens`, `est_cost_usd` (`null` khi không
+ước tính được), `est_complete` (`false` khi có nhóm thiếu giá, `true` khi đủ, `null` khi không có gì tính theo
+token hoặc không có file giá), `unpriced_groups`, `includes_reservations`, `includes_unreported`,
+`vendor_reported_cost_usd`. `exact`/`provisional` là số token thô;
 phần giữ chỗ là budget token (có trọng số `pipeline.budget_weights`), tính giá như uncached input. Profile
 `claude-foundry` cần có `model:` thì mới tính được giá. Không có file → báo cáo không có chi phí (không lỗi). Key lạ hay giá âm → lỗi nêu đúng tên key. Từ M10 mỗi dòng usage ghi luôn model;
 dòng cũ (trước M10) lấy model từ config đã đóng băng của task.

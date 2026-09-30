@@ -264,8 +264,9 @@ pub struct Report {
     pub est_with_reservations: bool,
     /// An estimated group includes killed turns' tokens (`includes_unreported`, R8).
     pub est_includes_unreported: bool,
-    /// `false`: some groups billed per token have no price, so `est_usd` leaves them out;
-    /// `None` when nothing was estimated (R3).
+    /// `Some(false)` when a group billed per token has no price — also when nothing could be
+    /// estimated (R8); `Some(true)` when every billed group is priced; `None` only when nothing is
+    /// billed per token or there is no price table (R9).
     pub est_complete: Option<bool>,
     /// How many groups billed per token have no price.
     pub unpriced_groups: usize,
@@ -459,6 +460,8 @@ pub fn render_text(r: &Report, task: &str, table: Option<&Path>) -> String {
             format!("{total_cost} + no price ({})", groups(r.unpriced_groups))
         }
         (Some(false), None) => format!("no price ({})", groups(r.unpriced_groups)),
+        // R9: billed groups but no price table: not the subscription `—`
+        _ if r.groups.iter().any(|g| g.cost == Cost::NoTable) => "no price table".into(),
         _ => total_cost,
     };
     s.push_str(&format!(
@@ -913,6 +916,42 @@ output = 10
             [1, 0, 0, 0],
         )];
         assert_eq!(report(&sub, Some(&prices)).est_complete, None);
+    }
+
+    /// R9: billed groups and no price table: the total says so (it read `—`, the subscription
+    /// label); a subscription-only report keeps `—`.
+    #[test]
+    fn r9_no_price_table_is_said_in_the_total() {
+        let total = |r: &Report| {
+            render_text(r, "T", None)
+                .lines()
+                .find(|l| l.starts_with("total"))
+                .unwrap()
+                .trim_end()
+                .to_string()
+        };
+        let billed = row(
+            1,
+            "implement",
+            "codex-foundry",
+            "gpt-6-astra",
+            "foundry",
+            "exact",
+            [10, 0, 0, 1],
+        );
+        let r = report(&[billed], None);
+        assert!(total(&r).ends_with("no price table"), "{}", total(&r));
+        assert_eq!(r.est_complete, None);
+        let sub = row(
+            1,
+            "plan",
+            "claude-max",
+            "opus",
+            "subscription",
+            "exact",
+            [10, 0, 0, 1],
+        );
+        assert!(total(&report(&[sub], None)).ends_with('—'));
     }
 
     /// R8.1: one `api` group whose model is unknown and nothing else: the total must say that
