@@ -14,7 +14,7 @@ pub struct TaskFacts {
     /// The lock owner while another process holds the task lock.
     pub active_owner: Option<String>,
     /// R59: the verify of this task proves compile level only (X++).
-    pub compile_only: bool,
+    pub compile_only: Option<bool>,
     pub next_action: String,
 }
 
@@ -84,7 +84,7 @@ pub fn show_json(
                 "attempt": u.attempt,
                 "profile": u.profile,
                 "accounting": u.accounting,
-                "budget_tokens": u.budget_tokens,
+                "counted_tokens": u.budget_tokens,
                 "reservation_tokens": u.reservation_tokens,
                 "reconciled_by": u.reconciled_by,
                 "includes_unreported": u.includes_unreported,
@@ -135,7 +135,7 @@ mod tests {
             &row(),
             &TaskFacts {
                 active_owner: None,
-                compile_only: false,
+                compile_only: Some(false),
                 next_action: "`toryo run T-1`".into(),
             },
         );

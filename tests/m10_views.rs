@@ -117,7 +117,9 @@ fn status_and_show_print_one_json_document() {
     let usage = d["usage"].as_array().unwrap();
     assert!(!usage.is_empty());
     let exact = usage.iter().find(|u| u["accounting"] == "exact").unwrap();
-    assert_eq!(exact["budget_tokens"], 125);
+    // R6: renamed from `budget_tokens` (the task-level key is the admission cap)
+    assert_eq!(exact["counted_tokens"], 125);
+    assert!(exact.get("budget_tokens").is_none());
     assert_eq!(exact["includes_unreported"], false);
     let gates = d["gates"].as_array().unwrap();
     assert_eq!(gates[0]["gate"], "plan");
@@ -152,6 +154,37 @@ fn a_cleaned_up_task_is_still_in_status_json() {
         next.contains("cleaned up") && next.contains("toryo/J-2"),
         "{next}"
     );
+    // R6: the frozen configuration went with the run store: unknown, not `false`
+    assert!(t["compile_only"].is_null(), "{t}");
+    assert!(t["active_owner"].is_null());
+}
+
+/// R6: `status` / `task show` find the owner of a running task from the recorded owner (PID and
+/// creation time), without a lock probe; a dead owner is none.
+#[test]
+fn the_active_owner_comes_from_the_recorded_owner() {
+    let env = setup("codex-openai");
+    create(&env, "J-3");
+    let s = script(
+        &env,
+        "h.json",
+        json!({"planner": [turn(vec![hang()])], "implementer": [], "reviewer": []}),
+    );
+    let mut run = spawn(&env, &["run", "J-3", "--fake-agents", &s], "j3-run.log");
+    let p = task(&env, "J-3").run_store.join("events.jsonl");
+    wait_until("the run to start", 60, || p.is_file());
+    let owner = json_of(&env, &["status", "J-3", "--json"])["tasks"][0]["active_owner"].clone();
+    let shown = json_of(&env, &["task", "show", "J-3", "--json"])["active_owner"].clone();
+    let (_, text, _) = out(&env, &["status", "J-3"]);
+    let _ = run.kill();
+    let _ = run.wait();
+    let label = owner.as_str().unwrap_or_default().to_string();
+    assert!(label.contains("pid"), "{owner}");
+    assert_eq!(shown, owner);
+    assert!(text.contains(&format!(" · ACTIVE ({label})")), "{text}");
+    // killed: the recorded owner is dead — nobody drives it
+    let after = json_of(&env, &["status", "J-3", "--json"])["tasks"][0]["active_owner"].clone();
+    assert!(after.is_null(), "{after}");
 }
 
 // ── B2: toryo watch ──────────────────────────────────────────────────────────────────

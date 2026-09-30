@@ -174,6 +174,13 @@ fn get(store: &Store, id: &str) -> Result<TaskRow> {
     store.call(move |tx| store::get_task(tx, &i))
 }
 
+/// [`get`] in a read-only transaction (R6): for the commands that only look (`status`, `task
+/// show`, `usage`, `watch`).
+fn read_task(store: &Store, id: &str) -> Result<TaskRow> {
+    let i = id.to_string();
+    store.read(move |tx| store::get_task(tx, &i))
+}
+
 fn hub_for(t: &TaskRow, d: &DriveArgs) -> Result<AgentHub> {
     let cfg = frozen_config(t)?;
     let fake = d.fake_agents.as_deref();
@@ -261,6 +268,59 @@ fn recorded(rec: &Recorder, from: PipelineState, event: &str, now: &TaskRow) {
     }
 }
 
+fn st_attempts(store: &Store, id: &str) -> Result<Vec<store::AttemptRow>> {
+    let i = id.to_string();
+    store.call(move |tx| store::attempts(tx, &i))
+}
+
+/// R6: the attempts §10 recovery ended (they were `running` before it) get their
+/// `stage_finished`, and a killed turn's reservation its `turn_finished` — quiet events, like the
+/// engine's own.
+fn recovered_events(
+    store: &Store,
+    rec: &Recorder,
+    id: &str,
+    running: &[store::AttemptRow],
+) -> Result<()> {
+    if running.is_empty() {
+        return Ok(());
+    }
+    let now = st_attempts(store, id)?;
+    let i = id.to_string();
+    let usage = store.call(move |tx| store::usage_rows(tx, &i))?;
+    for before in running {
+        let Some(a) = now
+            .iter()
+            .find(|a| a.id == before.id && a.status != store::AttemptStatus::Running)
+        else {
+            continue;
+        };
+        let reserved = usage
+            .iter()
+            .find(|u| u.1 == a.id && u.3 == "unknown")
+            .and_then(|u| u.5);
+        if let (Some(n), Some(p)) = (reserved, &a.profile) {
+            rec.emit_quiet(EngineEvent::TurnFinished {
+                stage: a.stage.clone(),
+                attempt: a.attempt,
+                profile: p.clone(),
+                success: false,
+                usage: None,
+                reserved_tokens: Some(n),
+                duration_ms: toryo::engine::flight::ms_since(&a.started_at),
+            });
+        }
+        rec.emit_quiet(EngineEvent::StageFinished {
+            stage: a.stage.clone(),
+            attempt: a.attempt,
+            status: a.status,
+            error_class: a.error_class.clone(),
+            duration_ms: toryo::engine::flight::ms_since(&a.started_at),
+        });
+    }
+    Ok(())
+}
+
 /// Recover (if needed) and run the locked task until it waits, finishes or is stopped. Every
 /// exit — also an error before the first stage (an unverified profile, a bad fake script, a
 /// Git or store error) — ends with one `run_ended` (R1): `watch` stops and the owner is told.
@@ -300,9 +360,17 @@ fn drive_inner(store: &Store, lock: &TaskLock, rec: &Recorder, d: &DriveArgs) ->
         protect: &protect,
         cfg: &cfg,
     };
+    let running: Vec<store::AttemptRow> = {
+        let i = lock.task.clone();
+        st_attempts(store, &i)?
+            .into_iter()
+            .filter(|a| a.status == store::AttemptStatus::Running)
+            .collect()
+    };
     for n in recovery.recover(&lock.task)? {
         eprintln!("↺ recovery: {n}");
     }
+    recovered_events(store, rec, &lock.task, &running)?;
     let before = t.state;
     let t = get(store, &lock.task)?;
     recorded(rec, before, "recovery", &t);
@@ -973,12 +1041,9 @@ pub fn stop(id: &str, wait: u64) -> Result<i32> {
 /// What `status` shows of a task besides its row: the lock owner while another process holds
 /// the lock, compile-only verify (R59), and the next action (the cleaned-up variant once the
 /// worktree and the run store are gone).
-fn facts(t: &TaskRow) -> Result<TaskFacts> {
-    let active_owner = if lock::probe_free(&t.id)? {
-        None
-    } else {
-        Some(t.run_lock_owner.clone().unwrap_or_default())
-    };
+fn facts(st: &Store, t: &TaskRow) -> Result<TaskFacts> {
+    // R6: from the recorded owner, never a lock probe; `None`, never an empty label
+    let active_owner = driven_owner(st, &t.id)?;
     let next_action = if t.state.is_terminal() && !t.run_store.exists() && !t.worktree.exists() {
         toryo::engine::runner::cleaned_up_action(t)
     } else {
@@ -986,7 +1051,10 @@ fn facts(t: &TaskRow) -> Result<TaskFacts> {
     };
     Ok(TaskFacts {
         active_owner,
-        compile_only: task::frozen_config(t).is_ok_and(|c| toryo::engine::xpp::compile_only(&c)),
+        // R6: unknown (`null`) when the frozen configuration cannot be read (after `task cleanup`)
+        compile_only: task::frozen_config(t)
+            .ok()
+            .map(|c| toryo::engine::xpp::compile_only(&c)),
         next_action,
     })
 }
@@ -1000,13 +1068,13 @@ fn print_json(v: &serde_json::Value) -> Result<()> {
 pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
     let st = store()?;
     let tasks = match id {
-        Some(i) => vec![get(&st, i)?],
-        None => st.call(store::list_tasks)?,
+        Some(i) => vec![read_task(&st, i)?],
+        None => st.read(store::list_tasks)?,
     };
     if json {
         let list = tasks
             .iter()
-            .map(|t| Ok(views::task_json(t, &facts(t)?)))
+            .map(|t| Ok(views::task_json(t, &facts(&st, t)?)))
             .collect::<Result<Vec<_>>>()?;
         print_json(&serde_json::json!({ "tasks": list }))?;
         return Ok(0);
@@ -1015,7 +1083,7 @@ pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
         println!("no tasks (`toryo task create --file TASK.md`)");
     }
     for t in tasks {
-        let f = facts(&t)?;
+        let f = facts(&st, &t)?;
         let active = f
             .active_owner
             .as_ref()
@@ -1039,7 +1107,7 @@ pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
             active
         );
         // R59: an X++ verify proves compile level only — say so wherever the state is shown
-        if f.compile_only {
+        if f.compile_only == Some(true) {
             println!("               {}", toryo::engine::xpp::COMPILE_ONLY);
         }
         println!("               next: {}", f.next_action);
@@ -1050,7 +1118,7 @@ pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
 /// The usage rows of a task as `task show` prints them.
 fn usage_lines(st: &Store, id: &str) -> Result<Vec<views::UsageLine>> {
     let i = id.to_string();
-    let rows = st.call(move |tx| store::usage_rows(tx, &i))?;
+    let rows = st.read(move |tx| store::usage_rows(tx, &i))?;
     Ok(rows
         .into_iter()
         .map(
@@ -1081,14 +1149,14 @@ fn usage_lines(st: &Store, id: &str) -> Result<Vec<views::UsageLine>> {
 
 fn show(id: &str, json: bool) -> Result<i32> {
     let st = store()?;
-    let t = get(&st, id)?;
+    let t = read_task(&st, id)?;
     let i = id.to_string();
-    let atts = st.call(move |tx| store::attempts(tx, &i))?;
+    let atts = st.read(move |tx| store::attempts(tx, &i))?;
     let usage = usage_lines(&st, id)?;
     let i = id.to_string();
-    let ap = st.call(move |tx| store::approvals(tx, &i))?;
+    let ap = st.read(move |tx| store::approvals(tx, &i))?;
     if json {
-        let task = views::task_json(&t, &facts(&t)?);
+        let task = views::task_json(&t, &facts(&st, &t)?);
         let events = toryo::engine::flight::events_path(&t);
         print_json(&views::show_json(task, &t, &atts, &usage, &ap, &events))?;
         return Ok(0);
@@ -1372,11 +1440,24 @@ fn interrupted_during(d: Duration) -> bool {
 /// Does a live process drive the task? From the recorded lock owner (its PID and creation
 /// time), never by taking the lock: a probe could refuse a `toryo run` starting at that moment.
 fn driven(st: &Store, id: &str) -> Result<bool> {
+    Ok(driven_owner(st, id)?.is_some())
+}
+
+/// The recorded lock owner, while its process (PID and creation time) is alive — never by
+/// taking the lock (R6: a probe could refuse a `toryo run` starting at that moment).
+fn driven_owner(st: &Store, id: &str) -> Result<Option<String>> {
     let i = id.to_string();
-    let owner = st.call(move |tx| store::lock_owner(tx, &i))?;
-    Ok(
-        matches!(owner, Some((_, _, Some(pid), Some(created))) if store::identity_alive(pid, &created)),
-    )
+    let owner = st.read(move |tx| store::lock_owner(tx, &i))?;
+    Ok(match owner {
+        Some((label, _, Some(pid), Some(created))) if store::identity_alive(pid, &created) => {
+            Some(if label.trim().is_empty() {
+                format!("pid {pid}")
+            } else {
+                label
+            })
+        }
+        _ => None,
+    })
 }
 
 /// `toryo watch` (B2): the task's flight recorder like `tail -f`, without the task lock. The
@@ -1386,7 +1467,7 @@ fn driven(st: &Store, id: &str) -> Result<bool> {
 pub fn watch(id: &str, json: bool, from_start: bool, no_follow: bool) -> Result<i32> {
     use toryo::engine::flight::{self, Tail};
     let st = store()?;
-    let t = get(&st, id)?;
+    let t = read_task(&st, id)?;
     let path = flight::events_path(&t);
     if !path.is_file() && (no_follow || !driven(&st, id)?) {
         bail!(
@@ -1417,7 +1498,7 @@ pub fn watch(id: &str, json: bool, from_start: bool, no_follow: bool) -> Result<
                 return Ok(0);
             }
         }
-        let state = get(&st, id)?.state;
+        let state = read_task(&st, id)?.state;
         if flight::watch_done(state, driven(&st, id)?, last.elapsed()) {
             done_polls += 1;
         } else {
@@ -1454,10 +1535,10 @@ fn show_lines(lines: &[String], json: bool) -> Result<bool> {
 pub fn usage(id: &str, json: bool, prices: Option<&std::path::Path>) -> Result<i32> {
     use toryo::engine::usage_report as ur;
     let st = store()?;
-    let t = get(&st, id)?;
+    let t = read_task(&st, id)?;
     let cfg = frozen_config(&t).ok();
     let i = id.to_string();
-    let mut rows = st.call(move |tx| store::usage_detail(tx, &i))?;
+    let mut rows = st.read(move |tx| store::usage_detail(tx, &i))?;
     for r in &mut rows {
         if r.model.is_none() {
             r.model = cfg

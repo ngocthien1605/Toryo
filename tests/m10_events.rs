@@ -392,6 +392,10 @@ fn a_blocked_review_prints_its_reason_once() {
         "the reviewer blocked the task",
         Some("   [state] Reviewing --review_blocked--> Escalated"),
     );
+    // R6: a typed class, not `other`
+    let ev = events(&env, "R5-1");
+    let esc = find(&ev, 0, |e| e["type"] == "escalated");
+    assert_eq!(ev[esc]["reason_class"], "review_blocked");
 }
 
 #[test]
@@ -432,6 +436,9 @@ fn the_fix_cycle_bound_prints_its_reason_once() {
         None,
     );
     assert!(!err.contains("--verify_failed--> Escalated"), "{err}");
+    let ev = events(&env, "R5-2");
+    let esc = find(&ev, 0, |e| e["type"] == "escalated");
+    assert_eq!(ev[esc]["reason_class"], "max_fix_cycles");
 }
 
 #[test]
@@ -494,5 +501,46 @@ fn a_failed_implementer_and_a_rejected_review_print_their_reason_once() {
         &err,
         &reason,
         Some("   [state] Reviewing --escalate--> Escalated"),
+    );
+}
+
+/// Review fix R6: an attempt §10 recovery ends (a crash right after the implement attempt
+/// began) gets its `stage_finished`, and the killed turn's reservation its `turn_finished`.
+#[test]
+fn attempts_ended_by_recovery_are_recorded() {
+    let env = setup("codex-openai");
+    create(&env, "EV-7");
+    let s = script(
+        &env,
+        "c.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()]), turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, _) = toryo(
+        &env,
+        &["run", "EV-7", "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "implement:after_begin")],
+    );
+    assert_eq!(code, 86, "crashed");
+    let (code, err) = toryo(&env, &["resume", "EV-7", "--yes", "--fake-agents", &s], &[]);
+    assert!(code == 0 || code == 1, "{err}");
+    let ev = events(&env, "EV-7");
+    let resumed = find(&ev, 1, |e| e["type"] == "run_started");
+    let fin = find(&ev, resumed, |e| {
+        e["type"] == "stage_finished" && e["stage"] == "implement" && e["attempt"] == 1
+    });
+    assert_eq!(ev[fin]["status"], "interrupted", "{}", ev[fin]);
+    let turn = find(&ev, resumed, |e| {
+        e["type"] == "turn_finished" && e["stage"] == "implement" && e["attempt"] == 1
+    });
+    assert!(turn < fin);
+    assert!(ev[turn].get("usage").is_none());
+    assert!(
+        ev[turn]["reserved_tokens"].as_i64().unwrap() > 0,
+        "{}",
+        ev[turn]
     );
 }

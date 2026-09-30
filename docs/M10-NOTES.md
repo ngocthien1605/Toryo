@@ -81,7 +81,7 @@ Review fixes (`M10-review-fixes.md`, 2026-09-30):
 - [x] R3 — `toryo usage` does not look complete when it is not
 - [x] R4 — toast hardening
 - [x] R5 — escalation reasons on stderr: keep, pin, document
-- [ ] R6 — cheap Low fixes
+- [x] R6 — cheap Low fixes
 
 ## A — Event backbone (ARCH-02)
 
@@ -270,14 +270,17 @@ Review fixes (`M10-review-fixes.md`, 2026-09-30):
 ### C2 — scripted turns in mixed runs report zero usage
 
 - **Rule.** When the fake script lists `only_profiles` (a mixed fake/real run, like the E7 canary), a
-  scripted turn that ends — `complete`, `fail` (also the "no turn left" failure and an interrupt), or a
-  replayed stream's terminal event — without having reported usage first reports **exact zero** usage
+  scripted turn that ends — `complete` or `fail` (also the "no turn left" failure and an interrupt) —
+  without having reported usage first reports **exact zero** usage
   (all four buckets 0) just before its end: the row is `exact`, 0 tokens, no reservation. A scripted
   turn with a `usage` step keeps its numbers. A pure fake run (no `only_profiles`) is unchanged: a turn
   without usage is `unknown` and R41 reserves (the R41 tests rely on that and pass unchanged).
 - **Where.** `agents::fake` — `Shared.zero_usage` (from the script), `FakeSession.usage_seen` (per
   turn), `FakeSession::zero_usage_before(step)`. A turn that ends without a terminal step (`crash`, the
   steps running out) still reports nothing: it models a crash, and a crash's usage is unknown.
+  **Replayed streams are not affected** (corrected in R6; this note first said they were): the real
+  parsers' `terminal_events` always emit a `Usage` event before the terminal one — `Unknown` when the
+  stream had none — so a replayed turn has reported usage and keeps it (R41 reserves for `Unknown`).
 - **Why exact zero, not "no row".** The engine records a row for every turn (R41: never silently zero);
   an exact zero row keeps that invariant and says what is true — a scripted turn costs nothing.
 - Tests: `tests/m10_usage.rs::scripted_turns_of_a_mixed_run_report_exact_zero` (both profiles listed, so
@@ -456,3 +459,45 @@ toast test stays; review item 5 — the new `!! reason` lines stay (R5).
   prints `!! not accepted after 1 fix cycle(s) (last: verify failed)` once (no `[state]` line, Q1); the
   plan-policy bound once before `[state] Planning --plan_policy_violation--> Escalated`; the implementer
   failure and the rejected review once before their `[state]` lines (this last test fails before R5).
+
+### R6 — cheap Low fixes
+
+- **Typed escalation class** (`flight::escalation_class`, snake_case): the state machine's own
+  escalations are classed by the event that led to them (`verify_failed`, `changes_requested`,
+  `final_rejected`, `path_policy_violation` at the bound → `max_fix_cycles`; `review_blocked`;
+  `plan_policy_violation` → `plan_policy`); else the engine passes the class (`Recorder::
+  transition_classed`): the attempt's error class in `end_with`/`finish_and` (`escalate_attempt`'s
+  class, `protected_config_changed`, `policy_violation`, `InvalidOutput` → `invalid_output`, a failed
+  read-only turn's `ErrorClass`), `implementer_failed` for a failed implementer turn (its attempt keeps the
+  turn's error class), `protected_config_changed` / `policy_violation` for `Engine::escalate`,
+  `approval_mismatch` for a withdrawn final gate. The reason-prefix heuristic (`reason_class`, now also
+  snake_case) is only the fallback — CLI-level transitions such as recovery's. Tests: unit
+  `escalation_classes_are_typed_and_snake_case`; the blocked review and the fix-cycle bound give
+  `review_blocked` and `max_fix_cycles` in `events.jsonl` (both were `other`).
+- **Redaction fails closed:** `redact_event` redacts every string field in place, per variant; enum
+  fields (states, statuses, accounting) stay typed. No serialise/deserialise round trip, so no fallback to
+  the unredacted event. Test: a secret equal to `Completed` (the state stays, the texts are redacted).
+- **`seq`:** `flight::scan` returns the highest `seq` and the line count, and counts a complete JSON
+  object on an unterminated last line; `flight::next_seq` restarts above the line count with a warning
+  when the last `seq` is implausible (> 2^53 − 1, e.g. `u64::MAX`); the in-process counter saturates
+  instead of wrapping (`fetch_update` + `saturating_add`). Test `seq_is_checked_and_an_unterminated_
+  object_counts`.
+- **Recovery:** `drive` lists the running attempts before `recover()`; those it ended get a quiet
+  `stage_finished`, and a killed turn's reservation a quiet `turn_finished` (`usage` absent,
+  `reserved_tokens`). Test `attempts_ended_by_recovery_are_recorded` (a crash right after the implement
+  attempt began, then `resume`).
+- **No lock probe in `status` / `task show`:** `engine_cli::facts` takes the owner from
+  `driven_owner` — the recorded owner whose PID and creation time are alive — like `watch`; the text
+  `status` keeps its format. `active_owner` is `null`, never `""` (an owner row without a label shows
+  `pid N`). Test `the_active_owner_comes_from_the_recorded_owner` (a hanging run, then killed).
+- **`compile_only`:** `TaskFacts.compile_only` is `Option<bool>` — `null` when the frozen configuration
+  cannot be read (after `task cleanup`); the text `status` prints the compile-only line only for
+  `Some(true)`.
+- **`task show --json`:** `usage[].budget_tokens` is renamed `counted_tokens` (the task-level
+  `budget_tokens` keeps meaning the admission cap); README schema and the B1 test updated (a rename the fix
+  list asks for).
+- **Read-only store calls:** `Store::read` runs the closure in a `DEFERRED` transaction that is rolled
+  back — it never takes the write lock. Used by `status`, `task show` (task, attempts, usage, gates),
+  `usage`, `watch` and the owner lookup. Test `a_read_does_not_wait_for_a_writer` (another connection
+  holds the write lock for 3 s; the read answers at once; a write inside a read is not kept).
+- **C2 notes corrected** (replayed streams always carry a `Usage` event); no behaviour change.

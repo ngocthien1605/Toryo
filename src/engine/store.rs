@@ -245,6 +245,31 @@ impl Store {
         &self.path
     }
 
+    /// Run `f` in a deferred, read-only transaction (R6): it never takes the write lock, so a
+    /// poller (`watch`, `status`, `task show`, `usage`) never waits for — or delays — a writer.
+    /// Nothing `f` writes is kept (the transaction is rolled back).
+    pub fn read<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Transaction) -> Result<T> + Send + 'static,
+    {
+        let (rtx, rrx) = mpsc::channel();
+        let job: Job = Box::new(move |conn: &mut Connection| {
+            let res = panic::catch_unwind(AssertUnwindSafe(|| {
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+                let v = f(&tx)?;
+                tx.rollback()?;
+                Ok(v)
+            }))
+            .unwrap_or_else(|p| Err(anyhow!("store job panicked: {}", panic_message(&*p))));
+            let _ = rtx.send(res);
+        });
+        self.tx
+            .send(job)
+            .map_err(|_| anyhow!("store actor stopped"))?;
+        rrx.recv().map_err(|_| anyhow!("store actor stopped"))?
+    }
+
     /// Run `f` in one transaction on the actor thread; commit if it returns `Ok`. A panic in
     /// `f` rolls the transaction back and is returned as an error (the actor keeps serving).
     pub fn call<T, F>(&self, f: F) -> Result<T>
@@ -1599,6 +1624,47 @@ mod tests {
             "a request never reaches a newer owner"
         );
         assert_eq!(s.call(move |tx| pending_stop(tx, "T-2", g2)).unwrap(), None);
+    }
+
+    /// M10-R6: a read-only call does not wait for the write lock another connection holds (a
+    /// `call`, `BEGIN IMMEDIATE`, would wait up to the 15 s busy timeout), and keeps nothing.
+    #[test]
+    fn a_read_does_not_wait_for_a_writer() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("t.db");
+        let writer = Store::open(&p).unwrap();
+        let reader = Store::open(&p).unwrap();
+        writer.call(|tx| insert_task(tx, &new_task("T-R"))).unwrap();
+        let (held_tx, held_rx) = mpsc::channel();
+        let w = writer.clone();
+        let h = std::thread::spawn(move || {
+            w.call(move |tx| {
+                tx.execute("UPDATE tasks SET title = 'x' WHERE id = 'T-R'", [])?;
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_secs(3));
+                Ok(())
+            })
+            .unwrap()
+        });
+        held_rx.recv().unwrap();
+        let t = std::time::Instant::now();
+        let n: i64 = reader
+            .read(|tx| Ok(tx.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        // a write inside a read is not kept
+        reader
+            .read(|tx| {
+                let _ = tx.execute("DELETE FROM tasks", []);
+                Ok(())
+            })
+            .ok();
+        h.join().unwrap();
+        let n: i64 = reader
+            .read(|tx| Ok(tx.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     /// CODE-09: a panic inside a job is the caller's error; its writes roll back and the actor

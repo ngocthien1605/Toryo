@@ -213,22 +213,23 @@ impl<'a> Engine<'a> {
     }
 
     fn apply(&self, e: Ev) -> Result<St> {
-        self.apply_with(e, false)
+        self.apply_with(e, false, None)
     }
 
     /// Escalate with `reason`, printed as `!! reason` before the `[state]` line.
-    fn escalate(&self, reason: String) -> Result<St> {
-        self.apply_with(Ev::Escalate { reason }, true)
+    fn escalate(&self, class: &str, reason: String) -> Result<St> {
+        self.apply_with(Ev::Escalate { reason }, true, Some(class))
     }
 
     /// Apply `e` and report it; `reason_line`: the escalation or pause reason is printed (see
     /// [`Self::end_with`] for the rule and its one exception, the budget pause).
-    fn apply_with(&self, e: Ev, reason_line: bool) -> Result<St> {
+    fn apply_with(&self, e: Ev, reason_line: bool, class: Option<&str>) -> Result<St> {
         let i = self.id.clone();
         let from = self.task()?.state;
         let name = e.name();
         let m = self.store.call(move |tx| store::transition(tx, &i, e))?;
-        self.rec.transition(from, name, &m, true, reason_line);
+        self.rec
+            .transition_classed(from, name, &m, true, reason_line, class);
         Ok(m.state())
     }
 
@@ -355,6 +356,7 @@ impl<'a> Engine<'a> {
             Some(Ev::BudgetExceeded),
             None,
             false,
+            None,
         )?;
         Ok(Flow::Next)
     }
@@ -400,7 +402,7 @@ impl<'a> Engine<'a> {
             // R35: nothing runs while protected state differs from the baseline in force
             if t.state.is_running() {
                 if let Some(reason) = self.protected_violation(&t, false)? {
-                    self.escalate(reason)?;
+                    self.escalate(protect::REASON, reason)?;
                     continue;
                 }
             }
@@ -589,7 +591,7 @@ impl<'a> Engine<'a> {
         // here means the chain was used up
         let Some(profile) = implementer_at(t, t.implementer_index, self.opts.no_fallback) else {
             let reason = implementer_quota_reason(&t.implementers.join(" → "));
-            self.apply_with(Ev::Pause { reason }, true)?;
+            self.apply_with(Ev::Pause { reason }, true, None)?;
             return Ok(Flow::Next);
         };
         let turn = self.prepare_implement(t, profile)?;
@@ -850,13 +852,15 @@ impl<'a> Engine<'a> {
             }
             ImplementOutcome::Failed { reason } => {
                 r.print_summary();
-                self.end_and(
+                self.end_with(
                     a,
                     AttemptStatus::Failed,
                     r,
                     AttemptEnd::default(),
                     Some(Ev::Escalate { reason }),
                     None,
+                    true,
+                    Some("implementer_failed"),
                 )?;
                 Ok(Flow::Next)
             }
@@ -970,7 +974,14 @@ impl<'a> Engine<'a> {
         })?;
         self.stage_finished(a, AttemptStatus::Failed, class);
         if let Some(m) = to {
-            self.rec.transition(from, "escalate", &m, true, true);
+            self.rec.transition_classed(
+                from,
+                "escalate",
+                &m,
+                true,
+                true,
+                Some("implementer_failed"),
+            );
         }
         Ok(Flow::Next)
     }
@@ -1097,7 +1108,7 @@ impl<'a> Engine<'a> {
                     .collect();
                 if !denied.is_empty() {
                     let reason = format!("policy_violation: denied paths {denied:?} would be committed (policy.deny_paths); nothing was committed");
-                    self.escalate(reason)?;
+                    self.escalate("policy_violation", reason)?;
                     return Ok(Flow::Next);
                 }
                 let no_change = wt.nothing_to_commit()?;
@@ -2070,13 +2081,14 @@ impl<'a> Engine<'a> {
         e: Option<Ev>,
         feedback: Option<Option<String>>,
     ) -> Result<()> {
-        self.end_with(a, status, r, end, e, feedback, true)
+        self.end_with(a, status, r, end, e, feedback, true, None)
     }
 
     /// [`Self::end_and`]; `reason_line: false` only for a stop whose reason another line already
     /// says — the budget pauses print `!! budget reached during the turn …` or `!! admission cap
     /// reached …` themselves. The rule (M10-R5): every transition into `Escalated` or `Paused`
     /// prints its reason exactly once, before its `[state]` line; no caller prints `!! reason` itself.
+    /// `class`: the escalation's class when it is not the attempt's error class (R6).
     #[allow(clippy::too_many_arguments)]
     fn end_with(
         &self,
@@ -2087,6 +2099,7 @@ impl<'a> Engine<'a> {
         e: Option<Ev>,
         feedback: Option<Option<String>>,
         reason_line: bool,
+        class: Option<&str>,
     ) -> Result<()> {
         if end.error_class.is_none() {
             end.error_class = r.error_class.map(|c| format!("{c:?}"));
@@ -2098,7 +2111,8 @@ impl<'a> Engine<'a> {
         let (i, aid) = (self.id.clone(), a.id.clone());
         let from = self.task()?.state;
         let name = e.as_ref().map(|e| e.name());
-        let class = end.error_class.clone();
+        let error_class = end.error_class.clone();
+        let class = class.map(str::to_string).or_else(|| error_class.clone());
         let to = self.store.call(move |tx| {
             store::finish_attempt(tx, &aid, status, &end)?;
             if let Some(f) = feedback {
@@ -2109,9 +2123,10 @@ impl<'a> Engine<'a> {
                 None => Ok(None),
             }
         })?;
-        self.stage_finished(a, status, class);
+        self.stage_finished(a, status, error_class);
         if let (Some(m), Some(name)) = (to, name) {
-            self.rec.transition(from, name, &m, true, reason_line);
+            self.rec
+                .transition_classed(from, name, &m, true, reason_line, class.as_deref());
         }
         Ok(())
     }
@@ -2142,9 +2157,10 @@ impl<'a> Engine<'a> {
                 None => Ok(None),
             }
         })?;
-        self.stage_finished(a, status, class);
+        self.stage_finished(a, status, class.clone());
         if let (Some(m), Some(name)) = (to, name) {
-            self.rec.transition(from, name, &m, false, true);
+            self.rec
+                .transition_classed(from, name, &m, false, true, class.as_deref());
         }
         Ok(())
     }
@@ -3591,9 +3607,11 @@ fn uncommitted_note(changed: &[String], checkpoint: &str) -> Option<String> {
 /// Withdraw the open final gate with `e` (`Escalate`, `Reverify`): the approval is refused.
 fn withdraw_final(store: &Store, rec: &Recorder, t: &TaskRow, e: Ev) -> Result<()> {
     let (i, name) = (t.id.clone(), e.name());
+    // the only escalation that withdraws the final gate is §11 `approval_mismatch` (R32)
+    let class = matches!(e, Ev::Escalate { .. }).then_some("approval_mismatch");
     let m = store.call(move |tx| store::transition(tx, &i, e))?;
     // the refusal is the command's error: the escalation reason is not printed twice
-    rec.transition(t.state, name, &m, true, false);
+    rec.transition_classed(t.state, name, &m, true, false, class);
     Ok(())
 }
 

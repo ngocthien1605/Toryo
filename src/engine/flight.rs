@@ -479,14 +479,46 @@ pub fn watch_done(state: St, active: bool, idle: std::time::Duration) -> bool {
 
 /// The highest `seq` in an events file (0: none).
 pub fn last_seq(path: &Path) -> u64 {
+    scan(path).0
+}
+
+/// The highest `seq` and the number of event lines of an events file. A complete JSON object on
+/// an unterminated last line counts too (R6): the next event closes that line, and its `seq` must
+/// not be reused.
+pub fn scan(path: &Path) -> (u64, usize) {
     let text = std::fs::read(path)
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
-    read_lines(&text)
+    let mut seqs: Vec<u64> = read_lines(&text)
         .iter()
         .filter_map(|(_, v)| v["seq"].as_u64())
-        .max()
-        .unwrap_or(0)
+        .collect();
+    let tail = text.rsplit('\n').next().unwrap_or("").trim();
+    if let Ok(v) = serde_json::from_str::<Value>(tail) {
+        seqs.extend(v["seq"].as_u64());
+    }
+    (seqs.iter().copied().max().unwrap_or(0), seqs.len())
+}
+
+/// Above this a `seq` is implausible: JSON consumers (JavaScript) lose integers beyond 2^53.
+pub const SEQ_MAX: u64 = (1 << 53) - 1;
+
+/// The first `seq` of a new recorder: the last one + 1. An implausible last `seq` (damaged or
+/// hand-edited file, e.g. `u64::MAX`) restarts above the number of lines, with a warning — never
+/// a panic or a wrap.
+pub fn next_seq(last: u64, lines: usize) -> (u64, Option<String>) {
+    match last.checked_add(1).filter(|n| *n <= SEQ_MAX) {
+        Some(n) => (n, None),
+        None => {
+            let n = lines as u64 + 1;
+            (
+                n,
+                Some(format!(
+                    "the last seq ({last}) is implausible — numbering restarts at {n}"
+                )),
+            )
+        }
+    }
 }
 
 /// The events file of a task.
@@ -505,22 +537,70 @@ pub fn reason_class(reason: &str) -> String {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ' '));
     if wordy && reason.contains(':') {
-        head.replace([' ', '-'], "_")
+        snake_case(head)
     } else {
         "other".into()
+    }
+}
+
+/// `InvalidOutput` → `invalid_output`, `implementer failed` → `implementer_failed`,
+/// `protected_config_changed` unchanged.
+pub fn snake_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    let mut prev: Option<char> = None;
+    for c in s.trim().chars() {
+        let c = if matches!(c, ' ' | '-') { '_' } else { c };
+        if c.is_uppercase() && prev.is_some_and(|p| p.is_lowercase() || p.is_ascii_digit()) {
+            out.push('_');
+        }
+        if !(c == '_' && out.ends_with('_')) {
+            out.extend(c.to_lowercase());
+        }
+        prev = Some(c);
+    }
+    out
+}
+
+/// The class of an escalation the state machine decides itself, from the pipeline event that
+/// led to it (R6): the fix-cycle bound, a blocked review, the plan-policy bound.
+pub fn machine_class(event: &str) -> Option<&'static str> {
+    match event {
+        "verify_failed" | "changes_requested" | "final_rejected" | "path_policy_violation" => {
+            Some("max_fix_cycles")
+        }
+        "review_blocked" => Some("review_blocked"),
+        "plan_policy_violation" => Some("plan_policy"),
+        _ => None,
+    }
+}
+
+/// The typed class of an escalation (R6), snake_case: the state machine's own class, else the
+/// class the engine gives (the attempt's error class, the escalation kind), else — only as a
+/// fallback — the prefix of the reason.
+pub fn escalation_class(event: &str, class: Option<&str>, reason: &str) -> String {
+    match (machine_class(event), class.filter(|c| !c.trim().is_empty())) {
+        (Some(c), _) => c.to_string(),
+        (None, Some(c)) => snake_case(c),
+        (None, None) => reason_class(reason),
     }
 }
 
 /// The events a transition from `from` (by the pipeline event `event`) to the machine `m`
 /// stands for, in the order the CLI prints them: the escalation or pause it led to (its
 /// reason is printed before the `[state]` line), the state change, the gate it opened.
-pub fn transition_events(from: St, event: &str, m: &Machine) -> Vec<EngineEvent> {
+/// `class`: the escalation's class, when the caller knows it ([`escalation_class`]).
+pub fn transition_events(
+    from: St,
+    event: &str,
+    m: &Machine,
+    class: Option<&str>,
+) -> Vec<EngineEvent> {
     let to = m.state();
     let reason = m.reason().unwrap_or("").to_string();
     let mut out = Vec::new();
     if to == St::Escalated && from != St::Escalated {
         out.push(EngineEvent::Escalated {
-            reason_class: reason_class(&reason),
+            reason_class: escalation_class(event, class, &reason),
             reason,
         });
     } else if to == St::Paused && from != St::Paused {
@@ -584,26 +664,67 @@ pub fn task_redactions(cfg: &Effective, t: &TaskRow) -> Redactions {
     Redactions::new(&secrets)
 }
 
-/// Every string of the event, redacted.
-fn redact_event(r: &Redactions, e: EngineEvent) -> EngineEvent {
+/// Every string field of the event, redacted in place (R6: fails closed). The enum fields
+/// (states, statuses, the accounting) are not text and stay typed, so a secret equal to, say, a
+/// state name can never make the redacted event unreadable — and there is no fallback to the
+/// unredacted event.
+fn redact_event(r: &Redactions, mut e: EngineEvent) -> EngineEvent {
     if r.is_empty() {
         return e;
     }
-    fn walk(r: &Redactions, v: &mut Value) {
-        match v {
-            Value::String(s) => *s = r.redact_str(s),
-            Value::Array(a) => a.iter_mut().for_each(|x| walk(r, x)),
-            Value::Object(o) => o.values_mut().for_each(|x| walk(r, x)),
-            _ => {}
+    let s = |x: &mut String| *x = r.redact_str(x);
+    let o = |x: &mut Option<String>| {
+        if let Some(v) = x {
+            *v = r.redact_str(v);
+        }
+    };
+    use EngineEvent as E;
+    match &mut e {
+        E::RunStarted { owner } => s(owner),
+        E::StateChanged { event, .. } => s(event),
+        E::StageStarted {
+            stage,
+            profile,
+            detail,
+            ..
+        } => {
+            s(stage);
+            o(profile);
+            o(detail);
+        }
+        E::StageFinished {
+            stage, error_class, ..
+        } => {
+            s(stage);
+            o(error_class);
+        }
+        E::TurnFinished { stage, profile, .. } => {
+            s(stage);
+            s(profile);
+        }
+        E::CheckpointCreated { head, kind, .. } => {
+            s(head);
+            s(kind);
+        }
+        E::VerifyCommand { name, .. } => s(name),
+        E::GateOpened { gate, .. } => s(gate),
+        E::BudgetWarning { .. } => {}
+        E::Escalated {
+            reason_class,
+            reason,
+        } => {
+            s(reason_class);
+            s(reason);
+        }
+        E::Paused { reason } => s(reason),
+        E::RunEnded {
+            next_action, error, ..
+        } => {
+            s(next_action);
+            o(error);
         }
     }
-    match serde_json::to_value(&e) {
-        Ok(mut v) => {
-            walk(r, &mut v);
-            serde_json::from_value(v).unwrap_or(e)
-        }
-        Err(_) => e,
-    }
+    e
 }
 
 /// Wraps events in envelopes and hands them to the sinks.
@@ -622,7 +743,7 @@ impl Recorder {
         Self {
             task: task.to_string(),
             generation,
-            next: AtomicU64::new(last_seq + 1),
+            next: AtomicU64::new(last_seq.saturating_add(1)),
             redact,
             sinks: Vec::new(),
             reported: Vec::new(),
@@ -636,7 +757,12 @@ impl Recorder {
         let redact = super::task::frozen_config(t)
             .map(|c| task_redactions(&c, t))
             .unwrap_or_else(|_| Redactions::empty());
-        Self::new(&t.id, generation, last_seq(&path), redact)
+        let (last, lines) = scan(&path);
+        let (first, warning) = next_seq(last, lines);
+        if let Some(w) = warning {
+            eprintln!("!! flight recorder {}: {w}", path.display());
+        }
+        Self::new(&t.id, generation, first - 1, redact)
             .with(Box::new(FileSink::new(path)))
             .with(Box::new(StderrSink))
     }
@@ -666,7 +792,20 @@ impl Recorder {
         state_line: bool,
         reason_line: bool,
     ) {
-        for e in transition_events(from, event, m) {
+        self.transition_classed(from, event, m, state_line, reason_line, None);
+    }
+
+    /// [`Self::transition`] with the escalation's class, when the caller knows it (R6).
+    pub fn transition_classed(
+        &self,
+        from: St,
+        event: &str,
+        m: &Machine,
+        state_line: bool,
+        reason_line: bool,
+        class: Option<&str>,
+    ) {
+        for e in transition_events(from, event, m, class) {
             let shown = match e {
                 EngineEvent::StateChanged { .. } => state_line,
                 EngineEvent::Escalated { .. } | EngineEvent::Paused { .. } => reason_line,
@@ -679,7 +818,13 @@ impl Recorder {
     fn dispatch(&self, e: EngineEvent, quiet: bool) {
         let env = Envelope {
             v: VERSION,
-            seq: self.next.fetch_add(1, Ordering::SeqCst),
+            // never wraps: at the (implausible) end of the range the number stays there
+            seq: self
+                .next
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    Some(n.saturating_add(1))
+                })
+                .unwrap_or(u64::MAX),
             ts: super::store::now(),
             task: self.task.clone(),
             generation: self.generation,
@@ -1078,7 +1223,7 @@ mod tests {
     #[test]
     fn a_transition_stands_for_its_escalation_pause_and_gate() {
         let m = machine(&[Ev::Start]);
-        let ev = transition_events(St::New, "start", &m);
+        let ev = transition_events(St::New, "start", &m, None);
         assert_eq!(
             ev,
             vec![EngineEvent::StateChanged {
@@ -1093,7 +1238,7 @@ mod tests {
                 subject: "s".into(),
             },
         ]);
-        let ev = transition_events(St::Planning, "plan_ready", &m);
+        let ev = transition_events(St::Planning, "plan_ready", &m, None);
         assert_eq!(ev.len(), 2);
         assert_eq!(
             ev[1],
@@ -1108,7 +1253,7 @@ mod tests {
                 reason: "protected_config_changed: .toryo/x".into(),
             },
         ]);
-        let ev = transition_events(St::Planning, "escalate", &m);
+        let ev = transition_events(St::Planning, "escalate", &m, None);
         assert_eq!(
             ev[0],
             EngineEvent::Escalated {
@@ -1118,7 +1263,7 @@ mod tests {
         );
         assert!(matches!(ev[1], EngineEvent::StateChanged { .. }));
         let m = machine(&[Ev::Start, Ev::BudgetExceeded]);
-        let ev = transition_events(St::Planning, "budget_exceeded", &m);
+        let ev = transition_events(St::Planning, "budget_exceeded", &m, None);
         assert_eq!(
             ev[0],
             EngineEvent::Paused {
@@ -1137,12 +1282,72 @@ mod tests {
             reason_class("implementer failed: Unknown — boom"),
             "implementer_failed"
         );
+        // R6: always snake_case
         assert_eq!(
             reason_class("InvalidOutput: rejected 3 times"),
-            "InvalidOutput"
+            "invalid_output"
         );
         assert_eq!(reason_class("no colon here"), "other");
         assert_eq!(reason_class("a (weird) prefix: x"), "other");
+    }
+
+    /// R6: the class comes from the source — the state machine's event, else the engine's
+    /// class — and the reason text is only the fallback.
+    #[test]
+    fn escalation_classes_are_typed_and_snake_case() {
+        for (s, want) in [
+            ("InvalidOutput", "invalid_output"),
+            ("RateLimit", "rate_limit"),
+            ("protected_config_changed", "protected_config_changed"),
+            ("implementer failed", "implementer_failed"),
+            ("PermissionDenied", "permission_denied"),
+        ] {
+            assert_eq!(snake_case(s), want, "{s}");
+        }
+        let bound = "not accepted after 1 fix cycle(s) (last: verify failed)";
+        assert_eq!(
+            escalation_class("verify_failed", None, bound),
+            "max_fix_cycles"
+        );
+        assert_eq!(
+            escalation_class("changes_requested", Some("x"), bound),
+            "max_fix_cycles"
+        );
+        assert_eq!(
+            escalation_class("review_blocked", None, "the reviewer blocked the task"),
+            "review_blocked"
+        );
+        assert_eq!(
+            escalation_class("plan_policy_violation", None, "the plan still lists …"),
+            "plan_policy"
+        );
+        assert_eq!(
+            escalation_class("escalate", Some("xpp_toolchain_unavailable"), "no NuGet: x"),
+            "xpp_toolchain_unavailable"
+        );
+        assert_eq!(
+            escalation_class("escalate", Some("InvalidOutput"), "whatever: x"),
+            "invalid_output"
+        );
+        assert_eq!(
+            escalation_class("escalate", None, "approval_mismatch: the branch …"),
+            "approval_mismatch",
+            "fallback"
+        );
+        let m = machine(&[
+            Ev::Start,
+            Ev::Escalate {
+                reason: "no prefix here".into(),
+            },
+        ]);
+        let ev = transition_events(St::Planning, "escalate", &m, Some("policy_violation"));
+        assert_eq!(
+            ev[0],
+            EngineEvent::Escalated {
+                reason_class: "policy_violation".into(),
+                reason: "no prefix here".into()
+            }
+        );
     }
 
     #[test]
@@ -1171,6 +1376,69 @@ mod tests {
         let line = serde_json::to_string(&got[0]).unwrap();
         assert!(!line.contains("s3cr3t-value"), "{line}");
         assert!(line.contains("[REDACTED:K]"), "{line}");
+    }
+
+    /// R6: redaction fails closed — a secret equal to a state name used to make the redacted
+    /// event unreadable, and the recorder fell back to the unredacted one.
+    #[test]
+    fn redaction_never_falls_back_to_the_original_event() {
+        let c = Collect::default();
+        let r = Recorder::new(
+            "T-1",
+            1,
+            0,
+            Redactions::new(&[Secret {
+                name: "K".into(),
+                value: "Completed".into(),
+            }]),
+        )
+        .with(Box::new(c.clone()));
+        r.emit(EngineEvent::RunEnded {
+            state: St::Completed,
+            next_action: "done: Completed — merge it".into(),
+            from: Some(St::Reviewing),
+            error: Some("Completed twice".into()),
+        });
+        let got = c.0.lock().unwrap().clone();
+        match &got[0].event {
+            EngineEvent::RunEnded {
+                state,
+                next_action,
+                error,
+                ..
+            } => {
+                assert_eq!(*state, St::Completed, "the enum stays typed");
+                assert_eq!(next_action, "done: [REDACTED:K] — merge it");
+                assert_eq!(error.as_deref(), Some("[REDACTED:K] twice"));
+            }
+            e => panic!("{e:?}"),
+        }
+    }
+
+    /// R6: `seq` never panics or wraps; an implausible last `seq` restarts above the line count;
+    /// a complete object on an unterminated last line keeps its `seq`.
+    #[test]
+    fn seq_is_checked_and_an_unterminated_object_counts() {
+        assert_eq!(next_seq(41, 3), (42, None));
+        let (n, w) = next_seq(u64::MAX, 7);
+        assert_eq!(n, 8);
+        assert!(w.unwrap().contains("implausible"));
+        assert!(next_seq(SEQ_MAX, 1).1.is_some());
+        assert!(next_seq(SEQ_MAX - 1, 1).1.is_none());
+        // a recorder that starts at the end of the range saturates instead of wrapping
+        let c = Collect::default();
+        let r = Recorder::new("T", 1, u64::MAX, Redactions::empty()).with(Box::new(c.clone()));
+        r.emit(EngineEvent::BudgetWarning { used: 1, cap: 2 });
+        r.emit(EngineEvent::BudgetWarning { used: 1, cap: 2 });
+        assert!(c.0.lock().unwrap().iter().all(|e| e.seq == u64::MAX));
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(EVENTS_FILE);
+        std::fs::write(&p, "{\"seq\":1}\n{\"seq\":5}").unwrap();
+        assert_eq!(scan(&p), (5, 2));
+        assert_eq!(last_seq(&p), 5, "the next process does not reuse 5");
+        std::fs::write(&p, "{\"seq\":1}\n{\"seq\":5,\"ty").unwrap();
+        assert_eq!(scan(&p), (1, 1), "a partial object does not count");
     }
 
     #[test]

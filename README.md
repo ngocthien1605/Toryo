@@ -131,16 +131,16 @@ print one JSON document on stdout and nothing else there. Field names are snake_
     "id": "BR-003", "title": "…", "state": "WaitingFinalApproval",   // PipelineState
     "fix_cycle": 1, "max_fix_cycles": 3,
     "spent_tokens": 61234, "reserved_tokens": 0, "budget_tokens": null,   // R41; null = no admission cap
-    "active_owner": null,          // "user pid N" while another process holds the task lock
-    "compile_only": false,         // R59: an X++ verify proves compile level only
+    "active_owner": null,          // "user pid N" while a live process holds the task lock (never a lock probe)
+    "compile_only": false,         // R59: an X++ verify proves compile level only; null: frozen config unreadable
     "next_action": "review the branch toryo/BR-003 …"   // what `status` prints after `next:`
 } ] }
 // task show ID --json: the task object above, plus
 { "worktree": "…", "branch": "toryo/BR-003", "run_store": "…\\runs\\BR-003",
   "attempts": [ { "id": "BR-003/implement/1", "stage": "implement", "attempt": 1, "status": "succeeded",
                   "profile": "codex-openai", "error_class": null, "head_after": "<sha>", "partial_commit": null } ],
-  "usage": [ { "id": 3, "attempt": "BR-003/implement/1", "profile": "codex-openai", "accounting": "exact",
-               "budget_tokens": 51000, "reservation_tokens": null, "reconciled_by": null, "includes_unreported": false } ],
+  "usage": [ { "id": 3, "attempt": "BR-003/implement/1", "profile": "codex-openai", "accounting": "exact",   // counted_tokens: what the row counts (weighted)
+               "counted_tokens": 51000, "reservation_tokens": null, "reconciled_by": null, "includes_unreported": false } ],
   "gates": [ { "gate": "plan", "occurrence": 1, "status": "approved", "subject_digest": "…", "reason": null,
                "requested_at": "…", "resolved_at": "…" } ],
   "events_file": "…\\runs\\BR-003\\events.jsonl" }
