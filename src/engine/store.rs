@@ -245,6 +245,31 @@ impl Store {
         &self.path
     }
 
+    /// Run `f` in a deferred, read-only transaction (R6): it never takes the write lock, so a
+    /// poller (`watch`, `status`, `task show`, `usage`) never waits for — or delays — a writer.
+    /// Nothing `f` writes is kept (the transaction is rolled back).
+    pub fn read<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Transaction) -> Result<T> + Send + 'static,
+    {
+        let (rtx, rrx) = mpsc::channel();
+        let job: Job = Box::new(move |conn: &mut Connection| {
+            let res = panic::catch_unwind(AssertUnwindSafe(|| {
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+                let v = f(&tx)?;
+                tx.rollback()?;
+                Ok(v)
+            }))
+            .unwrap_or_else(|p| Err(anyhow!("store job panicked: {}", panic_message(&*p))));
+            let _ = rtx.send(res);
+        });
+        self.tx
+            .send(job)
+            .map_err(|_| anyhow!("store actor stopped"))?;
+        rrx.recv().map_err(|_| anyhow!("store actor stopped"))?
+    }
+
     /// Run `f` in one transaction on the actor thread; commit if it returns `Ok`. A panic in
     /// `f` rolls the transaction back and is returned as an error (the actor keeps serving).
     pub fn call<T, F>(&self, f: F) -> Result<T>
@@ -932,6 +957,9 @@ pub struct UsageIn<'a> {
     pub attempt: &'a str,
     pub stage: &'a str,
     pub profile: &'a str,
+    /// The model the turn ran with (C1): the role's, else the profile's; `None` when neither
+    /// names one (the CLI's default).
+    pub model: Option<&'a str>,
     pub billing: &'a str,
     /// The external session (Codex thread / Claude session) the counters belong to.
     pub session: Option<&'a str>,
@@ -960,8 +988,21 @@ fn from_counters(v: &Value) -> Buckets {
     }
 }
 
-/// Record one turn's usage (R41) and update the task's spent / reserved tokens. Returns the
-/// row id.
+/// What [`record_usage_in`] stored for a turn (R2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recorded {
+    /// The `usage` row.
+    pub id: i64,
+    /// The buckets of the row — for a cumulative adapter the delta against the session's
+    /// baseline, not the adapter's counters; `None` for a reservation.
+    pub buckets: Option<Buckets>,
+    pub accounting: Accounting,
+    /// The tokens reserved for a turn with no telemetry.
+    pub reservation: Option<i64>,
+}
+
+/// Record one turn's usage (R41) and update the task's spent / reserved tokens. Returns what
+/// was stored (R2): the row, its buckets after the delta, the accounting, the reservation.
 /// - nothing known → `unknown` with a reservation (config, else the largest exact turn of the
 ///   same stage in this task, else 200 000) — never zero;
 /// - `provisional` (a killed Claude turn's streamed counts) → charged as they are;
@@ -969,7 +1010,7 @@ fn from_counters(v: &Value) -> Buckets {
 ///   (a counter going down is a reset); killed turns of the same session not yet absorbed make
 ///   it `includes_unreported`, and when the adapter is proven to include them they are
 ///   `reconciled_by` this row and stop counting.
-pub fn record_usage_in(tx: &Transaction, u: &UsageIn) -> Result<i64> {
+pub fn record_usage_in(tx: &Transaction, u: &UsageIn) -> Result<Recorded> {
     let acc = u.usage.and_then(|x| x.buckets.map(|b| (b, x.accounting)));
     let at = now();
     match acc {
@@ -986,14 +1027,19 @@ pub fn record_usage_in(tx: &Transaction, u: &UsageIn) -> Result<i64> {
                     .unwrap_or(DEFAULT_UNKNOWN_RESERVATION),
             };
             tx.execute(
-                "INSERT INTO usage (task_id, stage_attempt_id, profile, billing_kind, accounting, reservation_tokens, at) VALUES (?1, ?2, ?3, ?4, 'unknown', ?5, ?6)",
-                params![u.task, u.attempt, u.profile, u.billing, res, at],
+                "INSERT INTO usage (task_id, stage_attempt_id, profile, model, billing_kind, accounting, reservation_tokens, at) VALUES (?1, ?2, ?3, ?4, ?5, 'unknown', ?6, ?7)",
+                params![u.task, u.attempt, u.profile, u.model, u.billing, res, at],
             )?;
             tx.execute(
                 "UPDATE tasks SET reserved_tokens = reserved_tokens + ?2 WHERE id = ?1",
                 params![u.task, res],
             )?;
-            Ok(tx.last_insert_rowid())
+            Ok(Recorded {
+                id: tx.last_insert_rowid(),
+                buckets: None,
+                accounting: Accounting::Unknown,
+                reservation: Some(res),
+            })
         }
         Some((b, acc)) => {
             let exact = acc == Accounting::Exact;
@@ -1044,12 +1090,13 @@ pub fn record_usage_in(tx: &Transaction, u: &UsageIn) -> Result<i64> {
             }
             let budget = delta.budget_tokens(&u.weights) as i64;
             tx.execute(
-                "INSERT INTO usage (task_id, stage_attempt_id, profile, billing_kind, uncached_input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens, budget_tokens, accounting, includes_unreported, at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                "INSERT INTO usage (task_id, stage_attempt_id, profile, model, billing_kind, uncached_input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens, budget_tokens, accounting, includes_unreported, at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     u.task,
                     u.attempt,
                     u.profile,
+                    u.model,
                     u.billing,
                     delta.uncached_input as i64,
                     delta.cache_read as i64,
@@ -1081,7 +1128,16 @@ pub fn record_usage_in(tx: &Transaction, u: &UsageIn) -> Result<i64> {
                     tx.execute("UPDATE tasks SET spent_tokens = spent_tokens - ?2, reserved_tokens = reserved_tokens - ?3 WHERE id = ?1", params![u.task, ds, dr])?;
                 }
             }
-            Ok(id)
+            Ok(Recorded {
+                id,
+                buckets: Some(delta),
+                accounting: if exact {
+                    Accounting::Exact
+                } else {
+                    Accounting::Provisional
+                },
+                reservation: None,
+            })
         }
     }
 }
@@ -1109,6 +1165,7 @@ pub fn record_usage(
             attempt,
             stage: &stage,
             profile,
+            model: None,
             billing,
             session: None,
             cumulative: false,
@@ -1160,6 +1217,40 @@ pub fn usage_rows(
                 r.get(6)?,
                 r.get::<_, i64>(7)? != 0,
             ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(v)
+}
+
+/// The usage rows of a task for `toryo usage` (C1): with the attempt's stage, the recorded model
+/// (NULL before M10: `None`), the four buckets and the vendor-reported cost.
+pub fn usage_detail(tx: &Transaction, task: &str) -> Result<Vec<super::usage_report::UsageRow>> {
+    let mut q = tx.prepare(
+        "SELECT u.id, a.stage, u.profile, u.model, u.billing_kind, COALESCE(u.uncached_input_tokens, 0), COALESCE(u.cache_read_tokens, 0), COALESCE(u.cache_write_tokens, 0), COALESCE(u.output_tokens, 0), u.accounting, u.reservation_tokens, u.reconciled_by, u.vendor_reported_cost_usd, u.includes_unreported
+         FROM usage u JOIN stage_attempts a ON a.id = u.stage_attempt_id WHERE u.task_id = ?1 ORDER BY u.id",
+    )?;
+    let v = q
+        .query_map([task], |r| {
+            let n = |i: usize| r.get::<_, i64>(i).map(|x| x.max(0) as u64);
+            Ok(super::usage_report::UsageRow {
+                id: r.get(0)?,
+                stage: r.get(1)?,
+                profile: r.get(2)?,
+                model: r.get(3)?,
+                billing_kind: r.get(4)?,
+                buckets: Buckets {
+                    uncached_input: n(5)?,
+                    cache_read: n(6)?,
+                    cache_write: n(7)?,
+                    output: n(8)?,
+                    reasoning: None,
+                },
+                accounting: r.get(9)?,
+                reservation_tokens: r.get(10)?,
+                reconciled_by: r.get(11)?,
+                vendor_reported_cost_usd: r.get(12)?,
+                includes_unreported: r.get::<_, i64>(13)? != 0,
+            })
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(v)
@@ -1533,6 +1624,47 @@ mod tests {
             "a request never reaches a newer owner"
         );
         assert_eq!(s.call(move |tx| pending_stop(tx, "T-2", g2)).unwrap(), None);
+    }
+
+    /// M10-R6: a read-only call does not wait for the write lock another connection holds (a
+    /// `call`, `BEGIN IMMEDIATE`, would wait up to the 15 s busy timeout), and keeps nothing.
+    #[test]
+    fn a_read_does_not_wait_for_a_writer() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("t.db");
+        let writer = Store::open(&p).unwrap();
+        let reader = Store::open(&p).unwrap();
+        writer.call(|tx| insert_task(tx, &new_task("T-R"))).unwrap();
+        let (held_tx, held_rx) = mpsc::channel();
+        let w = writer.clone();
+        let h = std::thread::spawn(move || {
+            w.call(move |tx| {
+                tx.execute("UPDATE tasks SET title = 'x' WHERE id = 'T-R'", [])?;
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_secs(3));
+                Ok(())
+            })
+            .unwrap()
+        });
+        held_rx.recv().unwrap();
+        let t = std::time::Instant::now();
+        let n: i64 = reader
+            .read(|tx| Ok(tx.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        // a write inside a read is not kept
+        reader
+            .read(|tx| {
+                let _ = tx.execute("DELETE FROM tasks", []);
+                Ok(())
+            })
+            .ok();
+        h.join().unwrap();
+        let n: i64 = reader
+            .read(|tx| Ok(tx.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     /// CODE-09: a panic inside a job is the caller's error; its writes roll back and the actor

@@ -68,10 +68,11 @@ impl<'a> Recovery<'a> {
                 Ok(Billing::Api) => "api",
                 _ => "subscription",
             };
-            (p, billing)
+            let model = super::usage_report::configured_model(self.cfg, &a.stage, &p);
+            (p, billing, model)
         });
         self.store.call(move |tx| {
-            if let Some((p, b)) = killed {
+            if let Some((p, b, model)) = killed {
                 if !store::has_usage(tx, &aid)? {
                     store::record_usage_in(
                         tx,
@@ -80,6 +81,7 @@ impl<'a> Recovery<'a> {
                             attempt: &aid,
                             stage: &stage,
                             profile: &p,
+                            model: model.as_deref(),
                             billing: b,
                             session: sess.as_deref(),
                             cumulative: false,

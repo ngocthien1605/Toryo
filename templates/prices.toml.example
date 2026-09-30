@@ -1,0 +1,30 @@
+# TODO(owner): replace the placeholder prices below with the prices of YOUR contracts
+# (Azure AI Foundry deployment, OpenAI/Anthropic API), then copy this file to
+#   %USERPROFILE%\.toryo\prices.toml
+# The numbers below are FAKE placeholders chosen to be obviously wrong — do not use them.
+#
+# `toryo usage <ID>` (plan §12) estimates the cost of the usage rows billed `foundry` or `api`
+# (the profile's `billing:`); `subscription` rows have no marginal cost and show `—`.
+# A machine file like toryo.local.yaml (R60): prices are facts about your contracts, not about
+# a repository. Unknown keys and negative prices are errors that name the key.
+
+# Recorded with every estimate: change it whenever a price changes.
+version = "0000-00-00-placeholder"
+
+# Every estimate is multiplied by this (headroom for rounding, retries, price drift). Default 1.0.
+safety_factor = 1.2
+
+# One table per model, keyed by the name the usage rows record: the role's `model:`, else the
+# profile's `model:` (for a Codex profile with a `codex.provider` block, the Foundry deployment
+# name). USD per million tokens, per bucket. All four are required.
+[models."my-foundry-deployment"]
+uncached_input = 9.99
+cache_read = 0.99
+cache_write = 0.0
+output = 99.99
+
+# [models."another-deployment"]
+# uncached_input = …
+# cache_read = …
+# cache_write = …
+# output = …

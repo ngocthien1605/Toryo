@@ -35,9 +35,10 @@ use super::checks::{
 };
 use super::context;
 use super::contracts;
+use super::flight::{EngineEvent, Recorder, TurnUsage};
 use super::lock::{StopWatch, TaskLock};
 use super::protect;
-use super::state::{GateKind, PipelineEvent as Ev, PipelineState as St};
+use super::state::{GateKind, Machine, PipelineEvent as Ev, PipelineState as St};
 use super::store::{self, AttemptEnd, AttemptRow, AttemptStatus, NewAttempt, Store, TaskRow};
 use super::task::{frozen_config, sha256_hex, task_git};
 use super::untrusted;
@@ -89,6 +90,12 @@ pub fn crash_point(name: &str) {
         if v.split(',').any(|p| p.trim() == name) {
             eprintln!("!! TORYO_TEST_CRASH_AT: crashing at `{name}`");
             std::process::exit(86);
+        }
+    }
+    // M10-R7: `TORYO_TEST_PANIC_AT=<point>` panics there instead (the unwinding path)
+    if let Ok(v) = std::env::var("TORYO_TEST_PANIC_AT") {
+        if v.split(',').any(|p| p.trim() == name) {
+            panic!("TORYO_TEST_PANIC_AT: panicking at `{name}`");
         }
     }
 }
@@ -157,6 +164,8 @@ pub struct Engine<'a> {
     store: &'a Store,
     hub: &'a AgentHub,
     lock: &'a TaskLock,
+    /// The engine's events (M10): the flight recorder, the stderr renderer, the notifier.
+    rec: &'a Recorder,
     pub cfg: Effective,
     g: GitCmd,
     id: String,
@@ -171,6 +180,7 @@ impl<'a> Engine<'a> {
         store: &'a Store,
         hub: &'a AgentHub,
         lock: &'a TaskLock,
+        rec: &'a Recorder,
         opts: RunOptions,
     ) -> Result<Self> {
         let id = lock.task.clone();
@@ -184,6 +194,7 @@ impl<'a> Engine<'a> {
             store,
             hub,
             lock,
+            rec,
             cfg,
             g,
             id,
@@ -208,12 +219,38 @@ impl<'a> Engine<'a> {
     }
 
     fn apply(&self, e: Ev) -> Result<St> {
+        self.apply_with(e, false, None)
+    }
+
+    /// Escalate with `reason`, printed as `!! reason` before the `[state]` line.
+    fn escalate(&self, class: &str, reason: String) -> Result<St> {
+        self.apply_with(Ev::Escalate { reason }, true, Some(class))
+    }
+
+    /// Apply `e` and report it; `reason_line`: the escalation or pause reason is printed (see
+    /// [`Self::end_with`] for the rule and its one exception, the budget pause).
+    fn apply_with(&self, e: Ev, reason_line: bool, class: Option<&str>) -> Result<St> {
         let i = self.id.clone();
         let from = self.task()?.state;
         let name = e.name();
         let m = self.store.call(move |tx| store::transition(tx, &i, e))?;
-        eprintln!("   [state] {from:?} --{name}--> {:?}", m.state());
+        self.rec
+            .transition_classed(from, name, &m, true, reason_line, class);
         Ok(m.state())
+    }
+
+    /// A running attempt ended: `stage_finished`. An attempt that had already ended is no
+    /// stage end (the checkpoint records its commit on the writing attempt).
+    fn stage_finished(&self, a: &AttemptRow, status: AttemptStatus, class: Option<String>) {
+        if a.status == AttemptStatus::Running {
+            self.rec.emit_quiet(EngineEvent::StageFinished {
+                stage: a.stage.clone(),
+                attempt: a.attempt,
+                status,
+                error_class: class,
+                duration_ms: super::flight::ms_since(&a.started_at),
+            });
+        }
     }
 
     fn limits(&self) -> TurnLimits {
@@ -302,7 +339,7 @@ impl<'a> Engine<'a> {
             return Ok(false);
         }
         if used * 10 >= b * 8 {
-            eprintln!("!! budget: {used} of {b} tokens used (≥ 80 %; admission cap, may overshoot by one turn)");
+            self.rec.emit(EngineEvent::BudgetWarning { used, cap: b });
         }
         Ok(true)
     }
@@ -313,7 +350,7 @@ impl<'a> Engine<'a> {
         eprintln!(
             "!! budget reached during the turn — interrupted (R41 live interrupt), the task pauses"
         );
-        self.end_and(
+        self.end_with(
             a,
             AttemptStatus::Interrupted,
             r,
@@ -323,6 +360,8 @@ impl<'a> Engine<'a> {
                 ..Default::default()
             },
             Some(Ev::BudgetExceeded),
+            None,
+            false,
             None,
         )?;
         Ok(Flow::Next)
@@ -369,8 +408,7 @@ impl<'a> Engine<'a> {
             // R35: nothing runs while protected state differs from the baseline in force
             if t.state.is_running() {
                 if let Some(reason) = self.protected_violation(&t, false)? {
-                    eprintln!("!! {reason}");
-                    self.apply(Ev::Escalate { reason })?;
+                    self.escalate(protect::REASON, reason)?;
                     continue;
                 }
             }
@@ -390,7 +428,7 @@ impl<'a> Engine<'a> {
                         GateKind::Final
                     };
                     eprintln!("({kind:?} gate approved automatically: --yes)");
-                    approve_now(self.store, &t, kind, None)?;
+                    approve_now(self.store, self.rec, &t, kind, None)?;
                     Flow::Next
                 }
                 St::Implementing | St::Fixing => self.implement(&t)?,
@@ -439,7 +477,7 @@ impl<'a> Engine<'a> {
             head_before: Some(&head),
             subject_commit: None,
         })?;
-        eprintln!("\n── PLAN (attempt {}, {}) ──", a.attempt, t.planner);
+        self.stage_started(&a, None);
         crash_point("plan:after_begin");
         let Some(ctx) = self.context(t, &a, &t.planner)? else {
             return Ok(Flow::Next);
@@ -496,7 +534,6 @@ impl<'a> Engine<'a> {
         let plan = match plan_output(output) {
             Ok(plan) => plan,
             Err(reason) => {
-                eprintln!("!! {reason}");
                 self.end_and(
                     &a,
                     AttemptStatus::Failed,
@@ -560,7 +597,7 @@ impl<'a> Engine<'a> {
         // here means the chain was used up
         let Some(profile) = implementer_at(t, t.implementer_index, self.opts.no_fallback) else {
             let reason = implementer_quota_reason(&t.implementers.join(" → "));
-            self.apply(Ev::Pause { reason })?;
+            self.apply_with(Ev::Pause { reason }, true, None)?;
             return Ok(Flow::Next);
         };
         let turn = self.prepare_implement(t, profile)?;
@@ -638,12 +675,7 @@ impl<'a> Engine<'a> {
             head_before: Some(&head_before),
             subject_commit: None,
         })?;
-        eprintln!(
-            "\n── {} (attempt {}, {}) ──",
-            turn.stage.to_uppercase(),
-            a.attempt,
-            turn.profile
-        );
+        self.stage_started(&a, None);
         crash_point("implement:after_begin");
         let Some((ctx, data)) = self.context_and_data(t, &a, &turn.profile)? else {
             return Ok(None);
@@ -677,7 +709,7 @@ impl<'a> Engine<'a> {
             hooks,
         )?;
         crash_point("implement:after_turn");
-        self.usage(&a, &turn.profile, &r)?;
+        self.usage(&a, &turn.profile, &r, turn.model.as_deref())?;
         Ok(Some(ImplementRun {
             budget_hit: budget_hit.load(Ordering::SeqCst),
             attempt: a,
@@ -778,7 +810,6 @@ impl<'a> Engine<'a> {
                 self.switch_implementer(t, &turn.profile, run, wt, reason)
             }
             ImplementOutcome::GitViolation { reason } => {
-                eprintln!("!! {reason}");
                 self.end_and(
                     a,
                     AttemptStatus::Failed,
@@ -794,7 +825,6 @@ impl<'a> Engine<'a> {
                 Ok(Flow::Next)
             }
             ImplementOutcome::ProtectedChanged { reason } => {
-                eprintln!("!! {reason}");
                 self.end_and(
                     a,
                     AttemptStatus::Failed,
@@ -828,13 +858,15 @@ impl<'a> Engine<'a> {
             }
             ImplementOutcome::Failed { reason } => {
                 r.print_summary();
-                self.end_and(
+                self.end_with(
                     a,
                     AttemptStatus::Failed,
                     r,
                     AttemptEnd::default(),
                     Some(Ev::Escalate { reason }),
                     None,
+                    true,
+                    Some("implementer_failed"),
                 )?;
                 Ok(Flow::Next)
             }
@@ -922,13 +954,13 @@ impl<'a> Engine<'a> {
         let sha = wt.commit(&FailedTurn::message(t, a), &partial_trailers(t, a), false)?;
         crash_point("implement:after_partial_commit");
         let escalation = failed.escalation(&sha);
-        match &escalation {
-            Some(why) => eprintln!("!! {why}"),
-            None => eprintln!(
+        // an escalation's reason is printed with its event
+        if escalation.is_none() {
+            eprintln!(
                 "!! {}; {} — the stage runs again from it (once, §11)",
                 failed.reason,
                 FailedTurn::kept(&sha)
-            ),
+            );
         }
         let note = failed.note(a, &sha);
         let end = AttemptEnd {
@@ -937,18 +969,25 @@ impl<'a> Engine<'a> {
         };
         let (i, aid) = (self.id.clone(), a.id.clone());
         let from = self.task()?.state;
+        let class = end.error_class.clone();
         let to = self.store.call(move |tx| {
             store::finish_attempt(tx, &aid, AttemptStatus::Failed, &end)?;
             store::set_handoff(tx, &i, Some(&note))?;
             match escalation {
-                Some(reason) => Ok(Some(
-                    store::transition(tx, &i, Ev::Escalate { reason })?.state(),
-                )),
+                Some(reason) => Ok(Some(store::transition(tx, &i, Ev::Escalate { reason })?)),
                 None => Ok(None),
             }
         })?;
-        if let Some(to) = to {
-            eprintln!("   [state] {from:?} --escalate--> {to:?}");
+        self.stage_finished(a, AttemptStatus::Failed, class);
+        if let Some(m) = to {
+            self.rec.transition_classed(
+                from,
+                "escalate",
+                &m,
+                true,
+                true,
+                Some("implementer_failed"),
+            );
         }
         Ok(Flow::Next)
     }
@@ -994,22 +1033,22 @@ impl<'a> Engine<'a> {
         let pause = next.is_none();
         let payload =
             json!({"from": profile, "to": next, "reason": reason, "partial_changes": changed});
-        self.store.call(move |tx| {
+        let (from, class) = (self.task()?.state, end.error_class.clone());
+        let paused = self.store.call(move |tx| {
             store::finish_attempt(tx, &aid, AttemptStatus::Failed, &end)?;
             store::set_implementer_index(tx, &i, idx)?;
             store::set_handoff(tx, &i, Some(&note))?;
             store::event(tx, Some(&i), Some(&aid), "implementer_switch", &payload)?;
             if pause {
-                store::transition(
-                    tx,
-                    &i,
-                    Ev::Pause {
-                        reason: implementer_quota_reason(&reason),
-                    },
-                )?;
+                let reason = implementer_quota_reason(&reason);
+                return Ok(Some(store::transition(tx, &i, Ev::Pause { reason })?));
             }
-            Ok(())
+            Ok(None)
         })?;
+        self.stage_finished(&run.attempt, AttemptStatus::Failed, class);
+        if let Some(m) = paused {
+            self.rec.transition(from, "pause", &m, false, false);
+        }
         Ok(Flow::Next)
     }
 
@@ -1054,14 +1093,17 @@ impl<'a> Engine<'a> {
         }
         .with_context(|| format!("no `{stage}` attempt to checkpoint"))?;
         let implementer = a.profile.clone().unwrap_or_default();
-        let (head, kind) = match wt.find_checkpoint(&t.base_commit, &t.id, &stage, a.attempt)? {
-            Some(c) if !c.partial => {
-                eprintln!(
-                    "✔ checkpoint {} already committed (trailer match)",
-                    short(&c.sha)
-                );
-                (c.sha, if c.no_change { "no_change" } else { "normal" })
-            }
+        let (head, kind, found) = match wt.find_checkpoint(
+            &t.base_commit,
+            &t.id,
+            &stage,
+            a.attempt,
+        )? {
+            Some(c) if !c.partial => (
+                c.sha,
+                if c.no_change { "no_change" } else { "normal" },
+                true,
+            ),
             _ => {
                 // §8: deny paths are checked again right before the commit
                 let denied: Vec<String> = wt
@@ -1072,8 +1114,7 @@ impl<'a> Engine<'a> {
                     .collect();
                 if !denied.is_empty() {
                     let reason = format!("policy_violation: denied paths {denied:?} would be committed (policy.deny_paths); nothing was committed");
-                    eprintln!("!! {reason}");
-                    self.apply(Ev::Escalate { reason })?;
+                    self.escalate("policy_violation", reason)?;
                     return Ok(Flow::Next);
                 }
                 let no_change = wt.nothing_to_commit()?;
@@ -1088,7 +1129,7 @@ impl<'a> Engine<'a> {
                 }
                 let sha = wt.commit(&format!("toryo({}): {stage}", t.id), &tr, no_change)?;
                 crash_point("checkpoint:after_commit");
-                (sha, if no_change { "no_change" } else { "normal" })
+                (sha, if no_change { "no_change" } else { "normal" }, false)
             }
         };
         let full = self
@@ -1107,7 +1148,11 @@ impl<'a> Engine<'a> {
             &inc,
             "DIFF-incremental.patch",
         )?;
-        eprintln!("✔ checkpoint {} ({kind})", short(&head));
+        self.rec.emit(EngineEvent::CheckpointCreated {
+            head: head.clone(),
+            kind: kind.to_string(),
+            found,
+        });
         // R35: a committed tracked protected change allowed by TASK.md becomes the new baseline
         let c = protect::check(self.store, t, &self.g, &self.protect)?;
         let allowed: Vec<String> = c
@@ -1166,7 +1211,6 @@ impl<'a> Engine<'a> {
             Ok(x) => x,
             Err(e) => {
                 let reason = format!("{e:#}");
-                eprintln!("!! {reason}");
                 self.escalate_attempt(&a, xpp::UNAVAILABLE.into(), reason)?;
                 return Ok(Flow::Next);
             }
@@ -1174,11 +1218,9 @@ impl<'a> Engine<'a> {
         let Some((b, co)) = self.verify_checkout(t, &a, &head)? else {
             return Ok(Flow::Next);
         };
-        eprintln!(
-            "\n── VERIFY (attempt {}, {} in {}) ──",
-            a.attempt,
-            verify::describe(b),
-            co.dir.display()
+        self.stage_started(
+            &a,
+            Some(format!("{} in {}", verify::describe(b), co.dir.display())),
         );
         let stop = self.lock.watch_stop();
         let Some((results, failure)) = self.run_verify_commands(b, &co, &stop, xpp.as_ref())?
@@ -1225,13 +1267,11 @@ impl<'a> Engine<'a> {
             "VERIFY_RESULT.json",
         )?;
         if let Some(reason) = mutated {
-            eprintln!("!! {reason}");
             self.escalate_attempt(&a, verify::MUTATED.into(), reason)?;
             return Ok(Flow::Next);
         }
         // R35: the verify run must not have touched protected state
         if let Some(reason) = self.protected_violation(t, false)? {
-            eprintln!("!! {reason}");
             self.escalate_attempt(&a, protect::REASON.into(), reason)?;
             return Ok(Flow::Next);
         }
@@ -1265,7 +1305,6 @@ impl<'a> Engine<'a> {
                     || format!("{e:#}").starts_with(verify::MUTATED) =>
             {
                 let reason = format!("{e:#}");
-                eprintln!("!! {reason}");
                 self.escalate_attempt(a, reason_class(&reason, verify::UNAVAILABLE), reason)?;
                 Ok(None)
             }
@@ -1368,16 +1407,13 @@ impl<'a> Engine<'a> {
         if res.cancelled || stop.stopped() {
             return Ok(None);
         }
-        let exit = match res.exit {
-            Some(code) => format!("exit {code}"),
-            None if res.timed_out => "timed out".to_string(),
-            None => "no exit code".to_string(),
-        };
-        eprintln!(
-            "  {} {name} ({exit}, {:.1}s)",
-            if res.ok() { "✔" } else { "✘" },
-            res.duration_ms as f64 / 1000.0
-        );
+        self.rec.emit(EngineEvent::VerifyCommand {
+            name,
+            exit: res.exit,
+            timed_out: res.timed_out,
+            ok: res.ok(),
+            duration_ms: res.duration_ms as u64,
+        });
         Ok(Some(res))
     }
 
@@ -1419,15 +1455,11 @@ impl<'a> Engine<'a> {
             head_before: Some(&head),
             subject_commit: Some(&head),
         })?;
-        eprintln!(
-            "\n── REVIEW (attempt {}, {}{}) ──",
-            a.attempt,
-            t.reviewer,
-            if resume.is_some() {
-                ", resuming the interrupted session"
-            } else {
-                ""
-            }
+        self.stage_started(
+            &a,
+            resume
+                .is_some()
+                .then(|| "resuming the interrupted session".to_string()),
         );
         crash_point("review:after_begin");
         let Some(ctx) = self.context(t, &a, &t.reviewer)? else {
@@ -1677,7 +1709,8 @@ impl<'a> Engine<'a> {
             self.limits(),
             hooks,
         )?;
-        self.usage(a, profile, &r)?;
+        let model = self.role_model(role.as_str());
+        self.usage(a, profile, &r, model.as_deref())?;
         if let Some(flow) = self.cut_short(a, &r, budget_hit.load(Ordering::SeqCst))? {
             return Ok(Err(flow));
         }
@@ -1728,7 +1761,6 @@ impl<'a> Engine<'a> {
     ) -> Result<Flow> {
         last.print_summary();
         let reason = read_only_failure(role, class, last.error_detail.as_deref(), retries);
-        eprintln!("!! {reason}");
         self.end_and(
             a,
             AttemptStatus::Failed,
@@ -1791,7 +1823,6 @@ impl<'a> Engine<'a> {
         ) = r.error_class
         {
             let reason = format!("{role}_quota: {c:?} {} — `toryo resume {}` when the quota is back (no {role} fallback in v0.1)", r.error_detail.clone().unwrap_or_default(), t.id);
-            eprintln!("!! {reason}");
             self.end_and(
                 a,
                 AttemptStatus::Failed,
@@ -1803,7 +1834,6 @@ impl<'a> Engine<'a> {
             return Ok(Some(Flow::Next));
         }
         if let Some(reason) = self.protected_violation(t, false)? {
-            eprintln!("!! {reason}");
             self.end_and(
                 a,
                 AttemptStatus::Failed,
@@ -1819,7 +1849,6 @@ impl<'a> Engine<'a> {
         }
         let after = TreeState::read(&Worktree::new(&self.g, &t.worktree))?;
         if let Some(reason) = read_only_write(before, &after) {
-            eprintln!("!! {reason}");
             self.end_and(
                 a,
                 AttemptStatus::Failed,
@@ -1881,7 +1910,6 @@ impl<'a> Engine<'a> {
             Ok(r) => r,
             Err(e) if format!("{e:#}").starts_with("artifact_") => {
                 let reason = format!("{e:#}");
-                eprintln!("!! {reason}");
                 self.escalate_attempt(a, reason_class(&reason, "artifact_tampered"), reason)?;
                 return Ok(None);
             }
@@ -1953,8 +1981,21 @@ impl<'a> Engine<'a> {
 
     /// Record the turn's usage (R41): cumulative adapters store the delta against the
     /// session baseline; a turn that did not complete counts its streamed usage as provisional.
-    fn usage(&self, a: &AttemptRow, profile: &str, r: &StageOutcome) -> Result<()> {
+    /// `requested`: the model the engine asked the adapter for; the row records the one the turn
+    /// ran with (C1).
+    fn usage(
+        &self,
+        a: &AttemptRow,
+        profile: &str,
+        r: &StageOutcome,
+        requested: Option<&str>,
+    ) -> Result<()> {
         let caps = self.hub.capabilities(profile)?;
+        let model = self
+            .cfg
+            .profile(profile)
+            .ok()
+            .and_then(|p| super::usage_report::effective_model(requested, p));
         let mut u = r.usage;
         if let Some(x) = &mut u {
             if !r.success && (r.cancelled || r.timed_out) && x.accounting == Accounting::Exact {
@@ -1977,7 +2018,7 @@ impl<'a> Engine<'a> {
             r.session_id.clone(),
             self.weights(),
         );
-        self.store.call(move |tx| {
+        let stored = self.store.call(move |tx| {
             store::record_usage_in(
                 tx,
                 &store::UsageIn {
@@ -1985,6 +2026,7 @@ impl<'a> Engine<'a> {
                     attempt: &aid,
                     stage: &stage,
                     profile: &p,
+                    model: model.as_deref(),
                     billing: b,
                     session: sess.as_deref(),
                     cumulative: caps.cumulative_on_resume == Tri::Yes,
@@ -1994,8 +2036,33 @@ impl<'a> Engine<'a> {
                     reservation,
                 },
             )
-            .map(|_| ())
-        })
+        })?;
+        // R2: what the store recorded (a cumulative adapter's delta, the accounting after a
+        // cut-short turn), never the adapter's raw counters
+        self.rec.emit_quiet(EngineEvent::TurnFinished {
+            stage: a.stage.clone(),
+            attempt: a.attempt,
+            profile: profile.to_string(),
+            success: r.success,
+            usage: stored.buckets.map(|buckets| TurnUsage {
+                buckets,
+                accounting: stored.accounting,
+            }),
+            reserved_tokens: stored.reservation,
+            duration_ms: r.duration_ms as u64,
+        });
+        Ok(())
+    }
+
+    /// The stage header was printed: `stage_started`. `detail`: what the header shows after
+    /// the profile.
+    fn stage_started(&self, a: &AttemptRow, detail: Option<String>) {
+        self.rec.emit(EngineEvent::StageStarted {
+            stage: a.stage.clone(),
+            attempt: a.attempt,
+            profile: a.profile.clone(),
+            detail,
+        });
     }
 
     fn end(
@@ -2008,8 +2075,28 @@ impl<'a> Engine<'a> {
         self.end_and(a, status, r, end, None, None)
     }
 
-    /// Finish the attempt, optionally set the feedback and apply a transition — one transaction.
+    /// Finish the attempt, optionally set the feedback and apply a transition — one
+    /// transaction. An escalation's or pause's reason is printed (`!! reason`) before the
+    /// `[state]` line.
     fn end_and(
+        &self,
+        a: &AttemptRow,
+        status: AttemptStatus,
+        r: &StageOutcome,
+        end: AttemptEnd,
+        e: Option<Ev>,
+        feedback: Option<Option<String>>,
+    ) -> Result<()> {
+        self.end_with(a, status, r, end, e, feedback, true, None)
+    }
+
+    /// [`Self::end_and`]; `reason_line: false` only for a stop whose reason another line already
+    /// says — the budget pauses print `!! budget reached during the turn …` or `!! admission cap
+    /// reached …` themselves. The rule (M10-R5): every transition into `Escalated` or `Paused`
+    /// prints its reason exactly once, before its `[state]` line; no caller prints `!! reason` itself.
+    /// `class`: the escalation's class when it is not the attempt's error class (R6).
+    #[allow(clippy::too_many_arguments)]
+    fn end_with(
         &self,
         a: &AttemptRow,
         status: AttemptStatus,
@@ -2017,6 +2104,8 @@ impl<'a> Engine<'a> {
         mut end: AttemptEnd,
         e: Option<Ev>,
         feedback: Option<Option<String>>,
+        reason_line: bool,
+        class: Option<&str>,
     ) -> Result<()> {
         if end.error_class.is_none() {
             end.error_class = r.error_class.map(|c| format!("{c:?}"));
@@ -2028,25 +2117,30 @@ impl<'a> Engine<'a> {
         let (i, aid) = (self.id.clone(), a.id.clone());
         let from = self.task()?.state;
         let name = e.as_ref().map(|e| e.name());
+        let error_class = end.error_class.clone();
+        let class = class.map(str::to_string).or_else(|| error_class.clone());
         let to = self.store.call(move |tx| {
             store::finish_attempt(tx, &aid, status, &end)?;
             if let Some(f) = feedback {
                 store::set_feedback(tx, &i, f.as_deref())?;
             }
             match e {
-                Some(e) => Ok(Some(store::transition(tx, &i, e)?.state())),
+                Some(e) => Ok(Some(store::transition(tx, &i, e)?)),
                 None => Ok(None),
             }
         })?;
-        if let (Some(to), Some(name)) = (to, name) {
-            eprintln!("   [state] {from:?} --{name}--> {to:?}");
+        self.stage_finished(a, status, error_class);
+        if let (Some(m), Some(name)) = (to, name) {
+            self.rec
+                .transition_classed(from, name, &m, true, reason_line, class.as_deref());
         }
         Ok(())
     }
 
     /// Finish the attempt with `end` as given, optionally set the feedback and apply a
     /// transition — one transaction. Unlike `end_and` there is no turn outcome to take the
-    /// error or the session from, and no `[state]` line is printed.
+    /// error or the session from, and no `[state]` line is printed (the escalation reason of
+    /// `escalate_attempt` is).
     fn finish_and(
         &self,
         a: &AttemptRow,
@@ -2056,20 +2150,29 @@ impl<'a> Engine<'a> {
         e: Option<Ev>,
     ) -> Result<()> {
         let (i, aid) = (self.id.clone(), a.id.clone());
-        self.store.call(move |tx| {
+        let from = self.task()?.state;
+        let name = e.as_ref().map(|e| e.name());
+        let class = end.error_class.clone();
+        let to: Option<Machine> = self.store.call(move |tx| {
             store::finish_attempt(tx, &aid, status, &end)?;
             if let Some(f) = feedback {
                 store::set_feedback(tx, &i, f.as_deref())?;
             }
-            if let Some(e) = e {
-                store::transition(tx, &i, e)?;
+            match e {
+                Some(e) => Ok(Some(store::transition(tx, &i, e)?)),
+                None => Ok(None),
             }
-            Ok(())
-        })
+        })?;
+        self.stage_finished(a, status, class.clone());
+        if let (Some(m), Some(name)) = (to, name) {
+            self.rec
+                .transition_classed(from, name, &m, false, true, class.as_deref());
+        }
+        Ok(())
     }
 
     /// Fail the attempt with `class` and escalate the task with `reason` (one transaction;
-    /// the caller prints the reason).
+    /// its reason is printed with the escalation, R5).
     fn escalate_attempt(&self, a: &AttemptRow, class: String, reason: String) -> Result<()> {
         self.finish_and(
             a,
@@ -3325,7 +3428,13 @@ fn claude_implementer_prompt(base: &str) -> String {
 /// changes in the worktree (an IDE's `.vs/`, `.idea/`) are not part of the checkpoint: a
 /// one-line note, not a refusal (owner decision, F6). A refused approval is an error:
 /// nothing was approved.
-pub fn approve_now(store: &Store, t: &TaskRow, kind: GateKind, expect: Option<&str>) -> Result<()> {
+pub fn approve_now(
+    store: &Store,
+    rec: &Recorder,
+    t: &TaskRow,
+    kind: GateKind,
+    expect: Option<&str>,
+) -> Result<()> {
     let gate = t
         .machine
         .gate()
@@ -3355,6 +3464,7 @@ pub fn approve_now(store: &Store, t: &TaskRow, kind: GateKind, expect: Option<&s
             if let Some(reason) = approval_mismatch(&g, t, &gate.subject)? {
                 withdraw_final(
                     store,
+                    rec,
                     t,
                     Ev::Escalate {
                         reason: reason.clone(),
@@ -3363,7 +3473,7 @@ pub fn approve_now(store: &Store, t: &TaskRow, kind: GateKind, expect: Option<&s
                 bail!("{reason}");
             }
             if !verify_current(store, t)? {
-                withdraw_final(store, t, Ev::Reverify)?;
+                withdraw_final(store, rec, t, Ev::Reverify)?;
                 bail!(
                     "{}: checkpoint {} has no current passing verify result (e.g. the verify configuration was reloaded) — nothing was approved; the final gate was withdrawn: `toryo run {}` verifies the checkpoint again (R29)",
                     t.id,
@@ -3380,14 +3490,9 @@ pub fn approve_now(store: &Store, t: &TaskRow, kind: GateKind, expect: Option<&s
             }
         }
     };
-    let i = t.id.clone();
+    let (i, name) = (t.id.clone(), e.name());
     let m = store.call(move |tx| store::transition(tx, &i, e))?;
-    eprintln!(
-        "   [state] {:?} --{}_approved--> {:?}",
-        t.state,
-        gate_name(kind),
-        m.state()
-    );
+    rec.transition(t.state, name, &m, true, false);
     let digest = gate_digest(store, &t.id, kind, gate.occurrence).unwrap_or_default();
     super::decisions::append(
         store,
@@ -3405,7 +3510,13 @@ pub fn approve_now(store: &Store, t: &TaskRow, kind: GateKind, expect: Option<&s
 }
 
 /// Reject the open gate with a reason; the revision opens a new occurrence (R44a).
-pub fn reject_now(store: &Store, t: &TaskRow, kind: GateKind, reason: &str) -> Result<()> {
+pub fn reject_now(
+    store: &Store,
+    rec: &Recorder,
+    t: &TaskRow,
+    kind: GateKind,
+    reason: &str,
+) -> Result<()> {
     let gate = t
         .machine
         .gate()
@@ -3422,9 +3533,11 @@ pub fn reject_now(store: &Store, t: &TaskRow, kind: GateKind, reason: &str) -> R
             GateKind::Final => (Ev::FinalRejected { occurrence: gate.occurrence, reason: r.clone() }, format!("- HUMAN (final gate): {r}\n")),
         };
         store::set_feedback(tx, &i, Some(&fb))?;
-        store::transition(tx, &i, e)
+        Ok((e.name(), store::transition(tx, &i, e)?))
     })?;
-    eprintln!("   [state] {:?} --rejected--> {:?}", t.state, m.state());
+    let (name, m) = m;
+    // R7: a rejection at the fix-cycle bound escalates: its reason is printed like every other
+    rec.transition(t.state, name, &m, true, m.state() == St::Escalated);
     super::decisions::append(
         store,
         t,
@@ -3499,10 +3612,13 @@ fn uncommitted_note(changed: &[String], checkpoint: &str) -> Option<String> {
 }
 
 /// Withdraw the open final gate with `e` (`Escalate`, `Reverify`): the approval is refused.
-fn withdraw_final(store: &Store, t: &TaskRow, e: Ev) -> Result<()> {
+fn withdraw_final(store: &Store, rec: &Recorder, t: &TaskRow, e: Ev) -> Result<()> {
     let (i, name) = (t.id.clone(), e.name());
+    // the only escalation that withdraws the final gate is §11 `approval_mismatch` (R32)
+    let class = matches!(e, Ev::Escalate { .. }).then_some("approval_mismatch");
     let m = store.call(move |tx| store::transition(tx, &i, e))?;
-    eprintln!("   [state] {:?} --{name}--> {:?}", t.state, m.state());
+    // the refusal is the command's error: the escalation reason is not printed twice
+    rec.transition_classed(t.state, name, &m, true, false, class);
     Ok(())
 }
 

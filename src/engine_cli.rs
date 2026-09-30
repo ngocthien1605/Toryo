@@ -11,6 +11,7 @@ use clap::{Subcommand, ValueEnum};
 
 use toryo::agents::claude::LaunchMode;
 use toryo::agents::hub::AgentHub;
+use toryo::engine::flight::{EngineEvent, Recorder};
 use toryo::engine::lock::{self, StopOutcome, TaskLock};
 use toryo::engine::recovery::Recovery;
 use toryo::engine::runner::{
@@ -19,6 +20,7 @@ use toryo::engine::runner::{
 use toryo::engine::snapshot;
 use toryo::engine::store::{self, Store, TaskRow};
 use toryo::engine::task::{self, frozen_config, CreateArgs};
+use toryo::engine::views::{self, TaskFacts};
 use toryo::engine::worktree::Worktree;
 use toryo::engine::{GateKind, PipelineEvent, PipelineState};
 
@@ -53,6 +55,16 @@ pub struct DriveArgs {
     /// Scripted agents instead of the real CLIs (tests / demos; plan §6.4)
     #[arg(long, hide = true)]
     fake_agents: Option<PathBuf>,
+    /// M10: a Windows toast when the task needs you (a gate, an escalation, a pause, the end),
+    /// whatever `notify.toast` in the machine config says
+    #[arg(long, conflicts_with = "no_notify")]
+    notify: bool,
+    /// M10: no toast, whatever `notify.toast` in the machine config says
+    #[arg(long)]
+    no_notify: bool,
+    /// The machine config in use (`--machine-config`, else the default): where `notify:` is read.
+    #[arg(skip)]
+    pub machine_config: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -74,9 +86,18 @@ pub enum TaskCmd {
         max_fix_cycles: Option<u32>,
     },
     /// All tasks with state and the next human action.
-    List,
+    List {
+        /// One JSON document on stdout (the `status --json` schema)
+        #[arg(long)]
+        json: bool,
+    },
     /// One task: state, stage attempts, gate occurrences.
-    Show { id: String },
+    Show {
+        id: String,
+        /// One JSON document on stdout: the task, its attempts, usage rows, gates, events file
+        #[arg(long)]
+        json: bool,
+    },
     /// The frozen configuration (R35). `--reload` re-reads toryo.yaml + the machine config,
     /// shows the diff and applies it — waiting states only (a gate, Escalated, Paused).
     Config {
@@ -153,6 +174,13 @@ fn get(store: &Store, id: &str) -> Result<TaskRow> {
     store.call(move |tx| store::get_task(tx, &i))
 }
 
+/// [`get`] in a read-only transaction (R6): for the commands that only look (`status`, `task
+/// show`, `usage`, `watch`).
+fn read_task(store: &Store, id: &str) -> Result<TaskRow> {
+    let i = id.to_string();
+    store.read(move |tx| store::get_task(tx, &i))
+}
+
 fn hub_for(t: &TaskRow, d: &DriveArgs) -> Result<AgentHub> {
     let cfg = frozen_config(t)?;
     let fake = d.fake_agents.as_deref();
@@ -199,22 +227,211 @@ fn hub_for(t: &TaskRow, d: &DriveArgs) -> Result<AgentHub> {
     AgentHub::new(&cfg, LaunchMode::Restricted, fake)
 }
 
-/// Recover (if needed) and run the locked task until it waits, finishes or is stopped.
-fn drive(store: &Store, lock: &TaskLock, d: &DriveArgs) -> Result<i32> {
+/// The flight recorder of a command holding the task lock (M10).
+fn recorder(t: &TaskRow, lock: &TaskLock) -> Recorder {
+    Recorder::for_task(t, lock.generation)
+}
+
+/// The recorder of a drive command: [`recorder`] plus the toast notifier when toasts are on
+/// (`--notify` / `--no-notify`, else `notify.toast` of the machine config, M10-D1).
+fn drive_recorder(t: &TaskRow, lock: &TaskLock, d: &DriveArgs) -> Recorder {
+    let rec = recorder(t, lock);
+    if toryo::notify::enabled(d.notify, d.no_notify, machine_notify(d)) {
+        let n = toryo::notify::Notifier::system();
+        // R4 (Q2): with --yes the gates are approved automatically — nobody has to act on them
+        rec.with(Box::new(if d.yes { n.without_gates() } else { n }))
+    } else {
+        rec
+    }
+}
+
+/// `notify:` of the machine config in use; a machine config that cannot be read turns toasts
+/// off with a warning (the run itself uses the frozen configuration).
+fn machine_notify(d: &DriveArgs) -> toryo::config::Notify {
+    match d.machine_config.as_deref().filter(|p| p.exists()) {
+        Some(p) => match toryo::config::MachineConfig::load(p) {
+            Ok(m) => m.notify,
+            Err(e) => {
+                eprintln!("WARNING: {e:#} — no toasts");
+                Default::default()
+            }
+        },
+        None => Default::default(),
+    }
+}
+
+/// Record a state change a command made outside the engine (`event`: the pipeline event's
+/// name), if the state changed. The CLI prints no `[state]` line for these.
+fn recorded(rec: &Recorder, from: PipelineState, event: &str, now: &TaskRow) {
+    if now.state != from {
+        rec.transition(from, event, &now.machine, false, false);
+    }
+}
+
+fn st_attempts(store: &Store, id: &str) -> Result<Vec<store::AttemptRow>> {
+    let i = id.to_string();
+    store.call(move |tx| store::attempts(tx, &i))
+}
+
+/// R6: the attempts §10 recovery ended (they were `running` before it) get their
+/// `stage_finished`, and a killed turn's reservation its `turn_finished` — quiet events, like the
+/// engine's own.
+fn recovered_events(
+    store: &Store,
+    rec: &Recorder,
+    id: &str,
+    running: &[store::AttemptRow],
+    usage_before: &[i64],
+) -> Result<()> {
+    if running.is_empty() {
+        return Ok(());
+    }
+    let now = st_attempts(store, id)?;
+    let i = id.to_string();
+    let usage = store.call(move |tx| store::usage_rows(tx, &i))?;
+    for before in running {
+        let Some(a) = now
+            .iter()
+            .find(|a| a.id == before.id && a.status != store::AttemptStatus::Running)
+        else {
+            continue;
+        };
+        let reserved = usage
+            .iter()
+            // R7: only a row recovery inserted — the crashed process emitted its own rows
+            .find(|u| u.1 == a.id && u.3 == "unknown" && !usage_before.contains(&u.0))
+            .and_then(|u| u.5);
+        if let (Some(n), Some(p)) = (reserved, &a.profile) {
+            rec.emit_quiet(EngineEvent::TurnFinished {
+                stage: a.stage.clone(),
+                attempt: a.attempt,
+                profile: p.clone(),
+                success: false,
+                usage: None,
+                reserved_tokens: Some(n),
+                duration_ms: toryo::engine::flight::ms_since(&a.started_at),
+            });
+        }
+        rec.emit_quiet(EngineEvent::StageFinished {
+            stage: a.stage.clone(),
+            attempt: a.attempt,
+            status: a.status,
+            error_class: a.error_class.clone(),
+            duration_ms: toryo::engine::flight::ms_since(&a.started_at),
+        });
+    }
+    Ok(())
+}
+
+/// Recover (if needed) and run the locked task until it waits, finishes or is stopped. Every
+/// exit — also an error before the first stage (an unverified profile, a bad fake script, a
+/// Git or store error) — ends with one `run_ended` (R1): `watch` stops and the owner is told.
+fn drive(store: &Store, lock: &TaskLock, rec: &Recorder, d: &DriveArgs) -> Result<i32> {
+    rec.emit_quiet(EngineEvent::RunStarted {
+        owner: lock::owner_label(),
+    });
+    let from = get(store, &lock.task).ok().map(|t| t.state);
+    // R7: a panic unwinding through the drive still ends the record (exit code 101 stays)
+    let mut guard = RunEndGuard {
+        store,
+        rec,
+        task: &lock.task,
+        from,
+        armed: true,
+    };
+    let res = drive_inner(store, lock, rec, d);
+    guard.armed = false;
+    // the full text: the recorder redacts it, then shortens it (R7)
+    run_ended(
+        store,
+        rec,
+        &lock.task,
+        from,
+        res.as_ref().err().map(|e| format!("{e:#}")),
+    );
+    res
+}
+
+/// Emit the one `run_ended` of a drive: state and next action re-read from the store, the last
+/// known state if it cannot be read.
+fn run_ended(
+    store: &Store,
+    rec: &Recorder,
+    task: &str,
+    from: Option<PipelineState>,
+    error: Option<String>,
+) {
+    let (state, next) = match get(store, task) {
+        Ok(t) => (t.state, next_action(&t)),
+        Err(_) => (
+            from.unwrap_or(PipelineState::New),
+            format!("`toryo status {task}`"),
+        ),
+    };
+    rec.emit_quiet(EngineEvent::RunEnded {
+        state,
+        next_action: next,
+        from,
+        error,
+    });
+}
+
+/// Emits `run_ended { error: "panicked" }` when a panic unwinds through the drive (R7).
+struct RunEndGuard<'a> {
+    store: &'a Store,
+    rec: &'a Recorder,
+    task: &'a str,
+    from: Option<PipelineState>,
+    armed: bool,
+}
+
+impl Drop for RunEndGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed && std::thread::panicking() {
+            run_ended(
+                self.store,
+                self.rec,
+                self.task,
+                self.from,
+                Some("panicked".into()),
+            );
+        }
+    }
+}
+
+fn drive_inner(store: &Store, lock: &TaskLock, rec: &Recorder, d: &DriveArgs) -> Result<i32> {
     // recovery launches no agent: it needs neither the hub nor the R51 check
     let t = get(store, &lock.task)?;
     let cfg = frozen_config(&t)?;
     let (g, protect, _) = task_policy(&t, &cfg)?;
-    let rec = Recovery {
+    let recovery = Recovery {
         store,
         g: &g,
         protect: &protect,
         cfg: &cfg,
     };
-    for n in rec.recover(&lock.task)? {
+    let running: Vec<store::AttemptRow> = {
+        let i = lock.task.clone();
+        st_attempts(store, &i)?
+            .into_iter()
+            .filter(|a| a.status == store::AttemptStatus::Running)
+            .collect()
+    };
+    let usage_before: Vec<i64> = {
+        let i = lock.task.clone();
+        store
+            .call(move |tx| store::usage_rows(tx, &i))?
+            .into_iter()
+            .map(|u| u.0)
+            .collect()
+    };
+    for n in recovery.recover(&lock.task)? {
         eprintln!("↺ recovery: {n}");
     }
+    recovered_events(store, rec, &lock.task, &running, &usage_before)?;
+    let before = t.state;
     let t = get(store, &lock.task)?;
+    recorded(rec, before, "recovery", &t);
     let waiting = t.state.is_terminal()
         || matches!(t.state, PipelineState::Escalated | PipelineState::Paused)
         || (!d.yes
@@ -234,6 +451,7 @@ fn drive(store: &Store, lock: &TaskLock, d: &DriveArgs) -> Result<i32> {
             store,
             &hub,
             lock,
+            rec,
             RunOptions {
                 yes: d.yes,
                 no_fallback: d.no_fallback,
@@ -311,9 +529,9 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
             );
             Ok(0)
         }
-        TaskCmd::List => status(None),
+        TaskCmd::List { json } => status(None, *json),
         TaskCmd::Config { id, reload, expect } => task_config(cli, id, *reload, expect.as_deref()),
-        TaskCmd::Show { id } => show(id),
+        TaskCmd::Show { id, json } => show(id, *json),
         TaskCmd::Cleanup { id, force } => {
             let st = store()?;
             let lock = TaskLock::acquire(&st, id)?;
@@ -490,6 +708,9 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
         Ok(())
     })?;
     config_v.committed();
+    if to_verify {
+        recorded(&recorder(&t, &lock), t.state, "reverify", &get(&st, id)?);
+    }
     artifacts::write_view(&t, "config.json", new_text.as_bytes())?;
     let mut notes = vec![format!(
         "configuration {} → {} (diff: {})",
@@ -527,7 +748,8 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
 pub fn run(id: &str, d: &DriveArgs) -> Result<i32> {
     let st = store()?;
     let lock = TaskLock::acquire(&st, id)?;
-    let code = drive(&st, &lock, d);
+    let rec = drive_recorder(&get(&st, id)?, &lock, d);
+    let code = drive(&st, &lock, &rec, d);
     lock.release();
     code
 }
@@ -543,6 +765,12 @@ pub fn approve(
     let st = store()?;
     let lock = TaskLock::acquire(&st, id)?;
     let t = get(&st, id)?;
+    // only a drive (`--continue`) raises toasts: the human is at the keyboard otherwise
+    let rec = if cont {
+        drive_recorder(&t, &lock, d)
+    } else {
+        recorder(&t, &lock)
+    };
     let kind: GateKind = gate.into();
     if force {
         if kind != GateKind::Final || t.state != PipelineState::Escalated {
@@ -562,7 +790,10 @@ pub fn approve(
             "final gate forced (reviewer skipped)",
             &format!("From Escalated: {}", t.machine.reason().unwrap_or("")),
         )?;
+        let before = t.state;
         let t = get(&st, id)?;
+        // the owner just opened this gate: recorded, never toasted (R1)
+        recorded(&recorder(&t, &lock), before, "force_final", &t);
         eprintln!(
             "{id}: reviewer skipped — the final gate is open for checkpoint {}",
             t.machine.checkpoint().unwrap_or("")
@@ -582,9 +813,9 @@ pub fn approve(
             &digest[..12.min(digest.len())]
         );
     }
-    approve_now(&st, &t, kind, expect)?;
+    approve_now(&st, &rec, &t, kind, expect)?;
     let code = if cont {
-        drive(&st, &lock, d)?
+        drive(&st, &lock, &rec, d)?
     } else {
         let t = get(&st, id)?;
         write_summary(&st, &t)?;
@@ -602,7 +833,7 @@ pub fn reject(id: &str, gate: Gate, reason: &str) -> Result<i32> {
     let st = store()?;
     let lock = TaskLock::acquire(&st, id)?;
     let t = get(&st, id)?;
-    reject_now(&st, &t, gate.into(), reason)?;
+    reject_now(&st, &recorder(&t, &lock), &t, gate.into(), reason)?;
     let t = get(&st, id)?;
     eprintln!("next: {}", next_action(&t));
     lock.release();
@@ -721,13 +952,33 @@ fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Res
             t.state
         );
     }
-    if protected && r.note.is_none() {
-        if !resume_protected(st, &t, &r.accept_protected)? {
-            return Ok(1);
-        }
+    let rec = drive_recorder(&t, lock, d);
+    let event = if protected && r.note.is_none() {
+        "resume_stage"
     } else if r.discard_partial || r.keep_partial {
-        let cfg = frozen_config(&t)?;
-        let (g, protect, _) = task_policy(&t, &cfg)?;
+        "recovery"
+    } else if r.note.is_some() {
+        "resume_with_note"
+    } else {
+        "unpause"
+    };
+    let go = resume_before_drive(st, &t, r, protected)?;
+    recorded(&rec, t.state, event, &get(st, &lock.task)?);
+    if !go {
+        return Ok(1); // the protected change is still there and not accepted
+    }
+    drive(st, lock, &rec, d)
+}
+
+/// What `resume` changes before the task is driven again: the protected-state check, a
+/// partial-work decision, a note, or the end of a pause. False: the protected change is still
+/// there and not accepted — the task is not driven.
+fn resume_before_drive(st: &Store, t: &TaskRow, r: &ResumeArgs, protected: bool) -> Result<bool> {
+    if protected && r.note.is_none() {
+        return resume_protected(st, t, &r.accept_protected);
+    } else if r.discard_partial || r.keep_partial {
+        let cfg = frozen_config(t)?;
+        let (g, protect, _) = task_policy(t, &cfg)?;
         let rec = Recovery {
             store: st,
             g: &g,
@@ -742,7 +993,7 @@ fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Res
         eprintln!("↺ {msg}");
         toryo::engine::decisions::append(
             st,
-            &t,
+            t,
             if r.discard_partial {
                 "partial work discarded (R31)"
             } else {
@@ -762,7 +1013,7 @@ fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Res
         })?;
         toryo::engine::decisions::append(
             st,
-            &t,
+            t,
             "resumed from Escalated with a note (R5)",
             &format!(
                 "Escalation: {}\n\nNote: {note}",
@@ -790,7 +1041,7 @@ fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Res
             store::transition(tx, &i, PipelineEvent::Unpause).map(|_| ())
         })?;
     }
-    drive(st, lock, d)
+    Ok(true)
 }
 
 pub fn resume(id: Option<&str>, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
@@ -845,24 +1096,57 @@ pub fn stop(id: &str, wait: u64) -> Result<i32> {
     })
 }
 
-pub fn status(id: Option<&str>) -> Result<i32> {
+/// What `status` shows of a task besides its row: the lock owner while another process holds
+/// the lock, compile-only verify (R59), and the next action (the cleaned-up variant once the
+/// worktree and the run store are gone).
+fn facts(st: &Store, t: &TaskRow) -> Result<TaskFacts> {
+    // R6: from the recorded owner, never a lock probe; `None`, never an empty label
+    let active_owner = driven_owner(st, &t.id)?;
+    let next_action = if t.state.is_terminal() && !t.run_store.exists() && !t.worktree.exists() {
+        toryo::engine::runner::cleaned_up_action(t)
+    } else {
+        next_action(t)
+    };
+    Ok(TaskFacts {
+        active_owner,
+        // R6: unknown (`null`) when the frozen configuration cannot be read (after `task cleanup`)
+        compile_only: task::frozen_config(t)
+            .ok()
+            .map(|c| toryo::engine::xpp::compile_only(&c)),
+        next_action,
+    })
+}
+
+/// Print one JSON document on stdout (`--json`, DES-10).
+fn print_json(v: &serde_json::Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(v)?);
+    Ok(())
+}
+
+pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
     let st = store()?;
     let tasks = match id {
-        Some(i) => vec![get(&st, i)?],
-        None => st.call(store::list_tasks)?,
+        Some(i) => vec![read_task(&st, i)?],
+        None => st.read(store::list_tasks)?,
     };
+    if json {
+        let list = tasks
+            .iter()
+            .map(|t| Ok(views::task_json(t, &facts(&st, t)?)))
+            .collect::<Result<Vec<_>>>()?;
+        print_json(&serde_json::json!({ "tasks": list }))?;
+        return Ok(0);
+    }
     if tasks.is_empty() {
         println!("no tasks (`toryo task create --file TASK.md`)");
     }
     for t in tasks {
-        let active = if lock::probe_free(&t.id)? {
-            String::new()
-        } else {
-            format!(
-                " · ACTIVE ({})",
-                t.run_lock_owner.clone().unwrap_or_default()
-            )
-        };
+        let f = facts(&st, &t)?;
+        let active = f
+            .active_owner
+            .as_ref()
+            .map(|o| format!(" · ACTIVE ({o})"))
+            .unwrap_or_default();
         println!(
             "{:<14} {:<22} fix {}/{} · tokens {}{}{}{}",
             t.id,
@@ -881,31 +1165,67 @@ pub fn status(id: Option<&str>) -> Result<i32> {
             active
         );
         // R59: an X++ verify proves compile level only — say so wherever the state is shown
-        if task::frozen_config(&t).is_ok_and(|c| toryo::engine::xpp::compile_only(&c)) {
+        if f.compile_only == Some(true) {
             println!("               {}", toryo::engine::xpp::COMPILE_ONLY);
         }
-        let next = if t.state.is_terminal() && !t.run_store.exists() && !t.worktree.exists() {
-            toryo::engine::runner::cleaned_up_action(&t)
-        } else {
-            next_action(&t)
-        };
-        println!("               next: {next}");
+        println!("               next: {}", f.next_action);
     }
     Ok(0)
 }
 
-fn show(id: &str) -> Result<i32> {
-    status(Some(id))?;
+/// The usage rows of a task as `task show` prints them.
+fn usage_lines(st: &Store, id: &str) -> Result<Vec<views::UsageLine>> {
+    let i = id.to_string();
+    let rows = st.read(move |tx| store::usage_rows(tx, &i))?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                id,
+                attempt,
+                profile,
+                accounting,
+                budget_tokens,
+                reservation_tokens,
+                reconciled_by,
+                includes_unreported,
+            )| {
+                views::UsageLine {
+                    id,
+                    attempt,
+                    profile,
+                    accounting,
+                    budget_tokens,
+                    reservation_tokens,
+                    reconciled_by,
+                    includes_unreported,
+                }
+            },
+        )
+        .collect())
+}
+
+fn show(id: &str, json: bool) -> Result<i32> {
     let st = store()?;
-    let t = get(&st, id)?;
+    let t = read_task(&st, id)?;
+    let i = id.to_string();
+    let atts = st.read(move |tx| store::attempts(tx, &i))?;
+    let usage = usage_lines(&st, id)?;
+    let i = id.to_string();
+    let ap = st.read(move |tx| store::approvals(tx, &i))?;
+    if json {
+        let task = views::task_json(&t, &facts(&st, &t)?);
+        let events = toryo::engine::flight::events_path(&t);
+        print_json(&views::show_json(task, &t, &atts, &usage, &ap, &events))?;
+        return Ok(0);
+    }
+    status(Some(id), false)?;
     println!(
         "               worktree: {} · branch {} · run store {}",
         t.worktree.display(),
         t.branch,
         t.run_store.display()
     );
-    let i = id.to_string();
-    let atts = st.call(move |tx| store::attempts(tx, &i))?;
     println!("\nstage attempts:");
     for a in atts {
         println!(
@@ -922,30 +1242,31 @@ fn show(id: &str) -> Result<i32> {
                 .unwrap_or_default()
         );
     }
-    let i = id.to_string();
-    let rows = st.call(move |tx| store::usage_rows(tx, &i))?;
-    if !rows.is_empty() {
+    if !usage.is_empty() {
         println!("\nusage (R41; ~ = reservation for a turn with no telemetry):");
-        for (uid, att, prof, acc, budget, res, rec, inc) in rows {
-            let amount = match (acc.as_str(), budget, res) {
+        for u in usage {
+            let amount = match (u.accounting.as_str(), u.budget_tokens, u.reservation_tokens) {
                 ("unknown", _, Some(r)) => format!("~{r}"),
                 (_, Some(b), _) => b.to_string(),
                 _ => "?".into(),
             };
             println!(
-                "  #{uid:<4} {att:<22} {prof:<14} {acc:<11} {amount:>9}{}{}",
-                if inc {
+                "  #{:<4} {:<22} {:<14} {:<11} {amount:>9}{}{}",
+                u.id,
+                u.attempt,
+                u.profile,
+                u.accounting,
+                if u.includes_unreported {
                     "  includes an earlier killed turn"
                 } else {
                     ""
                 },
-                rec.map(|r| format!("  reconciled by #{r}"))
+                u.reconciled_by
+                    .map(|r| format!("  reconciled by #{r}"))
                     .unwrap_or_default()
             );
         }
     }
-    let i = id.to_string();
-    let ap = st.call(move |tx| store::approvals(tx, &i))?;
     if !ap.is_empty() {
         println!("\ngates:");
         for a in ap {
@@ -1126,4 +1447,170 @@ pub fn partial(cmd: &PartialCmd) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+/// Ctrl+C during `watch`: set, not killed, so `watch` exits 0.
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Route Ctrl+C to [`INTERRUPTED`] (no new crate: the console handler on Windows, SIGINT on
+/// Unix).
+fn catch_ctrl_c() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+        unsafe extern "system" fn handler(kind: u32) -> windows_sys::Win32::Foundation::BOOL {
+            // CTRL_C_EVENT, CTRL_BREAK_EVENT; anything else (close, logoff) as usual
+            if kind <= 1 {
+                INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+                return 1;
+            }
+            0
+        }
+        // SAFETY: registers a handler that only stores to an atomic
+        unsafe {
+            SetConsoleCtrlHandler(Some(handler), 1);
+        }
+    }
+    #[cfg(unix)]
+    {
+        extern "C" fn handler(_: libc::c_int) {
+            INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        // SAFETY: the handler only stores to an atomic (async-signal-safe)
+        unsafe {
+            libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
+        }
+    }
+}
+
+/// Sleep `d` in short steps; true when Ctrl+C was pressed.
+fn interrupted_during(d: Duration) -> bool {
+    let end = std::time::Instant::now() + d;
+    while std::time::Instant::now() < end {
+        if INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Does a live process drive the task? From the recorded lock owner (its PID and creation
+/// time), never by taking the lock: a probe could refuse a `toryo run` starting at that moment.
+fn driven(st: &Store, id: &str) -> Result<bool> {
+    Ok(driven_owner(st, id)?.is_some())
+}
+
+/// The recorded lock owner, while its process (PID and creation time) is alive — never by
+/// taking the lock (R6: a probe could refuse a `toryo run` starting at that moment).
+fn driven_owner(st: &Store, id: &str) -> Result<Option<String>> {
+    let i = id.to_string();
+    let owner = st.read(move |tx| store::lock_owner(tx, &i))?;
+    Ok(match owner {
+        Some((label, _, Some(pid), Some(created))) if store::identity_alive(pid, &created) => {
+            Some(if label.trim().is_empty() {
+                format!("pid {pid}")
+            } else {
+                label
+            })
+        }
+        _ => None,
+    })
+}
+
+/// `toryo watch` (B2): the task's flight recorder like `tail -f`, without the task lock. The
+/// history first (the last 20 events, or all with `from_start`), then new events every ~500 ms,
+/// rendered or (`json`) as the file's lines, until the task stops moving on its own
+/// (`flight::watch_done`) or Ctrl+C.
+pub fn watch(id: &str, json: bool, from_start: bool, no_follow: bool) -> Result<i32> {
+    use toryo::engine::flight::{self, Tail};
+    let st = store()?;
+    let t = read_task(&st, id)?;
+    let path = flight::events_path(&t);
+    if !path.is_file() && (no_follow || !driven(&st, id)?) {
+        bail!(
+            "{id}: no flight recorder at {} — the task has not run since M10, or `task cleanup` removed its run store",
+            path.display()
+        );
+    }
+    catch_ctrl_c();
+    let mut tail = Tail::default();
+    let history = tail.poll(&path)?;
+    // a reader that went away (`watch … | head -n 5`) ends `watch` with exit 0 (R1)
+    if !show_lines(flight::history(&history, from_start), json)? || no_follow {
+        return Ok(0);
+    }
+    let mut last = std::time::Instant::now();
+    // the engine commits a transition before it writes its events: "done" must hold on two
+    // polls in a row, and the file is read once more before returning (R1)
+    let mut done = flight::DonePolls::default();
+    loop {
+        if interrupted_during(Duration::from_millis(500)) {
+            return Ok(0);
+        }
+        let new = tail.poll(&path)?;
+        if !new.is_empty() {
+            last = std::time::Instant::now();
+            if !show_lines(&new, json)? {
+                return Ok(0);
+            }
+        }
+        let state = read_task(&st, id)?.state;
+        let now_done = flight::watch_done(state, driven(&st, id)?, last.elapsed());
+        if done.observe(now_done, !new.is_empty()) {
+            show_lines(&tail.poll(&path)?, json)?;
+            return Ok(0);
+        }
+    }
+}
+
+/// Print the `watch` text of `lines` on stdout. `false`: stdout is closed (a broken pipe).
+fn show_lines(lines: &[String], json: bool) -> Result<bool> {
+    use std::io::Write;
+    let out = std::io::stdout();
+    let mut out = out.lock();
+    for line in lines {
+        if let Some(text) = toryo::engine::flight::watch_line(line, json) {
+            match writeln!(out, "{text}").and_then(|_| out.flush()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(false),
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// `toryo usage` (C1, plan §12): the task's tokens per stage × profile × model and the estimated
+/// cost from the machine's price table (`--prices`, else `%USERPROFILE%\.toryo\prices.toml`).
+/// Read-only: no lock. Rows written before M10 have no model: the task's frozen configuration
+/// names it (role → profile), else `unknown model`.
+pub fn usage(id: &str, json: bool, prices: Option<&std::path::Path>) -> Result<i32> {
+    use toryo::engine::usage_report as ur;
+    let st = store()?;
+    let t = read_task(&st, id)?;
+    let cfg = frozen_config(&t).ok();
+    let i = id.to_string();
+    let mut rows = st.read(move |tx| store::usage_detail(tx, &i))?;
+    for r in &mut rows {
+        if r.model.is_none() {
+            r.model = cfg
+                .as_ref()
+                .and_then(|c| ur::configured_model(c, &r.stage, &r.profile));
+        }
+    }
+    let path = prices
+        .map(std::path::Path::to_path_buf)
+        .or_else(ur::default_prices_path);
+    let table = match &path {
+        Some(p) => ur::load_prices(p)?,
+        None => None,
+    };
+    let r = ur::report(&rows, table.as_ref());
+    if json {
+        print_json(&ur::to_json(&r, id, path.as_deref()))?;
+    } else {
+        print!("{}", ur::render_text(&r, id, path.as_deref()));
+    }
+    Ok(0)
 }

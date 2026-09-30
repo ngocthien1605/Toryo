@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, SetHandleInformation, BOOL, FILETIME, HANDLE,
-    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    CloseHandle, GetLastError, LocalFree, SetHandleInformation, BOOL, ERROR_ACCESS_DENIED,
+    FILETIME, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, STILL_ACTIVE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
@@ -51,11 +51,12 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::SystemServices::SE_GROUP_INTEGRITY;
 use windows_sys::Win32::System::Threading::{
-    CreateProcessAsUserW, GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess,
-    GetProcessTimes, OpenProcess, OpenProcessToken, OpenThread, ResumeThread, TerminateProcess,
-    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-    STARTF_USESTDHANDLES, STARTUPINFOW, THREAD_SUSPEND_RESUME,
+    CreateProcessAsUserW, CreateProcessW, GetCurrentProcess, GetCurrentProcessId,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenProcessToken, OpenThread, ResumeThread,
+    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, STARTF_USESTDHANDLES, STARTUPINFOW,
+    THREAD_SUSPEND_RESUME,
 };
 
 use super::{quote_windows_arg, Boundary, ProcId, SpawnSpec};
@@ -253,7 +254,24 @@ pub fn is_alive(p: ProcId) -> bool {
             p.pid,
         );
         if h.is_null() {
-            return false;
+            // M10-R7: an elevated toryo of the same user refuses SYNCHRONIZE but grants the
+            // limited query right: check its creation time with that right alone
+            if GetLastError() != ERROR_ACCESS_DENIED {
+                return false;
+            }
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, p.pid);
+            if h.is_null() {
+                // M10-R9: refused even that — not a toryo of this user (a same-user process,
+                // elevated or not, grants it), e.g. a SYSTEM process that got a dead owner's
+                // reused PID: not alive, or `watch` and `status` would see it `ACTIVE` forever
+                return false;
+            }
+            let _o = Owned(h);
+            if creation_time_of(h) != Some(p.created) {
+                return false;
+            }
+            let mut code = 0u32;
+            return GetExitCodeProcess(h, &mut code) != 0 && code == STILL_ACTIVE as u32;
         }
         let _o = Owned(h);
         if creation_time_of(h) != Some(p.created) {
@@ -632,4 +650,313 @@ pub fn set_low_label(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A process started with no inherited handle and no console window (M10-R4: the toast), so it
+/// never holds a pipe of toryo's open (a harness reading toryo's stdout would wait for it).
+pub struct Detached {
+    process: Owned,
+    pub pid: u32,
+}
+
+// SAFETY: a process handle may be waited on and terminated from any thread.
+unsafe impl Send for Detached {}
+
+impl Detached {
+    /// Wait up to `limit`: the exit code, `None` while it still runs.
+    pub fn wait(&self, limit: Duration) -> Option<u32> {
+        let ms = limit.as_millis().min(u32::MAX as u128 - 1) as u32;
+        // SAFETY: we own the process handle.
+        unsafe {
+            if WaitForSingleObject(self.process.0, ms) != WAIT_OBJECT_0 {
+                return None;
+            }
+            let mut code = 0u32;
+            (GetExitCodeProcess(self.process.0, &mut code) != 0).then_some(code)
+        }
+    }
+
+    pub fn kill(&self) {
+        // SAFETY: we own the process handle.
+        unsafe { TerminateProcess(self.process.0, 1) };
+    }
+}
+
+/// R8: what `std::process::Command` refuses too — a NUL in an argument, an environment name or
+/// value, an empty name, or `=` in a name after its first character (Windows keeps
+/// `=C:`-style names).
+pub fn check_spawn_input(
+    program: &Path,
+    args: &[String],
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<()> {
+    const NUL: char = '\0';
+    // R9: the program path too
+    if program.as_os_str().encode_wide().any(|c| c == 0) {
+        bail!("the program path holds a NUL character: {program:?}");
+    }
+    if let Some(a) = args.iter().find(|a| a.contains(NUL)) {
+        bail!("an argument holds a NUL character: {a:?}");
+    }
+    for (k, v) in env {
+        let name: Vec<u16> = k.encode_wide().collect();
+        if name.is_empty() {
+            bail!("an empty environment variable name");
+        }
+        if name.contains(&0) || v.encode_wide().any(|c| c == 0) {
+            bail!("the environment variable {k:?} holds a NUL character");
+        }
+        if name[1..].contains(&(b'=' as u16)) {
+            bail!("the environment variable name {k:?} holds `=`");
+        }
+    }
+    Ok(())
+}
+
+/// The order of two environment variable names in a Windows environment block (R9): an ordinal,
+/// case-insensitive comparison of the UTF-16 names — `CompareStringOrdinal(a, b, TRUE)`, what
+/// std's `EnvKey` uses — not a Rust uppercase of a lossy string (`ß` → `SS`, `ﬀ` → `FF`).
+pub fn env_name_order(a: &OsStr, b: &OsStr) -> std::cmp::Ordering {
+    use windows_sys::Win32::Globalization::CompareStringOrdinal;
+    let (a, b): (Vec<u16>, Vec<u16>) = (a.encode_wide().collect(), b.encode_wide().collect());
+    // SAFETY: both slices live across the call; lengths are given explicitly
+    let r =
+        unsafe { CompareStringOrdinal(a.as_ptr(), a.len() as i32, b.as_ptr(), b.len() as i32, 1) };
+    match r {
+        1 => std::cmp::Ordering::Less,
+        3 => std::cmp::Ordering::Greater,
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+/// Windows environment block from `OsString` pairs (non-Unicode values kept): sorted by name,
+/// case-insensitively, UTF-16, double-NUL terminated.
+fn env_block_os(env: &[(std::ffi::OsString, std::ffi::OsString)]) -> Vec<u16> {
+    let mut pairs: Vec<&(std::ffi::OsString, std::ffi::OsString)> = env.iter().collect();
+    pairs.sort_by(|a, b| env_name_order(&a.0, &b.0));
+    let mut out = Vec::new();
+    for (k, v) in pairs {
+        out.extend(k.encode_wide());
+        out.push(b'=' as u16);
+        out.extend(v.encode_wide());
+        out.push(0);
+    }
+    if out.is_empty() {
+        out.push(0);
+    }
+    out.push(0);
+    out
+}
+
+/// Start `program args` with exactly `env` as its environment, `bInheritHandles = FALSE`,
+/// `CREATE_NO_WINDOW`, in toryo's current directory, outside any Job.
+pub fn spawn_detached(
+    program: &Path,
+    args: &[String],
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<Detached> {
+    check_spawn_input(program, args, env)?;
+    let mut cmdline = quote_windows_arg(&program.to_string_lossy());
+    for a in args {
+        cmdline.push(' ');
+        cmdline.push_str(&quote_windows_arg(a));
+    }
+    let mut cmdline_w = wide(OsStr::new(&cmdline));
+    let env = env_block_os(env);
+    // SAFETY: all pointers live across the call; the thread handle is closed at once.
+    unsafe {
+        let mut si: STARTUPINFOW = std::mem::zeroed();
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+        let ok = CreateProcessW(
+            null(),
+            cmdline_w.as_mut_ptr(),
+            null(),
+            null(),
+            0,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            env.as_ptr() as *const c_void,
+            null(),
+            &si,
+            &mut pi,
+        );
+        if ok == 0 {
+            return Err(last_error(&format!(
+                "CreateProcessW({})",
+                program.display()
+            )));
+        }
+        drop(Owned(pi.hThread));
+        Ok(Detached {
+            process: Owned(pi.hProcess),
+            pid: pi.dwProcessId,
+        })
+    }
+}
+
+#[cfg(test)]
+mod detached_tests {
+    use super::*;
+
+    fn powershell() -> std::path::PathBuf {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        std::path::PathBuf::from(root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe")
+    }
+
+    fn sleeper(secs: u32) -> Detached {
+        let args: Vec<String> = ["-NoProfile", "-NonInteractive", "-Command"]
+            .iter()
+            .map(|s| s.to_string())
+            .chain([format!("Start-Sleep -Seconds {secs}")])
+            .collect();
+        spawn_detached(
+            &powershell(),
+            &args,
+            &std::env::vars_os().collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    /// M10-R4: a detached process holds none of toryo's inheritable handles — here the write end
+    /// of an inheritable pipe: once toryo drops it, the read end is at EOF at once, although the
+    /// child still runs (with `bInheritHandles = TRUE` the read would wait for the child).
+    #[test]
+    fn a_detached_process_inherits_no_handle() {
+        let (r, w) = pipe(false).unwrap();
+        let p = sleeper(6);
+        drop(w);
+        let t = Instant::now();
+        // SAFETY: the handle is ours; ownership moves to the File
+        let mut f = unsafe { File::from_raw_handle(r.0 as _) };
+        std::mem::forget(r);
+        let mut buf = Vec::new();
+        let _ = f.read_to_end(&mut buf);
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert_eq!(p.wait(Duration::ZERO), None, "the child still runs");
+        p.kill();
+        assert!(p.wait(Duration::from_secs(10)).is_some());
+    }
+}
+
+#[cfg(test)]
+mod alive_tests {
+    use super::*;
+
+    /// M10-R7: a process that refuses `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE`
+    /// (elevated, another user's, a system process) exists and is alive. The System process
+    /// (PID 4) refuses them to a non-elevated test run; an elevated run can open it and the test
+    /// has nothing to show (it says so).
+    #[test]
+    fn access_denied_is_decided_by_the_limited_right() {
+        const SYSTEM: u32 = 4;
+        // SAFETY: FFI; handles closed by Owned.
+        let created = unsafe {
+            let h = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                SYSTEM,
+            );
+            if !h.is_null() {
+                drop(Owned(h));
+                eprintln!("the System process can be opened (elevated run): nothing to test");
+                return;
+            }
+            assert_eq!(GetLastError(), ERROR_ACCESS_DENIED);
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, SYSTEM);
+            if h.is_null() {
+                None
+            } else {
+                let o = Owned(h);
+                creation_time_of(o.0)
+            }
+        };
+        match created {
+            // the limited right is granted: the creation time decides (R7)
+            Some(created) => {
+                assert!(is_alive(ProcId {
+                    pid: SYSTEM,
+                    created
+                }));
+                assert!(!is_alive(ProcId {
+                    pid: SYSTEM,
+                    created: created + 1
+                }));
+            }
+            // M10-R9: refused even the limited right — like a SYSTEM process that reused a dead
+            // owner's PID: not alive, whatever the creation time
+            None => {
+                eprintln!("the System process refuses the limited right too");
+                assert!(!is_alive(ProcId {
+                    pid: SYSTEM,
+                    created: 0
+                }));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod spawn_input_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    /// M10-R8: `spawn_detached` refuses what `std::process::Command` refused: a NUL in an
+    /// argument, a variable name or value, an empty name, `=` in a name after its first character.
+    #[test]
+    fn detached_spawns_refuse_what_command_refuses() {
+        let ok: Vec<(OsString, OsString)> = vec![
+            ("PATH".into(), r"C:\x".into()),
+            ("=C:".into(), r"C:\".into()),
+        ];
+        assert!(
+            check_spawn_input(Path::new("p"), &["-Command".into()], &ok).is_ok(),
+            "`=C:` names are fine"
+        );
+        let nul = String::from_utf8(vec![b'a', 0, b'b']).unwrap();
+        assert!(check_spawn_input(Path::new("p"), std::slice::from_ref(&nul), &ok).is_err());
+        for bad in [
+            vec![(OsString::from(nul.as_str()), OsString::from("v"))],
+            vec![(OsString::from("K"), OsString::from(nul.as_str()))],
+            vec![(OsString::from(""), OsString::from("v"))],
+            vec![(OsString::from("A=B"), OsString::from("v"))],
+        ] {
+            assert!(
+                check_spawn_input(Path::new("p"), &[], &bad).is_err(),
+                "{bad:?}"
+            );
+        }
+        let p = std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe");
+        assert!(
+            spawn_detached(&p, std::slice::from_ref(&nul), &ok).is_err(),
+            "checked before CreateProcessW"
+        );
+        // R9: a NUL in the program path too
+        assert!(check_spawn_input(Path::new(&nul), &[], &ok).is_err());
+    }
+
+    /// M10-R9: environment names are ordered like std's `EnvKey` — ordinal, case-insensitive on
+    /// UTF-16 (`CompareStringOrdinal`), not by a Rust uppercase (`ß` → `SS`, `ﬀ` → `FF`).
+    #[test]
+    fn environment_names_sort_ordinally_ignoring_case() {
+        let mut names: Vec<OsString> = ["ﬀX", "😀X", "ßX", "SSA", "path", "PATH2", "Path"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        names.sort_by(|a, b| env_name_order(a, b));
+        let got: Vec<String> = names
+            .iter()
+            .map(|n| n.to_string_lossy().into_owned())
+            .collect();
+        // `path` and `Path` compare equal (a stable sort keeps their order); U+00DF < the
+        // emoji's high surrogate U+D83D < U+FB00
+        assert_eq!(got, ["path", "Path", "PATH2", "SSA", "ßX", "😀X", "ﬀX"]);
+        assert_eq!(
+            env_name_order(OsStr::new("abc"), OsStr::new("ABC")),
+            std::cmp::Ordering::Equal
+        );
+    }
 }

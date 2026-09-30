@@ -6,6 +6,7 @@ pub mod checks;
 pub mod context;
 pub mod contracts;
 pub mod decisions;
+pub mod flight;
 pub mod lock;
 pub mod protect;
 pub mod recovery;
@@ -16,7 +17,9 @@ pub mod state;
 pub mod store;
 pub mod task;
 pub mod untrusted;
+pub mod usage_report;
 pub mod verify;
+pub mod views;
 pub mod worktree;
 pub mod xpp;
 

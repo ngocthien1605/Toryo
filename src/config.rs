@@ -417,6 +417,19 @@ pub struct MachineConfig {
     pub toolchains: Toolchains,
     #[serde(default)]
     pub git: MachineGit,
+    /// M10-D1: how the owner is told that a task needs them. A machine setting like the
+    /// profiles' origins: not frozen with a task and not hashed.
+    #[serde(default)]
+    pub notify: Notify,
+}
+
+/// `notify:` in the machine config (M10-D1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Notify {
+    /// A Windows toast at a gate, an escalation, a pause and the end of a run. Default off.
+    #[serde(default)]
+    pub toast: bool,
 }
 
 impl MachineConfig {
@@ -475,6 +488,9 @@ pub struct Effective {
     /// Where each profile and role came from (R60); not hashed.
     #[serde(skip)]
     pub origins: Origins,
+    /// M10-D1: the machine's `notify:`; not frozen, not hashed.
+    #[serde(skip)]
+    pub notify: Notify,
 }
 
 impl Effective {
@@ -500,6 +516,7 @@ impl Effective {
         let mut toolchains = Toolchains::default();
         let mut used_machine = None;
         let mut origins = Origins::default();
+        let mut notify = Notify::default();
         for k in repo.roles.keys() {
             origins.roles.insert(k.clone(), Origin::Repo);
         }
@@ -521,6 +538,7 @@ impl Effective {
                 }
                 trusted_filters = machine.git.trusted_filters;
                 toolchains = machine.toolchains;
+                notify = machine.notify;
                 for name in toolchains.names() {
                     origins.toolchains.insert(name.into(), Origin::Machine);
                 }
@@ -544,6 +562,7 @@ impl Effective {
             repo_path: repo_path.to_path_buf(),
             machine_path: used_machine,
             origins,
+            notify,
         };
         eff.validate().with_context(|| match &eff.machine_path {
             Some(m) => format!("{} (with {})", repo_path.display(), m.display()),
@@ -585,6 +604,7 @@ impl Effective {
             repo_path: origin.to_path_buf(),
             machine_path: None,
             origins: Origins::default(),
+            notify: Notify::default(),
         })
     }
 
@@ -1170,6 +1190,7 @@ policy:
             repo_path: PathBuf::new(),
             machine_path: None,
             origins: Origins::default(),
+            notify: Notify::default(),
         };
         let (_d, p, m) = write_split(SAMPLE);
         let new = Effective::load(&p, Some(&m)).unwrap();
@@ -1558,6 +1579,40 @@ commands:
         let back = Effective::from_frozen(&frozen, Path::new("config.json")).unwrap();
         assert_eq!(back.canonical_json(), frozen);
         assert!(back.toolchains.is_empty());
+    }
+
+    /// M10-D1 AC-3: `notify:` is read from the machine config, and it is not part of the
+    /// frozen, hashed configuration — a config with it hashes like the one without.
+    #[test]
+    fn notify_is_a_machine_setting_outside_the_hash() {
+        let d = tempfile::tempdir().unwrap();
+        let (p, m) = (d.path().join("toryo.yaml"), d.path().join("machine.yaml"));
+        std::fs::write(&p, "version: 1\nproject: { root: D:\\\\R, worktrees_root: D:\\\\W }\nroles:\n  planner: { profile: claude-max }\ncommands:\n  verify:\n    - { name: build, program: pwsh, args: [-File, scripts/build.ps1], timeout_min: 20 }\n    - { name: test, program: git, args: [status] }\n").unwrap();
+        let profiles =
+            "profiles:\n  claude-max: { kind: claude, billing: subscription, exe: claude }\n";
+        std::fs::write(&m, profiles).unwrap();
+        let without = Effective::load(&p, Some(&m)).unwrap();
+        assert_eq!(without.notify, Notify { toast: false });
+        std::fs::write(&m, format!("{profiles}notify: {{ toast: true }}\n")).unwrap();
+        let with = Effective::load(&p, Some(&m)).unwrap();
+        assert_eq!(with.notify, Notify { toast: true });
+        assert_eq!(with.sha256(), without.sha256());
+        assert_eq!(
+            with.sha256(),
+            "7ae81a43f08d24ea1866b54a3cbb30bce443dc15aa02a212f01cace2f719a3b8"
+        );
+        assert!(!with.canonical_json().contains("notify"));
+        // the frozen configuration has no notify setting: a drive command reads the machine's
+        let back = Effective::from_frozen(&with.canonical_json(), Path::new("c.json")).unwrap();
+        assert_eq!(back.notify, Notify::default());
+        // unknown keys under notify are refused (deny_unknown_fields)
+        std::fs::write(
+            &m,
+            format!("{profiles}notify: {{ toast: true, sound: loud }}\n"),
+        )
+        .unwrap();
+        let e = format!("{:#}", Effective::load(&p, Some(&m)).unwrap_err());
+        assert!(e.contains("sound"), "{e}");
     }
 
     /// The shipped templates keep loading under the checks.

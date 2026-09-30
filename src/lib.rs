@@ -16,6 +16,7 @@ pub mod domain;
 pub mod engine;
 pub mod evidence;
 pub mod git;
+pub mod notify;
 pub mod process;
 pub mod runner;
 #[cfg(feature = "m0-kit")]

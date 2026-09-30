@@ -150,6 +150,9 @@ pub struct FakeCall {
 #[derive(Default)]
 struct Shared {
     queues: HashMap<String, VecDeque<FakeTurn>>,
+    /// M10-C2: the script lists `only_profiles` (a mixed fake/real run) — a scripted turn that
+    /// ends without a `usage` step reports exact zero usage instead of none.
+    zero_usage: bool,
     capabilities: BTreeMap<String, UsageCapabilities>,
     calls: Vec<FakeCall>,
     sessions: u32,
@@ -166,6 +169,7 @@ pub struct FakeAgentAdapter {
 impl FakeAgentAdapter {
     pub fn new(script: FakeScript) -> Self {
         let capabilities = script.capabilities.clone();
+        let zero_usage = !script.only_profiles.is_empty();
         let queues = script
             .turns
             .into_iter()
@@ -175,6 +179,7 @@ impl FakeAgentAdapter {
             shared: Arc::new(Mutex::new(Shared {
                 queues,
                 capabilities,
+                zero_usage,
                 ..Default::default()
             })),
             profile: String::new(),
@@ -218,6 +223,7 @@ impl AgentAdapter for FakeAgentAdapter {
             announced: false,
             env: Default::default(),
             denials: 0,
+            usage_seen: false,
             delay_until: None,
         }))
     }
@@ -251,6 +257,8 @@ struct FakeSession {
     env: std::collections::BTreeMap<String, String>,
     /// Permission denials in the current turn: any fails it (TS-01).
     denials: usize,
+    /// The current turn reported usage (M10-C2).
+    usage_seen: bool,
     /// End of a running `delay` step. Kept in the session so the delay survives the turn
     /// loop dropping `next_event` at each limits poll (a plain sleep was cut to ~200 ms).
     delay_until: Option<tokio::time::Instant>,
@@ -316,6 +324,7 @@ impl AgentSession for FakeSession {
         self.done = false;
         self.hang = false;
         self.denials = 0;
+        self.usage_seen = false;
         self.delay_until = None;
         self.turns += 1;
         self.env = input.env.clone();
@@ -338,6 +347,16 @@ impl AgentSession for FakeSession {
                 self.done = true;
                 return None; // no terminal step: like a crash without a result
             };
+            // M10-C2: in a mixed run a scripted turn costs nothing — report it as exact zero
+            // before it ends, unless it reported usage itself
+            if self.zero_usage_before(&step) {
+                self.usage_seen = true;
+                self.pending.push_front(step);
+                return Some(AgentEvent::Usage(TokenUsage {
+                    buckets: Some(Buckets::default()),
+                    accounting: Accounting::Exact,
+                }));
+            }
             match step {
                 FakeStep::Delay { ms } => {
                     self.delay_until =
@@ -381,6 +400,7 @@ impl AgentSession for FakeSession {
                     cache_read,
                     output,
                 } => {
+                    self.usage_seen = true;
                     return Some(AgentEvent::Usage(TokenUsage {
                         buckets: Some(Buckets {
                             uncached_input: input,
@@ -390,7 +410,7 @@ impl AgentSession for FakeSession {
                             reasoning: None,
                         }),
                         accounting: Accounting::Exact,
-                    }))
+                    }));
                 }
                 FakeStep::Deny { tool, detail } => {
                     self.denials += 1;
@@ -428,6 +448,7 @@ impl AgentSession for FakeSession {
                     match &*e {
                         AgentEvent::SessionIdentified(id) => self.external = Some(id.clone()),
                         AgentEvent::PermissionDenied { .. } => self.denials += 1,
+                        AgentEvent::Usage(_) => self.usage_seen = true,
                         _ => {}
                     }
                     if e.is_terminal() {
@@ -482,6 +503,18 @@ impl AgentSession for FakeSession {
 
     async fn close(self: Box<Self>) -> Result<()> {
         Ok(())
+    }
+}
+
+impl FakeSession {
+    /// M10-C2: does `step` end the turn of a mixed run (`only_profiles`) that reported no usage?
+    fn zero_usage_before(&self, step: &FakeStep) -> bool {
+        let ends = match step {
+            FakeStep::Complete { .. } | FakeStep::Fail { .. } => true,
+            FakeStep::Emit(e) => e.is_terminal(),
+            _ => false,
+        };
+        ends && !self.usage_seen && self.adapter.shared.lock().expect("lock").zero_usage
     }
 }
 
