@@ -230,7 +230,9 @@ fn recorder(t: &TaskRow, lock: &TaskLock) -> Recorder {
 fn drive_recorder(t: &TaskRow, lock: &TaskLock, d: &DriveArgs) -> Recorder {
     let rec = recorder(t, lock);
     if toryo::notify::enabled(d.notify, d.no_notify, machine_notify(d)) {
-        rec.with(Box::new(toryo::notify::Notifier::system()))
+        let n = toryo::notify::Notifier::system();
+        // R4 (Q2): with --yes the gates are approved automatically — nobody has to act on them
+        rec.with(Box::new(if d.yes { n.without_gates() } else { n }))
     } else {
         rec
     }

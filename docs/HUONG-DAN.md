@@ -591,8 +591,10 @@ notify:
 ```
 
 Hoặc từng lần: `toryo run BR-003 --notify` / `--no-notify` (cũng cho `resume`, `approve --continue`;
-`--no-notify` thắng). `approve` không có `--continue` không bắn toast (anh đang ngồi ở máy). Kiểm tra máy có
-hiện toast không:
+hai cờ này **loại trừ nhau**, cờ nào cũng thắng cấu hình máy). `approve` không có `--continue` không bắn toast
+(anh đang ngồi ở máy); với `--yes` các gate được duyệt tự động nên **không** bắn toast gate — escalate, pause và
+kết thúc lần chạy vẫn bắn. Lần chạy dừng vì lỗi (vd. profile chưa xác minh, lỗi Git) cũng bắn toast "stopped
+with an error". Kiểm tra máy có hiện toast không:
 
 ```powershell
 toryo notify-test             # hiện một toast mẫu; không thấy → Settings > System > Notifications, cho phép "Windows PowerShell"
@@ -600,8 +602,11 @@ toryo notify-test --dry-run   # chỉ dựng toast, không hiện
 ```
 
 Toast chạy qua Windows PowerShell 5.1 với một script **cố định**; tiêu đề và nội dung (có thể chứa chữ do
-agent viết) chỉ đi qua biến môi trường, không bao giờ nằm trong dòng lệnh hay script. Không chờ, tự dừng sau
-10 giây, không bao giờ làm hỏng lần chạy.
+agent viết) chỉ đi qua biến môi trường, không bao giờ nằm trong dòng lệnh hay script; ký tự điều khiển/ANSI
+bị lọc bỏ. PowerShell được gọi với `-Command` (không dùng `-EncodedCommand`, vốn hay bị phần mềm EDR cảnh báo),
+không kế thừa handle nào của toryo. Không bao giờ làm hỏng lần chạy; khi thoát, toryo chờ toast xong (tối đa
+10 giây rồi dừng nó). Giới hạn: máy bật Constrained Language Mode (AppLocker/WDAC) thì PowerShell không nạp được
+WinRT — `notify-test` sẽ báo lỗi.
 
 ---
 

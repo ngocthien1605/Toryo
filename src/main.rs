@@ -320,7 +320,7 @@ fn run(cli: Cli) -> Result<i32> {
                 (0, false) => eprintln!("a toast was shown: \"toryo — notify-test\" (if you see none, check Windows notification settings for Windows PowerShell)"),
                 (0, true) => eprintln!("the toast was built (dry run: not shown)"),
                 (124, _) => eprintln!("the toast script did not finish in 10 s and was stopped"),
-                (c, _) => eprintln!("the toast script failed (exit {c}): Windows PowerShell could not show a toast"),
+                (c, _) => eprintln!("the toast script failed (exit {c}): Windows PowerShell could not show a toast (Constrained Language Mode, e.g. under AppLocker or WDAC, blocks the WinRT types it needs)"),
             }
             Ok(if code == 0 { 0 } else { 1 })
         }
@@ -354,7 +354,10 @@ fn main() -> ExitCode {
 
 fn cli_main() -> ExitCode {
     let cli = Cli::parse();
-    match run(cli) {
+    let res = run(cli);
+    // M10-R4: settle the toasts this toryo started (each within its 10 s deadline)
+    toryo::notify::wait_pending();
+    match res {
         Ok(code) => ExitCode::from(exit_status(code)),
         Err(e) => {
             if let Some(a) = e.downcast_ref::<toryo::engine::lock::TaskActive>() {

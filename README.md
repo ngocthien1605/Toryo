@@ -184,11 +184,16 @@ reconciled_rows, est_cost_usd, cost, vendor_reported_cost_usd} ], totals: {…},
 
 **Toasts (Windows).** With `notify: { toast: true }` in the machine config (default off; not frozen with a task,
 not hashed) or `--notify` on `run`, `resume` and `approve --continue`, toryo shows a Windows toast when a task
-needs you: a gate opens, the task escalates or pauses, or a run ends `Completed` or `Failed` — title
-`toryo — <ID>`, body the state and the next action (≤ 200 characters). `--no-notify` wins over both. The toast
-is Windows PowerShell 5.1 running a fixed script that reads the title and body from environment variables, so
-agent-written text is never part of a command line or a script; it never blocks or fails the run. Check it with
-`toryo notify-test` (hidden; `--dry-run` builds the toast without showing it). Elsewhere: nothing is shown.
+needs you: a gate opens, the task escalates or pauses, a run reaches `Completed` or `Failed`, or a run stops with
+an error — title `toryo — <ID>`, body the state and the next action (≤ 200 characters, ANSI and characters XML
+forbids removed). Under `--yes` the gates raise no toast (they are approved automatically); `approve` without
+`--continue` raises none. `--notify` and `--no-notify` are mutually exclusive; either overrides the machine
+setting. The toast is Windows PowerShell 5.1 started with `-Command <fixed script>` (no inherited handles, no
+console window) that reads the title and body from environment variables, so agent-written text is never part of
+a command line or a script; it never blocks or fails the run, and toryo waits for it at exit at most until its
+10 s deadline. Check it with `toryo notify-test` (hidden; `--dry-run` builds the toast without showing it).
+Known limit: under PowerShell Constrained Language Mode (AppLocker/WDAC policies) the script cannot load the
+WinRT types — `notify-test` then fails and says so. Elsewhere than Windows: nothing is shown.
 
 ## Build and test
 

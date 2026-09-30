@@ -135,13 +135,11 @@ fn toasts_at_the_gates_follow_the_machine_setting_and_the_flags() {
     assert_eq!(task(&env, "N-3").state, St::Completed);
     let t = toasts(&log);
     let bodies: Vec<&str> = t[2..].iter().map(|x| x["body"].as_str().unwrap()).collect();
-    assert_eq!(bodies.len(), 2, "{bodies:?}");
+    // M10-R4 (owner decision Q2): under --yes the gates raise no toast; the end still does.
+    // Before R4 this run also toasted the final gate it approved automatically.
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
     assert!(
-        bodies[0].starts_with("WaitingFinalApproval — "),
-        "{bodies:?}"
-    );
-    assert!(
-        bodies[1].starts_with("Completed — done — merge"),
+        bodies[0].starts_with("Completed — done — merge"),
         "{bodies:?}"
     );
 }
@@ -282,4 +280,18 @@ fn no_second_completed_toast_and_an_error_end_toasts() {
         .as_str()
         .unwrap()
         .starts_with("New — stopped with an error: "));
+}
+
+/// M10-R4: the real toast script, dry run, with hostile text in the title and the body —
+/// quotes, `$(...)`, backticks, ANSI, BEL, U+FFFE, Japanese and Vietnamese — builds the toast
+/// (exit 0): the text is cleaned for XML and reaches the script only as data.
+#[cfg(windows)]
+#[test]
+fn the_real_script_takes_hostile_text_as_data() {
+    let t = toryo::notify::Toast::new(
+        "toryo — T-1 \"; exit 3 # `whoami` $(Get-Date)",
+        "it's \"quoted\" $(Remove-Item nothing) `whoami` \u{1b}[31mred\u{1b}[0m \u{7}bell \u{fffe} ありがとう Cảm ơn nhiều\r\n'; exit 4; '",
+    );
+    assert!(!t.body.contains('\u{1b}') && !t.body.contains('\u{fffe}'));
+    assert_eq!(toryo::notify::run_script(&t, true).unwrap(), 0);
 }

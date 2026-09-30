@@ -1,16 +1,21 @@
 //! Notifications (M10-D1): a Windows toast when a task needs the owner — a gate opens, the task
-//! escalates or pauses, or a run ends `Completed` or `Failed`. A [`Notifier`] is an engine event
-//! sink ([`crate::engine::flight`]); what it shows is decided by the pure [`toast_for`], and a
-//! [`Toaster`] shows it (a recording double in tests).
+//! escalates or pauses, or a run ends (`Completed`, `Failed`, or with an error). A [`Notifier`] is
+//! an engine event sink ([`crate::engine::flight`]); what it shows is decided by the pure
+//! [`toast_for`], and a [`Toaster`] shows it (a recording double in tests).
 //!
-//! The Windows toaster starts `powershell.exe -NoProfile -NonInteractive -EncodedCommand <fixed
-//! script>`: the script is a constant and reads the title and the body from environment
-//! variables, so agent-written text (a reason, R61) is data — never part of a command line or a
-//! script. Fire and forget: the process is not in a task's Job, a watcher kills it after 10 s,
-//! and nothing waits for it. Off by default (`notify: { toast: true }` in the machine config, or
-//! `--notify`). Other platforms: nothing is shown.
+//! The Windows toaster starts `powershell.exe -NoProfile -NonInteractive -Command <fixed script>`:
+//! the script is a constant and reads the title and the body from environment variables, so
+//! agent-written text (a reason, R61) is data — never part of a command line or a script. The
+//! text is cleaned first (ANSI sequences and characters XML 1.0 forbids, R4). The process inherits
+//! no handle and has no console window (R4); it is not in a task's Job; toryo waits for it at exit
+//! at most until its 10 s deadline and kills it after that. Off by default (`notify: { toast:
+//! true }` in the machine config, or `--notify`). Other platforms: nothing is shown.
 
+#[cfg(windows)]
+use std::sync::Mutex;
 use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
 use anyhow::Result;
 
@@ -36,20 +41,46 @@ pub struct Toast {
     pub body: String,
 }
 
+impl Toast {
+    /// A toast with cleaned text ([`clean`]) and the body shortened to [`BODY_MAX`].
+    pub fn new(title: &str, body: &str) -> Self {
+        Self {
+            title: clean(title),
+            body: shorten(&clean(body), BODY_MAX),
+        }
+    }
+}
+
+/// Is `c` a character XML 1.0 allows (`Char`), other than the tab and line breaks?
+fn xml_char(c: char) -> bool {
+    matches!(c, '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
+}
+
+/// Text for a toast (R4): ANSI CSI/OSC sequences removed, every character XML 1.0 forbids (control
+/// characters, U+FFFE, U+FFFF) and tabs and line breaks turned into spaces, runs of spaces
+/// collapsed — the toast XML would be dropped silently otherwise.
+pub fn clean(s: &str) -> String {
+    let s = crate::process::strip_ansi(s);
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let c = if xml_char(c) { c } else { ' ' };
+        if !(c == ' ' && out.ends_with(' ')) {
+            out.push(c);
+        }
+    }
+    out.trim().to_string()
+}
+
 /// At most `max` characters (an ellipsis marks a cut); NUL characters, which an environment
 /// variable cannot hold, are dropped.
 pub fn shorten(s: &str, max: usize) -> String {
     let s: String = s.chars().filter(|c| *c != '\0').collect();
-    if s.chars().count() <= max {
-        return s;
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
+    crate::engine::flight::shorten(&s, max)
 }
 
-/// The toast an event raises, if any: the gates, an escalation, a pause, and the end of a run
-/// in `Completed` or `Failed`. Title `toryo — <task>`; body: the state and the next action.
+/// The toast an event raises, if any: the gates, an escalation, a pause, the end of a run that
+/// stopped with an error, and the end of a run that reached `Completed` or `Failed`. Title
+/// `toryo — <task>`; body: the state and the next action.
 pub fn toast_for(e: &Envelope) -> Option<Toast> {
     let id = &e.task;
     let body = match &e.event {
@@ -62,7 +93,10 @@ pub fn toast_for(e: &Envelope) -> Option<Toast> {
             St::WaitingFinalApproval
         ),
         EngineEvent::Escalated { reason, .. } => {
-            format!("{:?} (`toryo status {id}` for what to do) — {reason}", St::Escalated)
+            format!(
+                "{:?} (`toryo status {id}` for what to do) — {reason}",
+                St::Escalated
+            )
         }
         EngineEvent::Paused { reason } if reason == "budget" => format!(
             "{:?} — budget: `toryo budget set {id} --tokens N`, then `toryo resume {id}`",
@@ -89,14 +123,11 @@ pub fn toast_for(e: &Envelope) -> Option<Toast> {
         }
         _ => return None,
     };
-    Some(Toast {
-        title: format!("toryo — {id}"),
-        body: shorten(&body, BODY_MAX),
-    })
+    Some(Toast::new(&format!("toryo — {id}"), &body))
 }
 
-/// Whether toasts are on for a drive command: `--no-notify` wins, then `--notify`, then the
-/// machine config (default off).
+/// Whether toasts are on for a drive command: `--notify` and `--no-notify` (mutually exclusive)
+/// override the machine config (default off).
 pub fn enabled(notify: bool, no_notify: bool, machine: Notify) -> bool {
     !no_notify && (notify || machine.toast)
 }
@@ -109,16 +140,28 @@ pub trait Toaster: Send + Sync {
 /// The event sink that raises the toasts.
 pub struct Notifier {
     toaster: Box<dyn Toaster>,
+    /// `false` under `--yes` (owner decision Q2): the gates are approved automatically, nobody
+    /// has to act on them.
+    gates: bool,
 }
 
 impl Notifier {
     pub fn new(toaster: Box<dyn Toaster>) -> Self {
-        Self { toaster }
+        Self {
+            toaster,
+            gates: true,
+        }
     }
 
     /// The platform's toaster: the Windows toast, elsewhere nothing.
     pub fn system() -> Self {
         Self::new(Box::new(SystemToaster))
+    }
+
+    /// No toast when a gate opens (`--yes`); escalations, pauses and the end still toast.
+    pub fn without_gates(mut self) -> Self {
+        self.gates = false;
+        self
     }
 }
 
@@ -128,6 +171,9 @@ impl EventSink for Notifier {
     }
 
     fn emit(&self, e: &Envelope) -> Result<()> {
+        if !self.gates && matches!(e.event, EngineEvent::GateOpened { .. }) {
+            return Ok(());
+        }
         match toast_for(e) {
             Some(t) => self.toaster.show(&t),
             None => Ok(()),
@@ -137,7 +183,8 @@ impl EventSink for Notifier {
 
 /// The toast script (Windows PowerShell 5.1, which loads WinRT types). Constant: the title and
 /// the body come from [`ENV_TITLE`] and [`ENV_BODY`] and become XML text nodes (`CreateTextNode`),
-/// never code or markup.
+/// never code or markup. It holds no double quote, so it passes as one `-Command` argument without
+/// any escaping (R4: `-EncodedCommand` from an unsigned exe is a common EDR alert pattern).
 pub const SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
 $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
 $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
@@ -151,27 +198,8 @@ $app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show($toast)
 "#;
 
-/// Base64 (RFC 4648, padded) — for `-EncodedCommand`; no crate for 20 lines.
-pub fn base64(bytes: &[u8]) -> String {
-    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for c in bytes.chunks(3) {
-        let n = (c[0] as u32) << 16
-            | (*c.get(1).unwrap_or(&0) as u32) << 8
-            | *c.get(2).unwrap_or(&0) as u32;
-        for i in 0..4 {
-            if i <= c.len() {
-                out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
-/// What the toaster starts: the program, its (constant) arguments, and the environment that
-/// carries the toast.
+/// What the toaster starts: the program, its (constant) arguments, and the variables that carry
+/// the toast.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToastCommand {
     pub program: std::path::PathBuf,
@@ -181,7 +209,6 @@ pub struct ToastCommand {
 
 /// The toast command for `t`. Only `env` depends on the toast.
 pub fn toast_command(t: &Toast, dry_run: bool) -> ToastCommand {
-    let utf16: Vec<u8> = SCRIPT.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
     ToastCommand {
         program: std::path::PathBuf::from(root)
@@ -192,8 +219,8 @@ pub fn toast_command(t: &Toast, dry_run: bool) -> ToastCommand {
         args: vec![
             "-NoProfile".into(),
             "-NonInteractive".into(),
-            "-EncodedCommand".into(),
-            base64(&utf16),
+            "-Command".into(),
+            SCRIPT.into(),
         ],
         env: vec![
             (ENV_TITLE.into(), t.title.clone()),
@@ -203,44 +230,63 @@ pub fn toast_command(t: &Toast, dry_run: bool) -> ToastCommand {
     }
 }
 
-/// The process of a toast, without a console window and without stdin/stdout/stderr.
-fn spawn(t: &Toast, dry_run: bool) -> Result<std::process::Child> {
-    let c = toast_command(t, dry_run);
-    let mut cmd = std::process::Command::new(&c.program);
-    cmd.args(&c.args)
-        .envs(c.env)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    cmd.spawn()
-        .map_err(|e| anyhow::anyhow!("cannot start {}: {e}", c.program.display()))
+/// toryo's environment with `extra` set (names compare case-insensitively, as on Windows).
+pub fn child_env(
+    base: impl Iterator<Item = (String, String)>,
+    extra: &[(String, String)],
+) -> std::collections::BTreeMap<String, String> {
+    let mut env: std::collections::BTreeMap<String, String> = base
+        .filter(|(k, _)| !extra.iter().any(|(e, _)| e.eq_ignore_ascii_case(k)))
+        .collect();
+    env.extend(extra.iter().cloned());
+    env
 }
 
-/// Wait for `child` up to `limit`, then kill it. The exit code, `None` when killed.
-fn wait_or_kill(mut child: std::process::Child, limit: Duration) -> Option<i32> {
-    let end = std::time::Instant::now() + limit;
-    loop {
-        match child.try_wait() {
-            Ok(Some(s)) => return Some(s.code().unwrap_or(1)),
-            Ok(None) if std::time::Instant::now() < end => {
-                std::thread::sleep(Duration::from_millis(100))
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
+/// A running toast process and its deadline.
+#[cfg(windows)]
+struct Pending {
+    process: crate::process::windows::Detached,
+    deadline: Instant,
+}
+
+/// The toast processes started by this toryo; [`wait_pending`] settles them before it exits.
+#[cfg(windows)]
+static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
+
+/// Start the toast process (Windows): no inherited handle, no console window.
+#[cfg(windows)]
+fn spawn(t: &Toast, dry_run: bool) -> Result<crate::process::windows::Detached> {
+    let c = toast_command(t, dry_run);
+    let base = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
+    crate::process::windows::spawn_detached(&c.program, &c.args, &child_env(base, &c.env))
+}
+
+/// Wait for `p` until `deadline`, then kill it: the exit code, `None` when killed.
+#[cfg(windows)]
+fn settle(p: &crate::process::windows::Detached, deadline: Instant) -> Option<u32> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    let code = p.wait(left);
+    if code.is_none() {
+        p.kill();
+    }
+    code
+}
+
+/// Before toryo exits: wait for the toast processes it started, each until its 10 s deadline
+/// (usually well under a second), and kill those still running (R4). The watcher is toryo itself:
+/// a thread would die with the process right after most toasts.
+pub fn wait_pending() {
+    #[cfg(windows)]
+    {
+        let pending = std::mem::take(&mut *PENDING.lock().unwrap_or_else(|p| p.into_inner()));
+        for p in pending {
+            settle(&p.process, p.deadline);
         }
     }
 }
 
-/// The platform's toaster: fire and forget on Windows, nothing elsewhere.
+/// The platform's toaster: on Windows the toast process, settled at exit; nothing elsewhere.
 pub struct SystemToaster;
 
 /// Test hook: `TORYO_TEST_TOAST_LOG=<file>` appends each toast to that file as a JSON line
@@ -258,27 +304,45 @@ impl Toaster for SystemToaster {
                 .open(p)?;
             return Ok(writeln!(f, "{line}")?);
         }
-        if !cfg!(windows) {
-            return Ok(());
+        #[cfg(windows)]
+        {
+            let process = spawn(t, false)?;
+            let mut pending = PENDING.lock().unwrap_or_else(|p| p.into_inner());
+            // the ones that are done need no more waiting
+            pending.retain(|p| p.process.wait(Duration::ZERO).is_none());
+            pending.push(Pending {
+                process,
+                deadline: Instant::now() + TOAST_TIMEOUT,
+            });
         }
-        let child = spawn(t, false)?;
-        std::thread::spawn(move || wait_or_kill(child, TOAST_TIMEOUT));
         Ok(())
     }
 }
 
-/// `toryo notify-test`: show a sample toast (or with `dry_run` only build it) and wait for the
-/// script, up to [`TOAST_TIMEOUT`]. The script's exit code; an error on other platforms.
-pub fn test_toast(dry_run: bool) -> Result<i32> {
-    if !cfg!(windows) {
-        anyhow::bail!("toasts are Windows only: nothing to test on this platform");
+/// Run the toast script for `t` and wait for it, up to [`TOAST_TIMEOUT`]: its exit code (`124`
+/// when it was stopped). `dry_run`: build the toast, do not show it. An error off Windows.
+pub fn run_script(t: &Toast, dry_run: bool) -> Result<i32> {
+    #[cfg(windows)]
+    {
+        let p = spawn(t, dry_run)?;
+        Ok(settle(&p, Instant::now() + TOAST_TIMEOUT).map_or(124, |c| c as i32))
     }
-    let t = Toast {
-        title: "toryo — notify-test".into(),
-        body: "Toasts work: toryo shows one like this at a gate, an escalation, a pause and the end of a run.".into(),
-    };
-    let child = spawn(&t, dry_run)?;
-    Ok(wait_or_kill(child, TOAST_TIMEOUT).unwrap_or(124))
+    #[cfg(not(windows))]
+    {
+        let _ = (t, dry_run);
+        anyhow::bail!("toasts are Windows only: nothing to test on this platform")
+    }
+}
+
+/// `toryo notify-test`: show a sample toast (or with `dry_run` only build it).
+pub fn test_toast(dry_run: bool) -> Result<i32> {
+    run_script(
+        &Toast::new(
+            "toryo — notify-test",
+            "Toasts work: toryo shows one like this at a gate, an escalation, a pause and the end of a run.",
+        ),
+        dry_run,
+    )
 }
 
 #[cfg(test)]
@@ -389,6 +453,19 @@ mod tests {
         assert!(bodies[6].starts_with("Failed — "));
     }
 
+    /// R4 (Q2): under `--yes` the gates raise no toast; everything else still does.
+    #[test]
+    fn without_gates_the_gates_are_silent() {
+        let r = Recorded::default();
+        let n = Notifier::new(Box::new(r.clone())).without_gates();
+        for e in every_event() {
+            n.emit(&env(e)).unwrap();
+        }
+        let got = r.0.lock().unwrap().clone();
+        assert_eq!(got.len(), 5, "{got:#?}");
+        assert!(got.iter().all(|t| !t.body.starts_with("Waiting")));
+    }
+
     /// R1 AC-2: an end with an error always toasts; the end state only when this drive reached it.
     #[test]
     fn a_run_end_toasts_on_an_error_or_a_new_end_state() {
@@ -433,6 +510,34 @@ mod tests {
         assert_eq!(shorten("short", 200), "short");
     }
 
+    /// R4: agent text carries ANSI colours, BEL, U+FFFE, tabs and line breaks; the toast XML
+    /// allows none of them.
+    #[test]
+    fn toast_text_is_cleaned_for_xml() {
+        assert_eq!(
+            clean("\u{1b}[31merror\u{1b}[0m:\tbad\r\nline\u{7}\u{fffe}\u{ffff} end  "),
+            "error: bad line end"
+        );
+        assert_eq!(
+            clean("\u{1b}]0;title\u{7}x\u{1b}]8;;http://a\u{1b}\\y"),
+            "xy",
+            "OSC sequences"
+        );
+        assert_eq!(clean("a\u{0}b\u{b}c\u{c}d"), "a b c d");
+        assert_eq!(clean("ありがとう — Cảm ơn"), "ありがとう — Cảm ơn");
+        assert_eq!(
+            clean("\u{1F600} ok"),
+            "\u{1F600} ok",
+            "astral characters are XML chars"
+        );
+        let t = toast_for(&env(EngineEvent::Escalated {
+            reason_class: "other".into(),
+            reason: "boom\u{1b}[1m\u{7}\n\nagain".into(),
+        }))
+        .unwrap();
+        assert!(t.body.ends_with("— boom again"), "{}", t.body);
+    }
+
     #[test]
     fn nothing_is_sent_when_toasts_are_off() {
         let off = Notify { toast: false };
@@ -440,8 +545,7 @@ mod tests {
         assert!(!enabled(false, false, off), "default off");
         assert!(enabled(false, false, on));
         assert!(enabled(true, false, off), "--notify");
-        assert!(!enabled(false, true, on), "--no-notify wins");
-        assert!(!enabled(true, true, on));
+        assert!(!enabled(false, true, on), "--no-notify");
     }
 
     /// AC-2: agent-written text is data. The program and the arguments do not depend on the
@@ -452,10 +556,7 @@ mod tests {
             title: "toryo — T\"; Remove-Item -Recurse C:\\ #".into(),
             body: "it's \"quoted\" $(Remove-Item x) `whoami` $env:PATH\r\nline 2 <text>&amp;</text> '; exit 1; '".into(),
         };
-        let plain = Toast {
-            title: "toryo — T".into(),
-            body: "ok".into(),
-        };
+        let plain = Toast::new("toryo — T", "ok");
         let (a, b) = (toast_command(&hostile, false), toast_command(&plain, false));
         assert_eq!(
             (&a.program, &a.args),
@@ -472,9 +573,11 @@ mod tests {
         assert_eq!(a.env[1], (ENV_BODY.to_string(), hostile.body.clone()));
         assert_eq!(a.env[2], (ENV_DRY_RUN.to_string(), "0".to_string()));
         assert_eq!(toast_command(&plain, true).env[2].1, "1");
-        // the encoded script is exactly SCRIPT, which reads the text as data only
-        let utf16: Vec<u8> = SCRIPT.encode_utf16().flat_map(u16::to_le_bytes).collect();
-        assert_eq!(a.args.last().unwrap(), &base64(&utf16));
+        // the script is passed as it is, and reads the text as data only
+        assert_eq!(
+            a.args,
+            ["-NoProfile", "-NonInteractive", "-Command", SCRIPT]
+        );
         assert!(SCRIPT.contains("CreateTextNode([string]$env:TORYO_TOAST_BODY)"));
         for bad in [
             "Invoke-Expression",
@@ -485,25 +588,61 @@ mod tests {
         ] {
             assert!(!SCRIPT.contains(bad), "{bad}");
         }
-        assert_eq!(
-            a.args[..3],
-            ["-NoProfile", "-NonInteractive", "-EncodedCommand"]
-        );
         assert!(a.program.ends_with("powershell.exe"));
     }
 
+    /// R4: `-Command` takes the script as one argument; it must need no quoting of its own.
     #[test]
-    fn base64_matches_rfc_4648() {
-        for (i, o) in [
-            ("", ""),
-            ("f", "Zg=="),
-            ("fo", "Zm8="),
-            ("foo", "Zm9v"),
-            ("foob", "Zm9vYg=="),
-            ("fooba", "Zm9vYmE="),
-            ("foobar", "Zm9vYmFy"),
-        ] {
-            assert_eq!(base64(i.as_bytes()), o, "{i}");
-        }
+    fn the_script_holds_no_double_quote() {
+        assert!(!SCRIPT.contains('"'));
+        assert!(
+            !SCRIPT.ends_with('\\'),
+            "a trailing backslash would escape the closing quote"
+        );
+        let quoted = crate::process::quote_windows_arg(SCRIPT);
+        assert_eq!(quoted, format!("\"{SCRIPT}\""), "wrapped, nothing escaped");
+    }
+
+    /// R4: a toast process still running at its deadline is killed.
+    #[cfg(windows)]
+    #[test]
+    fn a_toast_process_is_killed_at_its_deadline() {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let ps = std::path::PathBuf::from(root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        let args: Vec<String> = [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 30",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let p = crate::process::windows::spawn_detached(&ps, &args, &std::env::vars().collect())
+            .unwrap();
+        let t = Instant::now();
+        assert_eq!(settle(&p, t + Duration::from_millis(500)), None);
+        assert!(t.elapsed() < Duration::from_secs(5));
+        assert!(p.wait(Duration::from_secs(5)).is_some(), "killed");
+    }
+
+    #[test]
+    fn the_toast_variables_replace_inherited_ones() {
+        let base = vec![
+            ("Path".to_string(), "C:\\x".to_string()),
+            (
+                "toryo_toast_body".to_string(),
+                "from the parent".to_string(),
+            ),
+        ];
+        let extra = vec![(ENV_BODY.to_string(), "mine".to_string())];
+        let env = child_env(base.into_iter(), &extra);
+        assert_eq!(env.get(ENV_BODY).map(String::as_str), Some("mine"));
+        assert!(!env.contains_key("toryo_toast_body"));
+        assert_eq!(env.get("Path").map(String::as_str), Some("C:\\x"));
     }
 }

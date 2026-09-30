@@ -79,7 +79,7 @@ Review fixes (`M10-review-fixes.md`, 2026-09-30):
 - [x] R1 — `run_ended` on every exit of a drive; `watch` always terminates
 - [x] R2 — `turn_finished.usage` is what the store recorded
 - [x] R3 — `toryo usage` does not look complete when it is not
-- [ ] R4 — toast hardening
+- [x] R4 — toast hardening
 - [ ] R5 — escalation reasons on stderr: keep, pin, document
 - [ ] R6 — cheap Low fixes
 
@@ -394,3 +394,40 @@ toast test stays; review item 5 — the new `!! reason` lines stay (R5).
   false` and the marker (and `true`/`null`); two billing kinds → two groups; four unpriced groups of
   one model → listed once; an `includes_unreported` row → `~est.`. Before the fix the grouping and
   listing tests fail and the others do not compile (the fields are new).
+
+### R4 — toast hardening
+
+(Supersedes parts of D1: `-EncodedCommand`/base64, the watcher thread, "`--no-notify` wins".)
+
+- **Clean text** (`notify::clean`, used by `Toast::new` for the title and the body before the 200-char
+  cut): ANSI CSI/OSC sequences removed (`process::strip_ansi`), every character outside the XML 1.0
+  `Char` set (control characters, U+FFFE, U+FFFF) and tab/CR/LF turned into a space, runs of spaces
+  collapsed, trimmed. A body with such characters made the toast XML invalid and the toast was likely
+  dropped silently.
+- **`--yes`** (owner decision Q2): `Notifier::without_gates()` — no toast when a gate opens; escalations,
+  pauses and the end of the run still toast. `tests/m10_notify.rs::toasts_at_the_gates_…` expected the
+  final-gate toast of a `--yes` run: **the one existing assertion changed**, as the fix list allows.
+- **No inherited handles:** `process::windows::spawn_detached` — `CreateProcessW` with `bInheritHandles =
+  FALSE`, `CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT`, toryo's environment plus the three toast
+  variables (names compared case-insensitively, `notify::child_env`). `std::process::Command` passed
+  `TRUE`, so the toast held e.g. toryo's stdout pipe under `Tee-Object` and the reader waited for it.
+  Straightforward with the existing `env_block`/`quote_windows_arg`/`Owned` helpers.
+- **Lifetime:** no watcher thread (it died with toryo, right after most toasts). The started processes are
+  kept in `notify::PENDING`; `notify::wait_pending()` runs at the end of `main::cli_main` and waits for each
+  until its 10 s deadline, then kills it (usually well under a second of extra wait). A toast that is
+  already done is dropped from the list when the next one starts. `run_script` (used by `notify-test`)
+  waits the same way.
+- **`-Command` instead of `-EncodedCommand`:** `SCRIPT` holds no double quote and does not end in a
+  backslash, so `quote_windows_arg` only wraps it (unit test `the_script_holds_no_double_quote`); the AC-2
+  test still checks that the program and arguments are constant and the text is only in the environment.
+  The base64 encoder is gone. README/HUONG-DAN name Constrained Language Mode as a known limit, and
+  `notify-test` says so when the script fails. Checked here: the real toast still shows (exit 0).
+- **Docs:** `--notify` and `--no-notify` are mutually exclusive (clap refuses the pair); either overrides
+  the machine setting.
+- Tests: unit `toast_text_is_cleaned_for_xml`, `without_gates_the_gates_are_silent`,
+  `the_script_holds_no_double_quote`, `the_toast_variables_replace_inherited_ones`,
+  `a_toast_process_is_killed_at_its_deadline` (Windows), `process::windows::detached_tests::
+  a_detached_process_inherits_no_handle` (Windows; a mutation with `bInheritHandles = 1` fails it);
+  `tests/m10_notify.rs::the_real_script_takes_hostile_text_as_data` (Windows, dry run: quotes, `$(...)`,
+  backticks, ANSI, BEL, U+FFFE, Japanese, Vietnamese → exit 0). The new unit tests use new API (they do not
+  compile before the fix); the `--yes` assertion fails before it.

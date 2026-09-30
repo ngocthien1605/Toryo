@@ -51,11 +51,12 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::SystemServices::SE_GROUP_INTEGRITY;
 use windows_sys::Win32::System::Threading::{
-    CreateProcessAsUserW, GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess,
-    GetProcessTimes, OpenProcess, OpenProcessToken, OpenThread, ResumeThread, TerminateProcess,
-    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-    STARTF_USESTDHANDLES, STARTUPINFOW, THREAD_SUSPEND_RESUME,
+    CreateProcessAsUserW, CreateProcessW, GetCurrentProcess, GetCurrentProcessId,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenProcessToken, OpenThread, ResumeThread,
+    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, STARTF_USESTDHANDLES, STARTUPINFOW,
+    THREAD_SUSPEND_RESUME,
 };
 
 use super::{quote_windows_arg, Boundary, ProcId, SpawnSpec};
@@ -632,4 +633,122 @@ pub fn set_low_label(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A process started with no inherited handle and no console window (M10-R4: the toast), so it
+/// never holds a pipe of toryo's open (a harness reading toryo's stdout would wait for it).
+pub struct Detached {
+    process: Owned,
+    pub pid: u32,
+}
+
+// SAFETY: a process handle may be waited on and terminated from any thread.
+unsafe impl Send for Detached {}
+
+impl Detached {
+    /// Wait up to `limit`: the exit code, `None` while it still runs.
+    pub fn wait(&self, limit: Duration) -> Option<u32> {
+        let ms = limit.as_millis().min(u32::MAX as u128 - 1) as u32;
+        // SAFETY: we own the process handle.
+        unsafe {
+            if WaitForSingleObject(self.process.0, ms) != WAIT_OBJECT_0 {
+                return None;
+            }
+            let mut code = 0u32;
+            (GetExitCodeProcess(self.process.0, &mut code) != 0).then_some(code)
+        }
+    }
+
+    pub fn kill(&self) {
+        // SAFETY: we own the process handle.
+        unsafe { TerminateProcess(self.process.0, 1) };
+    }
+}
+
+/// Start `program args` with exactly `env` as its environment, `bInheritHandles = FALSE`,
+/// `CREATE_NO_WINDOW`, in toryo's current directory, outside any Job.
+pub fn spawn_detached(
+    program: &Path,
+    args: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+) -> Result<Detached> {
+    let mut cmdline = quote_windows_arg(&program.to_string_lossy());
+    for a in args {
+        cmdline.push(' ');
+        cmdline.push_str(&quote_windows_arg(a));
+    }
+    let mut cmdline_w = wide(OsStr::new(&cmdline));
+    let env = env_block(env);
+    // SAFETY: all pointers live across the call; the thread handle is closed at once.
+    unsafe {
+        let mut si: STARTUPINFOW = std::mem::zeroed();
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+        let ok = CreateProcessW(
+            null(),
+            cmdline_w.as_mut_ptr(),
+            null(),
+            null(),
+            0,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            env.as_ptr() as *const c_void,
+            null(),
+            &si,
+            &mut pi,
+        );
+        if ok == 0 {
+            return Err(last_error(&format!(
+                "CreateProcessW({})",
+                program.display()
+            )));
+        }
+        drop(Owned(pi.hThread));
+        Ok(Detached {
+            process: Owned(pi.hProcess),
+            pid: pi.dwProcessId,
+        })
+    }
+}
+
+#[cfg(test)]
+mod detached_tests {
+    use super::*;
+
+    fn powershell() -> std::path::PathBuf {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        std::path::PathBuf::from(root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe")
+    }
+
+    fn sleeper(secs: u32) -> Detached {
+        let args: Vec<String> = ["-NoProfile", "-NonInteractive", "-Command"]
+            .iter()
+            .map(|s| s.to_string())
+            .chain([format!("Start-Sleep -Seconds {secs}")])
+            .collect();
+        spawn_detached(&powershell(), &args, &std::env::vars().collect()).unwrap()
+    }
+
+    /// M10-R4: a detached process holds none of toryo's inheritable handles — here the write end
+    /// of an inheritable pipe: once toryo drops it, the read end is at EOF at once, although the
+    /// child still runs (with `bInheritHandles = TRUE` the read would wait for the child).
+    #[test]
+    fn a_detached_process_inherits_no_handle() {
+        let (r, w) = pipe(false).unwrap();
+        let p = sleeper(6);
+        drop(w);
+        let t = Instant::now();
+        // SAFETY: the handle is ours; ownership moves to the File
+        let mut f = unsafe { File::from_raw_handle(r.0 as _) };
+        std::mem::forget(r);
+        let mut buf = Vec::new();
+        let _ = f.read_to_end(&mut buf);
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert_eq!(p.wait(Duration::ZERO), None, "the child still runs");
+        p.kill();
+        assert!(p.wait(Duration::from_secs(10)).is_some());
+    }
 }
