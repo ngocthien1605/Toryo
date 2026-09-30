@@ -540,7 +540,11 @@ thúc stage, từng lượt agent (token), checkpoint, từng lệnh verify, gat
 kết thúc lần chạy. Nhờ vậy trả lời được "40 phút vừa rồi đi đâu?", "lượt nào tốn token?", "vì sao escalate?"
 mà không phải đọc capture. Lý do (reason) đi qua cùng bộ lọc secret như capture. `task cleanup` xoá file này
 cùng run store. Các dòng engine in ra stderr (`[state] …`, tiêu đề stage, `✔ checkpoint …`, lệnh verify,
-`!! budget: …`, lý do escalate) giờ được **dựng từ chính các sự kiện đó** — nội dung y như trước.
+`!! budget: …`, lý do escalate) giờ được **dựng từ chính các sự kiện đó**. Khác trước M10 ở một điểm (có chủ
+đích): **mọi** escalate và pause đều in lý do đúng một lần ngay trước dòng `[state]` — vd. `!! the reviewer
+blocked the task`, `!! not accepted after 1 fix cycle(s) (last: verify failed)`. Mỗi lần chạy luôn kết thúc
+bằng sự kiện `run_ended`, kể cả khi dừng vì lỗi trước stage đầu tiên (kèm trường `error`); `escalated` có
+`reason_class` dạng snake_case (`max_fix_cycles`, `review_blocked`, `protected_config_changed`, …).
 
 **Theo dõi trực tiếp** — mở cửa sổ thứ hai trong lúc `toryo run` đang chạy (không cần lock, không làm phiền
 lần chạy):
@@ -562,6 +566,10 @@ toryo status --json                 # { "tasks": [ { id, state, fix_cycle, spent
 toryo task show BR-003 --json       # + worktree, branch, attempts[], usage[], gates[], events_file
 ```
 
+`status`/`task show` không đụng tới lock của task (không làm `toryo run` đang khởi động bị từ chối):
+`active_owner` lấy từ chủ lock đã ghi nhận còn sống, `null` khi không ai chạy; `compile_only` là `null` khi
+config đóng băng không còn (sau `task cleanup`); trong `usage[]` số token được tính là `counted_tokens`.
+
 **Token và chi phí ước tính** (plan §12):
 
 ```powershell
@@ -576,8 +584,11 @@ Bắt đầu từ `templates\prices.toml.example` (giá trong đó là **giá gi
 USD / 1 triệu token cho từng bucket của từng model (tên model = `model:` của role, nếu không thì của profile;
 với profile Codex có `codex.provider` là **tên deployment Foundry**), `version` (in kèm mọi ước tính) và
 `safety_factor` (nhân thêm cho an toàn). Dòng subscription hiện `—`; model chưa có giá hiện `no price` và được
-liệt kê cuối báo cáo; ước tính có cả phần giữ chỗ (turn không báo token) hiện `~est.`. Không có file → báo cáo
-không có chi phí (không lỗi). Key lạ hay giá âm → lỗi nêu đúng tên key. Từ M10 mỗi dòng usage ghi luôn model;
+liệt kê cuối báo cáo; ước tính có cả phần giữ chỗ (turn không báo token) hoặc token của turn bị kill hiện
+`~est.`. Nếu còn nhóm tính tiền theo token chưa có giá, dòng tổng ghi thêm `+ no price (N groups)` (JSON
+`totals.est_complete: false`) — con số ước tính khi đó **chưa đủ**. `exact`/`provisional` là số token thô;
+phần giữ chỗ là budget token (có trọng số `pipeline.budget_weights`), tính giá như uncached input. Profile
+`claude-foundry` cần có `model:` thì mới tính được giá. Không có file → báo cáo không có chi phí (không lỗi). Key lạ hay giá âm → lỗi nêu đúng tên key. Từ M10 mỗi dòng usage ghi luôn model;
 dòng cũ (trước M10) lấy model từ config đã đóng băng của task.
 
 **Thông báo Windows (toast)** khi task cần anh: gate mở (plan/final), escalate, pause, lần chạy kết thúc

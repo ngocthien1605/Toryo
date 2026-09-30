@@ -150,13 +150,17 @@ print one JSON document on stdout and nothing else there. Field names are snake_
 `<data_dir>\runs\<ID>\events.jsonl`, one JSON object per line: `{"v":1,"seq":N,"ts":"<RFC 3339>","task":"ID",
 "generation":G,"type":"…", …}` with `type` one of `run_started`, `state_changed` (`from`, `to`, `event`),
 `stage_started` (`stage`, `attempt`, `profile`, `detail`), `stage_finished` (`status`, `error_class`,
-`duration_ms`), `turn_finished` (`profile`, `success`, `usage` = the four buckets + `accounting`, `duration_ms`),
+`duration_ms`), `turn_finished` (`profile`, `success`, `usage` = the four buckets + `accounting` as the store
+recorded them — a cumulative adapter's delta —, or `reserved_tokens` for a turn with no telemetry, `duration_ms`),
 `checkpoint_created` (`head`, `kind`, `found`), `verify_command` (`name`, `exit`, `timed_out`, `ok`, `duration_ms`),
-`gate_opened` (`gate`, `occurrence`), `budget_warning` (`used`, `cap`), `escalated` (`reason_class`, `reason`),
-`paused` (`reason`), `run_ended` (`state`, `next_action`). `seq` grows across runs; `generation` is the task lock
-generation of the writing command. Reasons are redacted like captures. `task cleanup` removes the file with
-the run store. The engine's own stderr lines (`[state] …`, stage headers, `✔ checkpoint …`, verify commands,
-`!! budget: …`, `!! <escalation reason>`) are rendered from these events.
+`gate_opened` (`gate`, `occurrence`), `budget_warning` (`used`, `cap`), `escalated` (`reason_class` — a typed
+snake_case class such as `max_fix_cycles`, `review_blocked`, `protected_config_changed` —, `reason`),
+`paused` (`reason`), `run_ended` (`state`, `next_action`, `from` = the state when the drive started, `error` when
+it stopped with one). Every drive command ends its lines with one `run_ended`, also when it fails before the
+first stage. `seq` grows across runs; `generation` is the task lock generation of the writing command. Reasons
+are redacted like captures. `task cleanup` removes the file with the run store. The engine's own stderr lines
+(`[state] …`, stage headers, `✔ checkpoint …`, verify commands, `!! budget: …`, and the reason of every
+escalation and pause, once, before its `[state]` line) are rendered from these events.
 
 ```
 toryo watch ID [--json] [--from-start] [--no-follow]

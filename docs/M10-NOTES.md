@@ -2,63 +2,70 @@
 
 Every entry: what was decided, why, and where. The owner folds these into plan v0.9.
 
-## Morning summary (2026-09-30)
+## Morning summary (2026-09-30, after the review fixes)
 
-**All eight tasks are DONE; none PARTIAL, none NOT STARTED.** Branch `m10/flight-recorder`, 9 commits on
-`main` @ `5adf204`, not pushed:
+**M10 and all six review fixes are DONE; nothing PARTIAL.** Branch `m10/flight-recorder` on `main` @
+`5adf204`, not pushed. The review fixes are R1–R6 plus a docs commit:
 
 | Commit | Task | State |
 |---|---|---|
-| `ca35047` | docs: owner verification E1, E7 (M9) — your notes, committed alone | — |
-| `e17875c` | A1 — `EngineEvent`, sinks, `events.jsonl` flight recorder | DONE |
-| `bb49186` | A2 — the engine's stderr lines rendered from events (same text) | DONE |
-| `24679d4` | B1 — `status --json`, `task show --json` | DONE |
-| `0f69359` | B2 — `toryo watch <ID>` | DONE |
-| `80ed7a0` | C1 — `prices.toml` + `toryo usage <ID>` | DONE |
-| `87d587d` | C2 — scripted turns of a mixed run report exact zero usage | DONE |
-| `2ca9059` | D1 — Windows toast (`notify:`, `--notify`, `notify-test`) | DONE |
-| (last) | E1 — README, HUONG-DAN §5.8, this summary (the templates came with C1 and D1) | DONE |
+| `ca35047` | docs: owner verification E1, E7 (M9) — your notes | — |
+| `e17875c` … `de85374` | M10 A1, A2, B1, B2, C1, C2, D1, E1 (first night) | DONE |
+| `d75beea` | R1 — `run_ended` on every exit of a drive; `watch` always terminates | DONE |
+| `59cefb7` | R2 — `turn_finished.usage` is what the store recorded | DONE |
+| `f9e1971` | R3 — `toryo usage` says when an estimate is incomplete | DONE |
+| `6ae1624` | R4 — toast hardening (clean text, `--yes`, no inherited handles, exit wait, `-Command`) | DONE |
+| `dcd9611` | R5 — every escalation and pause prints its reason once | DONE |
+| `e27b1f5` | R6 — typed classes, fail-closed redaction, `seq`, recovery events, no lock probe, read-only store | DONE |
+| (last) | docs: review fixes in README, HUONG-DAN §5.8 and this summary | DONE |
 
 **Checks** (§0.2) green before every commit on this machine: `cargo fmt --check`, both `clippy -D warnings`,
-`cargo test --locked`. Tests: **401 passed, 0 failed, 6 ignored** (before M10: 355 passed, 5 ignored; the new
-ignored one shows a real toast). New test files: `tests/m10_events.rs`, `m10_views.rs`, `m10_usage.rs`,
-`m10_notify.rs`, plus unit tests in `engine::flight`, `engine::views`, `engine::usage_report`, `notify`,
-`config`. No real agent was run; the owner's configs and data dirs were not read.
+`cargo test --locked`. Tests: **426 passed, 0 failed, 6 ignored** — 401 / 6 at `de85374` (before the
+fixes), 355 / 5 before M10. Each fix has a test that fails before it, except where the commit says why not
+(new API that does not compile before, and the lock-probe race of R6, which is not practical to reproduce).
+No real agent was run; your configs and data dirs were not read. One real toast was shown here to check
+the new `-Command` path (exit 0).
 
-**Deviations from `M10_task.md`** (details in the sections below):
-1. The module is `src/engine/flight.rs`, not `events.rs`: `tests/architecture.rs` (R52) forbids the text
-   `events::` in engine files (it means the vendor module `agents::events`); the test was not weakened.
-2. `RunStarted { owner }`, not `{ generation }`: the envelope already has `generation`, and the flattened
-   event would write the key twice.
-3. `stage_started` for verify is emitted when its header is printed (after the checkout exists); a verify
-   that escalates before that has `stage_finished` only.
-4. The CLI now runs on a thread with an 8 MB stack: adding `watch` made the Windows debug build overflow the
-   1 MB main-thread stack in clap's builder already on `--help` (found in B2, `main::CLI_STACK`).
-5. The stderr engine lines now go through the task's secret redaction too (a reason that carried a profile
-   secret was printed as is before). Otherwise the text is identical — checked against `main`'s binary on
-   the same fake scenarios (335 stderr lines, A2).
+**Owner decisions applied:** Q1 `finish_and` transitions stay quiet on stderr; Q2 no gate toasts under
+`--yes` (R4); Q3 `vendor_reported_cost_usd` later — the column and the display stay, nothing fills it;
+Q4 reservations priced as uncached input, now said in the report header (R3); Q5 the CI toast test stays;
+review item 5 — the new `!! reason` lines stay, as a uniform rule (R5).
 
-**Open questions for you:**
-1. Transitions the CLI never printed (inside `finish_and`, e.g. `Verifying --verify_passed--> Reviewing`)
-   are in `events.jsonl` and in `watch`, still not on the run's stderr (`Envelope.quiet`). Print them too?
-2. With `--yes` and toasts on, the gates still raise toasts although they are approved automatically — as
-   the task says. Suppress toasts under `--yes`?
-3. `vendor_reported_cost_usd` is shown next to the estimate but nothing fills it (the Claude adapter parses
-   `total_cost_usd`, `StageOutcome` does not carry it). Worth carrying?
-4. Reservations are priced as uncached input in the `~est.` cost (C1). Another rule?
-5. CI: `notify_test_builds_the_toast` loads WinRT types in Windows PowerShell on `windows-latest`; if the
-   image cannot, mark it `#[ignore]`. The Unix Ctrl+C path of `watch` compiles only on Linux CI (no Linux
-   target here).
+**Deviations from `M10_task.md`** (details below):
+1. The module is `src/engine/flight.rs`, not `events.rs` (`tests/architecture.rs`, R52, forbids the text
+   `events::` in engine files).
+2. `RunStarted { owner }`, not `{ generation }` (the envelope has `generation`).
+3. `stage_started` for verify is emitted when its header is printed (after the checkout exists).
+4. The CLI runs on a thread with an 8 MB stack (the Windows debug build overflowed in clap's builder).
+5. The stderr engine lines go through the task's secret redaction.
+6. **stderr is not identical to `main`'s** (review item 5, kept by the owner): every escalation and pause
+   prints its reason exactly once before its `[state]` line; before M10 several escalation paths printed
+   none (a blocked review, the fix-cycle bound, the plan-policy bound, an implementer failure, a rejected
+   review). The budget pauses keep their own `!! budget …` line as their reason. The first night's claim
+   "identical on the same scenarios" held only because those paths were not in the scenarios.
+7. Changed M10 behaviour on the owner's or the fix list's request: `watch` also stops for `New` and any
+   state nobody drives (R1); `usage[].budget_tokens` → `counted_tokens` (R6); `compile_only` may be
+   `null` (R6); `reason_class` is snake_case and typed (R6); toasts use `-Command` (R4).
+
+**Open:**
+- `vendor_reported_cost_usd` is still never filled (Q3: later).
+- The Unix paths (`watch`'s SIGINT handler, the non-Windows notify stubs) compile
+  and run only on Linux CI — no Linux target on this machine.
+- `notify_test_builds_the_toast` and `the_real_script_takes_hostile_text_as_data` load WinRT types in
+  Windows PowerShell on `windows-latest` (Q5: you watch the first CI run).
+- Transitions made by CLI commands outside the engine (recovery, resume) still get their escalation class
+  from the reason-prefix fallback; `task cleanup`'s `Cancel` is not in `events.jsonl` (the file goes with
+  the run store).
 
 **Try first** (build first: `cargo build --release` — `bin\toryo.exe` is not rebuilt):
-1. `toryo notify-test` — a toast "toryo — notify-test" should appear; if not, allow notifications for
-   "Windows PowerShell" (Settings → System → Notifications). It was run once here: exit 0.
-2. Copy `templates\prices.toml.example` to `%USERPROFILE%\.toryo\prices.toml`, put in your Foundry
-   deployment names and contract prices, then `toryo usage <an existing task>` (older rows show the model
-   from the frozen config).
-3. On the next real task: `toryo run ID --notify` in one window, `toryo watch ID` in another; afterwards
-   `toryo status --json` and `toryo task show ID --json`.
-4. `scripts\m9-check.ps1 -Canary` again: the status line should no longer show `+~400000 reserved` (C2).
+1. `toryo notify-test` — a toast "toryo — notify-test"; if none, allow notifications for "Windows
+   PowerShell" (under Constrained Language Mode it fails and says so).
+2. `templates\prices.toml.example` → `%USERPROFILE%\.toryo\prices.toml` with your Foundry deployment names
+   and prices (give `claude-foundry` a `model:`), then `toryo usage <an existing task>` — a total that
+   misses a price now says `+ no price (N groups)`.
+3. The next real task: `toryo run ID --notify` in one window, `toryo watch ID` in another; `toryo status
+   --json` / `task show ID --json` while it runs no longer touch its lock.
+4. `scripts\m9-check.ps1 -Canary` again: no `+~400000 reserved` (C2).
 
 ## Progress
 
@@ -82,6 +89,7 @@ Review fixes (`M10-review-fixes.md`, 2026-09-30):
 - [x] R4 — toast hardening
 - [x] R5 — escalation reasons on stderr: keep, pin, document
 - [x] R6 — cheap Low fixes
+- [x] docs — README, HUONG-DAN §5.8, the rewritten morning summary
 
 ## A — Event backbone (ARCH-02)
 
