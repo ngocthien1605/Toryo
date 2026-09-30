@@ -292,7 +292,7 @@ fn the_real_script_takes_hostile_text_as_data() {
         "toryo — T-1 \"; exit 3 # `whoami` $(Get-Date)",
         "it's \"quoted\" $(Remove-Item nothing) `whoami` \u{1b}[31mred\u{1b}[0m \u{7}bell \u{fffe} ありがとう Cảm ơn nhiều\r\n'; exit 4; '",
     );
-    assert!(!t.body.contains('\u{1b}') && !t.body.contains('\u{fffe}'));
+    assert!(!t.body().contains('\u{1b}') && !t.body().contains('\u{fffe}'));
     assert_eq!(toryo::notify::run_script(&t, true).unwrap(), 0);
 }
 

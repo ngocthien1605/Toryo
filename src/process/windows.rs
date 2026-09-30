@@ -679,20 +679,66 @@ impl Detached {
     }
 }
 
+/// R8: what `std::process::Command` refuses too — a NUL in an argument, an environment name or
+/// value, an empty name, or `=` in a name after its first character (Windows keeps
+/// `=C:`-style names).
+pub fn check_spawn_input(
+    args: &[String],
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<()> {
+    const NUL: char = '\0';
+    if let Some(a) = args.iter().find(|a| a.contains(NUL)) {
+        bail!("an argument holds a NUL character: {a:?}");
+    }
+    for (k, v) in env {
+        let name: Vec<u16> = k.encode_wide().collect();
+        if name.is_empty() {
+            bail!("an empty environment variable name");
+        }
+        if name.contains(&0) || v.encode_wide().any(|c| c == 0) {
+            bail!("the environment variable {k:?} holds a NUL character");
+        }
+        if name[1..].contains(&(b'=' as u16)) {
+            bail!("the environment variable name {k:?} holds `=`");
+        }
+    }
+    Ok(())
+}
+
+/// Windows environment block from `OsString` pairs (non-Unicode values kept): sorted by name,
+/// case-insensitively, UTF-16, double-NUL terminated.
+fn env_block_os(env: &[(std::ffi::OsString, std::ffi::OsString)]) -> Vec<u16> {
+    let mut pairs: Vec<&(std::ffi::OsString, std::ffi::OsString)> = env.iter().collect();
+    pairs.sort_by_key(|(k, _)| k.to_string_lossy().to_uppercase());
+    let mut out = Vec::new();
+    for (k, v) in pairs {
+        out.extend(k.encode_wide());
+        out.push(b'=' as u16);
+        out.extend(v.encode_wide());
+        out.push(0);
+    }
+    if out.is_empty() {
+        out.push(0);
+    }
+    out.push(0);
+    out
+}
+
 /// Start `program args` with exactly `env` as its environment, `bInheritHandles = FALSE`,
 /// `CREATE_NO_WINDOW`, in toryo's current directory, outside any Job.
 pub fn spawn_detached(
     program: &Path,
     args: &[String],
-    env: &std::collections::BTreeMap<String, String>,
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> Result<Detached> {
+    check_spawn_input(args, env)?;
     let mut cmdline = quote_windows_arg(&program.to_string_lossy());
     for a in args {
         cmdline.push(' ');
         cmdline.push_str(&quote_windows_arg(a));
     }
     let mut cmdline_w = wide(OsStr::new(&cmdline));
-    let env = env_block(env);
+    let env = env_block_os(env);
     // SAFETY: all pointers live across the call; the thread handle is closed at once.
     unsafe {
         let mut si: STARTUPINFOW = std::mem::zeroed();
@@ -743,7 +789,12 @@ mod detached_tests {
             .map(|s| s.to_string())
             .chain([format!("Start-Sleep -Seconds {secs}")])
             .collect();
-        spawn_detached(&powershell(), &args, &std::env::vars().collect()).unwrap()
+        spawn_detached(
+            &powershell(),
+            &args,
+            &std::env::vars_os().collect::<Vec<_>>(),
+        )
+        .unwrap()
     }
 
     /// M10-R4: a detached process holds none of toryo's inheritable handles — here the write end
@@ -803,5 +854,40 @@ mod alive_tests {
             pid: SYSTEM,
             created
         }));
+    }
+}
+
+#[cfg(test)]
+mod spawn_input_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    /// M10-R8: `spawn_detached` refuses what `std::process::Command` refused: a NUL in an
+    /// argument, a variable name or value, an empty name, `=` in a name after its first character.
+    #[test]
+    fn detached_spawns_refuse_what_command_refuses() {
+        let ok: Vec<(OsString, OsString)> = vec![
+            ("PATH".into(), r"C:\x".into()),
+            ("=C:".into(), r"C:\".into()),
+        ];
+        assert!(
+            check_spawn_input(&["-Command".into()], &ok).is_ok(),
+            "`=C:` names are fine"
+        );
+        let nul = String::from_utf8(vec![b'a', 0, b'b']).unwrap();
+        assert!(check_spawn_input(std::slice::from_ref(&nul), &ok).is_err());
+        for bad in [
+            vec![(OsString::from(nul.as_str()), OsString::from("v"))],
+            vec![(OsString::from("K"), OsString::from(nul.as_str()))],
+            vec![(OsString::from(""), OsString::from("v"))],
+            vec![(OsString::from("A=B"), OsString::from("v"))],
+        ] {
+            assert!(check_spawn_input(&[], &bad).is_err(), "{bad:?}");
+        }
+        let p = std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe");
+        assert!(
+            spawn_detached(&p, &[nul], &ok).is_err(),
+            "checked before CreateProcessW"
+        );
     }
 }

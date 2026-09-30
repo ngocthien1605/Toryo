@@ -2,10 +2,10 @@
 
 Every entry: what was decided, why, and where. The owner folds these into plan v0.9.
 
-## Morning summary (2026-09-30, after the review fixes)
+## Morning summary (2026-09-30, after both rounds of review fixes)
 
-**M10 and all six review fixes are DONE; nothing PARTIAL.** Branch `m10/flight-recorder` on `main` @
-`5adf204`, not pushed. The review fixes are R1–R6 plus a docs commit:
+**M10, review fixes R1–R6 and round 2 (R7, R8) are DONE; nothing PARTIAL.** Branch
+`m10/flight-recorder` on `main` @ `5adf204`, not pushed.
 
 | Commit | Task | State |
 |---|---|---|
@@ -17,11 +17,13 @@ Every entry: what was decided, why, and where. The owner folds these into plan v
 | `6ae1624` | R4 — toast hardening (clean text, `--yes`, no inherited handles, exit wait, `-Command`) | DONE |
 | `dcd9611` | R5 — every escalation and pause prints its reason once | DONE |
 | `e27b1f5` | R6 — typed classes, fail-closed redaction, `seq`, recovery events, no lock probe, read-only store | DONE |
-| (last) | docs: review fixes in README, HUONG-DAN §5.8 and this summary | DONE |
+| `047a12d` | docs: review fixes in README, HUONG-DAN §5.8 and this summary | DONE |
+| `52101e0` | R7 — round 2, events and engine (recovery duplicate, redact-then-cut, reject reason, `watch` rule, panic guard, `seq`, coverage test, `is_alive`) | DONE |
+| (last) | R8 — round 2, usage and notify (`est_complete`, flags, `spawn_detached` checks, private `Toast`, title cut) | DONE |
 
 **Checks** (§0.2) green before every commit on this machine: `cargo fmt --check`, both `clippy -D warnings`,
-`cargo test --locked`. Tests: **426 passed, 0 failed, 6 ignored** — 401 / 6 at `de85374` (before the
-fixes), 355 / 5 before M10. Each fix has a test that fails before it, except where the commit says why not
+`cargo test --locked`. Tests: **437 passed, 0 failed, 6 ignored** — 426 / 6 at `047a12d` (before round 2),
+401 / 6 at `de85374` (before the fixes), 355 / 5 before M10. Each fix has a test that fails before it, except where the commit says why not
 (new API that does not compile before, and the lock-probe race of R6, which is not practical to reproduce).
 No real agent was run; your configs and data dirs were not read. One real toast was shown here to check
 the new `-Command` path (exit 0).
@@ -41,11 +43,17 @@ review item 5 — the new `!! reason` lines stay, as a uniform rule (R5).
 6. **stderr is not identical to `main`'s** (review item 5, kept by the owner): every escalation and pause
    prints its reason exactly once before its `[state]` line; before M10 several escalation paths printed
    none (a blocked review, the fix-cycle bound, the plan-policy bound, an implementer failure, a rejected
-   review). The budget pauses keep their own `!! budget …` line as their reason. The first night's claim
-   "identical on the same scenarios" held only because those paths were not in the scenarios.
+   review, a final-gate rejection at the bound). **Remaining exceptions** (the reason is still said once,
+   by another line): the budget pauses (`!! budget reached during the turn …` / `!! admission cap reached
+   …`), the pause after the last implementer switch (`!! implementer X: … → no fallback left`), the
+   withdrawn final gate (the refused `approve` prints the error), and transitions inside `finish_and`,
+   which print no `[state]` line at all (owner decision Q1). The first night's claim "identical on the
+   same scenarios" held only because those paths were not in the scenarios.
 7. Changed M10 behaviour on the owner's or the fix list's request: `watch` also stops for `New` and any
    state nobody drives (R1); `usage[].budget_tokens` → `counted_tokens` (R6); `compile_only` may be
-   `null` (R6); `reason_class` is snake_case and typed (R6); toasts use `-Command` (R4).
+   `null` (R6); `reason_class` is snake_case and typed (R6); toasts use `-Command` (R4); `watch` stops only
+   when nobody drives the task, whatever the state (R7); `totals.est_complete` is `false` when any billed
+   group is unpriced, also without an estimate (R8).
 
 **Open:**
 - `vendor_reported_cost_usd` is still never filled (Q3: later).
@@ -53,6 +61,8 @@ review item 5 — the new `!! reason` lines stay, as a uniform rule (R5).
   and run only on Linux CI — no Linux target on this machine.
 - `notify_test_builds_the_toast` and `the_real_script_takes_hostile_text_as_data` load WinRT types in
   Windows PowerShell on `windows-latest` (Q5: you watch the first CI run).
+- Not tested (not practical): the error printed before the toast wait (R8.5 — only the timing changes) and
+  the `notify-test` failure text (R8.7 — needs a failing script).
 - Transitions made by CLI commands outside the engine (recovery, resume) still get their escalation class
   from the reason-prefix fallback; `task cleanup`'s `Cancel` is not in `events.jsonl` (the file goes with
   the run store).
@@ -94,7 +104,7 @@ Review fixes (`M10-review-fixes.md`, 2026-09-30):
 Review fixes, round 2 (`M10-review-fixes-2.md`):
 
 - [x] R7 — events and engine
-- [ ] R8 — usage and notify
+- [x] R8 — usage and notify
 
 ## A — Event backbone (ARCH-02)
 
@@ -559,3 +569,38 @@ From `M10-review-fixes-2.md` (re-review of R1–R6 at `047a12d`).
    non-elevated run cannot open with both rights; an elevated run says "nothing to test" and passes.
 9. **Missing test** `a_forced_final_gate_raises_no_toast` (`approve --force --continue --notify` from a
    blocked review): no toast. It passes before this commit too — the fix was in R1.
+
+#### R8 — usage and notify
+
+1. **All billed groups unpriced:** `est_complete` is `Some(false)` whenever a group billed per token has no
+   price — also when nothing could be estimated (it was `null`, and the total read `—`, the subscription
+   label). The text total then reads `no price (N group[s])`; with an estimate, `est. $x + no price (N
+   groups)` as before. Subscription-only reports keep `null`. Test `r8_a_lone_unpriced_billed_group_is_
+   not_a_complete_total` (one `api` group with `unknown model`); the R3 test's `null` expectation for
+   two unpriced groups is now `false` (the fix itself).
+2. **The dedup test tests dedup:** `r3_an_unpriced_model_is_listed_once` interleaves A, B, A and expects
+   `[A, B]` (`dedup()` kept A twice).
+3. **Reservations and killed turns apart:** `totals.includes_reservations` is true only for real
+   reservations; the new `totals.includes_unreported` for rows that include killed turns' tokens. Both
+   make the total `~est.`; the footer says "`~est.` = includes reservations (priced as uncached input) or
+   killed turns' tokens".
+4. **Restored assertion** `assert!(!enabled(true, true, on));` ("clap refuses the pair; still off").
+   **Forced test changes of R4, declared here:** the AC-2 test `hostile_text_is_passed_as_data` was
+   rewritten for `-Command` (the constant arguments are now `[-NoProfile, -NonInteractive, -Command,
+   SCRIPT]`, before `-EncodedCommand <base64>`), and `base64_matches_rfc_4648` was deleted with the
+   base64 encoder it tested; this assertion was dropped by mistake in the same commit.
+5. **The error is printed before the toast wait:** `cli_main` builds the exit code and prints `error:` /
+   `task_active:` first, then `notify::wait_pending()`. No test: the difference is only when the text
+   appears (up to 10 s earlier), not what it says — not practical to assert.
+6. **`spawn_detached` input checks:** `process::windows::check_spawn_input` refuses a NUL in an argument,
+   a variable name or value, an empty name, and `=` in a name after its first character (`=C:`-style names
+   stay allowed) — what `std::process::Command` refused. The environment is now `OsString` pairs
+   (`env_block_os`), so a parent variable that is not valid Unicode is passed on (it was dropped).
+   `Toast`'s fields are private (`title()`/`body()` read them), so every toast goes through `Toast::new`
+   → `clean`. Tests `detached_spawns_refuse_what_command_refuses`, `a_non_unicode_parent_variable_is_kept`
+   (Windows). Checked here: `notify-test` and `--dry-run` still exit 0.
+7. **`notify-test` failure text:** "the toast script failed (exit N) — e.g. Constrained Language Mode
+   (AppLocker/WDAC) or notifications disabled for Windows PowerShell". No test (it needs a failing
+   script).
+8. **Title length:** `Toast::new` shortens the title to 200 characters like the body (unit assertion in
+   `the_body_is_capped`).

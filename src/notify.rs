@@ -37,17 +37,26 @@ pub const ENV_DRY_RUN: &str = "TORYO_TOAST_DRY_RUN";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Toast {
-    pub title: String,
-    pub body: String,
+    // private (R8): every toast goes through `Toast::new`, so through `clean` and the cuts
+    title: String,
+    body: String,
 }
 
 impl Toast {
-    /// A toast with cleaned text ([`clean`]) and the body shortened to [`BODY_MAX`].
+    /// A toast with cleaned text ([`clean`]), title and body shortened to [`BODY_MAX`] (R8).
     pub fn new(title: &str, body: &str) -> Self {
         Self {
-            title: clean(title),
+            title: shorten(&clean(title), BODY_MAX),
             body: shorten(&clean(body), BODY_MAX),
         }
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn body(&self) -> &str {
+        &self.body
     }
 }
 
@@ -232,13 +241,18 @@ pub fn toast_command(t: &Toast, dry_run: bool) -> ToastCommand {
 
 /// toryo's environment with `extra` set (names compare case-insensitively, as on Windows).
 pub fn child_env(
-    base: impl Iterator<Item = (String, String)>,
+    base: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     extra: &[(String, String)],
-) -> std::collections::BTreeMap<String, String> {
-    let mut env: std::collections::BTreeMap<String, String> = base
-        .filter(|(k, _)| !extra.iter().any(|(e, _)| e.eq_ignore_ascii_case(k)))
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    // R8: non-Unicode variables of the parent are kept as they are
+    let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = base
+        .filter(|(k, _)| {
+            !extra
+                .iter()
+                .any(|(e, _)| e.eq_ignore_ascii_case(&k.to_string_lossy()))
+        })
         .collect();
-    env.extend(extra.iter().cloned());
+    env.extend(extra.iter().map(|(k, v)| (k.into(), v.into())));
     env
 }
 
@@ -257,9 +271,11 @@ static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
 #[cfg(windows)]
 fn spawn(t: &Toast, dry_run: bool) -> Result<crate::process::windows::Detached> {
     let c = toast_command(t, dry_run);
-    let base = std::env::vars_os()
-        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
-    crate::process::windows::spawn_detached(&c.program, &c.args, &child_env(base, &c.env))
+    crate::process::windows::spawn_detached(
+        &c.program,
+        &c.args,
+        &child_env(std::env::vars_os(), &c.env),
+    )
 }
 
 /// Wait for `p` until `deadline`, then kill it: the exit code, `None` when killed.
@@ -508,6 +524,9 @@ mod tests {
         assert_eq!(shorten("a\0b", 10), "ab");
         assert_eq!(shorten("ありがとう", 3), "あり…");
         assert_eq!(shorten("short", 200), "short");
+        // R8: the title is cut like the body
+        let t = Toast::new(&"t".repeat(1000), "b");
+        assert_eq!(t.title().chars().count(), BODY_MAX);
     }
 
     /// R4: agent text carries ANSI colours, BEL, U+FFFE, tabs and line breaks; the toast XML
@@ -546,6 +565,8 @@ mod tests {
         assert!(enabled(false, false, on));
         assert!(enabled(true, false, off), "--notify");
         assert!(!enabled(false, true, on), "--no-notify");
+        // clap refuses the pair; still off (restored in R8)
+        assert!(!enabled(true, true, on));
     }
 
     /// AC-2: agent-written text is data. The program and the arguments do not depend on the
@@ -622,8 +643,12 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let p = crate::process::windows::spawn_detached(&ps, &args, &std::env::vars().collect())
-            .unwrap();
+        let p = crate::process::windows::spawn_detached(
+            &ps,
+            &args,
+            &std::env::vars_os().collect::<Vec<_>>(),
+        )
+        .unwrap();
         let t = Instant::now();
         assert_eq!(settle(&p, t + Duration::from_millis(500)), None);
         assert!(t.elapsed() < Duration::from_secs(5));
@@ -632,17 +657,31 @@ mod tests {
 
     #[test]
     fn the_toast_variables_replace_inherited_ones() {
-        let base = vec![
-            ("Path".to_string(), "C:\\x".to_string()),
-            (
-                "toryo_toast_body".to_string(),
-                "from the parent".to_string(),
-            ),
+        use std::ffi::OsString;
+        let base: Vec<(OsString, OsString)> = vec![
+            ("Path".into(), "C:\\x".into()),
+            ("toryo_toast_body".into(), "from the parent".into()),
         ];
         let extra = vec![(ENV_BODY.to_string(), "mine".to_string())];
         let env = child_env(base.into_iter(), &extra);
-        assert_eq!(env.get(ENV_BODY).map(String::as_str), Some("mine"));
-        assert!(!env.contains_key("toryo_toast_body"));
-        assert_eq!(env.get("Path").map(String::as_str), Some("C:\\x"));
+        let get = |k: &str| {
+            env.iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        };
+        assert_eq!(get(ENV_BODY).as_deref(), Some("mine"));
+        assert_eq!(get("toryo_toast_body"), None);
+        assert_eq!(get("Path").as_deref(), Some("C:\\x"));
+    }
+
+    /// R8: a parent variable that is not valid Unicode is passed on as it is (it used to be
+    /// dropped).
+    #[cfg(windows)]
+    #[test]
+    fn a_non_unicode_parent_variable_is_kept() {
+        use std::os::windows::ffi::OsStringExt;
+        let odd = std::ffi::OsString::from_wide(&[0x61, 0xD800, 0x62]); // a lone surrogate
+        let env = child_env(vec![("ODD".into(), odd.clone())].into_iter(), &[]);
+        assert_eq!(env, vec![("ODD".into(), odd)]);
     }
 }
