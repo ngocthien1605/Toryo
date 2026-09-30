@@ -378,3 +378,76 @@ fn ctrl_c_ends_watch_with_exit_0() {
         let _ = watch.kill();
     }
 }
+
+// ── review fix R1: every drive ends with run_ended; watch always terminates ──────────
+
+/// R1 AC-1: a drive that fails before its first stage (here: a fake script that does not
+/// exist) still ends its record with `run_ended` carrying the error, and `watch` — with and
+/// without `--no-follow` — exits 0 on its own although the task is still `New`.
+#[test]
+fn a_failed_drive_ends_its_record_and_watch_terminates() {
+    let env = setup("codex-openai");
+    create(&env, "H-1");
+    let missing = env.root.join("no-such-script.json");
+    let (code, err) = toryo(
+        &env,
+        &["run", "H-1", "--fake-agents", missing.to_str().unwrap()],
+        &[],
+    );
+    assert_eq!(code, 2, "{err}");
+    let lines = events_lines(&env, "H-1");
+    let last: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+    assert_eq!(last["type"], "run_ended", "{lines:?}");
+    assert_eq!(last["state"], "New");
+    assert_eq!(last["from"], "New");
+    assert!(
+        last["error"]
+            .as_str()
+            .unwrap()
+            .contains("no-such-script.json"),
+        "{last}"
+    );
+    let (code, text, _) = out(&env, &["watch", "H-1", "--no-follow"]);
+    assert_eq!(code, 0);
+    assert!(text.contains("!! stopped with an error:"), "{text}");
+    let t = std::time::Instant::now();
+    let (code, _, err) = out(&env, &["watch", "H-1"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(t.elapsed() < std::time::Duration::from_secs(15));
+}
+
+/// R1 AC-3: `watch` into a pipe whose reader is gone (`… | head -n 5`) exits 0, no panic.
+#[test]
+fn watch_into_a_closed_pipe_exits_0() {
+    let env = setup("codex-openai");
+    create(&env, "H-2");
+    let s = script(
+        &env,
+        "h2.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(&env, &["run", "H-2", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    for args in [
+        vec!["watch", "H-2", "--json", "--from-start", "--no-follow"],
+        vec!["watch", "H-2", "--from-start"],
+    ] {
+        let mut c = command(&env, &args, &[])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(c.stdout.take()); // the reader goes away before `watch` writes
+        let o = c.wait_with_output().unwrap();
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+}

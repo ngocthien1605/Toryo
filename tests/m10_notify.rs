@@ -210,3 +210,76 @@ fn notify_test_says_toasts_are_windows_only() {
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("Windows only"), "{err}");
 }
+
+/// R1 AC-2: the end state toasts only when the drive reached it — not `run` on a task that is
+/// already Completed, not `approve --gate final --continue` (the approval completed it); an error
+/// end toasts whatever the state.
+#[test]
+fn no_second_completed_toast_and_an_error_end_toasts() {
+    let env = setup("codex-openai");
+    let s = happy(&env);
+    let log = env.root.join("toasts.jsonl");
+    let l = log.to_str().unwrap();
+    create(&env, "N-5");
+    let (code, err) = toryo(&env, &["run", "N-5", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    let (code, err) = toryo(
+        &env,
+        &[
+            "approve",
+            "N-5",
+            "--gate",
+            "plan",
+            "--continue",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "N-5").state, St::WaitingFinalApproval);
+    let (code, err) = toryo(
+        &env,
+        &[
+            "approve",
+            "N-5",
+            "--gate",
+            "final",
+            "--continue",
+            "--notify",
+            "--fake-agents",
+            &s,
+        ],
+        &[("TORYO_TEST_TOAST_LOG", l)],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "N-5").state, St::Completed);
+    let (code, err) = toryo(
+        &env,
+        &["run", "N-5", "--notify", "--fake-agents", &s],
+        &[("TORYO_TEST_TOAST_LOG", l)],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(toasts(&log).is_empty(), "{:?}", toasts(&log));
+
+    create(&env, "N-6");
+    let missing = env.root.join("nope.json");
+    let (code, _) = toryo(
+        &env,
+        &[
+            "run",
+            "N-6",
+            "--notify",
+            "--fake-agents",
+            missing.to_str().unwrap(),
+        ],
+        &[("TORYO_TEST_TOAST_LOG", l)],
+    );
+    assert_eq!(code, 2);
+    let t = toasts(&log);
+    assert_eq!(t.len(), 1, "{t:?}");
+    assert!(t[0]["body"]
+        .as_str()
+        .unwrap()
+        .starts_with("New — stopped with an error: "));
+}

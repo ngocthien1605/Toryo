@@ -259,11 +259,35 @@ fn recorded(rec: &Recorder, from: PipelineState, event: &str, now: &TaskRow) {
     }
 }
 
-/// Recover (if needed) and run the locked task until it waits, finishes or is stopped.
+/// Recover (if needed) and run the locked task until it waits, finishes or is stopped. Every
+/// exit — also an error before the first stage (an unverified profile, a bad fake script, a
+/// Git or store error) — ends with one `run_ended` (R1): `watch` stops and the owner is told.
 fn drive(store: &Store, lock: &TaskLock, rec: &Recorder, d: &DriveArgs) -> Result<i32> {
     rec.emit_quiet(EngineEvent::RunStarted {
         owner: lock::owner_label(),
     });
+    let from = get(store, &lock.task).ok().map(|t| t.state);
+    let res = drive_inner(store, lock, rec, d);
+    let (state, next) = match get(store, &lock.task) {
+        Ok(t) => (t.state, next_action(&t)),
+        // the store cannot be read: the last known state
+        Err(_) => (
+            from.unwrap_or(PipelineState::New),
+            format!("`toryo status {}`", lock.task),
+        ),
+    };
+    rec.emit_quiet(EngineEvent::RunEnded {
+        state,
+        next_action: next,
+        from,
+        error: res.as_ref().err().map(|e| {
+            toryo::engine::flight::shorten(&format!("{e:#}"), toryo::engine::flight::ERROR_MAX)
+        }),
+    });
+    res
+}
+
+fn drive_inner(store: &Store, lock: &TaskLock, rec: &Recorder, d: &DriveArgs) -> Result<i32> {
     // recovery launches no agent: it needs neither the hub nor the R51 check
     let t = get(store, &lock.task)?;
     let cfg = frozen_config(&t)?;
@@ -325,10 +349,6 @@ fn drive(store: &Store, lock: &TaskLock, rec: &Recorder, d: &DriveArgs) -> Resul
     }
     eprintln!("next: {}", next_action(&t));
     eprintln!("summary: {}", summary.display());
-    rec.emit_quiet(EngineEvent::RunEnded {
-        state: t.state,
-        next_action: next_action(&t),
-    });
     Ok(match end {
         RunEnd::Done(PipelineState::Completed) | RunEnd::Stopped => 0,
         RunEnd::Waiting(
@@ -644,7 +664,8 @@ pub fn approve(
         )?;
         let before = t.state;
         let t = get(&st, id)?;
-        recorded(&rec, before, "force_final", &t);
+        // the owner just opened this gate: recorded, never toasted (R1)
+        recorded(&recorder(&t, &lock), before, "force_final", &t);
         eprintln!(
             "{id}: reviewer skipped — the final gate is open for checkpoint {}",
             t.machine.checkpoint().unwrap_or("")
@@ -1372,19 +1393,16 @@ pub fn watch(id: &str, json: bool, from_start: bool, no_follow: bool) -> Result<
         );
     }
     catch_ctrl_c();
-    let show = |line: &str| {
-        if let Some(text) = flight::watch_line(line, json) {
-            println!("{text}");
-        }
-    };
     let mut tail = Tail::default();
-    for line in flight::history(&tail.poll(&path)?, from_start) {
-        show(line);
-    }
-    if no_follow {
+    let history = tail.poll(&path)?;
+    // a reader that went away (`watch … | head -n 5`) ends `watch` with exit 0 (R1)
+    if !show_lines(flight::history(&history, from_start), json)? || no_follow {
         return Ok(0);
     }
     let mut last = std::time::Instant::now();
+    // the engine commits a transition before it writes its events: "done" must hold on two
+    // polls in a row, and the file is read once more before returning (R1)
+    let mut done_polls = 0;
     loop {
         if interrupted_during(Duration::from_millis(500)) {
             return Ok(0);
@@ -1392,13 +1410,39 @@ pub fn watch(id: &str, json: bool, from_start: bool, no_follow: bool) -> Result<
         let new = tail.poll(&path)?;
         if !new.is_empty() {
             last = std::time::Instant::now();
-            new.iter().for_each(|l| show(l));
+            done_polls = 0;
+            if !show_lines(&new, json)? {
+                return Ok(0);
+            }
         }
         let state = get(&st, id)?.state;
         if flight::watch_done(state, driven(&st, id)?, last.elapsed()) {
+            done_polls += 1;
+        } else {
+            done_polls = 0;
+        }
+        if done_polls >= 2 {
+            show_lines(&tail.poll(&path)?, json)?;
             return Ok(0);
         }
     }
+}
+
+/// Print the `watch` text of `lines` on stdout. `false`: stdout is closed (a broken pipe).
+fn show_lines(lines: &[String], json: bool) -> Result<bool> {
+    use std::io::Write;
+    let out = std::io::stdout();
+    let mut out = out.lock();
+    for line in lines {
+        if let Some(text) = toryo::engine::flight::watch_line(line, json) {
+            match writeln!(out, "{text}").and_then(|_| out.flush()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(false),
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// `toryo usage` (C1, plan §12): the task's tokens per stage × profile × model and the estimated

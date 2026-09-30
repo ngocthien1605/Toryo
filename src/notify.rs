@@ -71,9 +71,20 @@ pub fn toast_for(e: &Envelope) -> Option<Toast> {
         EngineEvent::Paused { reason } => {
             format!("{:?} (`toryo resume {id}`) — {reason}", St::Paused)
         }
-        EngineEvent::RunEnded { state, next_action }
-            if matches!(state, St::Completed | St::Failed) =>
-        {
+        // R1: a drive that stopped with an error always tells the owner
+        EngineEvent::RunEnded {
+            state,
+            error: Some(err),
+            ..
+        } => format!("{state:?} — stopped with an error: {err}"),
+        // the end state only when this drive reached it (not `run` on a finished task, not the
+        // `--continue` after the final approval that completed it)
+        EngineEvent::RunEnded {
+            state,
+            next_action,
+            from,
+            error: None,
+        } if matches!(state, St::Completed | St::Failed) && *from != Some(*state) => {
             format!("{state:?} — {next_action}")
         }
         _ => return None,
@@ -327,18 +338,26 @@ mod tests {
             EngineEvent::RunEnded {
                 state: St::WaitingPlanApproval,
                 next_action: "review".into(),
+                from: Some(St::Reviewing),
+                error: None,
             },
             EngineEvent::RunEnded {
                 state: St::Escalated,
                 next_action: "resume".into(),
+                from: Some(St::Reviewing),
+                error: None,
             },
             EngineEvent::RunEnded {
                 state: St::Completed,
                 next_action: "done — merge `toryo/BR-9` yourself".into(),
+                from: Some(St::Reviewing),
+                error: None,
             },
             EngineEvent::RunEnded {
                 state: St::Failed,
                 next_action: "failed: x — `toryo task cleanup BR-9`".into(),
+                from: Some(St::Reviewing),
+                error: None,
             },
         ]
     }
@@ -368,6 +387,35 @@ mod tests {
         assert!(bodies[4].starts_with("Paused (`toryo resume BR-9`) — implementer_quota"));
         assert_eq!(bodies[5], "Completed — done — merge `toryo/BR-9` yourself");
         assert!(bodies[6].starts_with("Failed — "));
+    }
+
+    /// R1 AC-2: an end with an error always toasts; the end state only when this drive reached it.
+    #[test]
+    fn a_run_end_toasts_on_an_error_or_a_new_end_state() {
+        let end = |state, from, error: Option<&str>| {
+            toast_for(&env(EngineEvent::RunEnded {
+                state,
+                next_action: "next".into(),
+                from,
+                error: error.map(str::to_string),
+            }))
+        };
+        let t = end(St::New, Some(St::New), Some("unverified profiles (R51)")).unwrap();
+        assert_eq!(
+            t.body,
+            "New — stopped with an error: unverified profiles (R51)"
+        );
+        assert!(end(St::Implementing, Some(St::Planning), Some("disk full")).is_some());
+        // `run` on a task that was already Completed, and `approve --gate final --continue`
+        // (the approval completed it before the drive started): no second toast
+        assert!(end(St::Completed, Some(St::Completed), None).is_none());
+        assert!(end(St::Failed, Some(St::Failed), None).is_none());
+        assert!(end(St::Completed, Some(St::Reviewing), None).is_some());
+        assert!(
+            end(St::Completed, None, None).is_some(),
+            "an older line without `from`"
+        );
+        assert!(end(St::WaitingPlanApproval, Some(St::Planning), None).is_none());
     }
 
     #[test]

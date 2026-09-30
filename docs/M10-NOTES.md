@@ -74,6 +74,15 @@ Branch `m10/flight-recorder` (from `main` @ `5adf204`). One commit per task.
 - [x] D1 — Windows toast
 - [x] E1 — docs, morning summary
 
+Review fixes (`M10-review-fixes.md`, 2026-09-30):
+
+- [x] R1 — `run_ended` on every exit of a drive; `watch` always terminates
+- [ ] R2 — `turn_finished.usage` is what the store recorded
+- [ ] R3 — `toryo usage` does not look complete when it is not
+- [ ] R4 — toast hardening
+- [ ] R5 — escalation reasons on stderr: keep, pin, document
+- [ ] R6 — cheap Low fixes
+
 ## A — Event backbone (ARCH-02)
 
 ### A1 — `EngineEvent`, sinks, the flight recorder
@@ -318,3 +327,36 @@ Branch `m10/flight-recorder` (from `main` @ `5adf204`). One commit per task.
 - **Open:** `notify_test_builds_the_toast` runs Windows PowerShell and loads WinRT types in CI
   (`windows-latest`). It passed here; if the CI image cannot load them, mark that test `#[ignore]`
   like the real-toast one — it is the only M10 test that needs more than the Rust toolchain and Git.
+
+## Review fixes (2026-09-30)
+
+From `M10-review-fixes.md` (review of `de85374`). Owner decisions taken as final: Q1 `finish_and`
+transitions stay quiet on stderr; Q2 no gate toasts under `--yes` (R4); Q3 `vendor_reported_cost_usd`
+later, not in M10; Q4 reservations priced as uncached input, said in the report header (R3); Q5 the CI
+toast test stays; review item 5 — the new `!! reason` lines stay (R5).
+
+### R1 — `run_ended` on every exit of a drive; `watch` always terminates
+
+- `drive` is now a wrapper around `drive_inner`: it records the state at the start, runs the drive, and
+  emits **one** `run_ended` whatever happened — state and next action re-read from the store (the last
+  known state if the store cannot be read), `from` = the state at the start, and on an error `error` =
+  `{e:#}`, redacted like every event and shortened to 400 characters (`flight::ERROR_MAX`). Both new
+  fields are optional (`skip_serializing_if`), so `v` stays 1 and older lines still parse.
+- **Toasts:** a `run_ended` with an `error` toasts whatever the state (`<state> — stopped with an error:
+  …`); `Completed`/`Failed` toast only when `from` differs (no second "Completed" for `run` on a finished
+  task or for `approve --gate final --continue`, whose approval completed the task before the drive). An
+  old line without `from` still toasts. `approve --force [--continue]` records the forced final gate with
+  a recorder without the notifier: the owner just opened it.
+- **`watch` stop rule** (`flight::watch_done`): 2 s without a new event and — whatever the state — no
+  live process drives the task, or the task waits or is finished. So `New` (never run, or a drive that
+  failed before its first stage) and a crashed running state end the follow. This changes one assertion
+  of B2's unit test (`New` without a driver was "follow on"), as the fix list asks. "Done" must hold on
+  **two consecutive polls** (the engine commits a transition before it writes its events) and the file is
+  read once more before returning.
+- **Closed stdout:** `watch` writes through a locked stdout and ends with exit 0 on `BrokenPipe`
+  (`show_lines`); before, `println!` panicked (exit 101). The test runs on both platforms (the reader is
+  dropped before `watch` writes; Windows reports `ERROR_NO_DATA` as `BrokenPipe`).
+- Tests (all three failed before the fix, checked with the source stashed): `tests/m10_views.rs::
+  a_failed_drive_ends_its_record_and_watch_terminates`, `watch_into_a_closed_pipe_exits_0`,
+  `tests/m10_notify.rs::no_second_completed_toast_and_an_error_end_toasts`; unit
+  `notify::tests::a_run_end_toasts_on_an_error_or_a_new_end_state`.

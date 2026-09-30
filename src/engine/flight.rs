@@ -110,10 +110,29 @@ pub enum EngineEvent {
     Paused {
         reason: String,
     },
+    /// Emitted once on every exit of a drive command (R1). `from`: the state when the drive
+    /// started; `error`: the command stopped with this error (redacted, shortened).
     RunEnded {
         state: St,
         next_action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<St>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
+}
+
+/// An error in `run_ended` is shortened to this many characters.
+pub const ERROR_MAX: usize = 400;
+
+/// At most `max` characters; an ellipsis marks a cut.
+pub fn shorten(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 impl EngineEvent {
@@ -310,11 +329,20 @@ pub fn render(env: &Envelope) -> String {
             "!! budget: {used} of {cap} tokens used (≥ 80 %; admission cap, may overshoot by one turn)"
         ),
         E::Escalated { reason, .. } | E::Paused { reason } => format!("!! {reason}"),
-        E::RunEnded { state, next_action } => {
-            format!(
+        E::RunEnded {
+            state,
+            next_action,
+            error,
+            ..
+        } => {
+            let mut s = format!(
                 "══════════ {}: {state:?} ══════════\nnext: {next_action}",
                 env.task
-            )
+            );
+            if let Some(e) = error {
+                s.push_str(&format!("\n!! stopped with an error: {e}"));
+            }
+            s
         }
     }
 }
@@ -435,12 +463,11 @@ pub fn watch_line(line: &str, json: bool) -> Option<String> {
 pub const WATCH_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Does `watch` stop? After [`WATCH_IDLE`] without a new event, when the task waits for a human
-/// (a gate, `Escalated`, `Paused`), is finished, or is in a running state that no process drives
-/// (`active`: another process holds the task lock — a crashed run needs `toryo resume`). A task
-/// that never ran (`New`) is followed until it starts.
+/// (a gate, `Escalated`, `Paused`), is finished, or — whatever its state — no live process drives
+/// it (`active`: the recorded lock owner is alive). So a crashed run, a drive that stopped with an
+/// error before its first stage, and a task that was never run all end the follow (R1).
 pub fn watch_done(state: St, active: bool, idle: std::time::Duration) -> bool {
-    idle >= WATCH_IDLE
-        && (state.is_waiting() || state.is_terminal() || (state.is_running() && !active))
+    idle >= WATCH_IDLE && (!active || state.is_waiting() || state.is_terminal())
 }
 
 /// The highest `seq` in an events file (0: none).
@@ -766,6 +793,14 @@ mod tests {
             EngineEvent::RunEnded {
                 state: St::Completed,
                 next_action: "done".into(),
+                from: None,
+                error: None,
+            },
+            EngineEvent::RunEnded {
+                state: St::New,
+                next_action: "`toryo run T-1`".into(),
+                from: Some(St::New),
+                error: Some("boom".into()),
             },
         ];
         for (i, e) in all.into_iter().enumerate() {
@@ -959,7 +994,9 @@ mod tests {
         assert_eq!(
             r(EngineEvent::RunEnded {
                 state,
-                next_action: next.into()
+                next_action: next.into(),
+                from: Some(St::Reviewing),
+                error: None,
             }),
             format!(
                 "══════════ {}: {:?} ══════════\nnext: {}",
@@ -1196,7 +1233,8 @@ mod tests {
             watch_done(St::Implementing, false, idle),
             "nobody drives it"
         );
-        assert!(!watch_done(St::New, false, idle), "not started yet");
+        assert!(watch_done(St::New, false, idle), "nobody drives it (R1)");
+        assert!(!watch_done(St::New, true, idle), "a drive is starting");
     }
 
     #[test]
