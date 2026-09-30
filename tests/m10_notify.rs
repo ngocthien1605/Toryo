@@ -295,3 +295,44 @@ fn the_real_script_takes_hostile_text_as_data() {
     assert!(!t.body.contains('\u{1b}') && !t.body.contains('\u{fffe}'));
     assert_eq!(toryo::notify::run_script(&t, true).unwrap(), 0);
 }
+
+/// R7.9: the final gate the owner forces open (`approve --force`) is not toasted, also with
+/// `--continue --notify`.
+#[test]
+fn a_forced_final_gate_raises_no_toast() {
+    let env = setup("codex-openai");
+    create(&env, "N-7");
+    let blocked = json!({"kind":"complete","structured":{"decision":"blocked","summary":"x","acceptance_criteria":[
+        {"id":"AC-1","met":false,"evidence":"e1"},{"id":"AC-2","met":false,"evidence":"e2"},{"id":"AC-3","met":false,"evidence":"e3"}],
+        "issues":[{"id":"I-1","severity":"high","blocking":true,"description":"no"}]}});
+    let s = script(
+        &env,
+        "b.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![blocked])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "N-7", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "N-7").state, St::Escalated, "{err}");
+    let log = env.root.join("toasts.jsonl");
+    let (code, err) = toryo(
+        &env,
+        &[
+            "approve",
+            "N-7",
+            "--gate",
+            "final",
+            "--force",
+            "--continue",
+            "--notify",
+            "--fake-agents",
+            &s,
+        ],
+        &[("TORYO_TEST_TOAST_LOG", log.to_str().unwrap())],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "N-7").state, St::WaitingFinalApproval);
+    assert!(toasts(&log).is_empty(), "{:?}", toasts(&log));
+}

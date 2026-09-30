@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, SetHandleInformation, BOOL, FILETIME, HANDLE,
-    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    CloseHandle, GetLastError, LocalFree, SetHandleInformation, BOOL, ERROR_ACCESS_DENIED,
+    FILETIME, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, STILL_ACTIVE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
@@ -254,7 +254,21 @@ pub fn is_alive(p: ProcId) -> bool {
             p.pid,
         );
         if h.is_null() {
-            return false;
+            // M10-R7: an elevated or other-user process refuses these rights but exists — it
+            // must still count as alive (a run shown `ACTIVE`, not a dead owner)
+            if GetLastError() != ERROR_ACCESS_DENIED {
+                return false;
+            }
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, p.pid);
+            if h.is_null() {
+                return GetLastError() == ERROR_ACCESS_DENIED; // exists, cannot be inspected
+            }
+            let _o = Owned(h);
+            if creation_time_of(h) != Some(p.created) {
+                return false;
+            }
+            let mut code = 0u32;
+            return GetExitCodeProcess(h, &mut code) != 0 && code == STILL_ACTIVE as u32;
         }
         let _o = Owned(h);
         if creation_time_of(h) != Some(p.created) {
@@ -750,5 +764,44 @@ mod detached_tests {
         assert_eq!(p.wait(Duration::ZERO), None, "the child still runs");
         p.kill();
         assert!(p.wait(Duration::from_secs(10)).is_some());
+    }
+}
+
+#[cfg(test)]
+mod alive_tests {
+    use super::*;
+
+    /// M10-R7: a process that refuses `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE`
+    /// (elevated, another user's, a system process) exists and is alive. The System process
+    /// (PID 4) refuses them to a non-elevated test run; an elevated run can open it and the test
+    /// has nothing to show (it says so).
+    #[test]
+    fn a_process_that_refuses_access_is_alive() {
+        const SYSTEM: u32 = 4;
+        // SAFETY: FFI; handles closed by Owned.
+        let created = unsafe {
+            let h = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                SYSTEM,
+            );
+            if !h.is_null() {
+                drop(Owned(h));
+                eprintln!("the System process can be opened (elevated run): nothing to test");
+                return;
+            }
+            assert_eq!(GetLastError(), ERROR_ACCESS_DENIED);
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, SYSTEM);
+            if h.is_null() {
+                0
+            } else {
+                let o = Owned(h);
+                creation_time_of(o.0).unwrap_or(0)
+            }
+        };
+        assert!(is_alive(ProcId {
+            pid: SYSTEM,
+            created
+        }));
     }
 }

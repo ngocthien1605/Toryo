@@ -92,6 +92,12 @@ pub fn crash_point(name: &str) {
             std::process::exit(86);
         }
     }
+    // M10-R7: `TORYO_TEST_PANIC_AT=<point>` panics there instead (the unwinding path)
+    if let Ok(v) = std::env::var("TORYO_TEST_PANIC_AT") {
+        if v.split(',').any(|p| p.trim() == name) {
+            panic!("TORYO_TEST_PANIC_AT: panicking at `{name}`");
+        }
+    }
 }
 
 /// Git (with the admitted filter plan), protected paths and verify commands of a task.
@@ -2166,7 +2172,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Fail the attempt with `class` and escalate the task with `reason` (one transaction;
-    /// the caller prints the reason).
+    /// its reason is printed with the escalation, R5).
     fn escalate_attempt(&self, a: &AttemptRow, class: String, reason: String) -> Result<()> {
         self.finish_and(
             a,
@@ -3530,7 +3536,8 @@ pub fn reject_now(
         Ok((e.name(), store::transition(tx, &i, e)?))
     })?;
     let (name, m) = m;
-    rec.transition(t.state, name, &m, true, false);
+    // R7: a rejection at the fix-cycle bound escalates: its reason is printed like every other
+    rec.transition(t.state, name, &m, true, m.state() == St::Escalated);
     super::decisions::append(
         store,
         t,

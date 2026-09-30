@@ -91,6 +91,11 @@ Review fixes (`M10-review-fixes.md`, 2026-09-30):
 - [x] R6 — cheap Low fixes
 - [x] docs — README, HUONG-DAN §5.8, the rewritten morning summary
 
+Review fixes, round 2 (`M10-review-fixes-2.md`):
+
+- [x] R7 — events and engine
+- [ ] R8 — usage and notify
+
 ## A — Event backbone (ARCH-02)
 
 ### A1 — `EngineEvent`, sinks, the flight recorder
@@ -509,3 +514,48 @@ toast test stays; review item 5 — the new `!! reason` lines stay (R5).
   `usage`, `watch` and the owner lookup. Test `a_read_does_not_wait_for_a_writer` (another connection
   holds the write lock for 3 s; the read answers at once; a write inside a read is not kept).
 - **C2 notes corrected** (replayed streams always carry a `Usage` event); no behaviour change.
+
+### Round 2
+
+From `M10-review-fixes-2.md` (re-review of R1–R6 at `047a12d`).
+
+#### R7 — events and engine
+
+1. **No duplicate `turn_finished` after recovery:** `drive_inner` records the usage row ids before
+   `recover()`; `recovered_events` emits a reservation's `turn_finished` only for a row recovery
+   inserted. The crashed process had already emitted its own rows. Test
+   `recovery_does_not_repeat_a_turn_the_crashed_process_recorded` (`TORYO_TEST_CRASH_AT=
+   implement:before_partial_commit` after a failed turn with changes; two `turn_finished` before the fix).
+2. **Redact, then shorten:** `drive` passes the whole error text; the recorder redacts every event and
+   then applies the length limits (`flight::limit`: `run_ended.error` to 400 characters). Before, the cut
+   came first and a secret crossing it left its prefix in the file, `watch` and the toast. Unit test
+   `a_long_error_is_redacted_before_it_is_shortened` (the secret starts 5 characters before the cut).
+3. **A final-gate rejection at the bound prints its reason:** `reject_now` passes `reason_line = true`
+   when the transition goes into `Escalated` (`!! not accepted after 0 fix cycle(s) (last: final gate
+   rejected: …)` right before `[state] WaitingFinalApproval --rejected--> Escalated`). The stale doc of
+   `escalate_attempt` ("the caller prints the reason") is fixed. Test
+   `a_rejection_at_the_bound_prints_its_reason_once`. **Deviation 6 now has no exception left in the
+   engine** except the budget pauses and the last implementer switch, whose own lines say the reason.
+4. **`watch` stop rule:** done = 2 s idle **and** no live driver, whatever the state — a drive holds the
+   lock until after its `run_ended`, so under `--yes` `watch` no longer exits at `WaitingFinalApproval`
+   while `approve_now` is still at work. The two-poll rule is the small `flight::DonePolls` struct with a
+   unit test (`done_must_hold_on_two_polls_in_a_row`); `watch_stops_on_a_task_that_does_not_move_on_
+   its_own` now expects "go on" for a waiting state that is still driven.
+5. **Panic → `run_ended { error: "panicked" }`:** a drop guard (`RunEndGuard`) in `drive` emits it when
+   a panic unwinds through the drive (`std::thread::panicking()`); the exit code stays 101. New test hook
+   `TORYO_TEST_PANIC_AT=<point>` (next to `TORYO_TEST_CRASH_AT`, same points). Test
+   `a_panic_still_ends_the_record`.
+6. **`seq` restart:** `flight::next_seq(&seqs)` restarts at `max(highest plausible seq, line count) + 1`
+   (`[500, 501, u64::MAX]` → 502, not 4); `flight::seqs(path)` lists the file's `seq`s (`scan` keeps its
+   shape).
+7. **Redaction coverage:** `every_string_field_of_every_variant_is_redacted` puts a secret into each
+   string of each variant's JSON in turn (a value that no longer parses is an enum, not text) and checks no
+   sink sees it — 18 text fields today; a variant must be in the test's list (it checks all 12 kinds).
+   This test passes before the fix too (the per-variant redaction of R6 was complete): it guards the future.
+8. **`is_alive` on access denied:** `OpenProcess` refused with `ERROR_ACCESS_DENIED` (an elevated or
+   other-user process) now counts as alive: it retries with `PROCESS_QUERY_LIMITED_INFORMATION` alone to
+   check the creation time and `STILL_ACTIVE`, and if even that is refused, the process exists → alive.
+   Windows test `a_process_that_refuses_access_is_alive` on the System process (PID 4), which a
+   non-elevated run cannot open with both rights; an elevated run says "nothing to test" and passes.
+9. **Missing test** `a_forced_final_gate_raises_no_toast` (`approve --force --continue --notify` from a
+   blocked review): no toast. It passes before this commit too — the fix was in R1.

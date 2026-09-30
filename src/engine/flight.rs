@@ -469,12 +469,32 @@ pub fn watch_line(line: &str, json: bool) -> Option<String> {
 /// moving on its own.
 pub const WATCH_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Does `watch` stop? After [`WATCH_IDLE`] without a new event, when the task waits for a human
-/// (a gate, `Escalated`, `Paused`), is finished, or — whatever its state — no live process drives
-/// it (`active`: the recorded lock owner is alive). So a crashed run, a drive that stopped with an
-/// error before its first stage, and a task that was never run all end the follow (R1).
-pub fn watch_done(state: St, active: bool, idle: std::time::Duration) -> bool {
-    idle >= WATCH_IDLE && (!active || state.is_waiting() || state.is_terminal())
+/// Does `watch` stop? After [`WATCH_IDLE`] without a new event, when no live process drives the
+/// task (`active`: the recorded lock owner is alive) — whatever its state (R7). A drive holds the
+/// lock until after its `run_ended`, so a task that waits for a human, is finished, crashed, or
+/// was never run ends the follow once its driver is gone, and a waiting state reached under
+/// `--yes` while `approve_now` still works does not. `state` is kept for the caller's messages.
+pub fn watch_done(_state: St, active: bool, idle: std::time::Duration) -> bool {
+    idle >= WATCH_IDLE && !active
+}
+
+/// The engine commits a transition before it writes its events: `watch` stops only when
+/// [`watch_done`] held on two polls in a row with no new event in between (R1, R7).
+#[derive(Debug, Default)]
+pub struct DonePolls {
+    in_a_row: u32,
+}
+
+impl DonePolls {
+    /// Record one poll; `true`: stop now (then read the file one last time).
+    pub fn observe(&mut self, done: bool, new_events: bool) -> bool {
+        self.in_a_row = if done && !new_events {
+            self.in_a_row + 1
+        } else {
+            0
+        };
+        self.in_a_row >= 2
+    }
 }
 
 /// The highest `seq` in an events file (0: none).
@@ -482,10 +502,16 @@ pub fn last_seq(path: &Path) -> u64 {
     scan(path).0
 }
 
-/// The highest `seq` and the number of event lines of an events file. A complete JSON object on
-/// an unterminated last line counts too (R6): the next event closes that line, and its `seq` must
-/// not be reused.
+/// The highest `seq` and the number of event lines of an events file ([`seqs`]).
 pub fn scan(path: &Path) -> (u64, usize) {
+    let s = seqs(path);
+    (s.iter().copied().max().unwrap_or(0), s.len())
+}
+
+/// The `seq` of every event line of an events file, in order. A complete JSON object on an
+/// unterminated last line counts too (R6): the next event closes that line, and its `seq` must
+/// not be reused.
+pub fn seqs(path: &Path) -> Vec<u64> {
     let text = std::fs::read(path)
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
@@ -497,28 +523,34 @@ pub fn scan(path: &Path) -> (u64, usize) {
     if let Ok(v) = serde_json::from_str::<Value>(tail) {
         seqs.extend(v["seq"].as_u64());
     }
-    (seqs.iter().copied().max().unwrap_or(0), seqs.len())
+    seqs
 }
 
 /// Above this a `seq` is implausible: JSON consumers (JavaScript) lose integers beyond 2^53.
 pub const SEQ_MAX: u64 = (1 << 53) - 1;
 
-/// The first `seq` of a new recorder: the last one + 1. An implausible last `seq` (damaged or
-/// hand-edited file, e.g. `u64::MAX`) restarts above the number of lines, with a warning — never
-/// a panic or a wrap.
-pub fn next_seq(last: u64, lines: usize) -> (u64, Option<String>) {
-    match last.checked_add(1).filter(|n| *n <= SEQ_MAX) {
-        Some(n) => (n, None),
-        None => {
-            let n = lines as u64 + 1;
-            (
-                n,
-                Some(format!(
-                    "the last seq ({last}) is implausible — numbering restarts at {n}"
-                )),
-            )
-        }
+/// The first `seq` of a new recorder, from the `seq`s already in the file: the highest + 1. When
+/// the highest is implausible (a damaged or hand-edited file, e.g. `u64::MAX`), numbering restarts
+/// above both the highest plausible `seq` and the number of lines (R7: never below an earlier
+/// valid value), with a warning — never a panic or a wrap.
+pub fn next_seq(seqs: &[u64]) -> (u64, Option<String>) {
+    let max = seqs.iter().copied().max().unwrap_or(0);
+    if max < SEQ_MAX {
+        return (max + 1, None);
     }
+    let plausible = seqs
+        .iter()
+        .copied()
+        .filter(|s| *s < SEQ_MAX)
+        .max()
+        .unwrap_or(0);
+    let n = plausible.max(seqs.len() as u64) + 1;
+    (
+        n,
+        Some(format!(
+            "the last seq ({max}) is implausible — numbering restarts at {n}"
+        )),
+    )
 }
 
 /// The events file of a task.
@@ -727,6 +759,18 @@ fn redact_event(r: &Redactions, mut e: EngineEvent) -> EngineEvent {
     e
 }
 
+/// Length limits of free text, applied after redaction (R7): `run_ended.error` to
+/// [`ERROR_MAX`] characters.
+fn limit(mut e: EngineEvent) -> EngineEvent {
+    if let EngineEvent::RunEnded {
+        error: Some(err), ..
+    } = &mut e
+    {
+        *err = shorten(err, ERROR_MAX);
+    }
+    e
+}
+
 /// Wraps events in envelopes and hands them to the sinks.
 pub struct Recorder {
     task: String,
@@ -757,8 +801,7 @@ impl Recorder {
         let redact = super::task::frozen_config(t)
             .map(|c| task_redactions(&c, t))
             .unwrap_or_else(|_| Redactions::empty());
-        let (last, lines) = scan(&path);
-        let (first, warning) = next_seq(last, lines);
+        let (first, warning) = next_seq(&seqs(&path));
         if let Some(w) = warning {
             eprintln!("!! flight recorder {}: {w}", path.display());
         }
@@ -828,7 +871,8 @@ impl Recorder {
             ts: super::store::now(),
             task: self.task.clone(),
             generation: self.generation,
-            event: redact_event(&self.redact, e),
+            // R7: redact first, then shorten — a cut never leaves a secret's prefix behind
+            event: limit(redact_event(&self.redact, e)),
             quiet,
         };
         for (s, reported) in self.sinks.iter().zip(&self.reported) {
@@ -1415,16 +1459,183 @@ mod tests {
         }
     }
 
+    /// R7: the recorder redacts before it shortens. A secret that starts just before the
+    /// 400-character cut used to lose its tail to the cut and its prefix stayed in the file.
+    #[test]
+    fn a_long_error_is_redacted_before_it_is_shortened() {
+        let secret = "zq7-SECRET-token-value-0123456789";
+        let c = Collect::default();
+        let r = Recorder::new(
+            "T",
+            1,
+            0,
+            Redactions::new(&[Secret {
+                name: "K".into(),
+                value: secret.into(),
+            }]),
+        )
+        .with(Box::new(c.clone()));
+        let error = format!("{}{secret} and more", "x".repeat(ERROR_MAX - 5));
+        r.emit(EngineEvent::RunEnded {
+            state: St::New,
+            next_action: "n".into(),
+            from: None,
+            error: Some(error),
+        });
+        let got = c.0.lock().unwrap().clone();
+        let line = serde_json::to_string(&got[0]).unwrap();
+        assert!(
+            !line.contains("zq7"),
+            "a prefix of the secret survived: {line}"
+        );
+        match &got[0].event {
+            EngineEvent::RunEnded { error: Some(e), .. } => {
+                assert_eq!(e.chars().count(), ERROR_MAX);
+                assert!(e.ends_with('…'));
+            }
+            e => panic!("{e:?}"),
+        }
+    }
+
+    /// R7: a secret in **every** string field of **every** event variant never reaches a sink.
+    /// Each string of each variant's JSON is replaced by the secret in turn; a replacement that
+    /// no longer parses is an enum (a state, a status), not text. A field added later is covered
+    /// as soon as its variant is in `all`.
+    #[test]
+    fn every_string_field_of_every_variant_is_redacted() {
+        const SECRET: &str = "SEKRIT-4a7b9c";
+        fn string_paths(v: &Value, at: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+            match v {
+                Value::String(_) => out.push(at.clone()),
+                Value::Object(o) => {
+                    for (k, x) in o {
+                        at.push(k.clone());
+                        string_paths(x, at, out);
+                        at.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn set(v: &mut Value, path: &[String]) {
+            match path.split_first() {
+                None => *v = Value::String(format!("before {SECRET} after")),
+                Some((k, rest)) => set(&mut v[k.as_str()], rest),
+            }
+        }
+        let all = vec![
+            EngineEvent::RunStarted { owner: "o".into() },
+            EngineEvent::StateChanged {
+                from: St::New,
+                to: St::Planning,
+                event: "start".into(),
+            },
+            EngineEvent::StageStarted {
+                stage: "s".into(),
+                attempt: 1,
+                profile: Some("p".into()),
+                detail: Some("d".into()),
+            },
+            EngineEvent::StageFinished {
+                stage: "s".into(),
+                attempt: 1,
+                status: AttemptStatus::Failed,
+                error_class: Some("c".into()),
+                duration_ms: 1,
+            },
+            EngineEvent::TurnFinished {
+                stage: "s".into(),
+                attempt: 1,
+                profile: "p".into(),
+                success: true,
+                usage: Some(TurnUsage {
+                    buckets: Buckets::default(),
+                    accounting: Accounting::Exact,
+                }),
+                reserved_tokens: Some(1),
+                duration_ms: 1,
+            },
+            EngineEvent::CheckpointCreated {
+                head: "h".into(),
+                kind: "k".into(),
+                found: true,
+            },
+            EngineEvent::VerifyCommand {
+                name: "n".into(),
+                exit: Some(0),
+                timed_out: false,
+                ok: true,
+                duration_ms: 1,
+            },
+            EngineEvent::GateOpened {
+                gate: "g".into(),
+                occurrence: 1,
+            },
+            EngineEvent::BudgetWarning { used: 1, cap: 2 },
+            EngineEvent::Escalated {
+                reason_class: "c".into(),
+                reason: "r".into(),
+            },
+            EngineEvent::Paused { reason: "r".into() },
+            EngineEvent::RunEnded {
+                state: St::Completed,
+                next_action: "n".into(),
+                from: Some(St::New),
+                error: Some("e".into()),
+            },
+        ];
+        let kinds: std::collections::BTreeSet<&str> = all.iter().map(|e| e.kind()).collect();
+        assert_eq!(kinds.len(), 12, "every variant, once");
+        let c = Collect::default();
+        let r = Recorder::new(
+            "T",
+            1,
+            0,
+            Redactions::new(&[Secret {
+                name: "K".into(),
+                value: SECRET.into(),
+            }]),
+        )
+        .with(Box::new(c.clone()));
+        let mut text_fields = 0;
+        for e in all {
+            let base = serde_json::to_value(&e).unwrap();
+            let mut paths = Vec::new();
+            string_paths(&base, &mut Vec::new(), &mut paths);
+            for p in paths.into_iter().filter(|p| p[0] != "type") {
+                let mut v = base.clone();
+                set(&mut v, &p);
+                let Ok(with_secret) = serde_json::from_value::<EngineEvent>(v) else {
+                    continue; // an enum field: not text
+                };
+                text_fields += 1;
+                r.emit(with_secret);
+                let env = c.0.lock().unwrap().pop().unwrap();
+                let line = serde_json::to_string(&env).unwrap();
+                assert!(!line.contains(SECRET), "{p:?} of {}: {line}", e.kind());
+                assert!(line.contains("[REDACTED:K]"), "{p:?}: {line}");
+            }
+        }
+        // every text field of the twelve variants today; a new one raises the count
+        assert!(text_fields >= 18, "{text_fields}");
+    }
+
     /// R6: `seq` never panics or wraps; an implausible last `seq` restarts above the line count;
     /// a complete object on an unterminated last line keeps its `seq`.
     #[test]
     fn seq_is_checked_and_an_unterminated_object_counts() {
-        assert_eq!(next_seq(41, 3), (42, None));
-        let (n, w) = next_seq(u64::MAX, 7);
-        assert_eq!(n, 8);
+        assert_eq!(next_seq(&[1, 41, 3]), (42, None));
+        assert_eq!(next_seq(&[]), (1, None));
+        let (n, w) = next_seq(&[3, u64::MAX, 5, 6, 7, 8, 9]);
+        assert_eq!(
+            n, 10,
+            "above the line count (7) and the highest plausible (9)"
+        );
         assert!(w.unwrap().contains("implausible"));
-        assert!(next_seq(SEQ_MAX, 1).1.is_some());
-        assert!(next_seq(SEQ_MAX - 1, 1).1.is_none());
+        assert!(next_seq(&[SEQ_MAX]).1.is_some());
+        assert!(next_seq(&[SEQ_MAX - 1]).1.is_none());
+        // R7: never below an earlier valid value (the line count alone would give 4)
+        assert_eq!(next_seq(&[500, 501, u64::MAX]).0, 502);
         // a recorder that starts at the end of the range saturates instead of wrapping
         let c = Collect::default();
         let r = Recorder::new("T", 1, u64::MAX, Redactions::empty()).with(Box::new(c.clone()));
@@ -1510,7 +1721,10 @@ mod tests {
     fn watch_stops_on_a_task_that_does_not_move_on_its_own() {
         let idle = WATCH_IDLE;
         let short = std::time::Duration::from_millis(500);
-        assert!(watch_done(St::WaitingPlanApproval, true, idle));
+        // R7: a waiting state still driven (under `--yes`, `approve_now` at work) goes on
+        assert!(!watch_done(St::WaitingPlanApproval, true, idle));
+        assert!(!watch_done(St::WaitingFinalApproval, true, idle));
+        assert!(watch_done(St::WaitingPlanApproval, false, idle));
         assert!(watch_done(St::Completed, false, idle));
         assert!(watch_done(St::Paused, false, idle));
         assert!(
@@ -1524,6 +1738,21 @@ mod tests {
         );
         assert!(watch_done(St::New, false, idle), "nobody drives it (R1)");
         assert!(!watch_done(St::New, true, idle), "a drive is starting");
+    }
+
+    /// R7: `watch` stops only after two "done" polls in a row with no new event in between.
+    #[test]
+    fn done_must_hold_on_two_polls_in_a_row() {
+        let mut d = DonePolls::default();
+        assert!(!d.observe(true, false), "one poll is not enough");
+        assert!(d.observe(true, false), "the second in a row stops");
+        let mut d = DonePolls::default();
+        assert!(!d.observe(true, false));
+        assert!(!d.observe(false, false), "not done: starts over");
+        assert!(!d.observe(true, false));
+        assert!(!d.observe(true, true), "a new event starts over");
+        assert!(!d.observe(true, false));
+        assert!(d.observe(true, false));
     }
 
     #[test]

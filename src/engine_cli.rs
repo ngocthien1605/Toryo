@@ -281,6 +281,7 @@ fn recovered_events(
     rec: &Recorder,
     id: &str,
     running: &[store::AttemptRow],
+    usage_before: &[i64],
 ) -> Result<()> {
     if running.is_empty() {
         return Ok(());
@@ -297,7 +298,8 @@ fn recovered_events(
         };
         let reserved = usage
             .iter()
-            .find(|u| u.1 == a.id && u.3 == "unknown")
+            // R7: only a row recovery inserted — the crashed process emitted its own rows
+            .find(|u| u.1 == a.id && u.3 == "unknown" && !usage_before.contains(&u.0))
             .and_then(|u| u.5);
         if let (Some(n), Some(p)) = (reserved, &a.profile) {
             rec.emit_quiet(EngineEvent::TurnFinished {
@@ -329,24 +331,72 @@ fn drive(store: &Store, lock: &TaskLock, rec: &Recorder, d: &DriveArgs) -> Resul
         owner: lock::owner_label(),
     });
     let from = get(store, &lock.task).ok().map(|t| t.state);
+    // R7: a panic unwinding through the drive still ends the record (exit code 101 stays)
+    let mut guard = RunEndGuard {
+        store,
+        rec,
+        task: &lock.task,
+        from,
+        armed: true,
+    };
     let res = drive_inner(store, lock, rec, d);
-    let (state, next) = match get(store, &lock.task) {
+    guard.armed = false;
+    // the full text: the recorder redacts it, then shortens it (R7)
+    run_ended(
+        store,
+        rec,
+        &lock.task,
+        from,
+        res.as_ref().err().map(|e| format!("{e:#}")),
+    );
+    res
+}
+
+/// Emit the one `run_ended` of a drive: state and next action re-read from the store, the last
+/// known state if it cannot be read.
+fn run_ended(
+    store: &Store,
+    rec: &Recorder,
+    task: &str,
+    from: Option<PipelineState>,
+    error: Option<String>,
+) {
+    let (state, next) = match get(store, task) {
         Ok(t) => (t.state, next_action(&t)),
-        // the store cannot be read: the last known state
         Err(_) => (
             from.unwrap_or(PipelineState::New),
-            format!("`toryo status {}`", lock.task),
+            format!("`toryo status {task}`"),
         ),
     };
     rec.emit_quiet(EngineEvent::RunEnded {
         state,
         next_action: next,
         from,
-        error: res.as_ref().err().map(|e| {
-            toryo::engine::flight::shorten(&format!("{e:#}"), toryo::engine::flight::ERROR_MAX)
-        }),
+        error,
     });
-    res
+}
+
+/// Emits `run_ended { error: "panicked" }` when a panic unwinds through the drive (R7).
+struct RunEndGuard<'a> {
+    store: &'a Store,
+    rec: &'a Recorder,
+    task: &'a str,
+    from: Option<PipelineState>,
+    armed: bool,
+}
+
+impl Drop for RunEndGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed && std::thread::panicking() {
+            run_ended(
+                self.store,
+                self.rec,
+                self.task,
+                self.from,
+                Some("panicked".into()),
+            );
+        }
+    }
 }
 
 fn drive_inner(store: &Store, lock: &TaskLock, rec: &Recorder, d: &DriveArgs) -> Result<i32> {
@@ -367,10 +417,18 @@ fn drive_inner(store: &Store, lock: &TaskLock, rec: &Recorder, d: &DriveArgs) ->
             .filter(|a| a.status == store::AttemptStatus::Running)
             .collect()
     };
+    let usage_before: Vec<i64> = {
+        let i = lock.task.clone();
+        store
+            .call(move |tx| store::usage_rows(tx, &i))?
+            .into_iter()
+            .map(|u| u.0)
+            .collect()
+    };
     for n in recovery.recover(&lock.task)? {
         eprintln!("↺ recovery: {n}");
     }
-    recovered_events(store, rec, &lock.task, &running)?;
+    recovered_events(store, rec, &lock.task, &running, &usage_before)?;
     let before = t.state;
     let t = get(store, &lock.task)?;
     recorded(rec, before, "recovery", &t);
@@ -1485,7 +1543,7 @@ pub fn watch(id: &str, json: bool, from_start: bool, no_follow: bool) -> Result<
     let mut last = std::time::Instant::now();
     // the engine commits a transition before it writes its events: "done" must hold on two
     // polls in a row, and the file is read once more before returning (R1)
-    let mut done_polls = 0;
+    let mut done = flight::DonePolls::default();
     loop {
         if interrupted_during(Duration::from_millis(500)) {
             return Ok(0);
@@ -1493,18 +1551,13 @@ pub fn watch(id: &str, json: bool, from_start: bool, no_follow: bool) -> Result<
         let new = tail.poll(&path)?;
         if !new.is_empty() {
             last = std::time::Instant::now();
-            done_polls = 0;
             if !show_lines(&new, json)? {
                 return Ok(0);
             }
         }
         let state = read_task(&st, id)?.state;
-        if flight::watch_done(state, driven(&st, id)?, last.elapsed()) {
-            done_polls += 1;
-        } else {
-            done_polls = 0;
-        }
-        if done_polls >= 2 {
+        let now_done = flight::watch_done(state, driven(&st, id)?, last.elapsed());
+        if done.observe(now_done, !new.is_empty()) {
             show_lines(&tail.poll(&path)?, json)?;
             return Ok(0);
         }

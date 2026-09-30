@@ -544,3 +544,118 @@ fn attempts_ended_by_recovery_are_recorded() {
         ev[turn]
     );
 }
+
+// ── review fixes round 2: R7 ─────────────────────────────────────────────────────────
+
+/// R7.1: the crashed process already recorded (and emitted) the failed turn's reservation;
+/// recovery must not emit a second `turn_finished` for it.
+#[test]
+fn recovery_does_not_repeat_a_turn_the_crashed_process_recorded() {
+    let env = setup("codex-openai");
+    create(&env, "R7-1");
+    let s = script(
+        &env,
+        "c.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write("src/Calculator.psm1", DIVIDE), fail("Unknown", "boom")]),
+                turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()]),
+            ],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["run", "R7-1", "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "implement:before_partial_commit")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let (_, err) = toryo(&env, &["resume", "R7-1", "--yes", "--fake-agents", &s], &[]);
+    let ev = events(&env, "R7-1");
+    let turns: Vec<&Value> = ev
+        .iter()
+        .filter(|e| e["type"] == "turn_finished" && e["stage"] == "implement" && e["attempt"] == 1)
+        .collect();
+    assert_eq!(turns.len(), 1, "{turns:#?}\n{err}");
+    assert!(turns[0]["reserved_tokens"].as_i64().unwrap() > 0);
+}
+
+/// R7.3: a final-gate rejection at the fix-cycle bound escalates and prints its reason once,
+/// right before its `[state]` line.
+#[test]
+fn a_rejection_at_the_bound_prints_its_reason_once() {
+    let env = setup("codex-openai");
+    let (code, err) = toryo(
+        &env,
+        &[
+            "task",
+            "create",
+            "--file",
+            "TASK.md",
+            "--id",
+            "R7-3",
+            "--max-fix-cycles",
+            "0",
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let s = script(
+        &env,
+        "g.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(&env, &["run", "R7-3", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    let (code, err) = toryo(
+        &env,
+        &[
+            "approve",
+            "R7-3",
+            "--gate",
+            "plan",
+            "--continue",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let (code, err) = toryo(
+        &env,
+        &["reject", "R7-3", "--gate", "final", "--reason", "more"],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "R7-3").state, St::Escalated);
+    reason_once_before(
+        &err,
+        "not accepted after 0 fix cycle(s) (last: final gate rejected: more)",
+        Some("   [state] WaitingFinalApproval --rejected--> Escalated"),
+    );
+}
+
+/// R7.5: a panic inside a drive still ends the record with `run_ended { error: "panicked" }`;
+/// the exit code stays 101.
+#[test]
+fn a_panic_still_ends_the_record() {
+    let env = setup("codex-openai");
+    create(&env, "R7-5");
+    let s = script(&env, "p.json", json!({"planner": [turn(vec![plan()])]}));
+    let (code, err) = toryo(
+        &env,
+        &["run", "R7-5", "--fake-agents", &s],
+        &[("TORYO_TEST_PANIC_AT", "plan:after_begin")],
+    );
+    assert_eq!(code, 101, "{err}");
+    let ev = events(&env, "R7-5");
+    let last = ev.last().unwrap();
+    assert_eq!(last["type"], "run_ended", "{ev:#?}");
+    assert_eq!(last["error"], "panicked");
+    assert_eq!(last["state"], "Planning");
+}
