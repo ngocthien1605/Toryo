@@ -2002,7 +2002,7 @@ impl<'a> Engine<'a> {
             r.session_id.clone(),
             self.weights(),
         );
-        self.store.call(move |tx| {
+        let stored = self.store.call(move |tx| {
             store::record_usage_in(
                 tx,
                 &store::UsageIn {
@@ -2020,19 +2020,19 @@ impl<'a> Engine<'a> {
                     reservation,
                 },
             )
-            .map(|_| ())
         })?;
+        // R2: what the store recorded (a cumulative adapter's delta, the accounting after a
+        // cut-short turn), never the adapter's raw counters
         self.rec.emit_quiet(EngineEvent::TurnFinished {
             stage: a.stage.clone(),
             attempt: a.attempt,
             profile: profile.to_string(),
             success: r.success,
-            usage: u.and_then(|x| {
-                x.buckets.map(|buckets| TurnUsage {
-                    buckets,
-                    accounting: x.accounting,
-                })
+            usage: stored.buckets.map(|buckets| TurnUsage {
+                buckets,
+                accounting: stored.accounting,
             }),
+            reserved_tokens: stored.reservation,
             duration_ms: r.duration_ms as u64,
         });
         Ok(())

@@ -77,7 +77,7 @@ Branch `m10/flight-recorder` (from `main` @ `5adf204`). One commit per task.
 Review fixes (`M10-review-fixes.md`, 2026-09-30):
 
 - [x] R1 — `run_ended` on every exit of a drive; `watch` always terminates
-- [ ] R2 — `turn_finished.usage` is what the store recorded
+- [x] R2 — `turn_finished.usage` is what the store recorded
 - [ ] R3 — `toryo usage` does not look complete when it is not
 - [ ] R4 — toast hardening
 - [ ] R5 — escalation reasons on stderr: keep, pin, document
@@ -360,3 +360,15 @@ toast test stays; review item 5 — the new `!! reason` lines stay (R5).
   a_failed_drive_ends_its_record_and_watch_terminates`, `watch_into_a_closed_pipe_exits_0`,
   `tests/m10_notify.rs::no_second_completed_toast_and_an_error_end_toasts`; unit
   `notify::tests::a_run_end_toasts_on_an_error_or_a_new_end_state`.
+
+### R2 — `turn_finished.usage` is what the store recorded
+
+- `store::record_usage_in` returns `store::Recorded { id, buckets, accounting, reservation }` — the row
+  as stored: for a cumulative adapter (Codex on a resumed session) the delta against the session
+  baseline, the accounting after the engine turned a cut-short `exact` into `provisional`, and the
+  reservation of a turn with no telemetry. `Engine::usage` emits exactly that in `turn_finished`; a
+  reservation is `usage` absent + the new optional `reserved_tokens` (rendered `no usage reported,
+  ~N reserved`). Recovery's reservations are emitted in R6.
+- Test `tests/m10_events.rs::turn_usage_in_events_is_what_the_store_recorded`: a Codex reviewer with a
+  correction turn (cumulative 3300 → 4400): events 3300 and 1100 = the rows; the planner turn without
+  usage shows `reserved_tokens: 200000`. Before the fix: `[3300, 4400]`.

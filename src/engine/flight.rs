@@ -78,6 +78,9 @@ pub enum EngineEvent {
         success: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<TurnUsage>,
+        /// R2: the reservation of a turn with no telemetry (then `usage` is absent).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reserved_tokens: Option<i64>,
         duration_ms: u64,
     },
     /// `found`: the checkpoint was already committed (trailer match, R40).
@@ -278,6 +281,7 @@ pub fn render(env: &Envelope) -> String {
             profile,
             success,
             usage,
+            reserved_tokens,
             duration_ms,
         } => format!(
             "   turn {stage}/{attempt} ({profile}): {} · {} ({:.1}s)",
@@ -291,7 +295,10 @@ pub fn render(env: &Envelope) -> String {
                         .and_then(|v| v.as_str().map(str::to_string))
                         .unwrap_or_default()
                 ),
-                None => "no usage reported".into(),
+                None => match reserved_tokens {
+                    Some(n) => format!("no usage reported, ~{n} reserved"),
+                    None => "no usage reported".into(),
+                },
             },
             secs(*duration_ms)
         ),
@@ -764,6 +771,7 @@ mod tests {
                     },
                     accounting: Accounting::Exact,
                 }),
+                reserved_tokens: None,
                 duration_ms: 9,
             },
             EngineEvent::CheckpointCreated {
@@ -1041,9 +1049,22 @@ mod tests {
                     },
                     accounting: Accounting::Exact
                 }),
+                reserved_tokens: None,
                 duration_ms: 2000
             }),
             "   turn review/1 (claude-max): completed · 35 tokens, exact (2.0s)"
+        );
+        assert_eq!(
+            r(EngineEvent::TurnFinished {
+                stage: "plan".into(),
+                attempt: 2,
+                profile: "claude-max".into(),
+                success: false,
+                usage: None,
+                reserved_tokens: Some(200_000),
+                duration_ms: 100
+            }),
+            "   turn plan/2 (claude-max): failed · no usage reported, ~200000 reserved (0.1s)"
         );
         assert_eq!(
             r(EngineEvent::GateOpened {

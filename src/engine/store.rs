@@ -963,8 +963,21 @@ fn from_counters(v: &Value) -> Buckets {
     }
 }
 
-/// Record one turn's usage (R41) and update the task's spent / reserved tokens. Returns the
-/// row id.
+/// What [`record_usage_in`] stored for a turn (R2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recorded {
+    /// The `usage` row.
+    pub id: i64,
+    /// The buckets of the row — for a cumulative adapter the delta against the session's
+    /// baseline, not the adapter's counters; `None` for a reservation.
+    pub buckets: Option<Buckets>,
+    pub accounting: Accounting,
+    /// The tokens reserved for a turn with no telemetry.
+    pub reservation: Option<i64>,
+}
+
+/// Record one turn's usage (R41) and update the task's spent / reserved tokens. Returns what
+/// was stored (R2): the row, its buckets after the delta, the accounting, the reservation.
 /// - nothing known → `unknown` with a reservation (config, else the largest exact turn of the
 ///   same stage in this task, else 200 000) — never zero;
 /// - `provisional` (a killed Claude turn's streamed counts) → charged as they are;
@@ -972,7 +985,7 @@ fn from_counters(v: &Value) -> Buckets {
 ///   (a counter going down is a reset); killed turns of the same session not yet absorbed make
 ///   it `includes_unreported`, and when the adapter is proven to include them they are
 ///   `reconciled_by` this row and stop counting.
-pub fn record_usage_in(tx: &Transaction, u: &UsageIn) -> Result<i64> {
+pub fn record_usage_in(tx: &Transaction, u: &UsageIn) -> Result<Recorded> {
     let acc = u.usage.and_then(|x| x.buckets.map(|b| (b, x.accounting)));
     let at = now();
     match acc {
@@ -996,7 +1009,12 @@ pub fn record_usage_in(tx: &Transaction, u: &UsageIn) -> Result<i64> {
                 "UPDATE tasks SET reserved_tokens = reserved_tokens + ?2 WHERE id = ?1",
                 params![u.task, res],
             )?;
-            Ok(tx.last_insert_rowid())
+            Ok(Recorded {
+                id: tx.last_insert_rowid(),
+                buckets: None,
+                accounting: Accounting::Unknown,
+                reservation: Some(res),
+            })
         }
         Some((b, acc)) => {
             let exact = acc == Accounting::Exact;
@@ -1085,7 +1103,16 @@ pub fn record_usage_in(tx: &Transaction, u: &UsageIn) -> Result<i64> {
                     tx.execute("UPDATE tasks SET spent_tokens = spent_tokens - ?2, reserved_tokens = reserved_tokens - ?3 WHERE id = ?1", params![u.task, ds, dr])?;
                 }
             }
-            Ok(id)
+            Ok(Recorded {
+                id,
+                buckets: Some(delta),
+                accounting: if exact {
+                    Accounting::Exact
+                } else {
+                    Accounting::Provisional
+                },
+                reservation: None,
+            })
         }
     }
 }

@@ -280,3 +280,65 @@ fn an_unwritable_flight_recorder_does_not_fail_the_run() {
         "reported once: {err}"
     );
 }
+
+/// Review fix R2: `turn_finished.usage` is what the store recorded. A Codex reviewer (cumulative
+/// counters per session) with a correction turn reports 3300 then 4400 in total; the store keeps
+/// 3300 and the delta 1100 — and so must the events. A turn with no usage shows its reservation.
+#[test]
+fn turn_usage_in_events_is_what_the_store_recorded() {
+    let env = setup("codex-openai");
+    let cfg = std::fs::read_to_string(&env.config).unwrap();
+    std::fs::write(
+        &env.config,
+        cfg.replace(
+            "planner: { profile: claude-max }",
+            "planner: { profile: claude-max }\n  reviewer: { profile: codex-openai }",
+        ),
+    )
+    .unwrap();
+    create(&env, "EV-6");
+    let partial = json!({"kind":"complete","structured":{"decision":"approved","summary":"s","acceptance_criteria":[
+        {"id":"AC-1","met":true,"evidence":"e1"}],"issues":[]}});
+    let usage = |input: u64, output: u64| json!({"kind":"usage","input":input,"cache_read":0,"output":output});
+    let s = script(
+        &env,
+        "r2.json",
+        json!({
+            "planner": [turn(vec![plan()])], // no usage: a reservation
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), usage(100, 10), implementation()])],
+            "reviewer": [turn(vec![usage(3000, 300), partial]), turn(vec![usage(4000, 400), approved()])],
+        }),
+    );
+    let (code, err) = toryo(&env, &["run", "EV-6", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    let ev = events(&env, "EV-6");
+    let turns: Vec<&Value> = ev.iter().filter(|e| e["type"] == "turn_finished").collect();
+    let total = |e: &Value| {
+        ["uncached_input", "cache_read", "cache_write", "output"]
+            .iter()
+            .map(|k| e["usage"][k].as_u64().unwrap())
+            .sum::<u64>()
+    };
+    let review: Vec<u64> = turns
+        .iter()
+        .filter(|e| e["stage"] == "review")
+        .map(|e| total(e))
+        .collect();
+    assert_eq!(review, vec![3300, 1100], "{turns:#?}");
+    let i = "EV-6".to_string();
+    let rows: Vec<i64> = db(&env)
+        .call(move |tx| {
+            let mut q = tx.prepare(
+                "SELECT u.budget_tokens FROM usage u JOIN stage_attempts a ON a.id = u.stage_attempt_id WHERE u.task_id = ?1 AND a.stage = 'review' ORDER BY u.id",
+            )?;
+            let v = q
+                .query_map([i], |r| r.get(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(v)
+        })
+        .unwrap();
+    assert_eq!(rows, vec![3300, 1100], "the store");
+    let plan = turns.iter().find(|e| e["stage"] == "plan").unwrap();
+    assert!(plan.get("usage").is_none(), "{plan}");
+    assert_eq!(plan["reserved_tokens"], 200_000, "{plan}");
+}
