@@ -80,7 +80,7 @@ Review fixes (`M10-review-fixes.md`, 2026-09-30):
 - [x] R2 — `turn_finished.usage` is what the store recorded
 - [x] R3 — `toryo usage` does not look complete when it is not
 - [x] R4 — toast hardening
-- [ ] R5 — escalation reasons on stderr: keep, pin, document
+- [x] R5 — escalation reasons on stderr: keep, pin, document
 - [ ] R6 — cheap Low fixes
 
 ## A — Event backbone (ARCH-02)
@@ -112,9 +112,10 @@ Review fixes (`M10-review-fixes.md`, 2026-09-30):
   `approve --force` records `force_final`, `task config --reload` its `reverify`. Not recorded:
   `task cleanup`'s `Cancel` (the file goes with the run store).
 - **`quiet`** (`Envelope.quiet`, `#[serde(skip)]`, never written): the CLI printed no line for that
-  event at that point before M10 (e.g. `finish_and` transitions have never printed `[state]`,
-  `ImplementOutcome::Failed` and a rejected review never printed `!! reason`). A2's stderr renderer
-  skips quiet events so the text of a run does not change; the file and `watch` see everything.
+  event at that point before M10 (e.g. `finish_and` transitions have never printed `[state]`).
+  A2's stderr renderer skips quiet events; the file and `watch` see everything. (Corrected by R5:
+  `ImplementOutcome::Failed` and a rejected review were quiet here at first; since R5 every
+  escalation and pause prints its reason once — see R5 and deviation 6.)
 - **Sequence** (`seq`): the recorder starts at the highest `seq` in the file + 1 (complete lines only),
   so it is monotonic across runs. Only the lock holder writes the file; gaps are possible (an event a
   sink could not write still takes its number).
@@ -141,15 +142,18 @@ Review fixes (`M10-review-fixes.md`, 2026-09-30):
   `eprintln!` for these lines are gone from `engine/runner.rs`: `[state]` (engine, `approve_now`,
   `reject_now`, `withdraw_final`), the four stage headers, `✔ checkpoint …` (both lines of a trailer
   match: one event with `found`), the verify command lines, `!! budget: …`, and the `!! <reason>` line
-  printed before an escalation or a reason-carrying pause (it is the `escalated`/`paused` event; the
-  paths that never printed it emit it quiet).
+  printed before an escalation or a reason-carrying pause (it is the `escalated`/`paused` event).
 - **Same text.** `reject_now` has always printed `--rejected-->`: the renderer maps `plan_rejected` /
   `final_rejected` to that. Unit test `events_render_the_text_the_engine_printed` compares each
   variant with the old format expressions. End to end, `main`'s binary and this one were run on the
   same fake scenarios (fix cycles with a failing and a passing verify, review changes, a final
   rejection that escalates at the fix-cycle bound, a protected-config escalation, an implementer
   failure without changes, resume with a note, a budget warning and the admission pause): after
-  normalising paths, hashes and durations the 335 stderr lines are identical.
+  normalising paths, hashes and durations the 335 stderr lines are identical. **Not identical in
+  general** (found by the review): transitions the state machine turns into an escalation inside
+  `end_and` — a blocked review, the fix-cycle bound after changes requested, the plan-policy bound —
+  print `!! <reason>` now, which `main` did not; those paths were not in the scenarios. The owner kept
+  the new lines (review item 5); R5 made the rule uniform (deviation 6).
 - **One difference**, only when a secret is involved: the stderr lines now go through the task's
   redaction (R42) like the file — a reason that carried a profile secret was printed as is before.
 - **Lines that are not events** (unchanged `eprintln!`, `engine/runner.rs`): `TORYO_TEST_CRASH_AT`,
@@ -431,3 +435,24 @@ toast test stays; review item 5 — the new `!! reason` lines stay (R5).
   `tests/m10_notify.rs::the_real_script_takes_hostile_text_as_data` (Windows, dry run: quotes, `$(...)`,
   backticks, ANSI, BEL, U+FFFE, Japanese, Vietnamese → exit 0). The new unit tests use new API (they do not
   compile before the fix); the `--yes` assertion fails before it.
+
+### R5 — escalation reasons on stderr: keep, pin, document
+
+- **The rule** (documented on `Engine::end_with`/`apply_with`): every transition into `Escalated` or
+  `Paused` prints its reason exactly once, as `!! <reason>`, right before its `[state]` line; no caller
+  prints `!! reason` itself (checked: the only `eprintln!("!! {…}")` left in `engine/runner.rs` are the
+  context warnings). The reason is the `escalated`/`paused` event itself.
+- **Changed to print** (they were quiet before R5, and before M10): an implementer failure without
+  changes (`!! implementer failed: …`, after the turn summary), a review rejected three times (`!!
+  InvalidOutput: …`), and the "no implementer left" pause of `implement()` (`!! implementer_quota: …`).
+- **Kept quiet, because another line already says the reason:** the budget pauses (`!! budget reached
+  during the turn …`, `!! admission cap reached …` — their event reason is just `budget`), and the pause
+  after the last implementer switch (`!! implementer X: … → no fallback left`). `withdraw_final` stays
+  quiet too: the refused approval's error is the reason line. Transitions inside `finish_and` still print
+  no `[state]` line (owner decision Q1): the fix-cycle bound after a failed verify prints its reason once
+  and no `[state]` line.
+- Tests (`tests/m10_events.rs`): a blocked review prints `!! the reviewer blocked the task` once, right
+  before `[state] Reviewing --review_blocked--> Escalated`; `--max-fix-cycles 1` with a failing verify
+  prints `!! not accepted after 1 fix cycle(s) (last: verify failed)` once (no `[state]` line, Q1); the
+  plan-policy bound once before `[state] Planning --plan_policy_violation--> Escalated`; the implementer
+  failure and the rejected review once before their `[state]` lines (this last test fails before R5).

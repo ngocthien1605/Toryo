@@ -221,7 +221,8 @@ impl<'a> Engine<'a> {
         self.apply_with(Ev::Escalate { reason }, true)
     }
 
-    /// Apply `e` and report it; `reason_line`: the escalation or pause reason is printed.
+    /// Apply `e` and report it; `reason_line`: the escalation or pause reason is printed (see
+    /// [`Self::end_with`] for the rule and its one exception, the budget pause).
     fn apply_with(&self, e: Ev, reason_line: bool) -> Result<St> {
         let i = self.id.clone();
         let from = self.task()?.state;
@@ -588,7 +589,7 @@ impl<'a> Engine<'a> {
         // here means the chain was used up
         let Some(profile) = implementer_at(t, t.implementer_index, self.opts.no_fallback) else {
             let reason = implementer_quota_reason(&t.implementers.join(" → "));
-            self.apply(Ev::Pause { reason })?;
+            self.apply_with(Ev::Pause { reason }, true)?;
             return Ok(Flow::Next);
         };
         let turn = self.prepare_implement(t, profile)?;
@@ -849,14 +850,13 @@ impl<'a> Engine<'a> {
             }
             ImplementOutcome::Failed { reason } => {
                 r.print_summary();
-                self.end_with(
+                self.end_and(
                     a,
                     AttemptStatus::Failed,
                     r,
                     AttemptEnd::default(),
                     Some(Ev::Escalate { reason }),
                     None,
-                    false,
                 )?;
                 Ok(Flow::Next)
             }
@@ -1458,7 +1458,7 @@ impl<'a> Engine<'a> {
                     "InvalidOutput: the review was rejected {} times (R22)",
                     MAX_CORRECTIONS + 1
                 );
-                self.end_with(
+                self.end_and(
                     &a,
                     AttemptStatus::Failed,
                     &last,
@@ -1469,7 +1469,6 @@ impl<'a> Engine<'a> {
                     },
                     Some(Ev::Escalate { reason }),
                     None,
-                    false,
                 )?;
                 Ok(Flow::Next)
             }
@@ -2074,7 +2073,10 @@ impl<'a> Engine<'a> {
         self.end_with(a, status, r, end, e, feedback, true)
     }
 
-    /// [`Self::end_and`]; `reason_line`: whether the reason is printed.
+    /// [`Self::end_and`]; `reason_line: false` only for a stop whose reason another line already
+    /// says — the budget pauses print `!! budget reached during the turn …` or `!! admission cap
+    /// reached …` themselves. The rule (M10-R5): every transition into `Escalated` or `Paused`
+    /// prints its reason exactly once, before its `[state]` line; no caller prints `!! reason` itself.
     #[allow(clippy::too_many_arguments)]
     fn end_with(
         &self,

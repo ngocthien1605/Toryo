@@ -342,3 +342,157 @@ fn turn_usage_in_events_is_what_the_store_recorded() {
     assert!(plan.get("usage").is_none(), "{plan}");
     assert_eq!(plan["reserved_tokens"], 200_000, "{plan}");
 }
+
+// ── review fix R5: every escalation and pause prints its reason once ─────────────────
+
+/// `!! <reason>` appears exactly once on stderr, on the line right before the `[state]` line
+/// into `Escalated`/`Paused`.
+fn reason_once_before(err: &str, reason: &str, state_line: Option<&str>) {
+    let lines: Vec<&str> = err.lines().collect();
+    let want = format!("!! {reason}");
+    let at: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| **l == want)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(at.len(), 1, "{want:?} not exactly once:\n{err}");
+    assert_eq!(
+        lines
+            .get(at[0] + 1)
+            .copied()
+            .filter(|l| l.starts_with("   [state]")),
+        state_line,
+        "the [state] line follows:\n{err}"
+    );
+}
+
+fn blocked() -> Value {
+    json!({"kind":"complete","structured":{"decision":"blocked","summary":"contradiction","acceptance_criteria":[
+        {"id":"AC-1","met":false,"evidence":"e1"},{"id":"AC-2","met":false,"evidence":"e2"},{"id":"AC-3","met":false,"evidence":"e3"}],
+        "issues":[{"id":"I-1","severity":"high","blocking":true,"description":"TASK.md contradicts AGENTS.md"}]}})
+}
+
+#[test]
+fn a_blocked_review_prints_its_reason_once() {
+    let env = setup("codex-openai");
+    create(&env, "R5-1");
+    let s = script(
+        &env,
+        "b.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![blocked()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R5-1", "--yes", "--fake-agents", &s], &[]);
+    reason_once_before(
+        &err,
+        "the reviewer blocked the task",
+        Some("   [state] Reviewing --review_blocked--> Escalated"),
+    );
+}
+
+#[test]
+fn the_fix_cycle_bound_prints_its_reason_once() {
+    let env = setup("codex-openai");
+    let (code, err) = toryo(
+        &env,
+        &[
+            "task",
+            "create",
+            "--file",
+            "TASK.md",
+            "--id",
+            "R5-2",
+            "--max-fix-cycles",
+            "1",
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    // the verify command greps for Divide-Numbers: never written, verify fails twice
+    let s = script(
+        &env,
+        "f.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("tests/x.ps1", "# x\n"), implementation()]), turn(vec![write("tests/y.ps1", "# y\n"), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R5-2", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "R5-2").state, St::Escalated, "{err}");
+    reason_once_before(
+        &err,
+        "not accepted after 1 fix cycle(s) (last: verify failed)",
+        // the verify stage ends in `finish_and`, whose `[state]` line stays quiet (owner
+        // decision Q1); the transition is in events.jsonl and `watch`
+        None,
+    );
+    assert!(!err.contains("--verify_failed--> Escalated"), "{err}");
+}
+
+#[test]
+fn the_plan_policy_bound_prints_its_reason_once() {
+    let env = setup("codex-openai");
+    create(&env, "R5-3");
+    let touching = json!({"kind":"complete","structured":{"understanding":"u","files_likely_involved":["TASK.md"],"steps":["x"],"validation":["tests"],"plan_markdown":"md"}});
+    let s = script(
+        &env,
+        "p.json",
+        json!({"planner": (0..4).map(|_| turn(vec![touching.clone()])).collect::<Vec<_>>()}),
+    );
+    let (_, err) = toryo(&env, &["run", "R5-3", "--fake-agents", &s], &[]);
+    let reason = task(&env, "R5-3").machine.reason().unwrap().to_string();
+    assert!(reason.contains("automatic re-plans"), "{reason}");
+    reason_once_before(
+        &err,
+        &reason,
+        Some("   [state] Planning --plan_policy_violation--> Escalated"),
+    );
+}
+
+/// The two escalation paths that printed no reason before M10-R5: an implementer failure without
+/// changes, and a review rejected three times.
+#[test]
+fn a_failed_implementer_and_a_rejected_review_print_their_reason_once() {
+    let env = setup("codex-openai");
+    create(&env, "R5-4");
+    let s = script(
+        &env,
+        "i.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![fail("Unknown", "boom")])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R5-4", "--yes", "--fake-agents", &s], &[]);
+    reason_once_before(
+        &err,
+        "implementer failed: Unknown — boom",
+        Some("   [state] Implementing --escalate--> Escalated"),
+    );
+
+    create(&env, "R5-5");
+    let partial = json!({"kind":"complete","structured":{"decision":"approved","summary":"s","acceptance_criteria":[
+        {"id":"AC-1","met":true,"evidence":"e1"}],"issues":[]}});
+    let s = script(
+        &env,
+        "r.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![partial.clone()]), turn(vec![partial.clone()]), turn(vec![partial])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R5-5", "--yes", "--fake-agents", &s], &[]);
+    let reason = task(&env, "R5-5").machine.reason().unwrap().to_string();
+    assert!(reason.starts_with("InvalidOutput"), "{reason}");
+    reason_once_before(
+        &err,
+        &reason,
+        Some("   [state] Reviewing --escalate--> Escalated"),
+    );
+}
