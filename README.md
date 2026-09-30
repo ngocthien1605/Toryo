@@ -264,8 +264,9 @@ real-CLI canary `scripts\m9-check.ps1 -Canary`, V08-VERIFY 2–4 with `toryo xpp
 task). Decisions made on the way: `docs/M9-NOTES.md`.
 
 M10 (`M10_task.md`, branch `m10/flight-recorder`) is done in code: the engine emits typed events (ARCH-02) —
-recorded per task in `events.jsonl` (the flight recorder) and rendered as the engine's own stderr lines, the same
-text as before; `status --json` / `task show --json` (DES-10); `toryo watch` follows a running task without its
+recorded per task in `events.jsonl` (the flight recorder) and rendered as the engine's own stderr lines — the same
+text as before, except that every escalation and pause now prints its reason once, right before its `[state]` line
+(deviation 6 in `docs/M10-NOTES.md`); `status --json` / `task show --json` (DES-10); `toryo watch` follows a running task without its
 lock; `toryo usage` with estimated cost from the machine's `prices.toml` (plan §12), and every usage row now
 records its model; scripted turns of a mixed fake/real run cost exact zero; an opt-in Windows toast when a task
 needs the owner. Decisions, deviations and open questions: `docs/M10-NOTES.md`.
