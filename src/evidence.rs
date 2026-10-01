@@ -126,8 +126,26 @@ pub fn collect_versions(cfg: Option<&Effective>, profiles: &[&str]) -> BTreeMap<
     out
 }
 
-/// First line of `<exe> --version` (60 s limit, no secrets in the environment).
-pub fn run_version(exe: &Path, env: BTreeMap<String, String>) -> Result<String> {
+/// The redaction set of a profile's own secrets (M11-E2, review M2): what the R51 evidence run
+/// of its program redacts. A secret that cannot be resolved here is left out.
+pub fn profile_redactions(p: &Profile) -> Redactions {
+    let secrets: Vec<crate::process::redact::Secret> = crate::config::resolve_profile_secrets(p)
+        .map(|m| {
+            m.into_iter()
+                .map(|(name, value)| crate::process::redact::Secret { name, value })
+                .collect()
+        })
+        .unwrap_or_default();
+    Redactions::new(&secrets)
+}
+
+/// First line of `<exe> --version` (60 s limit, no secrets in the environment; `redact`: the
+/// profile's secrets all the same, M11-E2).
+pub fn run_version(
+    exe: &Path,
+    env: BTreeMap<String, String>,
+    redact: &Redactions,
+) -> Result<String> {
     let spec = SpawnSpec {
         program: exe.to_path_buf(),
         args: vec!["--version".into()],
@@ -136,7 +154,7 @@ pub fn run_version(exe: &Path, env: BTreeMap<String, String>) -> Result<String> 
         stdin: None,
         boundary: Boundary::None,
     };
-    let r = spawn(&spec, &Redactions::empty())?;
+    let r = spawn(&spec, redact)?;
     let mut out = Vec::new();
     let info = r.wait(
         WaitOptions {
@@ -163,7 +181,7 @@ pub fn run_version(exe: &Path, env: BTreeMap<String, String>) -> Result<String> 
 pub fn profile_version(p: &Profile) -> Option<String> {
     let exe = PathBuf::from(expand_vars(&p.exe).ok()?);
     let env = build_env(std::env::vars(), &p.env, &BTreeMap::new());
-    parse_version(&run_version(&exe, env).ok()?)
+    parse_version(&run_version(&exe, env, &profile_redactions(p)).ok()?)
 }
 
 pub fn git_version() -> Option<String> {

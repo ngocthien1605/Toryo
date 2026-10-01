@@ -16,7 +16,7 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
 - [x] C3 — `checks.reviewer-differs-from-builder`: off / warn / error
 - [x] C4 — split limits: `max_gate_retries`, `max_review_rounds`
 - [x] E1 — check gates: mapping, gate variables, M18
-- [ ] E2 — verify output redacted with the task's secrets (M2)
+- [x] E2 — verify output redacted with the task's secrets (M2)
 - [ ] E3 — environment gates: run, lock, record what is deployed
 - [ ] D1 — skill lookup (repo, then machine) and the menu
 - [ ] D2 — the plan's `skills` field and its checks
@@ -363,6 +363,30 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   folder), `a_gate_script_missing_from_the_base_commit_is_refused_at_admission` (AC-2). The
   protected-path violation for an edit of an existing gate script is the M10 EC-07 path
   (`regress_policy.rs`), unchanged.
+
+### E2 — verify output is redacted with the task's secrets (review M2)
+
+- `runner::RunSpec` gains `redact: Redactions`; `LocalRunner` spawns with it instead of
+  `Redactions::empty()`. The engine's verify runs (`VerifyAt`) use `flight::task_redactions(cfg, t)`
+  — every secret of the task's profiles, plus `CLAUDE_CODE_OAUTH_TOKEN` from the parent environment;
+  E3 adds an environment gate's own `secret_env` values. So `VERIFY_RESULT.json`, the fix prompt,
+  the reviewer's pack and anything derived from the output only ever see `[REDACTED:<name>]`.
+- The output is collected whole (the stream redactor flushes its held-back tail at EOF), so the
+  H5 newline pitfall does not apply here: verify output is not parsed line by line while the
+  command runs. Output without a secret is byte-identical (an empty set is the identity; a set
+  whose values do not occur changes nothing — tested).
+- **The evidence run** (`evidence::run_version`, the R51 `--version` probe of `doctor` and the run
+  gate) takes a redaction set too: the profile's own resolved secrets
+  (`evidence::profile_redactions`; one that cannot be resolved is left out). Its environment holds
+  no secrets, so this is belt and braces.
+- `toryo xpp build` (outside a task) and `spike pipeline` keep an empty set (no task, no secrets).
+- Not done (not in the task list): scanning `DIFF.patch` for known secret values (review M2's last
+  sentence).
+- Tests (`tests/m11_gates.rs`): `verify_output_is_redacted_with_the_task_secrets` (AC-1: a verify
+  command prints the implementer profile's secret; it fails once, so there is a fix prompt, then
+  passes, so there is a reviewer pack; every file of the run store and stderr are free of it, the
+  tail shows `[REDACTED:TORYO_M11_TOKEN]`), `output_without_secrets_is_unchanged_by_redaction`
+  (AC-2).
 
 ## Open
 

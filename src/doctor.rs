@@ -279,7 +279,11 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
             ),
             Err(e) => r.add(Level::Fail, &area, format!("{e}")),
         }
-        let ver = run_version(&exe, build_env(std::env::vars(), &p.env, &BTreeMap::new()));
+        let ver = run_version(
+            &exe,
+            build_env(std::env::vars(), &p.env, &BTreeMap::new()),
+            &results::profile_redactions(p),
+        );
         let current = ver.as_ref().ok().and_then(|v| results::parse_version(v));
         match ver {
             Ok(v) => {

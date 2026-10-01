@@ -83,6 +83,7 @@ fn run_command(hub: &AgentHub, spec: &CommandSpec, cwd: &Path) -> Result<Command
             boundary: Boundary::None,
             timeout: Duration::from_secs(60 * spec.timeout_min.unwrap_or(30)),
             cancel: None,
+            redact: crate::process::redact::Redactions::empty(),
         },
         None,
     ))

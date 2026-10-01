@@ -24,6 +24,8 @@ pub struct RunSpec {
     pub env: BTreeMap<String, String>,
     pub boundary: Boundary,
     pub timeout: Duration,
+    /// M11-E2 (review M2): the task's secrets, redacted from the output as it is read.
+    pub redact: Redactions,
     /// Set to `true` to terminate the command's Job.
     pub cancel: Option<Arc<AtomicBool>>,
 }
@@ -81,7 +83,7 @@ impl CommandRunner for LocalRunner {
                 stdin: None,
                 boundary: spec.boundary,
             };
-            let running = spawn(&s, &Redactions::empty()).with_context(|| {
+            let running = spawn(&s, &spec.redact).with_context(|| {
                 format!("starting `{}` ({})", spec.name, spec.program.display())
             })?;
             let cancel_flag = spec.cancel.clone();

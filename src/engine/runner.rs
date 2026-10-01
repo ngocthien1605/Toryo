@@ -149,6 +149,8 @@ struct VerifyAt<'a> {
     env: BTreeMap<String, String>,
     boundary: Boundary,
     stop: &'a StopWatch,
+    /// M11-E2 (review M2): the task's secrets, redacted from every verify output.
+    redact: crate::process::redact::Redactions,
 }
 
 impl VerifyAt<'_> {
@@ -162,6 +164,7 @@ impl VerifyAt<'_> {
             boundary: self.boundary,
             timeout,
             cancel: Some(self.stop.flag.clone()),
+            redact: self.redact.clone(),
         }
     }
 }
@@ -1352,11 +1355,13 @@ impl<'a> Engine<'a> {
         let mut env = verify::env(co);
         // M11-E1: TORYO_TASK, TORYO_SHA, TORYO_VERIFY_CHECKOUT for every command
         verify::set_gate_vars(&mut env, &self.id, head, co);
+        let t = self.task()?;
         let at = VerifyAt {
             co,
             env,
             boundary: b,
             stop,
+            redact: super::flight::task_redactions(&self.cfg, &t),
         };
         let mut results = Vec::new();
         for c in &self.cmds {
