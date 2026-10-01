@@ -583,7 +583,26 @@ impl<'a> Engine<'a> {
                 AttemptStatus::Succeeded,
                 &r,
                 AttemptEnd::default(),
-                Some(Ev::PlanPolicyViolation { paths: bad }),
+                Some(Ev::PlanPolicyViolation {
+                    paths: bad,
+                    reason: None,
+                }),
+                Some(Some(fb)),
+            )?;
+            return Ok(Flow::Next);
+        }
+        // M11-D2: the implementer's skills — on its menu, within its context budget
+        if let Some((reason, fb)) = self.plan_skills_problem(t, &plan)? {
+            eprintln!("!! {reason} — rejected automatically (plan-time skills check)");
+            self.end_and(
+                &a,
+                AttemptStatus::Succeeded,
+                &r,
+                AttemptEnd::default(),
+                Some(Ev::PlanPolicyViolation {
+                    paths: vec![],
+                    reason: Some(reason),
+                }),
                 Some(Some(fb)),
             )?;
             return Ok(Flow::Next);
@@ -598,6 +617,71 @@ impl<'a> Engine<'a> {
             Some(None),
         )?;
         Ok(Flow::Next)
+    }
+
+    /// M11-D2: what is wrong with the plan's `skills` — `(reason, feedback for the planner)`:
+    /// a name that is not on the implementer's menu (the feedback lists the menu, with a "did
+    /// you mean"), or chosen skills that, with the implementer's never-trimmed parts, exceed its
+    /// context budget ("choose fewer"). `None` without an org chart or without skills.
+    fn plan_skills_problem(&self, t: &TaskRow, plan: &Value) -> Result<Option<(String, String)>> {
+        let Some(team) = &self.cfg.team else {
+            return Ok(None);
+        };
+        let chosen = plan_skills(plan);
+        if chosen.is_empty() {
+            return Ok(None);
+        }
+        let menu: Vec<&str> = team
+            .role("implementer")
+            .map(|r| r.skills.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        let machine = crate::team::machine_skills_dir(&team.skill_roots);
+        let off: Vec<String> = chosen
+            .iter()
+            .filter(|s| !menu.contains(&s.as_str()))
+            .map(|s| {
+                let mean = crate::team::did_you_mean(s, &menu)
+                    .map(|m| format!(" (did you mean `{m}`?)"))
+                    .unwrap_or_default();
+                format!("`{s}`{mean}")
+            })
+            .collect();
+        if !off.is_empty() {
+            let reason = format!(
+                "plan_skills: the plan lists skills that are not on the implementer's menu: {}",
+                off.join(", ")
+            );
+            let listed = context::skill_menu(team, &t.repo, machine.as_deref())
+                .unwrap_or_else(|| "(the implementer has no skills)\n".into());
+            let fb = format!(
+                "Your plan lists skills that are not on the implementer's menu: {}. {listed}Create the plan again with `skills` naming only skills from this menu (or none).",
+                off.join(", ")
+            );
+            return Ok(Some((reason, fb)));
+        }
+        // the chosen skills are never trimmed: with the implementer's other never-trimmed
+        // parts they must fit its budget
+        let skills: usize = chosen
+            .iter()
+            .filter_map(|s| crate::team::resolve_skill(s, &t.repo, machine.as_deref()).ok())
+            .map(|k| k.bytes)
+            .sum();
+        let profile = context::stage_profile(t, "implement")?;
+        let req = context::request(self.store, t, &self.cfg, "implement", &profile)?;
+        let fixed = context::assemble(&req)?.fixed_bytes;
+        if fixed + skills > req.budget {
+            let reason = format!(
+                "plan_skills: the chosen skills ({skills} bytes) and the implementer's fixed instructions ({fixed} bytes) exceed its context budget ({} KB)",
+                req.budget / 1024
+            );
+            let fb = format!(
+                "Choose fewer skills: the skills you chose ({}; {skills} bytes) and the implementer's fixed instructions ({fixed} bytes) exceed its context budget of {} KB (context.budget_kb.implementer). Create the plan again with fewer names in `skills`.",
+                chosen.join(", "),
+                req.budget / 1024
+            );
+            return Ok(Some((reason, fb)));
+        }
+        Ok(None)
     }
 
     fn role_model(&self, role: &str) -> Option<String> {
@@ -2473,6 +2557,19 @@ fn plan_files(plan: &Value) -> Vec<String> {
         .flatten()
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect()
+}
+
+/// M11-D2: the plan's `skills` — its string entries, once each, in order.
+fn plan_skills(plan: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in plan["skills"].as_array().into_iter().flatten() {
+        if let Some(s) = s.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            if !out.iter().any(|x| x == s) {
+                out.push(s.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// M11-C2: the plan-time feedback when a planned path breaks the implementer's write fence —

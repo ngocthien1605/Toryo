@@ -34,6 +34,7 @@ fn samples() -> Vec<E> {
         E::Start,
         E::PlanPolicyViolation {
             paths: vec![s("toryo.yaml")],
+            reason: None,
         },
         E::PlanReady { subject: s("p") },
         E::PlanApproved {
@@ -495,6 +496,7 @@ fn automatic_plan_rejections_are_bounded() {
     m.apply(E::Start).unwrap();
     let v = || E::PlanPolicyViolation {
         paths: vec!["toryo.yaml".into()],
+        reason: None,
     };
     for _ in 0..MAX_PLAN_AUTO_REJECTIONS {
         assert_eq!(m.apply(v()), Ok(S::Planning));

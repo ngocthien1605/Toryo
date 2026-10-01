@@ -103,6 +103,8 @@ pub struct TeamContext {
     pub culture: Option<(String, PathBuf)>,
     /// The role file's `instructions`, after the embedded role template.
     pub instructions: Option<(String, PathBuf)>,
+    /// M11-D2: the planner's menu of the implementer's skills (`name — description` lines).
+    pub menu: Option<String>,
 }
 
 /// One source as it went into the context.
@@ -135,6 +137,10 @@ pub struct Assembled {
     /// R61: untrusted pack files for an agent without run-store access, for its user prompt.
     #[serde(skip)]
     pub data: Vec<DataBlock>,
+    /// M11-D2: the bytes of the parts that are never trimmed (policy, culture, the role
+    /// template and instructions, the skill menu and skills) — what no budget trim can reduce.
+    #[serde(skip)]
+    pub fixed_bytes: usize,
 }
 
 /// An untrusted task-pack file handed over in the user prompt (R61).
@@ -337,6 +343,22 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
             None => skipped.push(format!("4: {}", disp(path))),
         }
     }
+    // M11-D2: the planner chooses the implementer's skills from this menu
+    if let Some(menu) = req.team.as_ref().and_then(|t| t.menu.as_ref()) {
+        parts.push(Part {
+            n: 4,
+            label: "skill menu (implementer)".into(),
+            path: PathBuf::from("(the implementer's role file)"),
+            heading: "Skills available to the implementer".into(),
+            original: menu.len(),
+            sha256: sha256_hex(menu.as_bytes()),
+            body: menu.clone(),
+            rank: None,
+            path_only: false,
+            truncated: false,
+            untrusted: false,
+        });
+    }
     let pack_start = parts.len();
     let mut data = Vec::new();
     let mut data_sources = Vec::new();
@@ -387,6 +409,12 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
         });
     }
     let data_labels: Vec<&str> = data.iter().map(|d| d.label.as_str()).collect();
+    // the never-trimmed parts as `render` writes them (`\n# heading\n\nbody\n`)
+    let fixed_bytes = parts[..pack_start]
+        .iter()
+        .filter(|p| p.rank.is_none())
+        .map(|p| p.heading.len() + p.body.trim_end().len() + 6)
+        .sum();
     let mut warnings = Vec::new();
     let mut text = render(req, &parts, pack_start, &data_labels);
     if text.len() > req.budget {
@@ -459,6 +487,7 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
         sha256: sha256_hex(text.as_bytes()),
         text,
         data,
+        fixed_bytes,
     })
 }
 
@@ -573,12 +602,17 @@ pub fn request(
     // M11-C1: org chart mode — from the repository checkout, like sources 2–4
     let team = cfg.team.as_ref().map(|team| {
         let at = |rel: &String| (rel.clone(), t.repo.join(rel));
+        let machine_dir = crate::team::machine_skills_dir(&team.skill_roots);
         TeamContext {
             culture: team.culture.as_ref().map(at),
             instructions: team
                 .role(role.as_str())
                 .and_then(|r| r.instructions.as_ref())
                 .map(at),
+            // M11-D2: only the planner sees the menu
+            menu: (role == Role::Planner)
+                .then(|| skill_menu(team, &t.repo, machine_dir.as_deref()))
+                .flatten(),
         }
     });
     Ok(Request {
@@ -591,6 +625,25 @@ pub fn request(
         budget: (kb as usize) * 1024,
         team,
     })
+}
+
+/// M11-D2: the planner's menu of the implementer's skills — one `name — description` line
+/// each, read now (repository first, then the machine); `None` when the implementer lists no
+/// skill.
+pub fn skill_menu(team: &crate::team::Team, repo: &Path, machine: Option<&Path>) -> Option<String> {
+    let skills = &team.role("implementer")?.skills;
+    if skills.is_empty() {
+        return None;
+    }
+    let mut s = String::from("Skills available to the implementer — list the ones this task needs in `skills` (names from this list only; leave it out when none applies). The implementer receives exactly the skills you list:\n");
+    for name in skills {
+        let d = match crate::team::resolve_skill(name, repo, machine) {
+            Ok(k) => k.description.unwrap_or_else(|| "(no description)".into()),
+            Err(_) => "(not found on this machine)".into(),
+        };
+        s.push_str(&format!("- {name} — {d}\n"));
+    }
+    Some(s)
 }
 
 /// The profile that runs the next attempt of `stage`.
@@ -666,6 +719,7 @@ mod tests {
                     format!(".toryo/roles/{r}/instructions.md"),
                     dir.join("instructions.md"),
                 )),
+                menu: None,
             }),
             ..req(repo, kind, role)
         }

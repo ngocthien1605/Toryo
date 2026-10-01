@@ -20,12 +20,30 @@ fn list(v: &Value, key: &str) -> String {
     }
 }
 
+/// M11-D2: `\n\nSkills for the implementer: a, b` when the plan lists skills; empty otherwise,
+/// so a plan without them renders as before.
+fn plan_skills_line(v: &Value) -> String {
+    let skills: Vec<&str> = v["skills"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if skills.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nSkills for the implementer: {}", skills.join(", "))
+    }
+}
+
 pub fn render(kind: &str, v: &Value) -> Result<String> {
     Ok(match kind {
         "plan" => format!(
-            "# PLAN\n\n## Understanding\n{}\n\n## Files likely involved\n{}\n\n## Steps\n{}\n\n## Validation\n{}\n\n## Risks\n{}\n\n## Assumptions\n{}\n\n## Open questions\n{}\n\n---\n\n{}\n",
+            "# PLAN\n\n## Understanding\n{}\n\n## Files likely involved\n{}{}\n\n## Steps\n{}\n\n## Validation\n{}\n\n## Risks\n{}\n\n## Assumptions\n{}\n\n## Open questions\n{}\n\n---\n\n{}\n",
             v["understanding"].as_str().unwrap_or(""),
             list(v, "files_likely_involved"),
+            // M11-D2: the planner's choice of the implementer's skills, for the plan gate
+            plan_skills_line(v),
             v["steps"].as_array().map(|a| a.iter().enumerate().map(|(i, s)| format!("{}. {}", i + 1, s.as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n")).unwrap_or_default(),
             list(v, "validation"),
             list(v, "risks"),
@@ -74,5 +92,33 @@ mod tests {
         let md = render("review", &json!({"decision":"changes_requested","summary":"s","acceptance_criteria":[{"id":"AC-1","met":false,"evidence":"a|b"}],"issues":[{"id":"I-1","severity":"high","blocking":true,"description":"d"}]})).unwrap();
         assert!(md.contains("| AC-1 | **no** | a\\|b |"));
         assert!(md.contains("**I-1** [high, blocking]"));
+    }
+
+    /// M11-D2 AC-1/AC-4: PLAN.md names the implementer's skills; a plan without them renders
+    /// exactly as before, and both are valid plans.
+    #[test]
+    fn a_plan_names_the_implementers_skills() {
+        let base = json!({"understanding": "u", "files_likely_involved": ["a"], "steps": ["s"], "validation": ["v"], "plan_markdown": "md"});
+        let mut with = base.clone();
+        with["skills"] = json!(["xpp-batch", "xpp-axclass"]);
+        let md = render("plan", &with).unwrap();
+        assert!(
+            md.contains("## Files likely involved\n- a\n\nSkills for the implementer: xpp-batch, xpp-axclass\n\n## Steps"),
+            "{md}"
+        );
+        let plain = render("plan", &base).unwrap();
+        assert!(!plain.contains("Skills for the implementer"));
+        assert!(
+            plain.contains("## Files likely involved\n- a\n\n## Steps"),
+            "{plain}"
+        );
+        for p in [&base, &with] {
+            assert_eq!(
+                super::super::contracts::validate("plan.schema.json", p),
+                Ok(())
+            );
+        }
+        let bad = json!({"understanding": "u", "files_likely_involved": [], "steps": [], "validation": [], "plan_markdown": "md", "skills": "xpp-batch"});
+        assert!(super::super::contracts::validate("plan.schema.json", &bad).is_err());
     }
 }

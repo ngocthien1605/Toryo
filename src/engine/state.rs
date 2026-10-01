@@ -129,6 +129,10 @@ pub enum PipelineEvent {
     /// The plan lists protected paths: re-plan (bounded), no gate is opened.
     PlanPolicyViolation {
         paths: Vec<String>,
+        /// M11-D2: what is wrong when it is not protected paths — skills off the implementer's
+        /// menu, or over its context budget. Absent (and not serialised) for paths.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// A valid plan exists: opens a plan gate occurrence.
     PlanReady {
@@ -458,14 +462,17 @@ impl Machine {
                 m.plan_attempt = 1;
                 m.state = S::Planning;
             }
-            (S::Planning, E::PlanPolicyViolation { paths }) => {
+            (S::Planning, E::PlanPolicyViolation { paths, reason }) => {
                 if m.plan_auto_rejections >= MAX_PLAN_AUTO_REJECTIONS {
-                    m.escalate(
-                        S::Planning,
-                        format!(
+                    let why = match reason {
+                        Some(r) => format!(
+                            "{r} — still, after {MAX_PLAN_AUTO_REJECTIONS} automatic re-plans"
+                        ),
+                        None => format!(
                             "the plan still lists protected paths {paths:?} after {MAX_PLAN_AUTO_REJECTIONS} automatic re-plans"
                         ),
-                    );
+                    };
+                    m.escalate(S::Planning, why);
                 } else {
                     m.plan_auto_rejections += 1;
                     m.plan_attempt += 1;

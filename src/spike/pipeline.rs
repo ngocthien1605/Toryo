@@ -351,7 +351,15 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
             if !bad.is_empty() {
                 eprintln!("!! plan wants to touch protected paths {bad:?} — rejected automatically (plan-time policy)");
                 let paths = bad.iter().map(|x| x.to_string()).collect();
-                if step(&mut sm, &mut trail, Ev::PlanPolicyViolation { paths })? == St::Escalated {
+                if step(
+                    &mut sm,
+                    &mut trail,
+                    Ev::PlanPolicyViolation {
+                        paths,
+                        reason: None,
+                    },
+                )? == St::Escalated
+                {
                     return Ok(escalated(&sm));
                 }
                 plan_prompt = format!("Your plan lists protected paths {bad:?}, which may not change. Create the plan again without touching them.");

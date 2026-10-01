@@ -19,7 +19,7 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
 - [x] E2 — verify output redacted with the task's secrets (M2)
 - [x] E3 — environment gates: run, lock, record what is deployed
 - [x] D1 — skill lookup (repo, then machine) and the menu
-- [ ] D2 — the plan's `skills` field and its checks
+- [x] D2 — the plan's `skills` field and its checks
 - [ ] D3 — skills delivered through the context loader
 - [ ] F1 — templates
 - [ ] F2 — docs, migration guide, morning summary
@@ -527,6 +527,33 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   `xpp-batch` in the machine folder.
 - Tests: `team::tests::skills_resolve_repository_first` (AC-1), `skill_front_matter` (AC-2),
   `skills_are_validated_at_load`.
+
+### D2 — the plan's `skills` field and its checks
+
+- `schemas/plan.schema.json`: optional `"skills": { "type": "array", "items": { "type": "string" } }`
+  (not in `required`; inside `contracts::KEYWORDS`). **Applies to every plan schema the agents get**,
+  also in legacy mode — an optional property; plans without it stay valid and render as before.
+- **Menu** (`context::skill_menu`): when the implementer's role has skills, the **planner's**
+  context gets a never-trimmed part `skill menu (implementer)` (heading `Skills available to the
+  implementer`): an instruction to list the needed ones in `skills`, then one `- name — description`
+  line per skill, read per attempt (a skill gone since `task create` shows `(not found on this
+  machine)`). None in legacy mode or with an empty menu.
+- **Checks after a valid plan** (`Engine::plan_skills_problem`, after the path/fence check): every
+  name must be on the implementer's menu — else the bounded automatic re-plan with feedback listing
+  the menu and a "did you mean" — and the chosen SKILL.md files plus the implementer's never-trimmed
+  parts (`context::Assembled.fixed_bytes`, new: policy, culture, role template, instructions, menu,
+  skills) must fit `context.budget_kb.implementer` — else "Choose fewer skills". 
+- **Event:** `Ev::PlanPolicyViolation` gains `reason: Option<String>` (serialised only when set, so
+  the stored M10 shape is unchanged); `paths` is empty for a skills problem; at the bound the
+  escalation says `plan_skills: … — still, after 2 automatic re-plans` (class `plan_policy`, as for
+  paths). The exhaustive state-machine tests construct it with `reason: None` (extended, not
+  weakened).
+- `PLAN.md` shows `Skills for the implementer: a, b` under "Files likely involved" when the plan
+  has skills (the plan digest already covers `plan.json`).
+- Tests: `render::tests::a_plan_names_the_implementers_skills` (rendering and schema, AC-1/AC-4),
+  `tests/m11_skills.rs` — `a_plan_chooses_skills_from_the_menu` (AC-1, the menu in the planner's
+  context), `a_skill_off_the_menu_is_replanned_then_escalates` (AC-2), `skills_over_the_budget_are_
+  replanned` (AC-3), `a_plan_without_skills_is_valid` (AC-4).
 
 ## Open
 
