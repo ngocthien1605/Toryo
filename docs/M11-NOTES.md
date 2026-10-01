@@ -2,6 +2,105 @@
 
 Every entry: what was decided, why, and where. The owner folds these into plan v0.9.
 
+## Morning summary (2026-10-02)
+
+**All 17 tasks of `M11_task.md` are DONE; nothing PARTIAL or NOT STARTED.** Branch `m11/orgchart` from
+`main` @ `aa0be03`, 21 commits, **not pushed, not merged**. After each group (A, B, C, E, D) an independent
+review subagent read the group's diff against the task list; its findings were fixed in one follow-up
+commit per group (the "Group X review" sections below say what was fixed and what was only recorded).
+
+| Commit | Task | State |
+|---|---|---|
+| `cd78b22` | A1 — repository files without machine-only keys; tagged keys refused (C1) | DONE |
+| `22cb580` | A2 — machine floor for `verify.boundary`, machine `verify_root` (H2) | DONE |
+| `6b89f2a` | A2 — group A review: `doctor` and the Low-IL canary use the root in force | DONE |
+| `37fe444` | B1 — types: org chart, role files, machine `seats`/`skills_dir`/`environment_gates` | DONE |
+| `8f760f6` | B2 — loader, merge, freeze and hash; `toryo config show` | DONE |
+| `c9f2655` | B3 — validation pass, key paths, "did you mean" | DONE |
+| `b11dad5` | B3 — group B review: machine-seat fallback, reach check, ≥ 1 check gate | DONE |
+| `995697d` | C1 — layered role instructions and culture | DONE |
+| `fc11289` | C2 — the implementer's write fence | DONE |
+| `8665b24` | C3 — `reviewer-differs-from-builder` off / warn / error | DONE |
+| `3a7aa61` | C4 — split limits | DONE |
+| `ea32fa6` | E1 — gate variables, M18 | DONE |
+| `d82a86d` | E2 — verify output redacted (M2) | DONE |
+| `8ecc409` | E3 — environment gates, lock, deployment record (+ group C review nit) | DONE |
+| `af3743f` | D1 — skill lookup | DONE |
+| `9ffd27c` | E3 — group E review: M18 per program, cwd lookups, lock folder, output order | DONE |
+| `a7f7d36` | D2 — the plan's `skills`, the planner's menu, the checks | DONE |
+| `8a846e9` | D3 — skills through the context loader | DONE |
+| `4deb12e` | F1 — templates | DONE |
+| `a99e23e` | D3 — group D review: exact names, legacy plans, skipped skills | DONE |
+| (last) | F2 — README, HUONG-DAN §5.9, migration guide, this summary | DONE |
+
+**Checks** (§0.2) green before every commit on this machine: `cargo fmt --check`, both `clippy -D
+warnings`, `cargo test --locked`. Tests: **519 passed, 0 failed, 6 ignored** (441 / 6 at `aa0be03`). New test
+files: `tests/m11_{trust,orgchart,roles,gates,env_gates,skills}.rs`; unit tests in `team.rs`, `config.rs`,
+`context.rs`, `checks.rs`, `state_tests.rs`, `views.rs`, `lock.rs`, `render.rs`, `runner.rs`. No real agent was run,
+nothing ran against a D365FO environment (environment-gate tests use `pwsh`/`sh` scripts in temp folders), and
+your configs and data dirs were not read. No new crate.
+
+**Backward compatibility:** a repository without `.toryo/toryo-orgchart.yaml` keeps its configuration hash
+(`templates_keep_their_m10_hash` pins the three shipped templates to the `aa0be03` values) and its behaviour,
+except what the task list applies to everyone (A1, A2, E1/M18, E2) — and these error **texts**: an unknown
+key in any machine config now gets the friendly form with a hint, `roles.<x>: unknown role …` gets a
+`Did you mean` suffix (B3), and a repository with `verify.boundary: none` now needs `verify: { min_boundary:
+none }` in the machine config (H2, the point of the fix). Existing tests changed only where a task says so: the
+fixture's machine config allows `boundary: none` (A2, 4 tests append `MACHINE_FLOOR`), the EC-07 unit test
+expects a not-yet-existing program to be protected (M18), the flight tests' exhaustive lists include the new
+events, the state tests construct `PlanPolicyViolation` with `reason: None`.
+
+**Deviations from the task list** (details in the sections below):
+1. A2: the floor is also checked at `task config --reload`; `task create --trusted-code` was not added.
+2. B3: added — the implementer's `before_handoff` needs at least one `check` gate; every declared environment
+   gate is checked against the machine, also an unused one.
+3. C2: an empty `writes` means "no allowlist" (only `never` applies).
+4. C4: `PathPolicyViolation` counts against `max_gate_retries`, `FinalRejected` against `max_review_rounds`; a
+   missing one of the two split keys is 2; `--max-fix-cycles` with split limits is refused; the `--json` keys
+   appear only for a split-limit task.
+5. E1 (group E review): the M18 entry point is each program's *script* (PowerShell `-File`, the first argument of
+   `sh`/`bash`/`python`/`node`/…, `cmd /c <file>`), not every `-f`.
+6. E2: the whole output is redacted at the end (a per-stream redactor could reorder stdout and stderr).
+7. E3: `status` names the lock holder from `environment_deployments` (Windows cannot read a locked file); the
+   table has two extra columns (`gate`, `machine`); lock files are `locks/env/<lock>.lock`; the gate environment
+   gets `NoDefaultCurrentDirectoryInExePath=1`; `environments[]` appears only when there is a row.
+8. D2: `plan.schema.json` gains the optional `skills` for every agent (legacy plans drop it before storing).
+9. F1: two skill stubs and `CULTURE.md` added so the template set loads; a second `toryo.yaml` example
+   (`toryo.orgchart.yaml.example`) instead of changing the M10 one.
+
+**Deviations from the drafts:** the lock holder's label is written into the lock file but `status` reads the
+holder from the deployment table (above); `reviewer-differs-from-builder: error` escalates before the review turn
+(the draft says "refuse to start the stage" — the same thing, with `resume --note` still possible); the
+`skills_dir` in the org chart and the `flow`/`reads`/`agent` keys get their own error messages as the task list
+says.
+
+**Open (your decision; the conservative choice is in place):**
+- A task created **before** M11 with `verify.boundary: none` keeps verifying that way (its config is frozen).
+- After a `same_vendor_review` escalation, `resume --note` costs one more implementer turn before the review is
+  refused again (the fallback is sticky); a "skip the check once" switch was not added.
+- Unix only: a killed toryo leaves an environment gate's process group running while the lock is free (review
+  M7); Windows kills it with the Job.
+- An environment gate's script can still load a DLL from the verify checkout (Windows DLL search) — the script
+  contract says to call tools by absolute path.
+- `task create --repo X` reads `.toryo/` from `project.root`, not from X.
+- `instructions: ../planner/x.md` (outside the role folder, inside the repository) is refused.
+- **Next after M11: review M13** — cp932 output on Japanese Windows will also garble DB-sync output on the Tokyo
+  machine.
+
+**Try first** (build first: `cargo build --release`):
+1. `toryo config show` on a copy of the drafts: copy `templates\d365fo\.toryo\` and `templates\d365fo\CULTURE.md`
+   into a scratch Git repo, use `templates\d365fo\toryo.orgchart.yaml.example` as its `toryo.yaml` (set
+   `project.root`), and a copy of your machine config with `environment_gates.dbsync` — run
+   `toryo --config <scratch>\toryo.yaml --machine-config <copy> config show` (and `--json`). Every seat, gate and
+   setting says where it came from; a typo shows the "did you mean" message.
+2. A fake run in org chart mode: `cargo test --release --test m11_orgchart -- --nocapture`, or by hand with a
+   temp `TORYO_DATA_DIR` and `--fake-agents` (the scripts in `tests/m11_*.rs` show the shape).
+3. Write `dbsync.ps1` against the contract in `templates\toryo.local.yaml.example` (exit code; deploy only
+   `$env:TORYO_VERIFY_CHECKOUT` / `$env:TORYO_VERIFY_BUILD`; idempotent; error lines at the end; never write into
+   the checkout; never prompt; absolute tool paths). Start with a script that prints `$env:TORYO_SHA` and exits 0,
+   then `toryo status` shows `d365-env holds <task> @ <sha>`.
+4. If a repository uses `verify.boundary: none`, add `verify: { min_boundary: none }` to the machine config.
+
 ## Progress
 
 Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
@@ -22,7 +121,7 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
 - [x] D2 — the plan's `skills` field and its checks
 - [x] D3 — skills delivered through the context loader
 - [x] F1 — templates
-- [ ] F2 — docs, migration guide, morning summary
+- [x] F2 — docs, migration guide, morning summary
 
 ## A — Trust floor
 
@@ -634,9 +733,24 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   example next to the org chart is refused, one place per setting). The existing template tests
   pass unchanged (AC-1).
 
+### F2 — docs, migration guide, morning summary
+
+- README: "Org chart mode (M11)" (the `.toryo/` layout, the two modes, seats and profiles, limits, checks,
+  instructions and culture, skills — lookup order, the planner's choice, only `SKILL.md` delivered —, the write
+  fence, check vs environment gates and the script contract, the deployment record, the machine `verify:` floor),
+  "Migrating an M10 `toryo.yaml` to `.toryo/`" (eight steps), "The effective configuration (M11)" (`config show
+  --json`, schema 1, from B2), the new event and `--json` keys, the new test files, an M11 status paragraph.
+- `docs/HUONG-DAN.md` §5.9 (Vietnamese): the workshop picture, the layout, what to remember, the two gate kinds,
+  a worked D365FO example (a `tool: xpp` build check gate + a `dbsync` environment gate, the role file, the machine
+  config), the script contract, the M13 note for the Tokyo machine, the migration in short.
+- This summary, at the top.
+
 ## Open
+
+The list is in the morning summary at the top ("Open"); each item is explained in its task's section.
 
 ## Not started / out of scope
 
 - **M13** (cp932 output on Japanese Windows) will also garble DB-sync output on the owner's Tokyo
   machine — the next thing to fix after M11.
+
