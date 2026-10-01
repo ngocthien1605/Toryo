@@ -590,3 +590,166 @@ fn reverify_before_the_review_takes_the_checkpoint_back_to_verify() {
         Ok(S::WaitingFinalApproval)
     );
 }
+
+// ── M11-C4: split limits ─────────────────────────────────────────────────────────────
+
+/// [`at`] with the split limits of an org chart (M11-C4).
+fn at_split(s: S) -> Machine {
+    let m = at(s);
+    Machine {
+        split: Machine::with_limits(2, 2).split,
+        ..m
+    }
+}
+
+/// The exhaustive table holds unchanged with split limits: the bounds change which
+/// counter a bounce uses, never which transitions exist.
+#[test]
+fn split_limits_keep_the_transition_table() {
+    let mut checked = 0;
+    for s in S::ALL {
+        for e in samples() {
+            let ok = allowed(s).contains(&e.name());
+            let r = at_split(s).transition(&e);
+            assert_eq!(r.is_ok(), ok, "{s:?} + {} → {r:?}", e.name());
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 14 * 25);
+}
+
+/// Plan approved, implemented, checkpoint `h`: in Verifying.
+fn to_verifying(m: &mut Machine, h: &str) {
+    if m.state() == S::New {
+        m.apply(E::Start).unwrap();
+        m.apply(E::PlanReady {
+            subject: "p".into(),
+        })
+        .unwrap();
+        let o = occ(m);
+        m.apply(E::PlanApproved {
+            occurrence: o,
+            subject: "p".into(),
+        })
+        .unwrap();
+    }
+    walk(
+        m,
+        vec![E::ImplementationDone, E::Checkpointed { head: h.into() }],
+    );
+}
+
+/// M11-C4 AC-1: `max_gate_retries: 2` — two failing verifies are fixed, the third escalates
+/// naming the gate limit; review rejections do not count against it.
+#[test]
+fn gate_retries_are_bounded_on_their_own() {
+    let mut m = Machine::with_limits(2, 5);
+    to_verifying(&mut m, "c1");
+    // a review rejection first: counts against the review rounds only
+    m.apply(E::VerifyPassed { head: "c1".into() }).unwrap();
+    assert_eq!(
+        m.apply(E::ChangesRequested { head: "c1".into() }),
+        Ok(S::Fixing)
+    );
+    for (n, h) in [(1, "c2"), (2, "c3")] {
+        to_verifying(&mut m, h);
+        assert_eq!(m.apply(E::VerifyFailed { head: h.into() }), Ok(S::Fixing));
+        assert_eq!(m.split_limits().unwrap().gate_retries, n);
+    }
+    to_verifying(&mut m, "c4");
+    assert_eq!(
+        m.apply(E::VerifyFailed { head: "c4".into() }),
+        Ok(S::Escalated)
+    );
+    let l = m.split_limits().unwrap();
+    assert_eq!((l.gate_retries, l.review_rounds), (2, 1));
+    assert_eq!(m.fix_cycle(), 3, "fix_cycle counts every entry into Fixing");
+    assert!(
+        m.reason().unwrap().starts_with(
+            "2 gate retries used (limits.max_gate_retries) — not accepted (last: verify failed)"
+        ),
+        "{:?}",
+        m.reason()
+    );
+    // a path-policy violation is a build-stage bounce too
+    let mut m = Machine::with_limits(0, 5);
+    to_verifying(&mut m, "c1");
+    let mut m2 = m.clone();
+    m2.state = S::Fixing;
+    assert_eq!(
+        m2.apply(E::PathPolicyViolation {
+            paths: vec!["AGENTS.md".into()]
+        }),
+        Ok(S::Escalated)
+    );
+    assert!(m2.reason().unwrap().contains("limits.max_gate_retries"));
+}
+
+/// M11-C4 AC-2: `max_review_rounds: 1` — the second rejection escalates naming the review
+/// limit; a human's final rejection is a review round too.
+#[test]
+fn review_rounds_are_bounded_on_their_own() {
+    let mut m = Machine::with_limits(5, 1);
+    to_verifying(&mut m, "c1");
+    m.apply(E::VerifyPassed { head: "c1".into() }).unwrap();
+    assert_eq!(
+        m.apply(E::ChangesRequested { head: "c1".into() }),
+        Ok(S::Fixing)
+    );
+    to_verifying(&mut m, "c2");
+    m.apply(E::VerifyFailed { head: "c2".into() }).unwrap();
+    to_verifying(&mut m, "c3");
+    m.apply(E::VerifyPassed { head: "c3".into() }).unwrap();
+    assert_eq!(
+        m.apply(E::ChangesRequested { head: "c3".into() }),
+        Ok(S::Escalated)
+    );
+    assert!(
+        m.reason().unwrap().starts_with("1 review rounds used (limits.max_review_rounds) — not accepted (last: changes requested)"),
+        "{:?}",
+        m.reason()
+    );
+    let mut f = at_split(S::WaitingFinalApproval);
+    f.split.as_mut().unwrap().review_rounds = 2;
+    let o = occ(&f);
+    assert_eq!(
+        f.apply(E::FinalRejected {
+            occurrence: o,
+            reason: "no".into()
+        }),
+        Ok(S::Escalated)
+    );
+    assert!(f.reason().unwrap().contains("limits.max_review_rounds"));
+}
+
+/// M11-C4 AC-3: a machine stored by M10 (the single counter, no `split` key) deserializes
+/// and escalates at the same cycle as before; a single-bound machine still serialises
+/// without the new key.
+#[test]
+fn an_m10_machine_reads_back_and_behaves_the_same() {
+    let m10 = r#"{"state":"Reviewing","max_fix_cycles":2,"fix_cycle":2,"plan_attempt":1,"plan_auto_rejections":0,"plan_approved":true,"occurrences":1,"gate":null,"checkpoint":"c3","verified_head":"c3","paused_from":null,"escalated_from":null,"reason":"verify failed"}"#;
+    let mut m: Machine = serde_json::from_str(m10).unwrap();
+    assert_eq!(m.split_limits(), None);
+    assert_eq!(
+        serde_json::to_string(&m).unwrap(),
+        m10,
+        "the same JSON back"
+    );
+    assert_eq!(
+        m.apply(E::ChangesRequested { head: "c3".into() }),
+        Ok(S::Escalated)
+    );
+    assert!(
+        m.reason().unwrap().contains("after 2 fix cycle(s)"),
+        "{:?}",
+        m.reason()
+    );
+    // the split machine round-trips with its counters
+    let mut s = Machine::with_limits(3, 1);
+    to_verifying(&mut s, "c1");
+    s.apply(E::VerifyFailed { head: "c1".into() }).unwrap();
+    let text = serde_json::to_string(&s).unwrap();
+    assert!(text.contains(r#""split":{"max_gate_retries":3,"max_review_rounds":1,"gate_retries":1,"review_rounds":0}"#), "{text}");
+    assert_eq!(serde_json::from_str::<Machine>(&text).unwrap(), s);
+    assert_eq!(s.max_fix_cycles(), 4, "the sum, for display");
+}

@@ -14,7 +14,7 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
 - [x] C1 — layered instructions and `culture` in the context loader
 - [x] C2 — the implementer's write fence (`writes` / `never`)
 - [x] C3 — `checks.reviewer-differs-from-builder`: off / warn / error
-- [ ] C4 — split limits: `max_gate_retries`, `max_review_rounds`
+- [x] C4 — split limits: `max_gate_retries`, `max_review_rounds`
 - [ ] E1 — check gates: mapping, gate variables, M18
 - [ ] E2 — verify output redacted with the task's secrets (M2)
 - [ ] E3 — environment gates: run, lock, record what is deployed
@@ -303,6 +303,37 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   quota fallback codex-openai → claude-max with a claude-max reviewer; `events.jsonl` has the
   `escalated` with `reason_class: same_vendor_review`; no review attempt) and
   `different_vendors_pass_at_every_level` (AC-2).
+
+### C4 — split limits: `max_gate_retries`, `max_review_rounds`
+
+- `state::Machine` gains `split: Option<SplitLimits { max_gate_retries, max_review_rounds,
+  gate_retries, review_rounds }>`, `#[serde(default, skip_serializing_if = "Option::is_none")]` —
+  a machine stored by M10 reads back unchanged and serialises to the same JSON
+  (`an_m10_machine_reads_back_and_behaves_the_same`). `Machine::new(max)` is unchanged;
+  `Machine::with_limits(gate, review)` sets the split bounds. `fix_cycle` still counts every entry
+  into `Fixing` (it names the `fix-N` stages).
+- Which counter (the task names two; decided for the others): `VerifyFailed` → gate retries;
+  **`PathPolicyViolation`** (the implementer's own fence/policy violation) → gate retries too (a
+  build-stage bounce); `ChangesRequested` → review rounds; **`FinalRejected`** (the human's final
+  rejection) → review rounds too (a review-stage bounce; M10 also bounded it). `resume --note`
+  still grants one more cycle without touching the counters, as in M10.
+- The escalation names the limit: `2 gate retries used (limits.max_gate_retries) — not accepted
+  (last: verify failed)`; the typed class (`escalated.reason_class`) is `max_gate_retries` /
+  `max_review_rounds` instead of `max_fix_cycles`.
+- `task::new_machine`: split limits when the org chart has either key — a missing one of the two
+  is **2** (today's default); `--max-fix-cycles` together with split limits is **refused** (it sets
+  the single counter; the conservative choice instead of silently overriding both). A lone
+  `limits.max_fix_cycles` keeps the single counter.
+- `status` prints `fix 1 (gate retries 1/1, review rounds 0/3)`; SUMMARY.md likewise;
+  `status --json` / `task show --json` get `gate_retries`, `max_gate_retries`, `review_rounds`,
+  `max_review_rounds` **only for a split-limit task** (a single-bound task's document is unchanged
+  — so the README rule "a key is always present" does not hold for these four); `max_fix_cycles`
+  is then their sum, for display.
+- The pure state machine stays pure; `split_limits_keep_the_transition_table` runs the exhaustive
+  table again with split limits. Tests: `gate_retries_are_bounded_on_their_own` (AC-1),
+  `review_rounds_are_bounded_on_their_own` (AC-2), `an_m10_machine_reads_back_and_behaves_the_same`
+  (AC-3), `tests/m11_roles.rs::split_limits_end_to_end` (escalation, `status`, `--json`, the class in
+  `events.jsonl`, `--max-fix-cycles` refused, a single-bound task without the new keys).
 
 ## Open
 

@@ -1153,11 +1153,10 @@ pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
             .map(|o| format!(" · ACTIVE ({o})"))
             .unwrap_or_default();
         println!(
-            "{:<14} {:<22} fix {}/{} · tokens {}{}{}{}",
+            "{:<14} {:<22} fix {} · tokens {}{}{}{}",
             t.id,
             format!("{:?}", t.state),
-            t.fix_cycle,
-            t.machine.max_fix_cycles(),
+            views::fix_cycles(&t, "/"),
             t.spent_tokens,
             if t.reserved_tokens > 0 {
                 format!(" (+~{} reserved)", t.reserved_tokens)

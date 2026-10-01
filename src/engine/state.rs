@@ -293,9 +293,56 @@ pub struct Machine {
     escalated_from: Option<PipelineState>,
     /// Why the task is `Escalated` / `Failed`, or what the last fix cycle is about.
     reason: Option<String>,
+    /// M11-C4: the split bounds of an org chart's `limits:` — then a failing gate counts
+    /// against `max_gate_retries` and a rejected review against `max_review_rounds`, and
+    /// `max_fix_cycles` bounds nothing. Absent (and not serialised) for the single bound, so a
+    /// machine stored by M10 reads back and behaves exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    split: Option<SplitLimits>,
+}
+
+/// The split retry bounds and their counters (M11-C4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitLimits {
+    pub max_gate_retries: u32,
+    pub max_review_rounds: u32,
+    /// Entries into `Fixing` after a failing gate (or a path-policy violation).
+    #[serde(default)]
+    pub gate_retries: u32,
+    /// Entries into `Fixing` after a rejected review (or a rejected final gate).
+    #[serde(default)]
+    pub review_rounds: u32,
+}
+
+/// What sent the work back to the implementer (M11-C4: which split counter it uses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bounce {
+    /// A failing gate, or the implementer's own path-policy violation (the build stage).
+    Gate,
+    /// The reviewer's changes requested, or the human's final rejection (the review stage).
+    Review,
 }
 
 impl Machine {
+    /// M11-C4: split bounds — `max_gate_retries` and `max_review_rounds`. `max_fix_cycles()`
+    /// then reports their sum (the most fix cycles the bounds allow), for display only.
+    pub fn with_limits(max_gate_retries: u32, max_review_rounds: u32) -> Self {
+        Self {
+            split: Some(SplitLimits {
+                max_gate_retries,
+                max_review_rounds,
+                gate_retries: 0,
+                review_rounds: 0,
+            }),
+            ..Self::new(max_gate_retries.saturating_add(max_review_rounds))
+        }
+    }
+
+    /// The split bounds and counters, when the task uses them (M11-C4).
+    pub fn split_limits(&self) -> Option<&SplitLimits> {
+        self.split.as_ref()
+    }
+
     pub fn new(max_fix_cycles: u32) -> Self {
         Self {
             state: PipelineState::New,
@@ -311,6 +358,7 @@ impl Machine {
             paused_from: None,
             escalated_from: None,
             reason: None,
+            split: None,
         }
     }
 
@@ -449,7 +497,7 @@ impl Machine {
             // ── implement / fix → checkpoint → verify ────────────────────────────────
             (S::Implementing | S::Fixing, E::ImplementationDone) => m.state = S::Checkpointing,
             (S::Implementing | S::Fixing, E::PathPolicyViolation { paths }) => {
-                m.enter_fixing(format!("protected paths changed: {paths:?}"))
+                m.enter_fixing(format!("protected paths changed: {paths:?}"), Bounce::Gate)
             }
             (S::Checkpointing, E::Checkpointed { head }) => {
                 // R40: a no-change turn still produces a checkpoint, so this is the only way on
@@ -464,7 +512,7 @@ impl Machine {
             (S::Verifying, E::VerifyFailed { head }) => {
                 m.require_checkpoint("verify result", head)?;
                 // never to Review (§5.2)
-                m.enter_fixing("verify failed".into());
+                m.enter_fixing("verify failed".into(), Bounce::Gate);
             }
 
             // ── review + final gate ──────────────────────────────────────────────────
@@ -476,7 +524,7 @@ impl Machine {
             }
             (S::Reviewing, E::ChangesRequested { head }) => {
                 m.require_checkpoint("review", head)?;
-                m.enter_fixing("changes requested".into());
+                m.enter_fixing("changes requested".into(), Bounce::Review);
             }
             (S::Reviewing, E::ReviewBlocked { head }) => {
                 m.require_checkpoint("review", head)?;
@@ -496,7 +544,7 @@ impl Machine {
             }
             (S::WaitingFinalApproval, E::FinalRejected { occurrence, reason }) => {
                 m.close_gate(GateKind::Final, *occurrence, None)?;
-                m.enter_fixing(format!("final gate rejected: {reason}"));
+                m.enter_fixing(format!("final gate rejected: {reason}"), Bounce::Review);
             }
 
             // ── leaving Escalated (R5) ───────────────────────────────────────────────
@@ -562,7 +610,35 @@ impl Machine {
         self.state = PipelineState::Escalated;
     }
 
-    fn enter_fixing(&mut self, cause: String) {
+    fn enter_fixing(&mut self, cause: String, bounce: Bounce) {
+        // M11-C4: the split bound of this kind of bounce, named in the escalation
+        if let Some(l) = &mut self.split {
+            let (used, max, what, key) = match bounce {
+                Bounce::Gate => (
+                    &mut l.gate_retries,
+                    l.max_gate_retries,
+                    "gate retries",
+                    "limits.max_gate_retries",
+                ),
+                Bounce::Review => (
+                    &mut l.review_rounds,
+                    l.max_review_rounds,
+                    "review rounds",
+                    "limits.max_review_rounds",
+                ),
+            };
+            if *used >= max {
+                let reason = format!("{used} {what} used ({key}) — not accepted (last: {cause})");
+                let from = self.state;
+                self.escalate(from, reason);
+            } else {
+                *used += 1;
+                self.fix_cycle += 1;
+                self.reason = Some(cause);
+                self.state = PipelineState::Fixing;
+            }
+            return;
+        }
         if self.fix_cycle >= self.max_fix_cycles {
             let from = self.state;
             self.escalate(

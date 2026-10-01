@@ -632,8 +632,14 @@ pub fn transition_events(
     let reason = m.reason().unwrap_or("").to_string();
     let mut out = Vec::new();
     if to == St::Escalated && from != St::Escalated {
+        // M11-C4: with split limits the bound that was hit is the class
+        let reason_class = match (m.split_limits(), event) {
+            (Some(_), "verify_failed" | "path_policy_violation") => "max_gate_retries".into(),
+            (Some(_), "changes_requested" | "final_rejected") => "max_review_rounds".into(),
+            _ => escalation_class(event, class, &reason),
+        };
         out.push(EngineEvent::Escalated {
-            reason_class: escalation_class(event, class, &reason),
+            reason_class,
             reason,
         });
     } else if to == St::Paused && from != St::Paused {

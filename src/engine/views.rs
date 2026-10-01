@@ -18,8 +18,34 @@ pub struct TaskFacts {
     pub next_action: String,
 }
 
-/// One task of `status --json`.
+/// The fix-cycle counters as `status` and SUMMARY.md show them: `1/2` (with `sep` between)
+/// for the single bound; `1 (gate retries 1/3, review rounds 0/3)` with the org chart's split
+/// limits (M11-C4).
+pub fn fix_cycles(t: &TaskRow, sep: &str) -> String {
+    match t.machine.split_limits() {
+        Some(l) => format!(
+            "{} (gate retries {}/{}, review rounds {}/{})",
+            t.fix_cycle, l.gate_retries, l.max_gate_retries, l.review_rounds, l.max_review_rounds
+        ),
+        None => format!("{}{sep}{}", t.fix_cycle, t.machine.max_fix_cycles()),
+    }
+}
+
+/// One task of `status --json`. With split limits (M11-C4) it also has `gate_retries`,
+/// `max_gate_retries`, `review_rounds`, `max_review_rounds` — only then, so the document of a
+/// single-bound task is unchanged.
 pub fn task_json(t: &TaskRow, f: &TaskFacts) -> Value {
+    let mut v = task_json_m10(t, f);
+    if let Some(l) = t.machine.split_limits() {
+        v["gate_retries"] = json!(l.gate_retries);
+        v["max_gate_retries"] = json!(l.max_gate_retries);
+        v["review_rounds"] = json!(l.review_rounds);
+        v["max_review_rounds"] = json!(l.max_review_rounds);
+    }
+    v
+}
+
+fn task_json_m10(t: &TaskRow, f: &TaskFacts) -> Value {
     json!({
         "id": t.id,
         "title": t.title,

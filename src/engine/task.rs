@@ -58,6 +58,26 @@ pub fn roles(cfg: &Effective) -> Result<(String, Vec<String>, String)> {
     Ok((planner, chain, reviewer))
 }
 
+/// The state machine of a new task: the org chart's split limits (M11-C4: a missing one of
+/// the two is 2, today's default), else the single bound — `--max-fix-cycles`, then
+/// `pipeline.max_fix_cycles` (or a lone `limits.max_fix_cycles`), then 2.
+pub fn new_machine(cfg: &Effective, cli_max: Option<u32>) -> Result<Machine> {
+    match cfg.team.as_ref().map(|t| &t.limits).filter(|l| l.split()) {
+        Some(l) => {
+            if cli_max.is_some() {
+                bail!("--max-fix-cycles sets the single fix-cycle counter, but the org chart splits it (limits.max_gate_retries / limits.max_review_rounds) — change those in .toryo/toryo-orgchart.yaml");
+            }
+            Ok(Machine::with_limits(
+                l.max_gate_retries.unwrap_or(2),
+                l.max_review_rounds.unwrap_or(2),
+            ))
+        }
+        None => Ok(Machine::new(
+            cli_max.or(cfg.repo.pipeline.max_fix_cycles).unwrap_or(2),
+        )),
+    }
+}
+
 /// Git for this task's repository, with the R37 filter plan admitted.
 pub fn task_git(cfg: &Effective, repo: &Path) -> Result<GitCmd> {
     let mut g = default_gitcmd()?;
@@ -112,6 +132,7 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     if let Some(reason) = super::verify::below_floor(cfg) {
         bail!("{reason}");
     }
+    let machine = new_machine(cfg, a.max_fix_cycles)?;
 
     let g = task_git(cfg, &repo)?;
     // R36/R45 admission: the verify boundary must be available before anything is created
@@ -222,10 +243,6 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         std::fs::write(&excl, format!("{cur}{sep}/.toryo-tmp/\n"))?;
     }
 
-    let max = a
-        .max_fix_cycles
-        .or(cfg.repo.pipeline.max_fix_cycles)
-        .unwrap_or(2);
     let nt = NewTask {
         id: id.clone(),
         title,
@@ -238,7 +255,7 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         base_commit: base,
         repo,
         task_file: file,
-        machine: Machine::new(max),
+        machine,
         implementers,
         planner,
         reviewer,

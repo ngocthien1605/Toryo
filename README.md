@@ -130,6 +130,8 @@ print one JSON document on stdout and nothing else there. Field names are snake_
 { "tasks": [ {
     "id": "BR-003", "title": "…", "state": "WaitingFinalApproval",   // PipelineState
     "fix_cycle": 1, "max_fix_cycles": 3,
+    // M11, only with the org chart's split limits: "gate_retries", "max_gate_retries",
+    // "review_rounds", "max_review_rounds" (max_fix_cycles is then their sum)
     "spent_tokens": 61234, "reserved_tokens": 0, "budget_tokens": null,   // R41; null = no admission cap
     "active_owner": null,          // "user pid N" while a live process holds the task lock (never a lock probe)
     "compile_only": false,         // R59: an X++ verify proves compile level only; null: frozen config unreadable

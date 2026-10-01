@@ -3831,15 +3831,14 @@ pub fn write_summary(store: &Store, t: &TaskRow) -> Result<PathBuf> {
     let i = t.id.clone();
     let atts = store.call(move |tx| store::attempts(tx, &i))?;
     let mut s = format!(
-        "# {} — {:?}\n\n{}\n\n- branch: `{}` (base `{}`) in `{}`\n- fix cycles: {} / {}\n- tokens: {} spent{}{}\n- next: {}\n\n## Stage attempts\n\n| attempt | status | profile | error | checkpoint |\n|---|---|---|---|---|\n",
+        "# {} — {:?}\n\n{}\n\n- branch: `{}` (base `{}`) in `{}`\n- fix cycles: {}\n- tokens: {} spent{}{}\n- next: {}\n\n## Stage attempts\n\n| attempt | status | profile | error | checkpoint |\n|---|---|---|---|---|\n",
         t.id,
         t.state,
         t.title,
         t.branch,
         &t.base_commit[..12.min(t.base_commit.len())],
         t.repo.display(),
-        t.fix_cycle,
-        t.machine.max_fix_cycles(),
+        super::views::fix_cycles(t, " / "),
         t.spent_tokens,
         if t.reserved_tokens > 0 { format!(" + ~{} reserved (unknown usage, R41)", t.reserved_tokens) } else { String::new() },
         t.budget_tokens.map(|b| format!(" of {b} (admission cap, may overshoot by one turn)")).unwrap_or_default(),

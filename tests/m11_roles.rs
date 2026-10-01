@@ -247,3 +247,82 @@ fn different_vendors_pass_at_every_level() {
         );
     }
 }
+
+/// M11-C4: an org chart with split limits — the gate limit escalates the task naming
+/// `limits.max_gate_retries`; `status` and `status --json` show the split counters;
+/// `--max-fix-cycles` is refused.
+#[test]
+fn split_limits_end_to_end() {
+    let org = ORGCHART.replace("IMPLEMENTER", "codex-openai")
+        + "limits:\n  max_gate_retries: 1\n  max_review_rounds: 3\n";
+    let env = setup_orgchart("codex-openai", "", &[(".toryo/toryo-orgchart.yaml", &org)]);
+    let (code, err) = toryo(
+        &env,
+        &[
+            "task",
+            "create",
+            "--file",
+            "TASK.md",
+            "--id",
+            "SL-0",
+            "--max-fix-cycles",
+            "4",
+        ],
+        &[],
+    );
+    assert_ne!(code, 0);
+    assert!(err.contains("the org chart splits it"), "{err}");
+    create(&env, "SL-1");
+    // the implementer never adds Divide-Numbers: the check gate fails every time
+    let s = script(
+        &env,
+        "sl.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![implementation()]), turn(vec![implementation()])],
+        }),
+    );
+    let (code, err) = toryo(&env, &["run", "SL-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 1, "an escalated run: {err}");
+    let t = task(&env, "SL-1");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert!(
+        err.contains(
+            "1 gate retries used (limits.max_gate_retries) — not accepted (last: verify failed)"
+        ),
+        "{err}"
+    );
+    let out = status_out(&env, "SL-1");
+    assert!(
+        out.contains("fix 1 (gate retries 1/1, review rounds 0/3)"),
+        "{out}"
+    );
+    let o = command(&env, &["status", "SL-1", "--json"], &[])
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    let j = &v["tasks"][0];
+    assert_eq!(
+        (
+            j["gate_retries"].clone(),
+            j["max_gate_retries"].clone(),
+            j["review_rounds"].clone(),
+            j["max_review_rounds"].clone()
+        ),
+        (json!(1), json!(1), json!(0), json!(3))
+    );
+    let ev = events(&env, "SL-1");
+    assert!(
+        ev.iter()
+            .any(|e| e["type"] == "escalated" && e["reason_class"] == "max_gate_retries"),
+        "{ev:?}"
+    );
+    // a single-bound task's status --json has none of the new keys
+    let legacy = setup("codex-openai");
+    create(&legacy, "SL-2");
+    let o = command(&legacy, &["status", "SL-2", "--json"], &[])
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(v["tasks"][0].get("gate_retries").is_none(), "{v}");
+}
