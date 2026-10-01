@@ -105,6 +105,11 @@ pub struct TeamContext {
     pub instructions: Option<(String, PathBuf)>,
     /// M11-D2: the planner's menu of the implementer's skills (`name — description` lines).
     pub menu: Option<String>,
+    /// M11-D3: the skills this attempt receives, resolved now (the implementer: the approved
+    /// plan's choice; planner and reviewer: their role file's list).
+    pub skills: Vec<crate::team::Skill>,
+    /// M11-D3: skills that could not be resolved now (reported as skipped).
+    pub missing_skills: Vec<String>,
 }
 
 /// One source as it went into the context.
@@ -347,7 +352,7 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
     if let Some(menu) = req.team.as_ref().and_then(|t| t.menu.as_ref()) {
         parts.push(Part {
             n: 4,
-            label: "skill menu (implementer)".into(),
+            label: "implementer skill menu".into(),
             path: PathBuf::from("(the implementer's role file)"),
             heading: "Skills available to the implementer".into(),
             original: menu.len(),
@@ -358,6 +363,29 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
             truncated: false,
             untrusted: false,
         });
+    }
+    // M11-D3: one part per skill — trusted (the repository checkout's protected `.toryo/` or
+    // the machine), never trimmed (half a manual is worse than none), hashed
+    if let Some(team) = &req.team {
+        for k in &team.skills {
+            let origin = k.origin.as_str();
+            parts.push(Part {
+                n: 4,
+                label: format!("skill {} ({origin})", k.name),
+                path: k.path.clone(),
+                heading: format!("Skill: {} ({origin})", k.name),
+                original: k.text.len(),
+                sha256: k.sha256.clone(),
+                body: k.text.clone(),
+                rank: None,
+                path_only: false,
+                truncated: false,
+                untrusted: false,
+            });
+        }
+        for m in &team.missing_skills {
+            skipped.push(format!("4: {m}"));
+        }
     }
     let pack_start = parts.len();
     let mut data = Vec::new();
@@ -599,11 +627,47 @@ pub fn request(
         .get(role.as_str())
         .copied()
         .unwrap_or(DEFAULT_BUDGET_KB);
+    // M11-D3: the implementer gets the approved plan's skills (those on its menu); planner
+    // and reviewer every skill of their role file
+    let wanted: Vec<String> = match (cfg.team.as_ref(), role) {
+        (None, _) => Vec::new(),
+        (Some(team), Role::Implementer) => {
+            let menu = team
+                .role("implementer")
+                .map(|r| r.skills.clone())
+                .unwrap_or_default();
+            let plan: serde_json::Value = super::artifacts::read_head(store, t, "plan")?
+                .and_then(|(_, b)| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+            let mut out: Vec<String> = Vec::new();
+            for s in plan["skills"].as_array().into_iter().flatten() {
+                if let Some(s) = s.as_str().filter(|s| menu.iter().any(|m| m == s)) {
+                    if !out.iter().any(|x| x == s) {
+                        out.push(s.to_string());
+                    }
+                }
+            }
+            out
+        }
+        (Some(team), r) => team
+            .role(r.as_str())
+            .map(|x| x.skills.clone())
+            .unwrap_or_default(),
+    };
     // M11-C1: org chart mode — from the repository checkout, like sources 2–4
     let team = cfg.team.as_ref().map(|team| {
         let at = |rel: &String| (rel.clone(), t.repo.join(rel));
         let machine_dir = crate::team::machine_skills_dir(&team.skill_roots);
+        let (mut skills, mut missing_skills) = (Vec::new(), Vec::new());
+        for name in &wanted {
+            match crate::team::resolve_skill(name, &t.repo, machine_dir.as_deref()) {
+                Ok(k) => skills.push(k),
+                Err(why) => missing_skills.push(why),
+            }
+        }
         TeamContext {
+            skills,
+            missing_skills,
             culture: team.culture.as_ref().map(at),
             instructions: team
                 .role(role.as_str())
@@ -675,9 +739,14 @@ pub fn describe(a: &Assembled) -> String {
     );
     for x in &a.sources {
         s.push_str(&format!(
-            "  [{}] {:<28} {:>7} B  {:<22} {}\n",
+            "  [{}] {:<28} {:>7} B  {:<22} {}",
             x.n, x.label, x.bytes, x.mode, x.path
         ));
+        // M11-D3: which manual an agent received
+        if x.label.starts_with("skill ") {
+            s.push_str(&format!("  sha256 {}", short(&x.sha256)));
+        }
+        s.push('\n');
     }
     for k in &a.skipped {
         s.push_str(&format!("  (skipped, not found) {k}\n"));
@@ -720,6 +789,8 @@ mod tests {
                     dir.join("instructions.md"),
                 )),
                 menu: None,
+                skills: vec![],
+                missing_skills: vec![],
             }),
             ..req(repo, kind, role)
         }

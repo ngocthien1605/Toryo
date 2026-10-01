@@ -20,7 +20,7 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
 - [x] E3 — environment gates: run, lock, record what is deployed
 - [x] D1 — skill lookup (repo, then machine) and the menu
 - [x] D2 — the plan's `skills` field and its checks
-- [ ] D3 — skills delivered through the context loader
+- [x] D3 — skills delivered through the context loader
 - [ ] F1 — templates
 - [ ] F2 — docs, migration guide, morning summary
 
@@ -534,7 +534,7 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   (not in `required`; inside `contracts::KEYWORDS`). **Applies to every plan schema the agents get**,
   also in legacy mode — an optional property; plans without it stay valid and render as before.
 - **Menu** (`context::skill_menu`): when the implementer's role has skills, the **planner's**
-  context gets a never-trimmed part `skill menu (implementer)` (heading `Skills available to the
+  context gets a never-trimmed part `implementer skill menu` (heading `Skills available to the
   implementer`): an instruction to list the needed ones in `skills`, then one `- name — description`
   line per skill, read per attempt (a skill gone since `task create` shows `(not found on this
   machine)`). None in legacy mode or with an empty menu.
@@ -554,6 +554,34 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   `tests/m11_skills.rs` — `a_plan_chooses_skills_from_the_menu` (AC-1, the menu in the planner's
   context), `a_skill_off_the_menu_is_replanned_then_escalates` (AC-2), `skills_over_the_budget_are_
   replanned` (AC-3), `a_plan_without_skills_is_valid` (AC-4).
+
+### D3 — skills delivered through the context loader
+
+- `context::TeamContext.skills` (resolved by `context::request` **per attempt**, from the repository
+  checkout and the machine folder): one part per skill right after the role part (C1) and the
+  menu (D2) — label `skill <name> (<origin>)`, heading `Skill: <name> (<origin>)`, the SKILL.md text,
+  **never trimmed**, hashed (into `context_sha256`, and each source's own `sha256` in the
+  `context_assembled` event). `context show` prints each skill line with its `sha256` (only skill
+  lines get the suffix — legacy output is unchanged).
+- Which skills: the implementer (implement and every fix stage) → the **approved plan's** `skills`
+  (the head of `plan`, filtered to the menu); planner and reviewer → every skill of their role file.
+  A skill that no longer resolves at attempt time is reported under `skipped`, not an error.
+- Skills are trusted content (protected `.toryo/` of the repository checkout, or the machine): for
+  the Claude implementer they are in the context file (its system prompt), never in the
+  `<untrusted_data>` user prompt (tested).
+- **Over budget at attempt time** (found out, kept): exactly what the loader does today when the
+  policy and the role template alone exceed the budget — the trimmable sources are trimmed first,
+  then a warning `context budget: N bytes still exceed K KB — policy files and the role template are
+  never trimmed` (wording unchanged; it now also covers culture, instructions, menu and skills), and
+  the attempt runs with the full context. The plan-time check (D2) is what keeps a plan's choice
+  inside the budget; it now measures the implementer's context **with** the chosen skills
+  (`fixed_bytes`).
+- The planner's menu label is `implementer skill menu` (so only skill parts start with `skill `).
+- Tests (`tests/m11_skills.rs`): `context_show_lists_the_skills_of_each_role` (AC-1: the planned
+  skill only, with origin and SHA-256; the reviewer's own; none in legacy mode),
+  `a_changed_skill_changes_the_context_hash` (AC-2, through the `context show` preview — exactly
+  what the next attempt gets), `the_claude_implementer_gets_skills_in_its_context_file` (AC-3, and
+  the reviewer's skill reached the reviewer).
 
 ## Open
 

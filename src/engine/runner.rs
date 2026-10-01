@@ -660,16 +660,19 @@ impl<'a> Engine<'a> {
             return Ok(Some((reason, fb)));
         }
         // the chosen skills are never trimmed: with the implementer's other never-trimmed
-        // parts they must fit its budget
-        let skills: usize = chosen
-            .iter()
-            .filter_map(|s| crate::team::resolve_skill(s, &t.repo, machine.as_deref()).ok())
-            .map(|k| k.bytes)
-            .sum();
+        // parts they must fit its budget — the implementer's context as it would be assembled
+        // (D3: from this plan, the head of `plan`)
         let profile = context::stage_profile(t, "implement")?;
         let req = context::request(self.store, t, &self.cfg, "implement", &profile)?;
-        let fixed = context::assemble(&req)?.fixed_bytes;
-        if fixed + skills > req.budget {
+        let c = context::assemble(&req)?;
+        let skills: usize = c
+            .sources
+            .iter()
+            .filter(|s| s.label.starts_with("skill "))
+            .map(|s| s.bytes)
+            .sum();
+        let fixed = c.fixed_bytes.saturating_sub(skills);
+        if c.fixed_bytes > req.budget {
             let reason = format!(
                 "plan_skills: the chosen skills ({skills} bytes) and the implementer's fixed instructions ({fixed} bytes) exceed its context budget ({} KB)",
                 req.budget / 1024
