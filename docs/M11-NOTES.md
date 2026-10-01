@@ -15,7 +15,7 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
 - [x] C2 — the implementer's write fence (`writes` / `never`)
 - [x] C3 — `checks.reviewer-differs-from-builder`: off / warn / error
 - [x] C4 — split limits: `max_gate_retries`, `max_review_rounds`
-- [ ] E1 — check gates: mapping, gate variables, M18
+- [x] E1 — check gates: mapping, gate variables, M18
 - [ ] E2 — verify output redacted with the task's secrets (M2)
 - [ ] E3 — environment gates: run, lock, record what is deployed
 - [ ] D1 — skill lookup (repo, then machine) and the menu
@@ -334,6 +334,35 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   `review_rounds_are_bounded_on_their_own` (AC-2), `an_m10_machine_reads_back_and_behaves_the_same`
   (AC-3), `tests/m11_roles.rs::split_limits_end_to_end` (escalation, `status`, `--json`, the class in
   `events.jsonl`, `--max-fix-cycles` refused, a single-bound task without the new keys).
+
+## E — Gates
+
+### E1 — check gates: mapping, gate variables, M18
+
+- **Mapping** (`team::gate_command`, B2): a check gate is a `CommandSpec` — `program`/`args` or
+  `tool: xpp` + `metadata`/`projects`, `timeout_sec` from `timeout` — in `commands.verify`, so it
+  runs exactly like an M10 verify command (clean checkout of the checkpoint, the configured
+  boundary, no secrets, `@verify-scripts` protection, the same `VERIFY_RESULT.json` entry).
+- **Gate variables** (`verify::set_gate_vars`, called for every verify run, legacy commands too —
+  new variables only): `TORYO_TASK`, `TORYO_SHA` (the checkpoint commit), `TORYO_VERIFY_CHECKOUT`
+  (the clean checkout), next to `TORYO_VERIFY_BUILD`. `toryo xpp build` (outside a task) does not
+  set them.
+- **M18 (applies to everyone):** `checks::verify_files` protects a repository-relative program and
+  the script after `-File` (PowerShell's `-File`/`-f`/`-fi`/`-fil`, case-insensitive) whether or
+  not they exist yet. **Existing test changed, as M18 requires:** `verify_files_include_a_repo_program`
+  (EC-07) now lists `scripts/missing.sh` (a program that does not exist yet) — before, it asserted
+  it was not protected. **Admission:** `task create` refuses a task whose base commit lacks one of
+  those entry points (`checks::verify_entry_points`), naming the gate (`verify command` in
+  legacy mode): `verify_script_missing: gate `later` runs `scripts/later.ps1`, which is not in the
+  base commit … — commit it before creating the task`. It runs before the worktree, the branch or
+  the run store exists. Other arguments that name files are protected only when they exist, as
+  before.
+- Tests: `checks::tests::m18_entry_points_are_protected_before_they_exist`,
+  `tests/m11_gates.rs` — `a_check_gate_gets_the_gate_variables` (AC-1: the script prints the four
+  variables; `VERIFY_RESULT.json` shows the task id, `head`, `verify_checkout` and its `build`
+  folder), `a_gate_script_missing_from_the_base_commit_is_refused_at_admission` (AC-2). The
+  protected-path violation for an edit of an existing gate script is the M10 EC-07 path
+  (`regress_policy.rs`), unchanged.
 
 ## Open
 

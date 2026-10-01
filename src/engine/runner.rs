@@ -1247,7 +1247,8 @@ impl<'a> Engine<'a> {
             Some(format!("{} in {}", verify::describe(b), co.dir.display())),
         );
         let stop = self.lock.watch_stop();
-        let Some((results, failure)) = self.run_verify_commands(b, &co, &stop, xpp.as_ref())?
+        let Some((results, failure)) =
+            self.run_verify_commands(b, &co, &head, &stop, xpp.as_ref())?
         else {
             self.finish_and(
                 &a,
@@ -1344,12 +1345,16 @@ impl<'a> Engine<'a> {
         &self,
         b: Boundary,
         co: &verify::Checkout,
+        head: &str,
         stop: &StopWatch,
         xpp: Option<&xpp::Toolchain>,
     ) -> Result<Option<(Vec<Value>, Option<String>)>> {
+        let mut env = verify::env(co);
+        // M11-E1: TORYO_TASK, TORYO_SHA, TORYO_VERIFY_CHECKOUT for every command
+        verify::set_gate_vars(&mut env, &self.id, head, co);
         let at = VerifyAt {
             co,
-            env: verify::env(co),
+            env,
             boundary: b,
             stop,
         };

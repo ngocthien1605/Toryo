@@ -547,15 +547,59 @@ pub fn verify_files(cmds: &[CommandSpec], repo: &Path) -> Vec<String> {
         };
         let program = expand_vars(program).unwrap_or_else(|_| program.to_string());
         if program.contains('/') || program.contains('\\') || Path::new(&program).is_absolute() {
-            if let Some(r) = in_repo(&program) {
+            // M18: a repository program is protected whether or not it exists yet
+            if let Some(r) = repo_relative(repo, &program) {
                 add(r);
             }
         }
+        let mut after_file = false;
         for a in args {
+            // M18: the script after `-File`, whether or not it exists yet
+            if std::mem::take(&mut after_file) {
+                if let Some(r) = repo_relative(repo, a) {
+                    add(r);
+                    continue;
+                }
+            }
+            after_file = is_file_flag(a);
             if let Some(r) = in_repo(a) {
                 add(r);
             } else if repo.join(a).is_file() {
                 add(a.replace('\\', "/"));
+            }
+        }
+    }
+    out
+}
+
+/// PowerShell's `-File` parameter (and its abbreviations), case-insensitive.
+fn is_file_flag(a: &str) -> bool {
+    ["-file", "-fil", "-fi", "-f", "/file"]
+        .iter()
+        .any(|f| a.eq_ignore_ascii_case(f))
+}
+
+/// M18: the repository files a verify command starts — its program when it is a path in the
+/// repository, and the script after `-File` — as `(command name, path)`, in `git status` form.
+/// Task admission refuses a task whose base commit lacks one of them: a script the task itself
+/// would create could be written by the implementer before verify runs it.
+pub fn verify_entry_points(cmds: &[CommandSpec], repo: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for c in cmds {
+        let CommandKind::Program { program, args } = c.kind() else {
+            continue;
+        };
+        let program = expand_vars(program).unwrap_or_else(|_| program.to_string());
+        if program.contains('/') || program.contains('\\') || Path::new(&program).is_absolute() {
+            if let Some(r) = repo_relative(repo, &program) {
+                out.push((c.name.clone(), r));
+            }
+        }
+        for w in args.windows(2) {
+            if is_file_flag(&w[0]) {
+                if let Some(r) = repo_relative(repo, &w[1]) {
+                    out.push((c.name.clone(), r));
+                }
             }
         }
     }
@@ -894,13 +938,15 @@ mod tests {
             cmd("scripts/gate.sh", &["scripts/gate.sh"]),
         ];
         let files = verify_files(&cmds, repo);
+        // M18 (M11-E1): `scripts/missing.sh` is protected although it does not exist yet
         assert_eq!(
             files,
             [
                 "scripts/gate.sh",
                 "gradlew",
                 "scripts/build.cmd",
-                "scripts/test.ps1"
+                "scripts/test.ps1",
+                "scripts/missing.sh"
             ]
         );
         let p = Protected::new(files, &[VERIFY_SCRIPTS.into(), "docs/**".into()]);
@@ -917,6 +963,65 @@ mod tests {
             "the macro is not a literal path"
         );
         assert!(p.matches("docs/x.md"), "the other globs still apply");
+    }
+
+    /// M18 (M11-E1): the repository program and the `-File` script of a verify command are
+    /// protected whether or not they exist yet, and they are the entry points task admission
+    /// looks for in the base commit; a bare program, an absolute one outside the repository
+    /// and the other arguments are not entry points.
+    #[test]
+    fn m18_entry_points_are_protected_before_they_exist() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path();
+        std::fs::create_dir_all(repo.join("scripts")).unwrap();
+        std::fs::write(repo.join("scripts/existing.ps1"), "x").unwrap();
+        let outside = d.path().parent().unwrap().join("tool.exe");
+        let cmd = |name: &str, program: &str, args: &[&str]| {
+            CommandSpec::program(name, program, args, None)
+        };
+        let cmds = [
+            cmd(
+                "build",
+                "pwsh",
+                &["-NoProfile", "-File", "scripts/build-model.ps1"],
+            ),
+            cmd(
+                "lint",
+                "powershell",
+                &["-file", "scripts\\lint.ps1", "-Strict"],
+            ),
+            cmd("gate", "scripts/gate.sh", &[]),
+            cmd(
+                "ext",
+                &outside.display().to_string(),
+                &["-File", "scripts/existing.ps1"],
+            ),
+            cmd("plain", "git", &["status", "scripts/not-a-script.txt"]),
+        ];
+        let files = verify_files(&cmds, repo);
+        for f in [
+            "scripts/build-model.ps1",
+            "scripts/lint.ps1",
+            "scripts/gate.sh",
+            "scripts/existing.ps1",
+        ] {
+            assert!(files.contains(&f.to_string()), "{f}: {files:?}");
+        }
+        assert!(
+            !files.iter().any(|f| f.contains("not-a-script")),
+            "{files:?}"
+        );
+        let p = Protected::new(files, &[VERIFY_SCRIPTS.into()]);
+        assert!(p.violates("scripts/build-model.ps1") && p.violates("Scripts/Lint.ps1"));
+        assert_eq!(
+            verify_entry_points(&cmds, repo),
+            [
+                ("build".to_string(), "scripts/build-model.ps1".to_string()),
+                ("lint".to_string(), "scripts/lint.ps1".to_string()),
+                ("gate".to_string(), "scripts/gate.sh".to_string()),
+                ("ext".to_string(), "scripts/existing.ps1".to_string()),
+            ]
+        );
     }
 
     /// R59 (as EC-07): `@verify-scripts` covers the projects of a `tool: xpp` command — also

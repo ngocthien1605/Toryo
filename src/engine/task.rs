@@ -156,6 +156,33 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         true,
         &["rev-parse", &format!("{base_ref}^{{commit}}")],
     )?;
+    // M18 admission: every repository program and `-File` script of a verify command (a
+    // check gate) is in the base commit — one the task created could be written by the
+    // implementer before verify runs it
+    let cmds = super::checks::verify_commands(cfg, &repo).unwrap_or_default();
+    let entry = super::checks::verify_entry_points(&cmds, &repo);
+    if !entry.is_empty() {
+        let listing = g.run(&repol, true, &["ls-tree", "-r", "-z", "--name-only", &base])?;
+        let tree: std::collections::HashSet<String> = listing
+            .split(|b| *b == 0)
+            .filter(|f| !f.is_empty())
+            .map(|f| String::from_utf8_lossy(f).to_lowercase())
+            .collect();
+        let what = if cfg.team.is_some() {
+            "gate"
+        } else {
+            "verify command"
+        };
+        for (name, path) in entry {
+            if !tree.contains(&path.to_lowercase()) {
+                bail!(
+                    "verify_script_missing: {what} `{name}` runs `{path}`, which is not in the base commit {} of {} — commit it before creating the task (M18: a verify script the task itself creates could be written by the implementer)",
+                    crate::git::short(&base),
+                    repo.display()
+                );
+            }
+        }
+    }
     // R59 admission: its metadata folder and (protected) build projects are in the base commit
     if super::xpp::compile_only(cfg) {
         let listing = g.run(&repol, true, &["ls-tree", "-r", "-z", "--name-only", &base])?;

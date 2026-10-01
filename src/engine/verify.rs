@@ -297,6 +297,22 @@ pub fn env(co: &Checkout) -> BTreeMap<String, String> {
     env
 }
 
+/// M11-E1: the variables every gate gets (check and environment gates, and the verify
+/// commands of `toryo.yaml`-only mode), next to `TORYO_VERIFY_BUILD`: `TORYO_TASK` (the task
+/// id), `TORYO_SHA` (the checkpoint commit being verified) and `TORYO_VERIFY_CHECKOUT` (the
+/// clean checkout of that commit).
+pub fn set_gate_vars(env: &mut BTreeMap<String, String>, task: &str, sha: &str, co: &Checkout) {
+    for (k, v) in [
+        ("TORYO_TASK", task.to_string()),
+        ("TORYO_SHA", sha.to_string()),
+        ("TORYO_VERIFY_CHECKOUT", co.dir.display().to_string()),
+        ("TORYO_VERIFY_BUILD", co.build().display().to_string()),
+    ] {
+        env.retain(|e, _| !e.eq_ignore_ascii_case(k));
+        env.insert(k.into(), v);
+    }
+}
+
 /// After the run (R29/R47): `Some(reason)` when the checkout was mutated.
 pub fn mutated(g: &GitCmd, co: &Checkout, sha: &str) -> Result<Option<String>> {
     if std::fs::read_to_string(co.dir.join(".git")).ok().as_deref() != Some(co.pointer.as_str()) {
