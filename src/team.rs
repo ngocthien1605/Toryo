@@ -540,6 +540,26 @@ pub fn load(
             },
         );
     }
+    // relative paths, checked as written (an absolute one would read as relative once
+    // normalised; group B review)
+    if let Some(why) = org
+        .culture
+        .as_deref()
+        .and_then(crate::config::not_a_repo_path)
+    {
+        let c = org.culture.as_deref().unwrap_or_default();
+        problems.push(format!("{}: `{c}` {why}", at("culture")));
+    }
+    for (seat, r) in &roles {
+        if let Some(i) = &r.instructions {
+            if let Some(why) = crate::config::not_a_repo_path(i) {
+                problems.push(format!(
+                    "{}: instructions: `{i}` {why} (it is relative to the role folder)",
+                    dir.join(seat).join(ROLE_FILE).display()
+                ));
+            }
+        }
+    }
     if org.limits.max_fix_cycles.is_some() && org.limits.split() {
         problems.push(format!(
             "{}: `max_fix_cycles` is the single counter — use it alone, or `max_gate_retries` / `max_review_rounds` without it",
@@ -723,20 +743,55 @@ pub fn friendly_serde(msg: &str) -> Option<String> {
 
 /// An argument that names a file: not a flag, and with a path separator or a script or
 /// program extension.
-fn path_like(a: &str) -> bool {
-    let lower = a.to_ascii_lowercase();
-    !a.starts_with('-')
-        && (a.contains('/')
-            || a.contains('\\')
-            || [".ps1", ".psm1", ".cmd", ".bat", ".sh", ".exe", ".py", ".js"]
-                .iter()
-                .any(|x| lower.ends_with(x)))
+fn named_path(a: &str) -> Option<&str> {
+    // the value of a `--name=value` / `-Name:value` flag; a flag alone names no file
+    let v = if a.starts_with('-') {
+        a.split_once(['=', ':']).map(|(_, v)| v)?
+    } else {
+        a
+    };
+    let lower = v.to_ascii_lowercase();
+    // a Windows switch (`/c`, `/q`) is not a path
+    let switch = v.starts_with('/') && v.len() <= 3 && !v[1..].contains(['/', '\\']);
+    let file = v.contains('/')
+        || v.contains('\\')
+        || [".ps1", ".psm1", ".cmd", ".bat", ".sh", ".exe", ".py", ".js"]
+            .iter()
+            .any(|x| lower.ends_with(x));
+    (!v.is_empty() && !switch && file).then_some(v)
 }
 
-/// `p` is `root` or inside it (separators and case folded).
+/// The lexical form the reach check compares (group B review): `/` separators, no `\\?\`
+/// prefix, `.` dropped, `..` resolved, trailing dots and spaces of a segment dropped (Windows
+/// ignores them), lower case. An existing path is canonicalised first (junctions, 8.3 names).
+fn lexical(p: &str) -> String {
+    let canon = std::fs::canonicalize(p)
+        .map(|c| c.display().to_string())
+        .unwrap_or_else(|_| p.to_string());
+    let s = canon.replace('\\', "/");
+    let s = s
+        .strip_prefix("//?/")
+        .or_else(|| s.strip_prefix("//./"))
+        .unwrap_or(&s);
+    let mut parts: Vec<&str> = Vec::new();
+    for (i, c) in s.split('/').enumerate() {
+        match c {
+            "" if i == 0 => parts.push(""),
+            "" | "." => {}
+            ".." => {
+                if parts.len() > 1 {
+                    parts.pop();
+                }
+            }
+            c => parts.push(c.trim_end_matches(['.', ' '])),
+        }
+    }
+    parts.join("/").to_lowercase()
+}
+
+/// `p` is `root` or inside it, compared in [`lexical`] form.
 fn inside(p: &str, root: &Path) -> bool {
-    let n = |s: &str| s.replace('\\', "/").trim_end_matches('/').to_lowercase();
-    let (p, r) = (n(p), n(&root.display().to_string()));
+    let (p, r) = (lexical(p), lexical(&root.display().to_string()));
     !r.is_empty() && (p == r || p.starts_with(&format!("{r}/")))
 }
 
@@ -774,7 +829,8 @@ fn env_gate_problems(
     let reach = |p: &str| roots.iter().find(|(_, r)| inside(p, r));
     let program = crate::config::expand_vars(&g.program).unwrap_or_else(|_| g.program.clone());
     if program.contains('/') || program.contains('\\') {
-        if !Path::new(&program).is_absolute() {
+        let dots = program.replace('\\', "/").split('/').any(|c| c == "..");
+        if dots || !Path::new(&program).is_absolute() {
             out.push(format!(
                 "{key}.program: `{}` must be an absolute path or a bare name found on PATH",
                 g.program
@@ -788,11 +844,15 @@ fn env_gate_problems(
         }
     }
     for a in &g.args {
-        if !path_like(a) {
+        let Some(named) = named_path(a) else {
             continue;
-        }
-        let x = crate::config::expand_vars(a).unwrap_or_else(|_| a.clone());
-        if !Path::new(&x).is_absolute() {
+        };
+        let x = crate::config::expand_vars(named).unwrap_or_else(|_| named.to_string());
+        if x.replace('\\', "/").split('/').any(|c| c == "..") {
+            out.push(format!(
+                "{key}.args: `{a}` may not contain `..` — write the absolute path of the script, outside the repository, the task worktrees and the verify root"
+            ));
+        } else if !Path::new(&x).is_absolute() {
             out.push(format!(
                 "{key}.args: `{a}` must be an absolute path — the script must be out of the agents' reach (not in the repository, a task worktree or the verify root)"
             ));
@@ -924,9 +984,20 @@ pub fn problems(cfg: &Effective, root: &Path, machine: &str) -> Vec<String> {
     if let Some(imp) = team.role("implementer") {
         let rf = role_file("implementer");
         let names: Vec<&str> = team.gates.keys().map(String::as_str).collect();
-        if imp.before_handoff.is_empty() {
+        // at least one check gate: environment gates alone (or skipped on this machine) would
+        // hand unverified work to review (group B review)
+        let checks = imp
+            .before_handoff
+            .iter()
+            .filter(|n| {
+                team.gates
+                    .get(*n)
+                    .is_some_and(|g| g.decl.kind == GateType::Check)
+            })
+            .count();
+        if checks == 0 {
             out.push(format!(
-                "{}: before_handoff: empty — at least one gate must pass before the work is handed to review (declare one under `gates:` of {})",
+                "{}: before_handoff: no check gate — at least one `kind: check` gate must pass before the work is handed to review (declare one under `gates:` of {})",
                 rf.display(),
                 org.display()
             ));
@@ -1508,7 +1579,129 @@ mod tests {
             ),
         )]);
         let e = load_err(&y, &m);
-        assert!(e.contains("before_handoff: empty"), "{e}");
+        assert!(e.contains("before_handoff: no check gate"), "{e}");
+        // environment gates alone do not verify the work either (group B review)
+        let (_d, y, m) = draft_repo(&[(
+            IMPL_ROLE,
+            &draft_with(IMPL_ROLE, "[build, dbsync]", "[dbsync]"),
+        )]);
+        let e = load_err(&y, &m);
+        assert!(e.contains("before_handoff: no check gate"), "{e}");
+    }
+
+    /// Group B review: the loader's own problems, each with its file and key path — a missing
+    /// role file, a version other than 1, `max_fix_cycles` with a split limit, a bad timeout,
+    /// a check gate with no command, absolute culture / instructions paths, a missing seat.
+    #[test]
+    fn the_loader_problems_name_their_key() {
+        let (d, y, m) = draft_repo(&[]);
+        std::fs::remove_file(
+            d.path()
+                .join("repo")
+                .join(".toryo/roles/reviewer/toryo-role.yaml"),
+        )
+        .unwrap();
+        let e = load_err(&y, &m);
+        assert!(e.contains("seat `reviewer` has no role file"), "{e}");
+        let org = draft_with(ORGCHART, "\ntoryo: 1\n", "\ntoryo: 2\n")
+            .replace("    timeout: 20m\n", "    timeout: 20min\n")
+            .replace(
+                "  max_review_rounds: 3\n",
+                "  max_review_rounds: 3\n  max_fix_cycles: 2\n",
+            )
+            .replace("culture: ./CULTURE.md", "culture: /etc/CULTURE.md");
+        let role = draft_with(IMPL_ROLE, "\ntoryo: 1\n", "\ntoryo: 3\n").replace(
+            "instructions: ./instructions.md",
+            "instructions: ../../../x.md",
+        );
+        let (_d, y, m) = draft_repo(&[(ORGCHART, &org), (IMPL_ROLE, &role)]);
+        let e = load_err(&y, &m);
+        for want in [
+            "toryo-orgchart.yaml: toryo: unsupported version 2",
+            "toryo-role.yaml: toryo: unsupported version 3",
+            "limits.max_fix_cycles: `max_fix_cycles` is the single counter",
+            "gates.build.timeout: `20min` is not a duration",
+            "culture: `/etc/CULTURE.md` must be relative to the repository",
+            "instructions: `../../../x.md` may not contain `..`",
+        ] {
+            assert!(e.contains(want), "{want}\n---\n{e}");
+        }
+        let org = draft_with(
+            ORGCHART,
+            "    program: pwsh\n    args: [-NoProfile, -NonInteractive, -File, scripts/build-model.ps1]\n",
+            "",
+        );
+        let (_d, y, m) = draft_repo(&[(ORGCHART, &org)]);
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains("gates.build: needs `program` (with `args`) or `tool`"),
+            "{e}"
+        );
+        // a missing seat, in the friendly form
+        let org = draft_with(
+            ORGCHART,
+            "  reviewer:\n    profile: claude-max ",
+            "  # reviewer gone\n    #",
+        );
+        let (_d, y, m) = draft_repo(&[(ORGCHART, &org)]);
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains("seats: seat 'reviewer' is missing — exactly three seats: planner, implementer, reviewer"),
+            "{e}"
+        );
+    }
+
+    /// Group B review: a machine seat override without `fallback` has none (D7), not the
+    /// planner's profile.
+    #[test]
+    fn a_machine_seat_override_has_no_implicit_fallback() {
+        let (_d, y, m) = draft_repo(&[]);
+        let text = std::fs::read_to_string(&m).unwrap();
+        std::fs::write(
+            &m,
+            format!("{text}seats:\n  implementer: {{ profile: claude-max }}\n"),
+        )
+        .unwrap();
+        let cfg = crate::config::Effective::load(&y, Some(&m)).unwrap();
+        assert_eq!(cfg.repo.roles["implementer"].fallback, Some(vec![]));
+        let (_, chain, _) = crate::engine::task::roles(&cfg).unwrap();
+        assert_eq!(chain, ["claude-max"]);
+    }
+
+    /// Group B review: the reach check of the machine's environment-gate command — the
+    /// worktrees and the verify root too, an absolute program inside a root, `..` segments, a
+    /// path in a `--flag=value`; a Windows switch (`/c`) is not a path.
+    #[test]
+    fn an_environment_gate_command_stays_out_of_reach() {
+        let (d, y, m) = draft_repo(&[]);
+        let tmp = d.path().display().to_string().replace('\\', "/");
+        let text = std::fs::read_to_string(&m).unwrap();
+        let args = format!(
+            "[/c, '{tmp}/wts/T-1/x.ps1', '{tmp}/elsewhere/../repo/y.ps1', '--script={tmp}/repo/z.ps1', '{tmp}/vr/T-1/v.ps1', '{tmp}/gates/ok.ps1']"
+        );
+        let bad = text
+            .replace(
+                "program: powershell ",
+                &format!("program: '{tmp}/repo/tools/ps.exe' "),
+            )
+            .replace(
+                &format!("[-NoProfile, -NonInteractive, -File, '{tmp}/gates/dbsync.ps1']"),
+                &args,
+            );
+        std::fs::write(&m, format!("{bad}verify: {{ verify_root: '{tmp}/vr' }}\n")).unwrap();
+        let e = load_err(&y, &m);
+        for want in [
+            "/repo/tools/ps.exe` is inside the repository",
+            "/wts/T-1/x.ps1` is inside the task worktrees",
+            "/elsewhere/../repo/y.ps1` may not contain `..`",
+            "--script=",
+            "is inside the repository",
+            "/vr/T-1/v.ps1` is inside the verify root",
+        ] {
+            assert!(e.contains(want), "{want}\n---\n{e}");
+        }
+        assert!(!e.contains("`/c`"), "a switch is not a path: {e}");
+        assert!(!e.contains("gates/ok.ps1"), "{e}");
     }
 
     /// M11-B3 AC-1: which fields each gate kind has.

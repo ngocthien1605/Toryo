@@ -203,6 +203,38 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   `environment_gates_on_this_machine`, `culture_and_instructions_must_exist` (AC-1, one per rule),
   `three_problems_are_reported_at_once` (AC-2, four problems from three files in one error).
 
+### Group B review (independent subagent) — follow-up commit
+
+- **Fixed:** a machine seat override without `fallback` fell back to the planner's profile in org
+  chart mode (`task::roles` maps `None` to the planner) — now `Some([])` like an org chart seat (D7).
+- **Fixed:** the "out of the agents' reach" check compared strings only. It now compares a
+  lexical form (`\\?\` prefix dropped, `.`/`..` resolved, Windows' trailing dots and spaces
+  dropped, case folded) of the canonicalised path when it exists (junctions, 8.3 names); a `..`
+  segment in a machine gate's program or argument is refused outright; the path in a
+  `--name=value` / `-Name:value` argument is checked too; a Windows switch (`/c`) is not a path.
+  **Limit (documented in the script contract, F1/F2):** a bare-name argument (`cmd /c build`,
+  `python -m deploy`) is resolved by the program against its working directory — the verify
+  checkout — so the script contract says to name scripts by absolute path. The program itself is
+  resolved to an absolute path through PATH before it starts (E3), never from the checkout.
+- **Fixed:** `before_handoff` now needs at least one **check** gate (environment gates alone, or
+  skipped on a laptop, would hand unverified work to review).
+- **Fixed:** an absolute `culture:` / `instructions:` path is refused as written ("must be
+  relative") instead of being normalised into a relative one.
+- Tests added for every loader problem the review listed (missing role file, version ≠ 1,
+  `max_fix_cycles` + split, bad timeout, a check gate with no command, absolute paths, the
+  friendly missing-seat message, the machine override fallback, the reach cases).
+- **Deviations from "byte for byte as in M10" (error texts only, valid configurations and hashes
+  unchanged):** an unknown or missing key in **any** machine config now gets the friendly form
+  (`<file>: <path>.<key>: unknown key 'x'. Did you mean …? (valid: …) (line N)` — serde's column is
+  dropped); `roles.<x>: unknown role (valid: …)` gets a `Did you mean` suffix when one role is
+  close. Both are B3 behaviour; existing tests assert with `contains` and pass unchanged.
+- Not changed (recorded): `templates_keep_their_m10_hash` reads the dogfood template, whose
+  `project.root` is this repository — a `.toryo/toryo-orgchart.yaml` at the root of the toryo
+  repository would switch it to org chart mode. `instructions: ../planner/x.md` (inside the
+  repository but outside the role folder) is refused — conservative. A misspelt machine seat
+  (`seats: { reviwer: … }`) is reported as `roles.reviwer: unknown role … Did you mean 'reviewer'?`
+  without naming the machine file. Unknown enum values (`kind: chek`) keep serde's message.
+
 ## C — Roles
 
 ### C1 — layered instructions and `culture` in the context loader

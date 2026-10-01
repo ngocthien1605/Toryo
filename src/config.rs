@@ -696,7 +696,12 @@ impl Effective {
             origins.verify.insert(k.into(), Origin::Repo);
         }
         if let Some((mp, machine)) = machine {
-            for (k, v) in machine.roles {
+            for (k, mut v) in machine.roles {
+                // org chart mode: a machine seat has the org chart's fields — an omitted
+                // fallback is none (D7), never the planner's profile (group B review)
+                if team.is_some() && v.fallback.is_none() {
+                    v.fallback = Some(Vec::new());
+                }
                 let o = if repo.roles.contains_key(&k) {
                     Origin::RepoOverriddenByMachine
                 } else {
