@@ -8,7 +8,7 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
 
 - [x] A1 — repository files parsed without machine-only keys; tagged keys refused (C1)
 - [x] A2 — machine floor for `verify.boundary` and `verify_root` (H2)
-- [ ] B1 — types for the org chart, role files and the new machine keys
+- [x] B1 — types for the org chart, role files and the new machine keys
 - [ ] B2 — loader: discover `.toryo/`, merge, freeze and hash; `toryo config show`
 - [ ] B3 — validation pass: cross-references, kinds, order, "did you mean"
 - [ ] C1 — layered instructions and `culture` in the context loader
@@ -76,6 +76,37 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   tests that rewrite the machine config (`engine_policy`, `m10_events`, `m10_notify`, `m10_usage`)
   append it too. No assertion changed. New: `config::tests::the_machine_verify_floor_and_root`,
   `tests/m11_trust.rs` (AC-1, AC-2).
+
+## B — The `.toryo/` loader
+
+### B1 — types for the org chart, role files and the new machine keys
+
+- **New module `src/team.rs`** (`config.rs` keeps `Effective`): `OrgChart`, `Seats` (a struct with
+  exactly `planner`, `implementer`, `reviewer` — a fourth or misspelt seat is an unknown field, a
+  missing one a missing field), `Seat`, `GateDecl` (`kind: check | environment` = `GateType`, the
+  name `GateKind` is taken by the approval gates of the state machine), `IfMissing`, `Limits`,
+  `Checks` / `Level` (`off | warn | error`, default `warn`; YAML key
+  `reviewer-differs-from-builder`), `RoleFile`. All `deny_unknown_fields`, mirroring the drafts.
+- **Parsing** (`team::parse_repo_file`): YAML → `refuse_tags` (C1, the A1 function) → the removed
+  keys → the typed parse. **Removed keys** get their own message, all of a file at once, each
+  with its key path: `flow` (the flow is fixed; move the retry knobs to `limits:`), `skills_dir`
+  in the org chart (belongs in the machine config), `seats.<seat>.agent` (name a Toryo profile:
+  `profile: codex-openai`), `reads` in a role file (Toryo decides what each stage sees).
+- **Durations** (`team::parse_duration`): `<n>s | <n>m | <n>h`, n ≥ 1, ASCII digits only;
+  anything else (`0s`, `20`, `20min`, `1.5h`, `1d`, an overflow) is an error naming the value.
+- **`CommandSpec.timeout_sec`** (the choice the task list asks to record): a new optional field in
+  seconds, serialised only when set, winning over `timeout_min` in `xpp::command_timeout`. Exact
+  (`30s` stays 30 s, no rounding to minutes) and every existing hash is unchanged.
+- **Machine config**: `seats:` (the new spelling of `roles:`, same `Role` fields; both in one file
+  is an error naming the file; `seats:` is then read exactly like `roles:`, so it hashes the
+  same), `skills_dir: Option<String>`, `environment_gates: { <name>: EnvGate }` with
+  `EnvGate { program, args, lock, env, secret_env }` (`secret_env` values are the existing
+  `credman:` / `env:` references). None of them is frozen or hashed in `toryo.yaml`-only mode.
+- **Fixtures** `tests/fixtures/m11/`: the three owner drafts, copied with their comments; in the
+  machine draft the owner paths (`C:\Users\<you>\…`, `C:/Temp/AgentShare/skills`,
+  `C:\.thien\toryo-gates\dbsync.ps1`) are `'@TMP@/…'`, which the B2 tests replace with a temp
+  folder. Tests: `team::tests::{the_owner_drafts_parse, removed_keys_have_their_own_message,
+  seats_are_exactly_three, durations}`, `config::tests::machine_seats_are_the_new_spelling_of_roles`.
 
 ## Open
 

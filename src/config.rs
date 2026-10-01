@@ -210,6 +210,10 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     #[serde(default)]
     pub timeout_min: Option<u64>,
+    /// M11: a gate's `timeout` (`30s`, `20m`, `1h`) in seconds; wins over `timeout_min`.
+    /// Serialised only when set, so a configuration without gates keeps its hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_sec: Option<u64>,
     /// R59: a built-in verify kind; `xpp` is the only one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
@@ -247,6 +251,7 @@ impl CommandSpec {
             program: Some(program.into()),
             args: args.iter().map(|a| a.to_string()).collect(),
             timeout_min,
+            timeout_sec: None,
             tool: None,
             metadata: None,
             projects: Vec::new(),
@@ -260,6 +265,7 @@ impl CommandSpec {
             program: None,
             args: Vec::new(),
             timeout_min,
+            timeout_sec: None,
             tool: Some("xpp".into()),
             metadata: Some(metadata.into()),
             projects: projects.iter().map(|p| p.to_string()).collect(),
@@ -451,6 +457,18 @@ impl Toolchains {
 pub struct MachineConfig {
     #[serde(default)]
     pub roles: BTreeMap<String, Role>,
+    /// M11: the new spelling of `roles:` — this machine's seat overrides (same fields). Both
+    /// in one file is an error ([`MachineConfig::load`]).
+    #[serde(default)]
+    pub seats: BTreeMap<String, Role>,
+    /// M11-D1: this machine's shared skills folder (`<skills_dir>/<name>/SKILL.md`), looked up
+    /// after the repository's `.toryo/skills/`.
+    #[serde(default)]
+    pub skills_dir: Option<String>,
+    /// M11-E3: the commands of the org chart's `kind: environment` gates. They run with the
+    /// owner's normal rights, so they are defined only here, out of every agent's reach.
+    #[serde(default)]
+    pub environment_gates: BTreeMap<String, EnvGate>,
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
     /// R59/R60: only here, never in the repository file.
@@ -465,6 +483,27 @@ pub struct MachineConfig {
     /// Review H2 (M11-A2): the machine's floor for the verify boundary and its verify root.
     #[serde(default)]
     pub verify: MachineVerify,
+}
+
+/// `environment_gates.<name>` in the machine config (M11-E3): the command an org chart's
+/// `kind: environment` gate runs, with the owner's normal token, in the verify checkout.
+/// Frozen and hashed with each task that uses it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvGate {
+    /// An absolute path or a bare PATH name.
+    pub program: String,
+    /// Every path-like argument absolute and outside the repository, the worktrees and the
+    /// verify root.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// The machine-wide lock: one environment gate per lock name runs at a time.
+    pub lock: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// `credman:<target>` or `env:<VAR>` references, resolved when the gate runs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secret_env: BTreeMap<String, String>,
 }
 
 /// `verify:` in the machine config (review H2, M11-A2): the repository chooses the sandbox its
@@ -502,7 +541,19 @@ impl MachineConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        let mut m: Self =
+            serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        // M11: `seats:` is the new spelling of `roles:` — one of the two
+        if !m.seats.is_empty() {
+            if !m.roles.is_empty() {
+                bail!(
+                    "{}: both `roles:` and `seats:` are set — `seats:` is the new spelling of `roles:` (same fields); keep one of them",
+                    path.display()
+                );
+            }
+            m.roles = std::mem::take(&mut m.seats);
+        }
+        Ok(m)
     }
 }
 
@@ -1790,6 +1841,45 @@ commands:
         let back = Effective::from_frozen(&frozen, Path::new("config.json")).unwrap();
         assert_eq!(back.canonical_json(), frozen);
         assert!(back.toolchains.is_empty());
+    }
+
+    /// M11-B1 AC-2: `seats:` is the machine's new spelling of `roles:` — it overrides like
+    /// `roles:` and hashes the same; both in one file are refused, naming the file.
+    #[test]
+    fn machine_seats_are_the_new_spelling_of_roles() {
+        let d = tempfile::tempdir().unwrap();
+        let (p, m) = (d.path().join("toryo.yaml"), d.path().join("machine.yaml"));
+        std::fs::write(&p, "version: 1\nproject: { root: r, worktrees_root: w }\nroles:\n  planner: { profile: a }\n").unwrap();
+        let profiles = "profiles:\n  a: { kind: claude, billing: subscription, exe: c }\n  b: { kind: codex, billing: subscription, exe: x }\n";
+        std::fs::write(
+            &m,
+            format!("{profiles}roles:\n  planner: {{ profile: b }}\n"),
+        )
+        .unwrap();
+        let old = Effective::load(&p, Some(&m)).unwrap();
+        std::fs::write(
+            &m,
+            format!("{profiles}seats:\n  planner: {{ profile: b }}\n"),
+        )
+        .unwrap();
+        let new = Effective::load(&p, Some(&m)).unwrap();
+        assert_eq!(new.repo.roles["planner"].profile, "b");
+        assert_eq!(
+            new.origins.roles["planner"],
+            Origin::RepoOverriddenByMachine
+        );
+        assert_eq!(new.sha256(), old.sha256());
+        std::fs::write(
+            &m,
+            format!("{profiles}roles:\n  planner: {{ profile: b }}\nseats:\n  reviewer: {{ profile: b }}\n"),
+        )
+        .unwrap();
+        let e = format!("{:#}", Effective::load(&p, Some(&m)).unwrap_err());
+        assert!(
+            e.contains(&m.display().to_string())
+                && e.contains("both `roles:` and `seats:` are set"),
+            "{e}"
+        );
     }
 
     /// Review H2 (M11-A2): the machine's `verify:` floor and root. Unset, nothing changes (the

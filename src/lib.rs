@@ -21,4 +21,5 @@ pub mod process;
 pub mod runner;
 #[cfg(feature = "m0-kit")]
 pub mod spike;
+pub mod team;
 pub mod usage;
