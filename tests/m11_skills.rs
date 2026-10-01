@@ -270,3 +270,95 @@ fn the_claude_implementer_gets_skills_in_its_context_file() {
         .unwrap()
         .contains("REVIEW-SKILL-BODY"));
 }
+
+/// Group D review: a name is a menu entry exactly as written — `" xpp-batch"` is off the menu
+/// (before, the check trimmed it and the delivery dropped it).
+#[test]
+fn a_skill_name_is_matched_exactly() {
+    let env = skills_env("", &[]);
+    create(&env, "SK-9");
+    let s = script(
+        &env,
+        "sk9.json",
+        json!({"planner": [turn(vec![plan_with(json!([" xpp-batch"]))]), turn(vec![plan_with(json!(["xpp-batch"]))])]}),
+    );
+    let (code, err) = toryo(&env, &["run", "SK-9", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "SK-9").state, St::WaitingPlanApproval, "{err}");
+    let p = calls_of(&env, "SK-9", "planner");
+    assert!(
+        p[1]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("not on the implementer's menu: ` xpp-batch` (did you mean `xpp-batch`?)"),
+        "{}",
+        p[1]["prompt"]
+    );
+}
+
+/// Group D review: without an org chart a plan's `skills` means nothing — PLAN.md and plan.json
+/// are as in M10.
+#[test]
+fn legacy_plans_ignore_skills() {
+    let env = setup("codex-openai");
+    create(&env, "SK-10");
+    let s = script(
+        &env,
+        "sk10.json",
+        json!({"planner": [turn(vec![plan_with(json!(["some-native-skill"]))])]}),
+    );
+    let (code, err) = toryo(&env, &["run", "SK-10", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "SK-10");
+    assert_eq!(t.state, St::WaitingPlanApproval, "{err}");
+    let md = std::fs::read_to_string(t.artifacts().join("PLAN.md")).unwrap();
+    assert!(!md.contains("Skills for the implementer"), "{md}");
+    let plan: Value =
+        serde_json::from_slice(&std::fs::read(t.artifacts().join("plan.json")).unwrap()).unwrap();
+    assert!(plan.get("skills").is_none(), "{plan}");
+}
+
+/// Group D review: a skill found only in the machine's `skills_dir` is delivered with origin
+/// `machine`; one that is gone at attempt time is reported as skipped, and the planner's menu
+/// says so.
+#[test]
+fn machine_skills_are_delivered_and_missing_ones_skipped() {
+    let env = skills_env("", &[]);
+    let shared = env.root.join("machine-skills").join("xpp-batch");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(
+        shared.join("SKILL.md"),
+        BATCH.replace("BATCH-SKILL-BODY", "MACHINE-BATCH-BODY"),
+    )
+    .unwrap();
+    std::fs::remove_file(env.repo.join(".toryo/skills/xpp-batch/SKILL.md")).unwrap();
+    let m = std::fs::read_to_string(&env.machine).unwrap();
+    std::fs::write(
+        &env.machine,
+        format!(
+            "{m}skills_dir: '{}'\n",
+            env.root
+                .join("machine-skills")
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        ),
+    )
+    .unwrap();
+    approved_plan(&env, "SK-11", json!(["xpp-batch"]));
+    let (err, text) = context_show(&env, "SK-11", "implement");
+    assert!(err.contains("skill xpp-batch (machine)"), "{err}");
+    assert!(text.contains("MACHINE-BATCH-BODY"));
+    std::fs::remove_file(shared.join("SKILL.md")).unwrap();
+    let (err, text) = context_show(&env, "SK-11", "implement");
+    assert!(
+        err.contains("(skipped, not found) 4: skill 'xpp-batch' not found"),
+        "{err}"
+    );
+    assert!(!text.contains("MACHINE-BATCH-BODY"));
+    let (_, plan_text) = context_show(&env, "SK-11", "plan");
+    assert!(
+        plan_text.contains("- xpp-batch — (not found on this machine)"),
+        "{plan_text}"
+    );
+}

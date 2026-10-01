@@ -583,6 +583,29 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   what the next attempt gets), `the_claude_implementer_gets_skills_in_its_context_file` (AC-3, and
   the reviewer's skill reached the reviewer).
 
+### Group D review (independent subagent) — follow-up commit
+
+- **Fixed:** the plan check trimmed skill names but the delivery compared them exactly, so
+  `" xpp-batch"` passed the check and was then silently dropped (also skipping the budget check).
+  One shared `context::plan_skills` (names exactly as written, deduplicated) is used by both; a name
+  with spaces is simply off the menu.
+- **Fixed:** in `toryo.yaml`-only mode a plan's `skills` is removed before `plan.json` / `PLAN.md` are
+  written — it means nothing there (a planner might list its native skills), so the plan looks as in
+  M10.
+- **Fixed:** an approved skill that is no longer on the implementer's menu at attempt time (e.g. a
+  `task config --reload` at the plan gate changed the menu) is reported under `skipped` instead of
+  disappearing silently. A lower budget after the plan was approved only gives the usual over-budget
+  warning (not re-checked).
+- **Fixed:** planner-written skill names are escaped in the stderr line, the escalation reason and
+  the feedback.
+- Not changed (recorded): `fixed_bytes` leaves out the render scaffolding (the preamble, the task-pack
+  listing), so a plan just under the budget can still exceed it slightly at attempt time — a warning
+  only. Skill files are read through symlinks/junctions without a containment check: both roots
+  (the repository's protected `.toryo/` and the machine's folder) are owner-controlled.
+- Tests added: `m11_skills::{a_skill_name_is_matched_exactly, legacy_plans_ignore_skills,
+  machine_skills_are_delivered_and_missing_ones_skipped}` (origin `machine`, `skipped`, the menu's
+  "(not found on this machine)").
+
 ## F — Wrap-up
 
 ### F1 — templates

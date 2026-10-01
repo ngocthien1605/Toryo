@@ -557,6 +557,14 @@ impl<'a> Engine<'a> {
                 return Ok(Flow::Next);
             }
         };
+        // M11-D2 (group D review): `skills` means something only with an org chart — a
+        // legacy plan is stored and shown as in M10
+        let mut plan = plan;
+        if self.cfg.team.is_none() {
+            if let Some(o) = plan.as_object_mut() {
+                o.remove("skills");
+            }
+        }
         let bytes = serde_json::to_vec_pretty(&plan)?;
         let md = super::render::render("plan", &plan)?;
         self.put(t, &a, "plan", "json", &bytes, "plan.json")?;
@@ -627,7 +635,7 @@ impl<'a> Engine<'a> {
         let Some(team) = &self.cfg.team else {
             return Ok(None);
         };
-        let chosen = plan_skills(plan);
+        let chosen = context::plan_skills(plan);
         if chosen.is_empty() {
             return Ok(None);
         }
@@ -643,7 +651,8 @@ impl<'a> Engine<'a> {
                 let mean = crate::team::did_you_mean(s, &menu)
                     .map(|m| format!(" (did you mean `{m}`?)"))
                     .unwrap_or_default();
-                format!("`{s}`{mean}")
+                // a name the planner wrote: escaped, it reaches the terminal and the reason
+                format!("`{}`{mean}", s.escape_debug())
             })
             .collect();
         if !off.is_empty() {
@@ -2560,19 +2569,6 @@ fn plan_files(plan: &Value) -> Vec<String> {
         .flatten()
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect()
-}
-
-/// M11-D2: the plan's `skills` — its string entries, once each, in order.
-fn plan_skills(plan: &Value) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for s in plan["skills"].as_array().into_iter().flatten() {
-        if let Some(s) = s.as_str().map(str::trim).filter(|s| !s.is_empty()) {
-            if !out.iter().any(|x| x == s) {
-                out.push(s.to_string());
-            }
-        }
-    }
-    out
 }
 
 /// M11-C2: the plan-time feedback when a planned path breaks the implementer's write fence —

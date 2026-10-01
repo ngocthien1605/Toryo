@@ -629,6 +629,7 @@ pub fn request(
         .unwrap_or(DEFAULT_BUDGET_KB);
     // M11-D3: the implementer gets the approved plan's skills (those on its menu); planner
     // and reviewer every skill of their role file
+    let mut off_menu: Vec<String> = Vec::new();
     let wanted: Vec<String> = match (cfg.team.as_ref(), role) {
         (None, _) => Vec::new(),
         (Some(team), Role::Implementer) => {
@@ -639,15 +640,20 @@ pub fn request(
             let plan: serde_json::Value = super::artifacts::read_head(store, t, "plan")?
                 .and_then(|(_, b)| serde_json::from_slice(&b).ok())
                 .unwrap_or_default();
-            let mut out: Vec<String> = Vec::new();
-            for s in plan["skills"].as_array().into_iter().flatten() {
-                if let Some(s) = s.as_str().filter(|s| menu.iter().any(|m| m == s)) {
-                    if !out.iter().any(|x| x == s) {
-                        out.push(s.to_string());
-                    }
-                }
-            }
-            out
+            let (on, off): (Vec<String>, Vec<String>) = plan_skills(&plan)
+                .into_iter()
+                .partition(|s| menu.iter().any(|m| m == s));
+            // e.g. a `task config --reload` changed the menu after the plan was approved
+            off_menu = off
+                .iter()
+                .map(|s| {
+                    format!(
+                        "skill {:?} of the approved plan is no longer on the implementer's menu",
+                        s
+                    )
+                })
+                .collect();
+            on
         }
         (Some(team), r) => team
             .role(r.as_str())
@@ -658,7 +664,7 @@ pub fn request(
     let team = cfg.team.as_ref().map(|team| {
         let at = |rel: &String| (rel.clone(), t.repo.join(rel));
         let machine_dir = crate::team::machine_skills_dir(&team.skill_roots);
-        let (mut skills, mut missing_skills) = (Vec::new(), Vec::new());
+        let (mut skills, mut missing_skills) = (Vec::new(), off_menu.clone());
         for name in &wanted {
             match crate::team::resolve_skill(name, &t.repo, machine_dir.as_deref()) {
                 Ok(k) => skills.push(k),
@@ -689,6 +695,21 @@ pub fn request(
         budget: (kb as usize) * 1024,
         team,
     })
+}
+
+/// M11-D2: the plan's `skills` — its string entries **as written** (no trimming: a name is a
+/// menu entry or it is not), once each, in order. The plan check and the delivery (D3) both use
+/// it, so what the check accepts is exactly what the implementer gets (group D review).
+pub fn plan_skills(plan: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in plan["skills"].as_array().into_iter().flatten() {
+        if let Some(s) = s.as_str() {
+            if !out.iter().any(|x| x == s) {
+                out.push(s.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// M11-D2: the planner's menu of the implementer's skills — one `name — description` line
