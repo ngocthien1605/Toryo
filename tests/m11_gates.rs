@@ -283,3 +283,54 @@ fn output_without_secrets_is_unchanged_by_redaction() {
     assert!(plain.contains("git version"), "{plain}");
     assert_eq!(plain.as_bytes(), redacted.as_bytes());
 }
+
+/// Group E review (E2 AC-2): with a secret configured that the command never prints, stdout and
+/// stderr keep their order — the whole output is redacted at the end, no stream holds bytes back.
+#[test]
+fn a_configured_secret_does_not_reorder_stdout_and_stderr() {
+    use toryo::process::redact::{Redactions, Secret};
+    use toryo::runner::{CommandRunner, LocalRunner, RunSpec};
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (program, args): (&str, Vec<String>) = if cfg!(windows) {
+        (
+            "pwsh",
+            vec![
+                "-NoProfile".into(),
+                "-Command".into(),
+                "[Console]::Out.WriteLine('o1'); Start-Sleep -Milliseconds 400; [Console]::Error.WriteLine('e1'); Start-Sleep -Milliseconds 400; [Console]::Out.WriteLine('o2')".into(),
+            ],
+        )
+    } else {
+        (
+            "sh",
+            vec![
+                "-c".into(),
+                "echo o1; sleep 0.4; echo e1 >&2; sleep 0.4; echo o2".into(),
+            ],
+        )
+    };
+    let spec = RunSpec {
+        name: "order".into(),
+        program: toryo::engine::checks::resolve_program(program),
+        args,
+        cwd: std::env::temp_dir(),
+        env: std::env::vars().collect(),
+        boundary: toryo::process::Boundary::None,
+        timeout: std::time::Duration::from_secs(60),
+        cancel: None,
+        redact: Redactions::new(&[Secret {
+            name: "X".into(),
+            value: "a-secret-value-long-enough-to-hold-bytes-back".into(),
+        }]),
+    };
+    let out = rt.block_on(LocalRunner.run(spec, None)).unwrap().output;
+    let order: Vec<&str> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(order, ["o1", "e1", "o2"], "{out:?}");
+}

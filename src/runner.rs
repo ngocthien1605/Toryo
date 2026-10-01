@@ -83,7 +83,10 @@ impl CommandRunner for LocalRunner {
                 stdin: None,
                 boundary: spec.boundary,
             };
-            let running = spawn(&s, &spec.redact).with_context(|| {
+            // the raw streams, interleaved as they arrive; the whole output is redacted at the
+            // end (M11-E2): a per-stream redactor holds back bytes and would reorder stdout and
+            // stderr when any secret is configured (group E review)
+            let running = spawn(&s, &Redactions::empty()).with_context(|| {
                 format!("starting `{}` ({})", spec.name, spec.program.display())
             })?;
             let cancel_flag = spec.cancel.clone();
@@ -99,7 +102,10 @@ impl CommandRunner for LocalRunner {
                 |c| {
                     let (Chunk::Stdout(b) | Chunk::Stderr(b)) = c;
                     if let Some(tx) = &sink {
-                        let _ = tx.send(strip_ansi(&String::from_utf8_lossy(&b)));
+                        // live chunks (no engine caller uses them) are redacted chunk by chunk
+                        let _ = tx.send(strip_ansi(
+                            &spec.redact.redact_str(&String::from_utf8_lossy(&b)),
+                        ));
                     }
                     out.extend(b);
                 },
@@ -114,7 +120,7 @@ impl CommandRunner for LocalRunner {
                 timed_out: info.timed_out,
                 cancelled: info.cancelled,
                 duration_ms: info.duration_ms,
-                output: strip_ansi(&String::from_utf8_lossy(&out)),
+                output: strip_ansi(&String::from_utf8_lossy(&spec.redact.redact_all(&out))),
             })
         })
         .await?

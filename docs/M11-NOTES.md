@@ -456,6 +456,43 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   `views::tests::deployment_status_in_words`, the extended flight tests.
 - Also in this commit: the group C review nit (a doc comment had moved off `ImplementTurn`).
 
+### Group E review (independent subagent) — follow-up commit
+
+- **Fixed (M18):** the entry point of a verify command is now its **script**, per program
+  (`checks::script_arg`): the argument after the first `-File` of `pwsh`/`powershell` only (a
+  script's own `-f x` after it is not), the first non-flag argument of an interpreter (`sh`,
+  `bash`, `zsh`, `dash`, `ksh`, `python`, `python3`, `py`, `node`, `ruby`, `perl`; none when `-c`,
+  `-m`, `-e`… runs inline code or a module), the file after `cmd /c`. Before, `-f` counted for
+  every program (`dotnet test -f net8.0` would have been refused) and `sh scripts/x.sh` was not
+  protected before it existed. The admission check also runs at **`task config --reload`**
+  (`task::check_entry_points`, shared).
+- **Fixed (E3):** an environment gate's environment gets `NoDefaultCurrentDirectoryInExePath=1`, so
+  cmd.exe and `CreateProcess` in the owner's script never run a bare-named program from the verify
+  checkout. **Not fixable here (script contract):** DLL loading still searches the working
+  directory — the contract says to call tools by absolute path.
+- **Fixed:** environment lock files live in `locks/env/<lock>.lock` (lower case), so a task id like
+  `env-d365-env` can never take a gate's lock; a gate program that does not exist (or a bare name
+  not on PATH) escalates with `environment_gate_unavailable` before any record is written; a gate
+  that fails to start marks its record `ok: false` instead of "interrupted"; `which` results are
+  made absolute; `status` shows "waiting for lock" only while the task's run is alive (a crash while
+  waiting leaves the `environment_waits` row behind).
+- **Fixed (E2 AC-2):** `LocalRunner` collects the raw streams and redacts the whole output at the
+  end — a per-stream redactor held bytes back and could move a short stdout line after later
+  stderr output whenever any secret was configured. Live chunks (no engine caller) are redacted
+  chunk by chunk.
+- **Fixed:** `task config --reload` treats a change of the `team` section (gates, their machine
+  commands, the role files) as a verify-configuration change (the verify result is invalidated).
+- **Known limit (not fixed, Unix only):** on Unix a killed toryo leaves the gate's process group
+  running while the lock is free (review M7: the process group is not a containment boundary);
+  Windows kills the Job with toryo.
+- Lock names that differ only in case share one lock file but get separate `environment_deployments`
+  rows.
+- Tests added: `checks::tests::m18_script_arguments_per_program`, `lock::tests::environment_locks_
+  have_their_own_folder`, `runner::tests::the_verify_scope_at_the_final_gate`,
+  `m11_env_gates::{an_environment_gate_that_cannot_run_escalates,
+  a_stop_during_an_environment_gate_interrupts_it}`,
+  `m11_gates::a_configured_secret_does_not_reorder_stdout_and_stderr`.
+
 ### Group C review (independent subagent)
 
 - Nothing serious. Fixed: the misplaced doc comment. Recorded, not changed: after a

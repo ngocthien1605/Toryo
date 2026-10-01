@@ -552,16 +552,12 @@ pub fn verify_files(cmds: &[CommandSpec], repo: &Path) -> Vec<String> {
                 add(r);
             }
         }
-        let mut after_file = false;
+        // M18: the script the program runs, whether or not it exists yet
+        let script = script_arg(&program, args);
+        if let Some(r) = script.and_then(|s| repo_relative(repo, s)) {
+            add(r);
+        }
         for a in args {
-            // M18: the script after `-File`, whether or not it exists yet
-            if std::mem::take(&mut after_file) {
-                if let Some(r) = repo_relative(repo, a) {
-                    add(r);
-                    continue;
-                }
-            }
-            after_file = is_file_flag(a);
             if let Some(r) = in_repo(a) {
                 add(r);
             } else if repo.join(a).is_file() {
@@ -579,10 +575,77 @@ fn is_file_flag(a: &str) -> bool {
         .any(|f| a.eq_ignore_ascii_case(f))
 }
 
+/// A program's base name in lower case, without a directory or `.exe` / `.cmd` / `.bat`.
+fn program_base(program: &str) -> String {
+    let name = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    for ext in [".exe", ".cmd", ".bat"] {
+        if let Some(n) = name.strip_suffix(ext) {
+            return n.to_string();
+        }
+    }
+    name
+}
+
+/// Script interpreters (M18, group E review): the first argument that is not a flag is the
+/// script they run — unless one of the flags runs inline code or a module instead.
+const INTERPRETERS: &[(&str, &[&str])] = &[
+    ("sh", &["-c"]),
+    ("bash", &["-c"]),
+    ("zsh", &["-c"]),
+    ("dash", &["-c"]),
+    ("ksh", &["-c"]),
+    ("python", &["-c", "-m"]),
+    ("python3", &["-c", "-m"]),
+    ("py", &["-c", "-m"]),
+    ("node", &["-e", "-p", "--eval", "--print"]),
+    ("ruby", &["-e"]),
+    ("perl", &["-e", "-E"]),
+];
+
+/// M18: the script a verify command runs, as written — the argument after the first `-File`
+/// of `pwsh` / `powershell` (later arguments belong to the script), the first non-flag
+/// argument of a script interpreter (`sh`, `bash`, `python`, `node`, …), the argument after
+/// `/c` of `cmd` when it names a file (a separator or a script extension). `None` for any
+/// other program: `-f` of `dotnet`, `docker` or `grep` is not a script.
+pub fn script_arg<'a>(program: &str, args: &'a [String]) -> Option<&'a String> {
+    let base = program_base(program);
+    if base == "pwsh" || base == "powershell" {
+        let i = args.iter().position(|a| is_file_flag(a))?;
+        return args.get(i + 1);
+    }
+    if base == "cmd" {
+        let i = args
+            .iter()
+            .position(|a| a.eq_ignore_ascii_case("/c") || a.eq_ignore_ascii_case("/k"))?;
+        let s = args.get(i + 1)?;
+        let lower = s.to_ascii_lowercase();
+        let file = s.contains(['/', '\\'])
+            || [".cmd", ".bat", ".ps1", ".exe"]
+                .iter()
+                .any(|x| lower.ends_with(x));
+        return file.then_some(s);
+    }
+    let (_, inline) = INTERPRETERS.iter().find(|(n, _)| *n == base)?;
+    for a in args {
+        if inline.iter().any(|f| a == f) {
+            return None;
+        }
+        if !a.starts_with('-') {
+            return Some(a);
+        }
+    }
+    None
+}
+
 /// M18: the repository files a verify command starts — its program when it is a path in the
-/// repository, and the script after `-File` — as `(command name, path)`, in `git status` form.
-/// Task admission refuses a task whose base commit lacks one of them: a script the task itself
-/// would create could be written by the implementer before verify runs it.
+/// repository, and the script it runs ([`script_arg`]) — as `(command name, path)`, in `git
+/// status` form. Task admission (and `task config --reload`) refuses a configuration whose
+/// base commit lacks one of them: a script the task itself would create could be written by the
+/// implementer before verify runs it.
 pub fn verify_entry_points(cmds: &[CommandSpec], repo: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for c in cmds {
@@ -595,12 +658,8 @@ pub fn verify_entry_points(cmds: &[CommandSpec], repo: &Path) -> Vec<(String, St
                 out.push((c.name.clone(), r));
             }
         }
-        for w in args.windows(2) {
-            if is_file_flag(&w[0]) {
-                if let Some(r) = repo_relative(repo, &w[1]) {
-                    out.push((c.name.clone(), r));
-                }
-            }
+        if let Some(r) = script_arg(&program, args).and_then(|s| repo_relative(repo, s)) {
+            out.push((c.name.clone(), r));
         }
     }
     out
@@ -1013,15 +1072,52 @@ mod tests {
         );
         let p = Protected::new(files, &[VERIFY_SCRIPTS.into()]);
         assert!(p.violates("scripts/build-model.ps1") && p.violates("Scripts/Lint.ps1"));
+        // `ext` is not PowerShell: its `-File` is not a script (the existing file is still
+        // protected, as any existing argument)
         assert_eq!(
             verify_entry_points(&cmds, repo),
             [
                 ("build".to_string(), "scripts/build-model.ps1".to_string()),
                 ("lint".to_string(), "scripts/lint.ps1".to_string()),
                 ("gate".to_string(), "scripts/gate.sh".to_string()),
-                ("ext".to_string(), "scripts/existing.ps1".to_string()),
             ]
         );
+    }
+
+    /// Group E review: the script of an interpreter is an entry point; `-f` of other programs,
+    /// inline code, modules and a script's own arguments are not.
+    #[test]
+    fn m18_script_arguments_per_program() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let cases: &[(&str, &[&str], Option<&str>)] = &[
+            (
+                "pwsh",
+                &["-NoProfile", "-File", "s.ps1", "-f", "x"],
+                Some("s.ps1"),
+            ),
+            ("C:/PS7/pwsh.exe", &["-file", "a/b.ps1"], Some("a/b.ps1")),
+            ("powershell", &["-Command", "x"], None),
+            ("sh", &["scripts/later.sh"], Some("scripts/later.sh")),
+            ("bash", &["-e", "-x", "ci/run.sh", "arg"], Some("ci/run.sh")),
+            ("sh", &["-c", "exit 0"], None),
+            ("python3", &["tools/check.py", "-v"], Some("tools/check.py")),
+            ("python", &["-m", "pytest", "tests"], None),
+            ("node", &["-e", "1"], None),
+            ("cmd", &["/c", r"scripts\b.cmd"], Some(r"scripts\b.cmd")),
+            ("cmd.exe", &["/C", "echo", "hi"], None),
+            ("dotnet", &["test", "-f", "net8.0"], None),
+            ("docker", &["compose", "-f", "build/gen.yml", "up"], None),
+            ("grep", &["-F", "TODO", "src"], None),
+            ("cargo", &["test", "-F", "feat"], None),
+        ];
+        for (program, args, want) in cases {
+            let a = s(args);
+            assert_eq!(
+                script_arg(program, &a).map(String::as_str),
+                *want,
+                "{program} {args:?}"
+            );
+        }
     }
 
     /// R59 (as EC-07): `@verify-scripts` covers the projects of a `tool: xpp` command — also

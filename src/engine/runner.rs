@@ -1543,6 +1543,10 @@ impl<'a> Engine<'a> {
                 .call(move |tx| store::deployment_start(tx, &l, &i, &h, &n, &mc))?;
             crash_point("verify:environment_gate_started");
             let mut env = crate::process::env::build_env(std::env::vars(), &m.env, &secrets);
+            // group E review: a bare name the script runs is never looked up in the working
+            // directory (the verify checkout, which holds the checkpoint's files) — cmd.exe and
+            // CreateProcess honour this; DLL loading does not (documented in the script contract)
+            env.insert("NoDefaultCurrentDirectoryInExePath".into(), "1".into());
             verify::set_gate_vars(&mut env, &t.id, head, co);
             let mut redact = super::flight::task_secrets(&self.cfg, t);
             redact.extend(secrets.iter().map(|(k, v)| crate::process::redact::Secret {
@@ -1564,7 +1568,17 @@ impl<'a> Engine<'a> {
                 cancel: Some(stop.flag.clone()),
                 redact: crate::process::redact::Redactions::new(&redact),
             };
-            let res = self.run_gate_command(run, stop, Some("environment"))?;
+            let res = match self.run_gate_command(run, stop, Some("environment")) {
+                Ok(r) => r,
+                Err(e) => {
+                    // it did not start: say so in the record, not "interrupted"
+                    let (i, l) = (t.id.clone(), m.lock.clone());
+                    let _ = self
+                        .store
+                        .call(move |tx| store::deployment_end(tx, &l, &i, Some(false)));
+                    return Err(e);
+                }
+            };
             let ok = res.as_ref().map(|r| r.ok());
             let (i, l) = (t.id.clone(), m.lock.clone());
             self.store
@@ -3605,10 +3619,14 @@ pub fn computer_name() -> String {
 /// working directory). `None` when a bare name is not on PATH.
 fn env_gate_program(program: &str) -> Option<PathBuf> {
     let p = expand_vars(program).ok()?;
-    if p.contains('/') || p.contains('\\') || Path::new(&p).is_absolute() {
-        return Some(PathBuf::from(p));
-    }
-    super::checks::which(&p)
+    let found = if p.contains('/') || p.contains('\\') || Path::new(&p).is_absolute() {
+        PathBuf::from(p)
+    } else {
+        super::checks::which(&p)?
+    };
+    // a relative PATH entry would resolve against the working directory (the checkout)
+    let found = std::path::absolute(&found).ok()?;
+    found.is_file().then_some(found)
 }
 
 /// How often a waiting environment gate tries its lock again: about every 2 s
@@ -3672,23 +3690,12 @@ pub fn final_gate_notes(store: &Store, t: &TaskRow) -> Result<Vec<String>> {
             }
         }
     }
-    match (xpp::compile_only(&cfg), passed.is_empty()) {
-        (true, true) => out.push(xpp::COMPILE_ONLY.to_string()),
-        (true, false) => out.push(format!(
-            "verify: compile + {} on {machine}",
-            passed.join(" + ")
-        )),
-        (false, false) => out.push(format!(
-            "verify: {} on {machine} (environment gate)",
-            passed.join(" + ")
-        )),
-        (false, true) => {}
-    }
-    for s in &skipped {
-        out.push(format!(
-            "{s} did not run on this machine (environment gate not defined here, if_missing: skip)"
-        ));
-    }
+    out.extend(verify_scope_notes(
+        xpp::compile_only(&cfg),
+        &passed,
+        &skipped,
+        &machine,
+    ));
     // M11-E3: the environments this task's checkpoints were deployed to
     let i = t.id.clone();
     let deployed = store.call(move |tx| {
@@ -3728,6 +3735,37 @@ pub fn final_gate_notes(store: &Store, t: &TaskRow) -> Result<Vec<String>> {
         }
     }
     Ok(out)
+}
+
+/// What verify proved, for the final gate (R59, M11-E3): `COMPILE_ONLY` for an X++ compile
+/// without environment gates; `verify: compile + dbsync on <machine>` when environment gates
+/// passed after it; `verify: dbsync on <machine> (environment gate)` without X++; one note per
+/// skipped environment gate.
+fn verify_scope_notes(
+    compile_only: bool,
+    passed: &[String],
+    skipped: &[String],
+    machine: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    match (compile_only, passed.is_empty()) {
+        (true, true) => out.push(xpp::COMPILE_ONLY.to_string()),
+        (true, false) => out.push(format!(
+            "verify: compile + {} on {machine}",
+            passed.join(" + ")
+        )),
+        (false, false) => out.push(format!(
+            "verify: {} on {machine} (environment gate)",
+            passed.join(" + ")
+        )),
+        (false, true) => {}
+    }
+    for s in skipped {
+        out.push(format!(
+            "{s} did not run on this machine (environment gate not defined here, if_missing: skip)"
+        ));
+    }
+    out
 }
 
 /// The profiles of the implement and fix attempts that succeeded — after a fallback, the one
@@ -4327,6 +4365,29 @@ mod tests {
         for (plan, want) in cases {
             assert_eq!(plan_files(&plan), want, "{plan}");
         }
+    }
+
+    /// M11-E3: the final gate's verify wording — `COMPILE_ONLY` replaced once an environment
+    /// gate passed after an X++ compile, kept when none ran; skipped gates noted.
+    #[test]
+    fn the_verify_scope_at_the_final_gate() {
+        let none: Vec<String> = vec![];
+        assert_eq!(
+            verify_scope_notes(true, &none, &none, "UDE-1"),
+            [xpp::COMPILE_ONLY]
+        );
+        assert_eq!(
+            verify_scope_notes(true, &strings(&["dbsync"]), &none, "UDE-1"),
+            ["verify: compile + dbsync on UDE-1"]
+        );
+        assert_eq!(
+            verify_scope_notes(false, &strings(&["dbsync", "deploy"]), &none, "UDE-1"),
+            ["verify: dbsync + deploy on UDE-1 (environment gate)"]
+        );
+        assert!(verify_scope_notes(false, &none, &none, "x").is_empty());
+        let n = verify_scope_notes(true, &none, &strings(&["dbsync"]), "x");
+        assert_eq!(n[0], xpp::COMPILE_ONLY);
+        assert!(n[1].starts_with("dbsync did not run on this machine"));
     }
 
     /// M11-C2: the plan-time feedback and the fix note name the fence rule of each path; with

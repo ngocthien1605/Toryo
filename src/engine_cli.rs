@@ -633,6 +633,8 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     std::fs::write(&a, pretty(&old_text)?)?;
     std::fs::write(&b, pretty(&new_text)?)?;
     let g = task::task_git(&new, &t.repo)?; // R37 admission under the new machine config
+                                            // M18 (group E review): a reloaded gate script must be in the base commit too
+    task::check_entry_points(&new, &g, &t.repo, &t.base_commit)?;
     let out = g.output(
         &toryo::git::Loc::Discover(dir.clone()),
         true,
@@ -667,6 +669,8 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
         != serde_json::to_value(&new.repo.commands.verify)?
         || serde_json::to_value(&old.repo.verify)? != serde_json::to_value(&new.repo.verify)?
         || old.machine_verify != new.machine_verify // M11-A2
+        // M11 (group E review): the gates, their machine commands, the role files
+        || serde_json::to_value(&old.team)? != serde_json::to_value(&new.team)?
         || toryo::engine::xpp::build_toolchain(&old) != toryo::engine::xpp::build_toolchain(&new); // R59
     let reverify = verify_changed && artifacts::head(&st, &t, "verify-result")?.is_some();
     let invalidated = serde_json::to_vec_pretty(
@@ -1203,8 +1207,9 @@ pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
         if f.compile_only == Some(true) {
             println!("               {}", toryo::engine::xpp::COMPILE_ONLY);
         }
-        // M11-E3: an environment gate waiting for its machine-wide lock
-        if t.state == PipelineState::Verifying {
+        // M11-E3: an environment gate waiting for its machine-wide lock (only while its run is
+        // alive: a crash while waiting leaves the row behind — group E review)
+        if t.state == PipelineState::Verifying && f.active_owner.is_some() {
             let i = t.id.clone();
             if let Some(lock) = st.read(move |tx| store::env_wait(tx, &i))? {
                 let holder = st

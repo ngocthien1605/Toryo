@@ -710,3 +710,105 @@ fn a_crash_during_the_environment_gate_is_recovered_by_resume() {
     let d = deployments(&env);
     assert_eq!(d[0].ok, Some(true));
 }
+
+/// Group E review: an environment gate this machine cannot run — an unresolved `secret_env`,
+/// a program that does not exist — escalates with `environment_gate_unavailable` and leaves
+/// the deployment record alone.
+#[test]
+fn an_environment_gate_that_cannot_run_escalates() {
+    for (id, extra, program) in [
+        (
+            "UN-1",
+            "    secret_env: { K: 'env:TORYO_M11_NEVER_SET_SECRET' }\n",
+            None,
+        ),
+        (
+            "UN-2",
+            "",
+            Some(if cfg!(windows) {
+                "'C:/no/such/sync.exe'"
+            } else {
+                "'/no/such/sync'"
+            }),
+        ),
+    ] {
+        let env = env_gate_setup("codex-openai", "error", "");
+        let mut g = machine_gate(&env, "dbsync", "d365-env", "exit 0\n", "exit 0\n", extra);
+        if let Some(p) = program {
+            let line = g
+                .lines()
+                .find(|l| l.contains("program:"))
+                .unwrap()
+                .to_string();
+            g = g.replace(&line, &format!("    program: {p}"));
+            g = g.replace(
+                &g.lines().find(|l| l.contains("args:")).unwrap().to_string(),
+                "    args: []",
+            );
+        }
+        define_gates(&env, &g);
+        create(&env, id);
+        let s = script(
+            &env,
+            &format!("{id}.json"),
+            json!({
+                "planner": [turn(vec![plan()])],
+                "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            }),
+        );
+        let (_, err) = toryo(&env, &["run", id, "--yes", "--fake-agents", &s], &[]);
+        assert_eq!(task(&env, id).state, St::Escalated, "{id}: {err}");
+        assert!(
+            err.contains("environment_gate_unavailable: environment gate `dbsync`"),
+            "{id}: {err}"
+        );
+        let ev = events(&env, id);
+        assert!(
+            ev.iter()
+                .any(|e| e["type"] == "escalated"
+                    && e["reason_class"] == "environment_gate_unavailable"),
+            "{id}: {ev:?}"
+        );
+        assert!(deployments(&env).is_empty(), "{id}: nothing ran");
+    }
+}
+
+/// Group E review: `toryo stop` while an environment gate runs — the gate is killed, the
+/// attempt is interrupted, and the record shows an interrupted deploy (`ok` empty).
+#[test]
+fn a_stop_during_an_environment_gate_interrupts_it() {
+    let env = env_gate_setup("codex-openai", "error", "");
+    let (ps1, sh) = waiting_gate(&env, "never");
+    define_gates(
+        &env,
+        &machine_gate(&env, "dbsync", "d365-env", &ps1, &sh, ""),
+    );
+    let s = script(
+        &env,
+        "st.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+        }),
+    );
+    to_implementing(&env, "ST-1", &s);
+    let mut run = spawn_run(
+        &env,
+        &["run", "ST-1", "--yes", "--fake-agents", &s],
+        "st.log",
+    );
+    wait_until("the gate runs", 60, || {
+        deployments(&env).iter().any(|d| d.task == "ST-1")
+    });
+    let (code, err) = toryo(&env, &["stop", "ST-1", "--wait-secs", "30"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(run.wait().unwrap().success());
+    assert_eq!(task(&env, "ST-1").state, St::Verifying);
+    let d = deployments(&env);
+    assert!(d[0].finished_at.is_some() && d[0].ok.is_none(), "{d:?}");
+    assert!(
+        status_out(&env, "ST-1").contains("(interrupted"),
+        "{}",
+        status_out(&env, "ST-1")
+    );
+}

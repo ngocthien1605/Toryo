@@ -78,6 +78,40 @@ pub fn new_machine(cfg: &Effective, cli_max: Option<u32>) -> Result<Machine> {
     }
 }
 
+/// M18 admission: every repository program and script of a verify command (a check gate,
+/// [`super::checks::verify_entry_points`]) is in the commit `base` — one the task created could
+/// be written by the implementer before verify runs it. At `task create` and at `task config
+/// --reload` (group E review).
+pub fn check_entry_points(cfg: &Effective, g: &GitCmd, repo: &Path, base: &str) -> Result<()> {
+    let cmds = super::checks::verify_commands(cfg, repo).unwrap_or_default();
+    let entry = super::checks::verify_entry_points(&cmds, repo);
+    if entry.is_empty() {
+        return Ok(());
+    }
+    let repol = Loc::Discover(repo.to_path_buf());
+    let listing = g.run(&repol, true, &["ls-tree", "-r", "-z", "--name-only", base])?;
+    let tree: std::collections::HashSet<String> = listing
+        .split(|b| *b == 0)
+        .filter(|f| !f.is_empty())
+        .map(|f| String::from_utf8_lossy(f).to_lowercase())
+        .collect();
+    let what = if cfg.team.is_some() {
+        "gate"
+    } else {
+        "verify command"
+    };
+    for (name, path) in entry {
+        if !tree.contains(&path.to_lowercase()) {
+            bail!(
+                "verify_script_missing: {what} `{name}` runs `{path}`, which is not in the base commit {} of {} — commit it before creating the task (M18: a verify script the task itself creates could be written by the implementer)",
+                crate::git::short(base),
+                repo.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Git for this task's repository, with the R37 filter plan admitted.
 pub fn task_git(cfg: &Effective, repo: &Path) -> Result<GitCmd> {
     let mut g = default_gitcmd()?;
@@ -156,33 +190,7 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         true,
         &["rev-parse", &format!("{base_ref}^{{commit}}")],
     )?;
-    // M18 admission: every repository program and `-File` script of a verify command (a
-    // check gate) is in the base commit — one the task created could be written by the
-    // implementer before verify runs it
-    let cmds = super::checks::verify_commands(cfg, &repo).unwrap_or_default();
-    let entry = super::checks::verify_entry_points(&cmds, &repo);
-    if !entry.is_empty() {
-        let listing = g.run(&repol, true, &["ls-tree", "-r", "-z", "--name-only", &base])?;
-        let tree: std::collections::HashSet<String> = listing
-            .split(|b| *b == 0)
-            .filter(|f| !f.is_empty())
-            .map(|f| String::from_utf8_lossy(f).to_lowercase())
-            .collect();
-        let what = if cfg.team.is_some() {
-            "gate"
-        } else {
-            "verify command"
-        };
-        for (name, path) in entry {
-            if !tree.contains(&path.to_lowercase()) {
-                bail!(
-                    "verify_script_missing: {what} `{name}` runs `{path}`, which is not in the base commit {} of {} — commit it before creating the task (M18: a verify script the task itself creates could be written by the implementer)",
-                    crate::git::short(&base),
-                    repo.display()
-                );
-            }
-        }
-    }
+    check_entry_points(cfg, &g, &repo, &base)?;
     // R59 admission: its metadata folder and (protected) build projects are in the base commit
     if super::xpp::compile_only(cfg) {
         let listing = g.run(&repol, true, &["ls-tree", "-r", "-z", "--name-only", &base])?;

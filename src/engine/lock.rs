@@ -203,9 +203,14 @@ impl Drop for StopWatch {
     }
 }
 
-/// M11-E3: the file of an environment gate's machine-wide lock, `<data_dir>/locks/env-<lock>.lock`.
+/// M11-E3: the file of an environment gate's machine-wide lock,
+/// `<data_dir>/locks/env/<lock>.lock` — a folder of its own, so no task id (`locks/<task>.lock`)
+/// can name the same file (group E review). Lower case: Windows file names ignore case.
 pub fn env_lock_path(lock: &str) -> PathBuf {
-    data_dir().join("locks").join(format!("env-{lock}.lock"))
+    data_dir()
+        .join("locks")
+        .join("env")
+        .join(format!("{}.lock", lock.to_ascii_lowercase()))
 }
 
 /// An environment-gate lock name is part of a file name: letters, digits, `-`, `_`, `.`
@@ -338,4 +343,22 @@ pub fn stop(store: &Store, task: &str, wait: Duration) -> Result<StopOutcome> {
         }
     }
     Ok(StopOutcome::Pending)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Group E review: an environment lock never shares a file with a task lock (task ids
+    /// allow `-`, so `env-<lock>` could be one), and its name is folded to lower case.
+    #[test]
+    fn environment_locks_have_their_own_folder() {
+        assert_ne!(env_lock_path("d365-env"), lock_path("env-d365-env"));
+        assert_ne!(
+            env_lock_path("d365-env").parent(),
+            lock_path("env-d365-env").parent()
+        );
+        assert_eq!(env_lock_path("D365-Env"), env_lock_path("d365-env"));
+        assert!(env_lock_path("d365-env").ends_with("env/d365-env.lock"));
+    }
 }
