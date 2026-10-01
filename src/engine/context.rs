@@ -9,8 +9,11 @@
 //! 1. `%USERPROFILE%\.toryo\context\global.md` — personal rules.
 //! 2. Repo `AGENTS.md`, then `CLAUDE.md` — **Claude only**: Codex reads `AGENTS.md` natively
 //!    (R20), so the loader omits source 2 for Codex.
-//! 3. Repo `.toryo/context/*.md`, sorted by name — project policy, **never trimmed**.
-//! 4. Role template: repo `.toryo/roles/<role>.md`, else the embedded one — never trimmed.
+//! 3. Repo `.toryo/context/*.md`, sorted by name — project policy, **never trimmed**; in org
+//!    chart mode (M11-C1) then the team's `culture` file.
+//! 4. Role template: repo `.toryo/roles/<role>.md`, else the embedded one — never trimmed. In
+//!    org chart mode the embedded template always, then the role's `instructions.md` under
+//!    `Role instructions (team)`: a repository adds to the built-in rules, never removes them.
 //! 5. Task pack (run store). (R61) Only the **trusted** files — the `TASK.md` snapshot and the
 //!    approved `PLAN.md` — may be inlined (under 8 KB). The **untrusted** ones (diffs, the verify
 //!    result, the review, `DECISIONS.md`) are always listed as paths, whatever their size: an
@@ -88,6 +91,18 @@ pub struct Request {
     /// are always inlined, untrusted ones become user-prompt data blocks (R61).
     pub no_run_store: bool,
     pub budget: usize,
+    /// M11-C1: org chart mode — the team's culture and the role's instructions.
+    pub team: Option<TeamContext>,
+}
+
+/// What org chart mode adds to sources 3 and 4 (M11-C1): files of the repository checkout,
+/// each as `(repo-relative path, absolute path)`, never trimmed, hashed.
+#[derive(Debug, Clone, Default)]
+pub struct TeamContext {
+    /// The org chart's `culture`, after `.toryo/context/*.md`.
+    pub culture: Option<(String, PathBuf)>,
+    /// The role file's `instructions`, after the embedded role template.
+    pub instructions: Option<(String, PathBuf)>,
 }
 
 /// One source as it went into the context.
@@ -259,13 +274,26 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
             &mut skipped,
         );
     }
+    // M11-C1: the team culture closes source 3 (org chart mode)
+    if let Some((rel, path)) = req.team.as_ref().and_then(|t| t.culture.as_ref()) {
+        add(
+            3,
+            &format!("culture ({rel})"),
+            path,
+            format!("Team culture ({rel})"),
+            None,
+            &mut skipped,
+        );
+    }
     let role = req.role.as_str();
     let custom = req
         .repo
         .join(".toryo")
         .join("roles")
         .join(format!("{role}.md"));
-    if custom.is_file() {
+    // org chart mode never replaces the embedded template (M11-C1): it carries the engine's
+    // rules — the output contract, no Git, untrusted data
+    if req.team.is_none() && custom.is_file() {
         add(
             4,
             &format!(".toryo/roles/{role}.md"),
@@ -289,6 +317,25 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
             truncated: false,
             untrusted: false,
         });
+    }
+    // M11-C1: the role's instructions.md is added after the built-in rules, never instead
+    if let Some((rel, path)) = req.team.as_ref().and_then(|t| t.instructions.as_ref()) {
+        match read(path) {
+            Some(body) => parts.push(Part {
+                n: 4,
+                label: rel.clone(),
+                path: path.clone(),
+                heading: "Role instructions (team)".into(),
+                original: body.len(),
+                sha256: sha256_hex(body.as_bytes()),
+                body,
+                rank: None,
+                path_only: false,
+                truncated: false,
+                untrusted: false,
+            }),
+            None => skipped.push(format!("4: {}", disp(path))),
+        }
     }
     let pack_start = parts.len();
     let mut data = Vec::new();
@@ -523,6 +570,17 @@ pub fn request(
         .get(role.as_str())
         .copied()
         .unwrap_or(DEFAULT_BUDGET_KB);
+    // M11-C1: org chart mode — from the repository checkout, like sources 2–4
+    let team = cfg.team.as_ref().map(|team| {
+        let at = |rel: &String| (rel.clone(), t.repo.join(rel));
+        TeamContext {
+            culture: team.culture.as_ref().map(at),
+            instructions: team
+                .role(role.as_str())
+                .and_then(|r| r.instructions.as_ref())
+                .map(at),
+        }
+    });
     Ok(Request {
         role,
         kind,
@@ -531,6 +589,7 @@ pub fn request(
         pack: task_pack(store, t, stage)?,
         no_run_store: role == Role::Implementer && kind == ProfileKind::Claude,
         budget: (kb as usize) * 1024,
+        team,
     })
 }
 
@@ -589,7 +648,118 @@ mod tests {
             pack: vec![],
             no_run_store: false,
             budget: 40 * 1024,
+            team: None,
         }
+    }
+
+    /// Org chart mode (M11-C1): a culture file and the role's instructions in the repository.
+    fn team_req(repo: &Path, kind: ProfileKind, role: Role) -> Request {
+        let r = role.as_str();
+        std::fs::write(repo.join("CULTURE.md"), "CULTURE-NORMS\n").unwrap();
+        let dir = repo.join(".toryo").join("roles").join(r);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("instructions.md"), format!("TEAM-{r}-RULES\n")).unwrap();
+        Request {
+            team: Some(TeamContext {
+                culture: Some(("CULTURE.md".into(), repo.join("CULTURE.md"))),
+                instructions: Some((
+                    format!(".toryo/roles/{r}/instructions.md"),
+                    dir.join("instructions.md"),
+                )),
+            }),
+            ..req(repo, kind, role)
+        }
+    }
+
+    /// M11-C1 AC-1: in org chart mode the embedded role template comes first — also when an
+    /// instructions file exists, and a legacy `.toryo/roles/<role>.md` is not read — then the
+    /// role's instructions, then the task pack; the culture closes source 3.
+    #[test]
+    fn org_chart_mode_layers_the_role_instructions_after_the_embedded_rules() {
+        for role in [Role::Planner, Role::Implementer, Role::Reviewer] {
+            let d = setup();
+            let r = role.as_str();
+            std::fs::create_dir_all(d.path().join(".toryo/roles")).unwrap();
+            std::fs::write(
+                d.path().join(format!(".toryo/roles/{r}.md")),
+                "LEGACY-OVERRIDE\n",
+            )
+            .unwrap();
+            std::fs::write(d.path().join("TASK.md"), "TASK-BODY\n").unwrap();
+            let mut q = team_req(d.path(), ProfileKind::Claude, role);
+            q.pack = vec![("TASK.md".into(), d.path().join("TASK.md"))];
+            let c = assemble(&q).unwrap();
+            let t = &c.text;
+            let pos = |x: &str| t.find(x).unwrap_or_else(|| panic!("{r}: {x} missing"));
+            let embedded = contracts::role(&format!("{r}.md")).replace("\r\n", "\n");
+            let first = embedded.lines().find(|l| !l.trim().is_empty()).unwrap();
+            assert!(pos("NAMING") < pos("# Team culture (CULTURE.md)"));
+            assert!(pos("CULTURE-NORMS") < pos(&format!("# Role: {r}")));
+            assert!(pos(&format!("# Role: {r}")) < pos(first.trim()));
+            assert!(pos(first.trim()) < pos("# Role instructions (team)"));
+            assert!(pos(&format!("TEAM-{r}-RULES")) < pos("TASK-BODY"));
+            assert!(
+                !t.contains("LEGACY-OVERRIDE"),
+                "{r}: the M4 file is not read"
+            );
+            let labels: Vec<(u8, &str)> = c
+                .sources
+                .iter()
+                .map(|s| (s.n, s.label.as_str()))
+                .filter(|(n, _)| *n >= 3)
+                .collect();
+            assert_eq!(
+                labels,
+                [
+                    (3, ".toryo/context/10-models.md"),
+                    (3, ".toryo/context/20-naming.md"),
+                    (3, "culture (CULTURE.md)"),
+                    (4, &format!("embedded {r}.md") as &str),
+                    (4, &format!(".toryo/roles/{r}/instructions.md") as &str),
+                    (5, "TASK.md"),
+                ],
+                "{r}"
+            );
+            // never trimmed, also under a tight budget
+            q.budget = 1024;
+            let c = assemble(&q).unwrap();
+            assert!(
+                c.text.contains("CULTURE-NORMS") && c.text.contains(&format!("TEAM-{r}-RULES"))
+            );
+        }
+    }
+
+    /// M11-C1 AC-2: the context hash changes when `instructions.md` or the culture changes
+    /// between two attempts.
+    #[test]
+    fn instructions_and_culture_are_hashed() {
+        let d = setup();
+        let q = team_req(d.path(), ProfileKind::Codex, Role::Implementer);
+        let a = assemble(&q).unwrap().sha256;
+        assert_eq!(assemble(&q).unwrap().sha256, a, "deterministic");
+        std::fs::write(
+            d.path().join(".toryo/roles/implementer/instructions.md"),
+            "TEAM-implementer-RULES v2\n",
+        )
+        .unwrap();
+        let b = assemble(&q).unwrap().sha256;
+        assert_ne!(a, b);
+        std::fs::write(d.path().join("CULTURE.md"), "CULTURE-NORMS v2\n").unwrap();
+        let c = assemble(&q).unwrap();
+        assert_ne!(c.sha256, b);
+        let src = c
+            .sources
+            .iter()
+            .find(|s| s.label == "culture (CULTURE.md)")
+            .unwrap();
+        assert_eq!(src.sha256, sha256_hex(b"CULTURE-NORMS v2\n"));
+        // a file named by the role file that is gone at attempt time is skipped and reported
+        std::fs::remove_file(d.path().join("CULTURE.md")).unwrap();
+        let c = assemble(&q).unwrap();
+        assert!(c
+            .skipped
+            .iter()
+            .any(|s| s.starts_with("3: ") && s.contains("CULTURE.md")));
     }
 
     fn setup() -> tempfile::TempDir {

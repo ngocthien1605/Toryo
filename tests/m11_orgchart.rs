@@ -120,6 +120,72 @@ fn a_fake_run_in_org_chart_mode_reaches_the_final_gate() {
     );
 }
 
+/// The fixture in org chart mode with a culture file and instructions for every seat.
+fn with_instructions() -> Env {
+    let org = ORGCHART.replace("IMPLEMENTER", "codex-openai").replace(
+        "team: calc-team\n",
+        "team: calc-team\nculture: ./CULTURE.md\n",
+    );
+    let mut files: Vec<(String, String)> = vec![
+        (".toryo/toryo-orgchart.yaml".into(), org),
+        (
+            "CULTURE.md".into(),
+            "CULTURE-NORMS: evidence first\n".into(),
+        ),
+    ];
+    for (seat, extra) in [
+        ("planner", ""),
+        ("implementer", "before_handoff: [divide-present]\n"),
+        ("reviewer", ""),
+    ] {
+        files.push((
+            format!(".toryo/roles/{seat}/toryo-role.yaml"),
+            format!("toryo: 1\npurpose: the {seat}\ninstructions: ./instructions.md\n{extra}"),
+        ));
+        files.push((
+            format!(".toryo/roles/{seat}/instructions.md"),
+            format!("TEAM-{seat}-RULES\n"),
+        ));
+    }
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    setup_orgchart("codex-openai", "", &refs)
+}
+
+/// M11-C1 AC-1: `toryo context show` for each role lists the embedded template, then the
+/// role's `instructions.md`, then the task pack; the embedded text is there too.
+#[test]
+fn context_show_layers_the_team_instructions_after_the_embedded_template() {
+    let env = with_instructions();
+    create(&env, "OC-2");
+    for (stage, role) in [
+        ("plan", "planner"),
+        ("implement", "implementer"),
+        ("review", "reviewer"),
+    ] {
+        let o = command(&env, &["context", "show", "OC-2", "--stage", stage], &[])
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let (text, err) = (
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr),
+        );
+        let at = |s: &str, x: &str| s.find(x).unwrap_or_else(|| panic!("{stage}: {x}\n{s}"));
+        assert!(at(&err, "culture (CULTURE.md)") < at(&err, &format!("embedded {role}.md")));
+        assert!(
+            at(&err, &format!("embedded {role}.md"))
+                < at(&err, &format!(".toryo/roles/{role}/instructions.md"))
+        );
+        assert!(at(&err, &format!(".toryo/roles/{role}/instructions.md")) < at(&err, "TASK.md"));
+        assert!(at(&text, &format!("# Role: {role}")) < at(&text, "# Role instructions (team)"));
+        assert!(at(&text, &format!("TEAM-{role}-RULES")) < at(&text, "# Task pack"));
+        assert!(text.contains("CULTURE-NORMS"));
+    }
+}
+
 /// M11-B2 AC-2: without `.toryo/toryo-orgchart.yaml`, `config show` says `toryo.yaml only`
 /// and lists no team.
 #[test]

@@ -11,7 +11,7 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
 - [x] B1 — types for the org chart, role files and the new machine keys
 - [x] B2 — loader: discover `.toryo/`, merge, freeze and hash; `toryo config show`
 - [x] B3 — validation pass: cross-references, kinds, order, "did you mean"
-- [ ] C1 — layered instructions and `culture` in the context loader
+- [x] C1 — layered instructions and `culture` in the context loader
 - [ ] C2 — the implementer's write fence (`writes` / `never`)
 - [ ] C3 — `checks.reviewer-differs-from-builder`: off / warn / error
 - [ ] C4 — split limits: `max_gate_retries`, `max_review_rounds`
@@ -202,6 +202,30 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   `before_handoff_names_order_and_owner`, `gate_kinds_and_their_fields`,
   `environment_gates_on_this_machine`, `culture_and_instructions_must_exist` (AC-1, one per rule),
   `three_problems_are_reported_at_once` (AC-2, four problems from three files in one error).
+
+## C — Roles
+
+### C1 — layered instructions and `culture` in the context loader
+
+- `context::Request.team: Option<TeamContext>` (org chart mode only, built by `context::request`
+  from the frozen `team` section): the culture file and the role's `instructions.md`, both in the
+  **repository checkout** (`tasks.repo`), like sources 2–4.
+- **Source 3** ends with the culture (`culture (CULTURE.md)`, heading `Team culture (…)`), never
+  trimmed. **Source 4** is two parts, both never trimmed and hashed: the embedded role template
+  (`contracts::role`) **always**, then `instructions.md` under `Role instructions (team)` (label
+  `.toryo/roles/<role>/instructions.md`). A repository adds to the built-in rules (output contract,
+  no Git, untrusted data) and can no longer remove them: in org chart mode a
+  `.toryo/roles/<role>.md` is never read (B2 refuses it at load; the loader ignores it at attempt
+  time too). **This closes the M4 gap** where a repository file replaced the embedded template —
+  legacy mode keeps that behaviour unchanged (`repo_role_template_overrides_the_embedded_one`
+  passes unchanged).
+- A culture or instructions file that is gone at attempt time is skipped and reported (`skipped`),
+  like the other sources; the task was validated at `task create`.
+- Org chart paths in messages use the platform separators (`team::org_chart_path`).
+- Tests: `context::tests::org_chart_mode_layers_the_role_instructions_after_the_embedded_rules`
+  (each role; the legacy file present and ignored; never trimmed under a 1 KB budget),
+  `instructions_and_culture_are_hashed` (AC-2), `tests/m11_orgchart.rs::
+  context_show_layers_the_team_instructions_after_the_embedded_template` (AC-1 through the CLI).
 
 ## Open
 

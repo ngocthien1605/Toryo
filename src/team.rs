@@ -373,12 +373,17 @@ impl Team {
     }
 }
 
+/// `<root>/.toryo/toryo-orgchart.yaml` with the platform's separators (for messages).
+pub fn org_chart_path(root: &Path) -> PathBuf {
+    root.join(".toryo").join("toryo-orgchart.yaml")
+}
+
 /// The repository root of org chart mode: `project.root` (expanded) when it holds
 /// `.toryo/toryo-orgchart.yaml`; `None` is `toryo.yaml`-only mode, byte for byte as in M10.
 /// `.toryo/` is read from the repository checkout, never from a task worktree (§7).
 pub fn org_chart_root(project_root: &str) -> Option<PathBuf> {
     let root = PathBuf::from(crate::config::expand_vars(project_root).ok()?);
-    root.join(ORGCHART).is_file().then_some(root)
+    org_chart_path(&root).is_file().then_some(root)
 }
 
 /// What org chart mode adds to a configuration (M11-B2).
@@ -435,7 +440,7 @@ pub fn load(
     machine: Option<&MachineConfig>,
 ) -> Result<Loaded> {
     use crate::config::untagged;
-    let org_path = root.join(ORGCHART);
+    let org_path = org_chart_path(root);
     let bytes =
         std::fs::read(&org_path).with_context(|| format!("reading {}", org_path.display()))?;
     let org: OrgChart = parse_repo_file(
@@ -810,7 +815,7 @@ pub fn problems(cfg: &Effective, root: &Path, machine: &str) -> Vec<String> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    let org = root.join(ORGCHART);
+    let org = org_chart_path(root);
     let org_at = |key: &str| format!("{}: {key}", org.display());
     let role_file = |seat: &str| root.join(".toryo").join("roles").join(seat).join(ROLE_FILE);
     // seat profiles (R60): named in the org chart, or by a machine seat override
