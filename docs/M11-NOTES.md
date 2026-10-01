@@ -12,7 +12,7 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
 - [x] B2 — loader: discover `.toryo/`, merge, freeze and hash; `toryo config show`
 - [x] B3 — validation pass: cross-references, kinds, order, "did you mean"
 - [x] C1 — layered instructions and `culture` in the context loader
-- [ ] C2 — the implementer's write fence (`writes` / `never`)
+- [x] C2 — the implementer's write fence (`writes` / `never`)
 - [ ] C3 — `checks.reviewer-differs-from-builder`: off / warn / error
 - [ ] C4 — split limits: `max_gate_retries`, `max_review_rounds`
 - [ ] E1 — check gates: mapping, gate variables, M18
@@ -258,6 +258,31 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   (each role; the legacy file present and ignored; never trimmed under a 1 KB budget),
   `instructions_and_culture_are_hashed` (AC-2), `tests/m11_orgchart.rs::
   context_show_layers_the_team_instructions_after_the_embedded_template` (AC-1 through the CLI).
+
+### C2 — the implementer's write fence (`writes` / `never`)
+
+- `checks::Protected` gains an optional fence (`with_fence(writes, never)`, built by
+  `runner::task_policy` from the frozen implementer role in org chart mode). `fence_rule(path)`:
+  `Never` when a `never` glob matches (never wins), `Outside` when `writes` lists anything and no
+  glob matches, `None` when the task's `## Allow protected` lists the path (it opens fence entries
+  like protected paths; `deny_paths` still cannot be opened). Same matcher as the other rules
+  (`glob_ci`: case-insensitive, `/` and `\` alike, `dir/**` also matches `dir`). `violates()` adds
+  the fence — it only **adds** violations — while `matches()` (the R35 snapshot) is unchanged.
+- **Decision:** an empty `writes` means "no allowlist" (only `never` applies), not "nothing may be
+  written" — a role file without `writes` must not fence everything.
+- **Plan time:** a `files_likely_involved` entry outside the fence joins the automatic re-plan
+  (`Ev::PlanPolicyViolation`, bounded by `MAX_PLAN_AUTO_REJECTIONS`); the feedback names each path
+  and its rule: ``"`docs/x.md` — outside the implementer's write fence (`writes: [src/**]`)"`` /
+  ``"… — a `never` path (`never: [**/Descriptor/*.xml]`)"``, then any protected or denied paths.
+- **After each build turn:** a changed path outside the fence is restored and sent back like a
+  denied path (one fix cycle, as M10); the fix note names the rule (``"`…/Model.xml` (touched a never
+  path (`never: [**/Descriptor/*.xml]`))"``). Crash recovery uses the same `violates()`.
+- When no fence rule is broken, the M10 texts (stderr and feedback) are used unchanged.
+- No fence for planner and reviewer (read-only already) and none in legacy mode.
+- Tests: `checks::tests::the_write_fence` (AC-3 case and `\`, AC-4 protected/denied inside
+  `writes`, allow-protected), `runner::tests::fence_feedback_names_the_rule`,
+  `tests/m11_roles.rs` — `a_plan_outside_the_write_fence_is_replanned` (AC-1),
+  `a_never_path_is_restored_unless_the_task_allows_it` (AC-2, also with `## Allow protected`).
 
 ## Open
 

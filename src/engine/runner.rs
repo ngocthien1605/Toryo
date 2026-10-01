@@ -124,6 +124,11 @@ pub fn task_policy(t: &TaskRow, cfg: &Effective) -> Result<(GitCmd, Protected, V
         &parse_allow_protected(&task_md),
         &cfg.repo.policy.deny_paths,
     );
+    // M11-C2: the implementer's write fence (org chart mode)
+    let p = match cfg.team.as_ref().and_then(|t| t.role("implementer")) {
+        Some(r) => p.with_fence(&r.writes, &r.never),
+        None => p,
+    };
     Ok((g, p, cmds))
 }
 
@@ -558,8 +563,17 @@ impl<'a> Engine<'a> {
             .filter(|f| self.protect.violates(f))
             .collect();
         if !bad.is_empty() {
-            eprintln!("!! the plan lists protected or denied paths {bad:?} — rejected automatically (plan-time policy)");
-            let fb = format!("Your plan lists protected or denied paths {bad:?} (toryo.yaml policy), which may not change. Create the plan again without touching them.");
+            let fb = match plan_fence_feedback(&bad, &self.protect) {
+                // M11-C2: the feedback names the fence rule each path breaks
+                Some(fb) => {
+                    eprintln!("!! the plan lists paths the implementer may not change {bad:?} — rejected automatically (plan-time policy, write fence)");
+                    fb
+                }
+                None => {
+                    eprintln!("!! the plan lists protected or denied paths {bad:?} — rejected automatically (plan-time policy)");
+                    format!("Your plan lists protected or denied paths {bad:?} (toryo.yaml policy), which may not change. Create the plan again without touching them.")
+                }
+            };
             self.end_and(
                 &a,
                 AttemptStatus::Succeeded,
@@ -839,9 +853,18 @@ impl<'a> Engine<'a> {
                 Ok(Flow::Next)
             }
             ImplementOutcome::PathPolicy { paths } => {
-                eprintln!("!! protected or denied paths changed: {paths:?} — restored, nothing committed; sent back to the implementer");
+                let fb = match change_fence_feedback(&paths, &self.protect) {
+                    // M11-C2: the fix note names the fence rule each path breaks
+                    Some(fb) => {
+                        eprintln!("!! paths the implementer may not change were changed: {paths:?} — restored, nothing committed; sent back to the implementer (write fence)");
+                        fb
+                    }
+                    None => {
+                        eprintln!("!! protected or denied paths changed: {paths:?} — restored, nothing committed; sent back to the implementer");
+                        format!("- POLICY: you changed protected or denied paths {paths:?}. They were restored. Do not modify them; achieve the task another way.")
+                    }
+                };
                 wt.restore(&paths)?;
-                let fb = format!("- POLICY: you changed protected or denied paths {paths:?}. They were restored. Do not modify them; achieve the task another way.");
                 self.end_and(
                     a,
                     AttemptStatus::Failed,
@@ -2234,6 +2257,57 @@ fn plan_files(plan: &Value) -> Vec<String> {
 }
 
 /// An Implementer turn as prepared before admission (R48, R49).
+/// M11-C2: the plan-time feedback when a planned path breaks the implementer's write fence —
+/// each such path with its rule, then any protected or denied ones; `None` when no path breaks
+/// the fence (the M10 message is used).
+fn plan_fence_feedback(bad: &[String], protect: &Protected) -> Option<String> {
+    let fenced: Vec<String> = bad
+        .iter()
+        .filter_map(|f| {
+            protect
+                .fence_rule(f)
+                .map(|r| format!("`{f}` — {}", r.plan_reason()))
+        })
+        .collect();
+    if fenced.is_empty() {
+        return None;
+    }
+    let others: Vec<&String> = bad
+        .iter()
+        .filter(|f| protect.fence_rule(f).is_none())
+        .collect();
+    let mut fb = format!(
+        "Your plan lists paths the implementer may not change: {}.",
+        fenced.join("; ")
+    );
+    if !others.is_empty() {
+        fb.push_str(&format!(
+            " It also lists protected or denied paths {others:?} (toryo.yaml policy)."
+        ));
+    }
+    fb.push_str(" Create the plan again without them.");
+    Some(fb)
+}
+
+/// M11-C2: the fix note when a changed path breaks the implementer's write fence — every
+/// restored path with its rule; `None` when none breaks the fence (the M10 note is used).
+fn change_fence_feedback(paths: &[String], protect: &Protected) -> Option<String> {
+    if paths.iter().all(|p| protect.fence_rule(p).is_none()) {
+        return None;
+    }
+    let list: Vec<String> = paths
+        .iter()
+        .map(|p| match protect.fence_rule(p) {
+            Some(r) => format!("`{p}` ({})", r.change_reason()),
+            None => format!("`{p}` (a protected or denied path)"),
+        })
+        .collect();
+    Some(format!(
+        "- POLICY: you changed paths you may not change: {}. They were restored. Do not modify them; achieve the task another way.",
+        list.join("; ")
+    ))
+}
+
 struct ImplementTurn {
     /// `implement` or `fix-N`.
     stage: String,
@@ -3915,6 +3989,52 @@ mod tests {
         for (plan, want) in cases {
             assert_eq!(plan_files(&plan), want, "{plan}");
         }
+    }
+
+    /// M11-C2: the plan-time feedback and the fix note name the fence rule of each path; with
+    /// no fence (or no fence violation) they are `None`, so the M10 texts are used.
+    #[test]
+    fn fence_feedback_names_the_rule() {
+        let p = Protected::new(vec![], &["Metadata/Locked/**".into()])
+            .with_policy(&[], &["**/ZZZ/**".into()])
+            .with_fence(
+                &strings(&["Metadata/**"]),
+                &strings(&["**/Descriptor/*.xml"]),
+            );
+        let bad = strings(&[
+            "docs/x.md",
+            "Metadata/Pkg/Model/Descriptor/Model.xml",
+            "Metadata/ZZZ/a.xml",
+        ]);
+        let fb = plan_fence_feedback(&bad, &p).unwrap();
+        assert!(
+            fb.contains(
+                "`docs/x.md` — outside the implementer's write fence (`writes: [Metadata/**]`)"
+            ),
+            "{fb}"
+        );
+        assert!(
+            fb.contains("`Metadata/Pkg/Model/Descriptor/Model.xml` — a `never` path (`never: [**/Descriptor/*.xml]`)"),
+            "{fb}"
+        );
+        assert!(
+            fb.contains("It also lists protected or denied paths [\"Metadata/ZZZ/a.xml\"]"),
+            "{fb}"
+        );
+        let note = change_fence_feedback(&bad, &p).unwrap();
+        assert!(
+            note.contains("`Metadata/Pkg/Model/Descriptor/Model.xml` (touched a never path (`never: [**/Descriptor/*.xml]`))")
+                && note.contains("`docs/x.md` (outside your write fence (`writes: [Metadata/**]`))")
+                && note.contains("`Metadata/ZZZ/a.xml` (a protected or denied path)")
+                && note.contains("They were restored."),
+            "{note}"
+        );
+        // no fence rule broken: the M10 messages
+        let denied = strings(&["Metadata/ZZZ/a.xml", "Metadata/Locked/x.md"]);
+        assert_eq!(plan_fence_feedback(&denied, &p), None);
+        assert_eq!(change_fence_feedback(&denied, &p), None);
+        let legacy = Protected::new(vec![], &[]);
+        assert_eq!(plan_fence_feedback(&strings(&["docs/x.md"]), &legacy), None);
     }
 
     // ── implement: prepare ──────────────────────────────────────────────────────────

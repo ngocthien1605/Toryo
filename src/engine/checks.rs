@@ -196,6 +196,44 @@ pub struct Protected {
     allowed: Vec<regex::Regex>,
     /// `policy.deny_paths` (§8): never changed, never planned (e.g. `**/ZZZ/**`).
     deny: Vec<regex::Regex>,
+    /// M11-C2: the implementer's write fence (org chart mode only).
+    fence: Option<Fence>,
+}
+
+/// The implementer's write fence (M11-C2): `writes` / `never` of its role file, as written
+/// (for the messages) and as case-insensitive matchers.
+struct Fence {
+    writes: Vec<regex::Regex>,
+    never: Vec<regex::Regex>,
+    writes_src: Vec<String>,
+    never_src: Vec<String>,
+}
+
+/// Which fence rule a path breaks (M11-C2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FenceRule {
+    /// Outside every `writes` glob.
+    Outside(String),
+    /// Inside a `never` glob (`never` wins over `writes`).
+    Never(String),
+}
+
+impl FenceRule {
+    /// For a plan that lists the path.
+    pub fn plan_reason(&self) -> String {
+        match self {
+            Self::Outside(w) => format!("outside the implementer's write fence (`writes: [{w}]`)"),
+            Self::Never(n) => format!("a `never` path (`never: [{n}]`)"),
+        }
+    }
+
+    /// For a change the implementer made.
+    pub fn change_reason(&self) -> String {
+        match self {
+            Self::Outside(w) => format!("outside your write fence (`writes: [{w}]`)"),
+            Self::Never(n) => format!("touched a never path (`never: [{n}]`)"),
+        }
+    }
 }
 
 /// `policy.protected_paths` entry for "every repo file referenced by `commands.verify[]`"
@@ -327,7 +365,43 @@ impl Protected {
                 .collect(),
             allowed: Vec::new(),
             deny: Vec::new(),
+            fence: None,
         }
+    }
+
+    /// M11-C2: the implementer's write fence — `writes` (an allowlist, when it lists anything)
+    /// and `never` (always wins over `writes`), case-insensitive, `/` and `\` alike. It only
+    /// adds violations: `policy.deny_paths` and the protected paths work exactly as before, and
+    /// the task's `## Allow protected` list opens fence entries like protected paths (R61: it is
+    /// human-written). Planner and reviewer get no fence (they are read-only).
+    pub fn with_fence(mut self, writes: &[String], never: &[String]) -> Self {
+        if writes.is_empty() && never.is_empty() {
+            return self;
+        }
+        self.fence = Some(Fence {
+            writes: writes.iter().map(|g| glob_ci(g)).collect(),
+            never: never.iter().map(|g| glob_ci(g)).collect(),
+            writes_src: writes.to_vec(),
+            never_src: never.to_vec(),
+        });
+        self
+    }
+
+    /// The fence rule a change to `path` breaks, or None (no fence, inside it, or allowed by
+    /// the task).
+    pub fn fence_rule(&self, path: &str) -> Option<FenceRule> {
+        let f = self.fence.as_ref()?;
+        if self.is_allowed(path) {
+            return None;
+        }
+        let p = norm_path(path);
+        if f.never.iter().any(|g| g.is_match(&p)) {
+            return Some(FenceRule::Never(f.never_src.join(", ")));
+        }
+        if !f.writes.is_empty() && !f.writes.iter().any(|g| g.is_match(&p)) {
+            return Some(FenceRule::Outside(f.writes_src.join(", ")));
+        }
+        None
     }
 
     /// Add the task's `## Allow protected` list and `policy.deny_paths`.
@@ -342,9 +416,10 @@ impl Protected {
         self.matches(path) && !self.is_allowed(path)
     }
 
-    /// A change here breaks the path policy: protected (and not allowed) or denied.
+    /// A change here breaks the path policy: protected (and not allowed), denied, or outside
+    /// the implementer's write fence (M11-C2).
     pub fn violates(&self, path: &str) -> bool {
-        self.is_protected(path) || self.is_denied(path)
+        self.is_protected(path) || self.is_denied(path) || self.fence_rule(path).is_some()
     }
 
     /// Listed under `## Allow protected` in TASK.md (case-insensitive, like the protection
@@ -734,6 +809,59 @@ mod tests {
             assert!(!p.is_denied(path), "{path}");
         }
         assert!(p.is_allowed("docs") && p.is_allowed("DOCS/a.md") && !p.is_allowed("docsx"));
+    }
+
+    /// M11-C2 AC-3/AC-4: the write fence — outside `writes` or inside `never` violates, `never`
+    /// wins, matched case-insensitively with `/` and `\` alike; `## Allow protected` opens it;
+    /// it only adds violations (a protected path inside `writes` stays protected, a denied one
+    /// stays denied even when allowed); nothing changes for `matches` (the R35 snapshot).
+    #[test]
+    fn the_write_fence() {
+        let p = Protected::new(vec![], &["Metadata/Pkg/Config/**".into()])
+            .with_policy(&[], &["**/ZZZ/**".into()])
+            .with_fence(&["Metadata/**".into()], &["**/Descriptor/*.xml".into()]);
+        for ok in [
+            "Metadata/Pkg/Model/AxClass/Foo.xml",
+            "metadata/pkg/model/axclass/foo.xml",
+            "Metadata\\Pkg\\Model\\AxClass\\Foo.xml",
+            "Metadata",
+        ] {
+            assert_eq!(p.fence_rule(ok), None, "{ok}");
+            assert!(!p.violates(ok), "{ok}");
+        }
+        for (bad, never) in [
+            ("docs/x.md", false),
+            ("README.md", false),
+            ("Metadata/Pkg/Model/Descriptor/Model.xml", true),
+            ("metadata/pkg/model/descriptor/model.XML", true),
+            ("Metadata\\Pkg\\Model\\Descriptor\\Model.xml", true),
+        ] {
+            let r = p.fence_rule(bad).unwrap_or_else(|| panic!("{bad}"));
+            assert_eq!(matches!(r, FenceRule::Never(_)), never, "{bad}: {r:?}");
+            assert!(p.violates(bad), "{bad}");
+            assert!(!p.matches(bad), "the fence is not a protected path: {bad}");
+        }
+        // AC-4: protected inside `writes` stays protected; denied stays denied
+        assert!(p.fence_rule("Metadata/Pkg/Config/x.xml").is_none());
+        assert!(p.violates("Metadata/Pkg/Config/x.xml"));
+        assert!(p.violates("Metadata/ZZZ/x.xml"));
+        // `## Allow protected` opens a fence entry, never a denied path
+        let allowed = Protected::new(vec![], &[])
+            .with_policy(
+                &[
+                    "Metadata/Pkg/Model/Descriptor/Model.xml".into(),
+                    "Metadata/ZZZ/x.xml".into(),
+                ],
+                &["**/ZZZ/**".into()],
+            )
+            .with_fence(&["Metadata/**".into()], &["**/Descriptor/*.xml".into()]);
+        assert!(!allowed.violates("Metadata/Pkg/Model/Descriptor/Model.xml"));
+        assert!(allowed.violates("Metadata/ZZZ/x.xml"));
+        // `never` alone fences nothing else; no fence at all: unchanged
+        let never_only = Protected::new(vec![], &[]).with_fence(&[], &["**/*.pfx".into()]);
+        assert!(!never_only.violates("docs/x.md") && never_only.violates("a/b.PFX"));
+        let none = Protected::new(vec![], &[]).with_fence(&[], &[]);
+        assert!(!none.violates("anything/at/all.txt"));
     }
 
     /// EC-07: a verify program that is a repo file is a verify file (protected, hashed);
