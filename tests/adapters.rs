@@ -326,6 +326,7 @@ async fn local_runner_captures_plain_text_and_exit() {
                 boundary: toryo::process::Boundary::None,
                 timeout: Duration::from_secs(20),
                 cancel: None,
+                redact: toryo::process::redact::Redactions::empty(),
             },
             None,
         )

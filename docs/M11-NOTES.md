@@ -33,7 +33,7 @@ commit per group (the "Group X review" sections below say what was fixed and wha
 | `a99e23e` | D3 — group D review: exact names, legacy plans, skipped skills | DONE |
 | (last) | F2 — README, HUONG-DAN §5.9, migration guide, this summary | DONE |
 
-**Checks** (§0.2) green before every commit on this machine: `cargo fmt --check`, both `clippy -D
+**Checks** (§0.2) green before every commit **on this Windows machine only** — the Linux test build did not compile (review blocker, fixed in R1), so F2 AC-2 was not met on Linux: `cargo fmt --check`, both `clippy -D
 warnings`, `cargo test --locked`. Tests: **519 passed, 0 failed, 6 ignored** (441 / 6 at `aa0be03`). New test
 files: `tests/m11_{trust,orgchart,roles,gates,env_gates,skills}.rs`; unit tests in `team.rs`, `config.rs`,
 `context.rs`, `checks.rs`, `state_tests.rs`, `views.rs`, `lock.rs`, `render.rs`, `runner.rs`. No real agent was run,
@@ -100,6 +100,49 @@ says.
    the checkout; never prompt; absolute tool paths). Start with a script that prints `$env:TORYO_SHA` and exits 0,
    then `toryo status` shows `d365-env holds <task> @ <sha>`.
 4. If a repository uses `verify.boundary: none`, add `verify: { min_boundary: none }` to the machine config.
+
+## Review fixes (2026-10-02)
+
+Task list: `M11-review-fixes.md` (review of 2026-10-02, built and run on Linux by the reviewer). Same branch
+`m11/orgchart`, from `4bfa291`. One commit per task.
+
+### Progress
+
+- [x] R1 — the test build compiles on Linux again
+- [ ] R2 — environment gates see exactly the checkpoint; neutral working directory
+- [ ] R3 — environment gate `program`/`args`: validate what runs
+- [ ] R4 — fence patterns that match nothing; the culture file is protected
+- [ ] R5 — a skill that cannot be delivered stops the turn; the budget check covers the whole chain
+- [ ] R6 — M18 script detection: no false refusals, no missed scripts
+- [ ] R7 — the same-vendor check counts every turn that ran
+- [ ] R8 — cheap Low fixes and test gaps
+
+### Decisions of the list (X1–X5) and the answers to "Open"
+
+- **X1** an environment gate's working directory is an empty folder agent code cannot write (R2); **X2** before
+  the first environment gate the checkout must be exactly the checkpoint, so an org chart with an environment
+  gate needs `verify.checkout: clean` (R2); **X3** `%VAR%` in an environment gate's `program`/`args` is expanded
+  once, at load (R3); **X4** `reviewer-differs-from-builder` counts every implementer turn that ran (R7); **X5**
+  the same-vendor note keeps `(Claude both)` (R7).
+- Answers to the M11 "Open" list: a pre-M11 task with `boundary: none` keeps it — accepted; the extra turn after
+  `same_vendor_review` — accepted; Unix process group of a killed toryo — accepted, note kept; a DLL from the
+  checkout — closed by X1; `task create --repo X` — refused in org chart mode unless X is `project.root` (R8);
+  `instructions:` outside the role folder — stays refused.
+
+### R1 — the test build compiles on Linux again
+
+- `tests/adapters.rs::local_runner_captures_plain_text_and_exit` (`#[cfg(unix)]`) built a `RunSpec` without the
+  `redact` field E2 added: `E0063` on Linux, invisible here because Windows compiles the test out.
+- §0.3 applied to every type and signature M11 changed (`RunSpec`, `PipelineEvent::PlanPolicyViolation`,
+  `context::Request`/`TeamContext`, `EngineEvent` + `VerifyCommand.kind`, `Machine`, `MachineConfig`,
+  `Checkout`, `Effective`, `CommandSpec`, `Origins`, `evidence::run_version`): read every `cfg(unix)` /
+  `cfg(not(windows))` / `cfg(all(unix, …))` block of `src/config.rs`, `src/engine/{artifacts,protect,snapshot,
+  runner_review_tests}.rs`, `src/engine_cli.rs`, `src/git/canary.rs`, `src/notify.rs`, `src/process/{mod,unix}.rs`,
+  `tests/{adapters,m10_notify,m10_views,m9_xpp,redaction,regress_agents,regress_engine,regress_policy,
+  spike_e2e}.rs`. That literal was the only one.
+- **Not compiled on Linux here**: WSL exists on this machine but has no cargo (nothing installed for this). The
+  reviewer's Linux run with this one line was clean (fmt, both clippy, 551 tests passed) — the first CI run
+  (`ubuntu-latest`) is the real check.
 
 ## Progress
 
