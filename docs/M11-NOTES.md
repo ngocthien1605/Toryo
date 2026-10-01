@@ -13,7 +13,7 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
 - [x] B3 — validation pass: cross-references, kinds, order, "did you mean"
 - [x] C1 — layered instructions and `culture` in the context loader
 - [x] C2 — the implementer's write fence (`writes` / `never`)
-- [ ] C3 — `checks.reviewer-differs-from-builder`: off / warn / error
+- [x] C3 — `checks.reviewer-differs-from-builder`: off / warn / error
 - [ ] C4 — split limits: `max_gate_retries`, `max_review_rounds`
 - [ ] E1 — check gates: mapping, gate variables, M18
 - [ ] E2 — verify output redacted with the task's secrets (M2)
@@ -283,6 +283,26 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   `writes`, allow-protected), `runner::tests::fence_feedback_names_the_rule`,
   `tests/m11_roles.rs` — `a_plan_outside_the_write_fence_is_replanned` (AC-1),
   `a_never_path_is_restored_unless_the_task_allows_it` (AC-2, also with `## Allow protected`).
+
+### C3 — `checks.reviewer-differs-from-builder`: off / warn / error
+
+- `runner::implementer_profiles(store, t)` — the profiles of the **succeeded** implement/fix
+  attempts (the profile that actually ran, after any fallback), factored out of
+  `final_gate_notes`; `same_vendor` compares their profile `kind` with the reviewer's.
+- `warn` (the default, and the only behaviour in legacy mode): today's "same vendor" note at the
+  final gate, byte-identical. `off`: no note. `error`: before a **review** turn starts (after the
+  EC-10 re-verify check, before admission and before the attempt begins), the task escalates with
+  the typed class `same_vendor_review` and a message naming both profiles and the ways out
+  (`approve --gate final --force` to review it yourself, or a reviewer of another kind via machine
+  `seats:` + `task config --reload`, then `resume --note`). `resume --note` works as for any
+  escalation (R5).
+- **Note:** after `resume --note` the implementer index is sticky (R49), so the next review is
+  refused again unless the reviewer seat changed — the message says so implicitly by offering the
+  two ways out. A "skip the check once" switch was not added.
+- Tests: `tests/m11_roles.rs::reviewer_differs_from_builder_off_warn_error` (AC-1: the
+  quota fallback codex-openai → claude-max with a claude-max reviewer; `events.jsonl` has the
+  `escalated` with `reason_class: same_vendor_review`; no review attempt) and
+  `different_vendors_pass_at_every_level` (AC-2).
 
 ## Open
 

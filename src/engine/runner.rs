@@ -52,6 +52,7 @@ use crate::domain::{ErrorClass, OpenSession, Role, StageOutcome, Tri, TurnInput,
 use crate::git::GitCmd;
 use crate::process::Boundary;
 use crate::runner::{CommandResult, CommandRunner, LocalRunner, RunSpec};
+use crate::team::Level;
 use crate::usage::{Accounting, Weights};
 
 #[derive(Debug, Clone, Default)]
@@ -1458,6 +1459,18 @@ impl<'a> Engine<'a> {
             eprintln!("!! checkpoint {} has no current passing verify result (e.g. the verify configuration was reloaded) — it is verified again before the review (R29)", short(&head));
             self.apply(Ev::Reverify)?;
             return Ok(Flow::Next);
+        }
+        // M11-C3: `reviewer-differs-from-builder: error` — no review turn by the vendor that
+        // built the checkpoint (the profile that actually ran, after any fallback)
+        if reviewer_check(&self.cfg) == Level::Error {
+            let imps = implementer_profiles(self.store, t)?;
+            let same = same_vendor(&self.cfg, &imps, &t.reviewer);
+            if !same.is_empty() {
+                let kind = both_kind(&self.cfg, &t.reviewer);
+                let reason = same_vendor_reason(&t.id, &same, &t.reviewer, &kind);
+                self.escalate(SAME_VENDOR, reason)?;
+                return Ok(Flow::Next);
+            }
         }
         // R48: a review of the same checkpoint that was interrupted (crash, stop) resumes the
         // Reviewer's session
@@ -3417,6 +3430,26 @@ pub fn final_gate_notes(store: &Store, t: &TaskRow) -> Result<Vec<String>> {
             ));
         }
     }
+    // M11-C3: `off` drops the note; `warn` (the default, and legacy mode) keeps it
+    if reviewer_check(&cfg) != Level::Off {
+        let imps = implementer_profiles(store, t)?;
+        let same = same_vendor(&cfg, &imps, &t.reviewer);
+        if !same.is_empty() {
+            out.push(format!(
+                "same vendor: {} implemented and {} reviewed ({}) — the review is less independent (R49); read the diff yourself",
+                same.join(", "),
+                t.reviewer,
+                both_kind(&cfg, &t.reviewer)
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// The profiles of the implement and fix attempts that succeeded — after a fallback, the one
+/// that actually built (R49) — in order, consecutive repeats once (M11-C3: the final-gate note
+/// and the pre-review check share it).
+pub fn implementer_profiles(store: &Store, t: &TaskRow) -> Result<Vec<String>> {
     let i = t.id.clone();
     let atts = store.call(move |tx| store::attempts(tx, &i))?;
     let mut imps: Vec<String> = atts
@@ -3429,21 +3462,43 @@ pub fn final_gate_notes(store: &Store, t: &TaskRow) -> Result<Vec<String>> {
         .filter_map(|a| a.profile.clone())
         .collect();
     imps.dedup();
-    let kind = |p: &str| cfg.profile(p).map(|x| x.kind).ok();
-    let same: Vec<&String> = imps
-        .iter()
-        .filter(|p| kind(p).is_some() && kind(p) == kind(&t.reviewer))
-        .collect();
-    if !same.is_empty() {
-        out.push(format!(
-            "same vendor: {} implemented and {} reviewed ({:?} both) — the review is less independent (R49); read the diff yourself",
-            same.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
-            t.reviewer,
-            kind(&t.reviewer).map(|k| format!("{k:?}")).unwrap_or_default()
-        ));
-    }
-    Ok(out)
+    Ok(imps)
 }
+
+/// The implementer profiles of `imps` whose `kind` (claude | codex) is the reviewer's.
+fn same_vendor<'a>(cfg: &Effective, imps: &'a [String], reviewer: &str) -> Vec<&'a str> {
+    let kind = |p: &str| cfg.profile(p).map(|x| x.kind).ok();
+    imps.iter()
+        .map(String::as_str)
+        .filter(|p| kind(p).is_some() && kind(p) == kind(reviewer))
+        .collect()
+}
+
+/// `Claude both` / `Codex both`, for the messages.
+fn both_kind(cfg: &Effective, reviewer: &str) -> String {
+    cfg.profile(reviewer)
+        .map(|p| format!("{:?} both", p.kind))
+        .unwrap_or_default()
+}
+
+/// `checks.reviewer-differs-from-builder` of the org chart (M11-C3); `warn` in legacy mode.
+fn reviewer_check(cfg: &Effective) -> Level {
+    cfg.team
+        .as_ref()
+        .map(|t| t.checks.reviewer_differs_from_builder)
+        .unwrap_or(Level::Warn)
+}
+
+/// The escalation reason of `reviewer-differs-from-builder: error` (M11-C3).
+fn same_vendor_reason(id: &str, same: &[&str], reviewer: &str, kind: &str) -> String {
+    format!(
+        "{SAME_VENDOR}: {} built this checkpoint and {reviewer} would review it ({kind}) — `checks.reviewer-differs-from-builder: error` in the org chart (R49). Review it yourself (`toryo approve {id} --gate final --force` opens the final gate without the AI review), or give the reviewer seat a profile of another kind (machine `seats:`), `toryo task config {id} --reload`, then `toryo resume {id} --note …`",
+        same.join(", ")
+    )
+}
+
+/// The escalation class of a same-vendor review refused before it starts (M11-C3).
+pub const SAME_VENDOR: &str = "same_vendor_review";
 
 fn review_feedback(review: &Value) -> String {
     let mut f = String::new();
