@@ -541,8 +541,14 @@ impl MachineConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        // M11-B3: an unknown key gets the friendly form with a "did you mean" hint
         let mut m: Self =
-            serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+            serde_yaml::from_str(&text).map_err(|e| {
+                match crate::team::friendly_serde(&e.to_string()) {
+                    Some(f) => anyhow::anyhow!("{}: {f}", path.display()),
+                    None => anyhow::Error::new(e).context(format!("parsing {}", path.display())),
+                }
+            })?;
         // M11: `seats:` is the new spelling of `roles:` — one of the two
         if !m.seats.is_empty() {
             if !m.roles.is_empty() {
@@ -736,7 +742,8 @@ impl Effective {
                 origins.gates.insert(name.clone(), o);
             }
         }
-        for (name, role) in &repo.roles {
+        // in org chart mode the validation pass reports unknown seat profiles with the others
+        for (name, role) in repo.roles.iter().filter(|_| team.is_none()) {
             for p in std::iter::once(&role.profile).chain(role.fallback.iter().flatten()) {
                 if !repo.profiles.contains_key(p) {
                     bail!(
@@ -777,10 +784,19 @@ impl Effective {
     /// [`Self::validate`] with the problems the org chart loader found (M11-B2), first.
     fn validate_with(&self, mut problems: Vec<String>) -> Result<()> {
         let hint = machine_config_hint(self.machine_path.as_deref());
-        problems.extend(self::problems(&self.repo, &self.toolchains, &hint));
+        problems.extend(self::problems(
+            &self.repo,
+            &self.toolchains,
+            &hint,
+            self.team.is_some(),
+        ));
         if let Some(b) = &self.machine_verify.min_boundary {
             let key = format!("verify.min_boundary (machine config {hint})");
             one_of(&mut problems, &key, b, VERIFY_BOUNDARIES);
+        }
+        // M11-B3: the org chart's cross-references, kinds and order
+        if let Some(root) = crate::team::org_chart_root(&self.repo.project.root) {
+            problems.extend(crate::team::problems(self, &root, &hint));
         }
         if self.team.is_some() {
             // M11-B2: a machine seat override cannot give the planner or reviewer a fallback
@@ -884,14 +900,18 @@ fn one_of(out: &mut Vec<String>, key: &str, value: &str, valid: &[&str]) {
 /// A problem for the key `section.name` unless `name` is one of `valid`.
 fn known_key(out: &mut Vec<String>, section: &str, name: &str, what: &str, valid: &[&str]) {
     if !valid.contains(&name) {
-        let valid = valid.join(", ");
-        out.push(format!("{section}.{name}: unknown {what} (valid: {valid})"));
+        // M11-B3: a "did you mean" hint when one valid key is close
+        let hint = crate::team::hint(name, valid);
+        out.push(format!(
+            "{section}.{name}: unknown {what} (valid: {}){hint}",
+            valid.join(", ")
+        ));
     }
 }
 
 /// Every semantic problem of a (merged) configuration, as `key: what is wrong`. `machine` names
 /// the machine config for the messages that send the reader there.
-fn problems(repo: &RepoConfig, toolchains: &Toolchains, machine: &str) -> Vec<String> {
+fn problems(repo: &RepoConfig, toolchains: &Toolchains, machine: &str, team: bool) -> Vec<String> {
     let mut out = Vec::new();
     let roles = role_names();
     for name in repo.roles.keys() {
@@ -933,7 +953,10 @@ fn problems(repo: &RepoConfig, toolchains: &Toolchains, machine: &str) -> Vec<St
         }
     }
     for (i, c) in repo.commands.verify.iter().enumerate() {
-        let key = format!("commands.verify[{i}]");
+        if team {
+            break; // M11-B3: the check gates, checked as `gates.<name>` by `team::problems`
+        }
+        let key = format!("commands.verify[{i}] ({})", c.name);
         verify_command_problems(&mut out, &key, c, toolchains, machine);
     }
     if let Some(x) = &toolchains.xpp {
@@ -954,14 +977,14 @@ fn problems(repo: &RepoConfig, toolchains: &Toolchains, machine: &str) -> Vec<St
 /// The problems of one `commands.verify[]` item (R59): exactly one of `program` and `tool`;
 /// `tool` is `xpp`; `tool: xpp` has `metadata` and projects, as relative paths inside the
 /// repository, and needs `toolchains.xpp` in the machine config.
-fn verify_command_problems(
+pub(crate) fn verify_command_problems(
     out: &mut Vec<String>,
     key: &str,
     c: &CommandSpec,
     toolchains: &Toolchains,
     machine: &str,
 ) {
-    let key = format!("{key} ({})", c.name);
+    let key = key.to_string();
     let Some(tool) = &c.tool else {
         if c.program.is_none() {
             out.push(format!("{key}: needs `program` (with `args`) or `tool`"));

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{CommandSpec, EnvGate, MachineConfig, Role};
+use crate::config::{CommandSpec, Effective, EnvGate, MachineConfig, Origin, Role};
 
 /// The org chart, relative to the repository root.
 pub const ORGCHART: &str = ".toryo/toryo-orgchart.yaml";
@@ -275,7 +275,11 @@ pub fn parse_repo_file<T: serde::de::DeserializeOwned>(
             .collect();
         bail!("{}:\n  - {}", file.display(), lines.join("\n  - "));
     }
-    serde_yaml::from_value(doc).with_context(|| format!("parsing {}", file.display()))
+    // the typed parse of the text keeps serde's key path and line for the friendly message
+    serde_yaml::from_str(text).map_err(|e| match friendly_serde(&e.to_string()) {
+        Some(f) => anyhow::anyhow!("{}: {f}", file.display()),
+        None => anyhow::Error::new(e).context(format!("parsing {}", file.display())),
+    })
 }
 
 // ── B2: org chart mode — load, merge, freeze ─────────────────────────────────────────
@@ -607,6 +611,358 @@ pub fn load(
     })
 }
 
+// ── B3: the validation pass ──────────────────────────────────────────────────────────
+
+/// The edit distance between `a` and `b` (Levenshtein, on chars).
+pub fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != *cb);
+            cur[j + 1] = sub.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// The one candidate `name` was probably meant to be: a case-insensitive match, else the
+/// single candidate within edit distance 2. `None` when nothing is close or two candidates
+/// are equally close.
+pub fn did_you_mean<'a>(name: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let lower = name.to_lowercase();
+    let ci: Vec<&str> = candidates
+        .iter()
+        .copied()
+        .filter(|c| c.to_lowercase() == lower)
+        .collect();
+    if ci.len() == 1 {
+        return Some(ci[0]);
+    }
+    let mut best: Option<(usize, &str)> = None;
+    let mut tie = false;
+    for c in candidates {
+        let d = edit_distance(&lower, &c.to_lowercase());
+        if d > 2 {
+            continue;
+        }
+        match best {
+            Some((bd, _)) if d > bd => {}
+            Some((bd, _)) if d == bd => tie = true,
+            _ => {
+                best = Some((d, c));
+                tie = false;
+            }
+        }
+    }
+    best.filter(|_| !tie).map(|(_, c)| c)
+}
+
+/// ` Did you mean 'x'?` when [`did_you_mean`] finds one, else empty.
+pub fn hint(name: &str, candidates: &[&str]) -> String {
+    did_you_mean(name, candidates)
+        .map(|c| format!(" Did you mean '{c}'?"))
+        .unwrap_or_default()
+}
+
+/// serde's `unknown field` / `missing field` errors in the friendly form, with the key path
+/// and a "did you mean" hint: `seats: unknown field `reviwer`, expected one of …` →
+/// `seats.reviwer: seat 'reviwer' not found. Did you mean 'reviewer'? (the seats are …)`.
+/// `None` for any other error.
+pub fn friendly_serde(msg: &str) -> Option<String> {
+    static UNKNOWN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^(?:(?P<path>[^ ]+): )?unknown field `(?P<f>[^`]+)`, expected (?P<list>.*?)(?: at line (?P<line>\d+) column \d+)?$").expect("regex")
+    });
+    static MISSING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^(?:(?P<path>[^ ]+): )?missing field `(?P<f>[^`]+)`(?: at line (?P<line>\d+) column \d+)?$").expect("regex")
+    });
+    let line = |c: &regex::Captures| {
+        c.name("line")
+            .map(|l| format!(" (line {})", l.as_str()))
+            .unwrap_or_default()
+    };
+    if let Some(c) = UNKNOWN.captures(msg) {
+        let f = &c["f"];
+        let list: Vec<&str> = c["list"].split('`').skip(1).step_by(2).collect();
+        let path = c.name("path").map(|p| p.as_str());
+        let key = match path {
+            Some(p) => format!("{p}.{f}"),
+            None => f.to_string(),
+        };
+        let valid = list.join(", ");
+        let what = if path == Some("seats") {
+            format!("seat '{f}' not found.{} (the seats are {valid}; the flow is fixed: plan → build → review)", hint(f, &list))
+        } else {
+            format!("unknown key '{f}'.{} (valid: {valid})", hint(f, &list))
+        };
+        return Some(format!("{key}: {what}{}", line(&c)));
+    }
+    if let Some(c) = MISSING.captures(msg) {
+        let f = &c["f"];
+        let path = c.name("path").map(|p| p.as_str());
+        if path == Some("seats") {
+            return Some(format!(
+                "seats: seat '{f}' is missing — exactly three seats: planner, implementer, reviewer{}",
+                line(&c)
+            ));
+        }
+        let key = path
+            .map(|p| format!("{p}.{f}"))
+            .unwrap_or_else(|| f.to_string());
+        return Some(format!("{key}: required{}", line(&c)));
+    }
+    None
+}
+
+/// An argument that names a file: not a flag, and with a path separator or a script or
+/// program extension.
+fn path_like(a: &str) -> bool {
+    let lower = a.to_ascii_lowercase();
+    !a.starts_with('-')
+        && (a.contains('/')
+            || a.contains('\\')
+            || [".ps1", ".psm1", ".cmd", ".bat", ".sh", ".exe", ".py", ".js"]
+                .iter()
+                .any(|x| lower.ends_with(x)))
+}
+
+/// `p` is `root` or inside it (separators and case folded).
+fn inside(p: &str, root: &Path) -> bool {
+    let n = |s: &str| s.replace('\\', "/").trim_end_matches('/').to_lowercase();
+    let (p, r) = (n(p), n(&root.display().to_string()));
+    !r.is_empty() && (p == r || p.starts_with(&format!("{r}/")))
+}
+
+/// The problems of a machine `EnvGate` (B3): a lock; a program that is absolute or a PATH
+/// name; every path-like argument absolute and out of the agents' reach — not inside the
+/// repository, the task worktrees or the verify root.
+fn env_gate_problems(
+    out: &mut Vec<String>,
+    name: &str,
+    g: &EnvGate,
+    cfg: &Effective,
+    machine: &str,
+) {
+    let key = format!("{machine}: environment_gates.{name}");
+    if g.lock.trim().is_empty() {
+        out.push(format!(
+            "{key}.lock: required — the machine-wide lock name (e.g. d365-env): one environment gate per lock runs at a time"
+        ));
+    }
+    let expand = |s: &str| crate::config::expand_vars(s).map(PathBuf::from).ok();
+    let roots: Vec<(&str, PathBuf)> = [
+        ("the repository", expand(&cfg.repo.project.root)),
+        (
+            "the task worktrees",
+            expand(&cfg.repo.project.worktrees_root),
+        ),
+        (
+            "the verify root",
+            Some(crate::engine::verify::verify_root(cfg)),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(w, p)| p.map(|p| (w, p)))
+    .collect();
+    let reach = |p: &str| roots.iter().find(|(_, r)| inside(p, r));
+    let program = crate::config::expand_vars(&g.program).unwrap_or_else(|_| g.program.clone());
+    if program.contains('/') || program.contains('\\') {
+        if !Path::new(&program).is_absolute() {
+            out.push(format!(
+                "{key}.program: `{}` must be an absolute path or a bare name found on PATH",
+                g.program
+            ));
+        } else if let Some((what, r)) = reach(&program) {
+            out.push(format!(
+                "{key}.program: `{}` is inside {what} ({}) — an agent could change it; keep it outside the repository, the task worktrees and the verify root",
+                g.program,
+                r.display()
+            ));
+        }
+    }
+    for a in &g.args {
+        if !path_like(a) {
+            continue;
+        }
+        let x = crate::config::expand_vars(a).unwrap_or_else(|_| a.clone());
+        if !Path::new(&x).is_absolute() {
+            out.push(format!(
+                "{key}.args: `{a}` must be an absolute path — the script must be out of the agents' reach (not in the repository, a task worktree or the verify root)"
+            ));
+        } else if let Some((what, r)) = reach(&x) {
+            out.push(format!(
+                "{key}.args: `{a}` is inside {what} ({}) — an agent could change it; keep the script outside the repository, the task worktrees and the verify root",
+                r.display()
+            ));
+        }
+    }
+}
+
+/// Every cross-reference and kind problem of org chart mode (M11-B3), all at once, each with
+/// its file and key path: role files and their instructions, seat profiles (R60), gate kinds
+/// and fields, the implementer's `before_handoff` (declared gates, checks before
+/// environments), the machine's environment gates, the culture file. `root`: the repository
+/// checkout; `machine`: how to name the machine config.
+pub fn problems(cfg: &Effective, root: &Path, machine: &str) -> Vec<String> {
+    let Some(team) = &cfg.team else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let org = root.join(ORGCHART);
+    let org_at = |key: &str| format!("{}: {key}", org.display());
+    let role_file = |seat: &str| root.join(".toryo").join("roles").join(seat).join(ROLE_FILE);
+    // seat profiles (R60): named in the org chart, or by a machine seat override
+    let profiles: Vec<&str> = cfg.repo.profiles.keys().map(String::as_str).collect();
+    for seat in SEATS {
+        let Some(r) = cfg.repo.roles.get(seat) else {
+            continue;
+        };
+        let from_repo = cfg.origins.roles.get(seat) == Some(&Origin::Repo);
+        let place = |k: &str| {
+            if from_repo {
+                org_at(&format!("seats.{seat}.{k}"))
+            } else {
+                format!("{machine}: seats.{seat}.{k}")
+            }
+        };
+        let names = std::iter::once(("profile", &r.profile))
+            .chain(r.fallback.iter().flatten().map(|f| ("fallback", f)));
+        for (k, p) in names {
+            if !cfg.repo.profiles.contains_key(p) {
+                out.push(format!(
+                    "{}: profile '{p}' is not defined in the machine config ({machine}) under `profiles:` — profiles live only there (R60).{}",
+                    place(k),
+                    hint(p, &profiles)
+                ));
+            }
+        }
+    }
+    // the role files: their instructions; the implementer-only keys
+    for seat in SEATS {
+        let Some(r) = team.role(seat) else {
+            continue;
+        };
+        let rf = role_file(seat);
+        if let Some(i) = &r.instructions {
+            match crate::config::not_a_repo_path(i) {
+                Some(why) => out.push(format!("{}: instructions: `{i}` {why}", rf.display())),
+                None if !root.join(i).is_file() => out.push(format!(
+                    "{}: instructions: {} not found (the path is relative to the role folder)",
+                    rf.display(),
+                    root.join(i).display()
+                )),
+                None => {}
+            }
+        }
+        if seat != "implementer" {
+            for (k, set) in [
+                ("before_handoff", !r.before_handoff.is_empty()),
+                ("writes", !r.writes.is_empty()),
+                ("never", !r.never.is_empty()),
+            ] {
+                if set {
+                    out.push(format!(
+                        "{}: {k}: only the implementer may have `{k}` — the {seat} is read-only; remove it",
+                        rf.display()
+                    ));
+                }
+            }
+        }
+    }
+    // the gates: which fields each kind has; environment gates on this machine
+    for (name, g) in &team.gates {
+        let key = org_at(&format!("gates.{name}"));
+        let d = &g.decl;
+        match d.kind {
+            GateType::Check => {
+                let c = gate_command(name, d);
+                crate::config::verify_command_problems(
+                    &mut out,
+                    &key,
+                    &c,
+                    &cfg.toolchains,
+                    machine,
+                );
+                if d.if_missing.is_some() {
+                    out.push(format!(
+                        "{key}.if_missing: only for an environment gate — a check gate is defined in the repository and always runs"
+                    ));
+                }
+            }
+            GateType::Environment => {
+                for (k, set) in [
+                    ("program", d.program.is_some()),
+                    ("args", !d.args.is_empty()),
+                    ("tool", d.tool.is_some()),
+                    ("metadata", d.metadata.is_some()),
+                    ("projects", !d.projects.is_empty()),
+                ] {
+                    if set {
+                        out.push(format!(
+                            "{key}.{k}: an environment gate has no command in the repository — it runs with your full rights, so its command is `environment_gates.{name}` in the machine config ({machine}); remove `{k}`"
+                        ));
+                    }
+                }
+                match &g.machine {
+                    None if d.if_missing != Some(IfMissing::Skip) => out.push(format!(
+                        "{key}: environment gate '{name}' is not defined on this machine — add `environment_gates.{name}` to the machine config ({machine}), or set `if_missing: skip` to run without it here"
+                    )),
+                    None => {}
+                    Some(m) => env_gate_problems(&mut out, name, m, cfg, machine),
+                }
+            }
+        }
+    }
+    // the implementer's before_handoff: declared gates, every check before every environment
+    if let Some(imp) = team.role("implementer") {
+        let rf = role_file("implementer");
+        let names: Vec<&str> = team.gates.keys().map(String::as_str).collect();
+        if imp.before_handoff.is_empty() {
+            out.push(format!(
+                "{}: before_handoff: empty — at least one gate must pass before the work is handed to review (declare one under `gates:` of {})",
+                rf.display(),
+                org.display()
+            ));
+        }
+        let mut first_env: Option<&str> = None;
+        for n in &imp.before_handoff {
+            match team.gates.get(n) {
+                None => out.push(format!(
+                    "{}: before_handoff: gate '{n}' is not declared under `gates:` of {}.{}",
+                    rf.display(),
+                    org.display(),
+                    hint(n, &names)
+                )),
+                Some(g) if g.decl.kind == GateType::Environment => {
+                    first_env.get_or_insert(n);
+                }
+                Some(_) => {
+                    if let Some(e) = first_env {
+                        out.push(format!(
+                            "{}: before_handoff: check gate '{n}' comes after environment gate '{e}' — every check gate must come before every environment gate (never deploy code that does not compile)",
+                            rf.display()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(c) = &team.culture {
+        match crate::config::not_a_repo_path(c) {
+            Some(why) => out.push(format!("{}: `{c}` {why}", org_at("culture"))),
+            None if !root.join(c).is_file() => out.push(format!(
+                "{}: {} not found (the path is relative to the repository root)",
+                org_at("culture"),
+                root.join(c).display()
+            )),
+            None => {}
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,6 +1134,14 @@ mod tests {
             all.push((
                 format!(".toryo/roles/{seat}/toryo-role.yaml"),
                 format!("toryo: 1\npurpose: {purpose}\ninstructions: ./instructions.md\n"),
+            ));
+        }
+        // what the drafts name: the culture and each role's instructions
+        all.push(("CULTURE.md".into(), "Be careful.\n".into()));
+        for seat in SEATS {
+            all.push((
+                format!(".toryo/roles/{seat}/instructions.md"),
+                format!("{seat} house rules\n"),
             ));
         }
         all.extend(files.iter().map(|(p, c)| (p.to_string(), c.to_string())));
@@ -986,6 +1350,291 @@ mod tests {
                 && e.contains("move it to .toryo/roles/reviewer/instructions.md"),
             "{e}"
         );
+    }
+
+    /// The draft org chart / implementer role file with `from` replaced by `to` (it must be
+    /// there).
+    fn draft_with(file: &str, from: &str, to: &str) -> String {
+        let text = std::fs::read_to_string(fixtures().join(file))
+            .unwrap()
+            .replace(CRLF, "\n");
+        assert!(text.contains(from), "{from:?} not in {file}");
+        text.replacen(from, to, 1)
+    }
+
+    const IMPL_ROLE: &str = ".toryo/roles/implementer/toryo-role.yaml";
+
+    /// M11-B3 AC-3: one close candidate is suggested; a tie or nothing close is not.
+    #[test]
+    fn did_you_mean_suggests_only_one_close_candidate() {
+        let seats = ["planner", "implementer", "reviewer"];
+        assert_eq!(did_you_mean("reviwer", &seats), Some("reviewer"));
+        assert_eq!(did_you_mean("implementor", &seats), Some("implementer"));
+        assert_eq!(did_you_mean("Reviewer", &seats), Some("reviewer"));
+        assert_eq!(did_you_mean("tester", &seats), None);
+        assert_eq!(did_you_mean("dbsnyc", &["dbsync", "build"]), Some("dbsync"));
+        // two equally close: no guess
+        assert_eq!(did_you_mean("bat", &["cat", "hat"]), None);
+        assert_eq!(did_you_mean("x", &[]), None);
+        // a case-insensitive match wins over a closer edit
+        assert_eq!(did_you_mean("BUILD", &["build", "buil"]), Some("build"));
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(edit_distance("", "ab"), 2);
+        assert_eq!(hint("tester", &seats), "");
+        assert_eq!(hint("reviwer", &seats), " Did you mean 'reviewer'?");
+    }
+
+    /// M11-B3 AC-1: unknown keys get the friendly form with the key path and the hint — a
+    /// misspelt seat, a top-level key, a gate field, a machine-config key.
+    #[test]
+    fn unknown_keys_name_the_path_and_the_hint() {
+        let (_d, y, m) = draft_repo(&[(
+            ORGCHART,
+            &draft_with(ORGCHART, "  reviewer:\n", "  reviwer:\n"),
+        )]);
+        let e = load_err(&y, &m);
+        assert!(e.contains("toryo-orgchart.yaml: seats.reviwer: seat 'reviwer' not found. Did you mean 'reviewer'?"), "{e}");
+        let (_d, y, m) = draft_repo(&[(ORGCHART, &draft_with(ORGCHART, "\nlimits:", "\nlimts:"))]);
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains("toryo-orgchart.yaml: limts: unknown key 'limts'. Did you mean 'limits'?"),
+            "{e}"
+        );
+        let (_d, y, m) = draft_repo(&[(
+            ORGCHART,
+            &draft_with(ORGCHART, "    timeout: 30m\n", "    timout: 30m\n"),
+        )]);
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains("gates.dbsync.timout: unknown key 'timout'. Did you mean 'timeout'?"),
+            "{e}"
+        );
+        let (_d, y, m) =
+            draft_repo(&[(IMPL_ROLE, &draft_with(IMPL_ROLE, "\nskills:", "\nskils:"))]);
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains("toryo-role.yaml: skils: unknown key 'skils'. Did you mean 'skills'?"),
+            "{e}"
+        );
+        let (_d, y, m) = draft_repo(&[]);
+        let text = std::fs::read_to_string(&m).unwrap();
+        std::fs::write(&m, text.replace("\nskills_dir:", "\nskils_dir:")).unwrap();
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains(&format!(
+                "{}: skils_dir: unknown key 'skils_dir'. Did you mean 'skills_dir'?",
+                m.display()
+            )),
+            "{e}"
+        );
+    }
+
+    /// M11-B3 AC-1: seat profiles must exist in the machine config (R60), with a hint.
+    #[test]
+    fn a_seat_profile_must_exist_on_the_machine() {
+        let (_d, y, m) = draft_repo(&[(
+            ORGCHART,
+            &draft_with(ORGCHART, "profile: codex-openai ", "profile: codex-opnai "),
+        )]);
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains("toryo-orgchart.yaml: seats.implementer.profile: profile 'codex-opnai' is not defined in the machine config")
+                && e.contains("profiles live only there (R60). Did you mean 'codex-openai'?"),
+            "{e}"
+        );
+        let (_d, y, m) = draft_repo(&[(
+            ORGCHART,
+            &draft_with(ORGCHART, "fallback: [claude-max]", "fallback: [claude-mx]"),
+        )]);
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains("seats.implementer.fallback: profile 'claude-mx'")
+                && e.contains("Did you mean 'claude-max'?"),
+            "{e}"
+        );
+    }
+
+    /// M11-B3 AC-1: every `before_handoff` name is a declared gate (with a hint); the order
+    /// rule; only the implementer has `before_handoff`, `writes` and `never`.
+    #[test]
+    fn before_handoff_names_order_and_owner() {
+        let (_d, y, m) = draft_repo(&[(
+            IMPL_ROLE,
+            &draft_with(IMPL_ROLE, "[build, dbsync]", "[build, dbsnyc]"),
+        )]);
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains("implementer")
+                && e.contains(
+                    "toryo-role.yaml: before_handoff: gate 'dbsnyc' is not declared under `gates:`"
+                )
+                && e.contains("Did you mean 'dbsync'?"),
+            "{e}"
+        );
+        let (_d, y, m) = draft_repo(&[(
+            IMPL_ROLE,
+            &draft_with(IMPL_ROLE, "[build, dbsync]", "[dbsync, build]"),
+        )]);
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains("before_handoff: check gate 'build' comes after environment gate 'dbsync'"),
+            "{e}"
+        );
+        let (_d, y, m) = draft_repo(&[(
+            ".toryo/roles/reviewer/toryo-role.yaml",
+            "toryo: 1\npurpose: r\nbefore_handoff: [build]\nwrites: [x/**]\nnever: [y]\n",
+        )]);
+        let e = load_err(&y, &m);
+        for k in ["before_handoff", "writes", "never"] {
+            assert!(
+                e.contains(&format!(
+                    "reviewer{}toryo-role.yaml: {k}: only the implementer may have `{k}`",
+                    std::path::MAIN_SEPARATOR
+                )),
+                "{k}: {e}"
+            );
+        }
+        let (_d, y, m) = draft_repo(&[(
+            IMPL_ROLE,
+            &draft_with(
+                IMPL_ROLE,
+                "before_handoff: [build, dbsync]",
+                "before_handoff: []",
+            ),
+        )]);
+        let e = load_err(&y, &m);
+        assert!(e.contains("before_handoff: empty"), "{e}");
+    }
+
+    /// M11-B3 AC-1: which fields each gate kind has.
+    #[test]
+    fn gate_kinds_and_their_fields() {
+        let org = draft_with(
+            ORGCHART,
+            "    timeout: 20m\n",
+            "    timeout: 20m\n    tool: xpp\n    if_missing: skip\n",
+        );
+        let org = org.replacen(
+            "    kind: environment     # command: toryo.local.yaml -> environment_gates.dbsync\n",
+            "    kind: environment\n    program: pwsh\n    args: [-File, x.ps1]\n",
+            1,
+        );
+        let (_d, y, m) = draft_repo(&[(ORGCHART, &org)]);
+        let e = load_err(&y, &m);
+        for want in [
+            "gates.build: has both `program` and `tool` — use one",
+            "gates.build.if_missing: only for an environment gate",
+            "gates.dbsync.program: an environment gate has no command in the repository",
+            "gates.dbsync.args: an environment gate has no command in the repository",
+            "its command is `environment_gates.dbsync` in the machine config",
+        ] {
+            assert!(e.contains(want), "{want}\n---\n{e}");
+        }
+        // tool: xpp needs metadata, projects and the machine's toolchain, as in commands.verify
+        let org = draft_with(
+            ORGCHART,
+            "    program: pwsh\n    args: [-NoProfile, -NonInteractive, -File, scripts/build-model.ps1]\n",
+            "    tool: xpp\n",
+        );
+        let (_d, y, m) = draft_repo(&[(ORGCHART, &org)]);
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains("gates.build.metadata: required for `tool: xpp`")
+                && e.contains("gates.build.projects: `tool: xpp` needs at least one project")
+                && e.contains("gates.build.tool: `tool: xpp` needs `toolchains.xpp`"),
+            "{e}"
+        );
+    }
+
+    /// M11-B3 AC-1: an environment gate the machine does not define is refused with
+    /// `if_missing: error` (the default), allowed with `skip`; the machine's command must be
+    /// out of the agents' reach.
+    #[test]
+    fn environment_gates_on_this_machine() {
+        let (_d, y, m) = draft_repo(&[]);
+        let text = std::fs::read_to_string(&m).unwrap();
+        let start = text.find("environment_gates:").unwrap();
+        let end = start + text[start..].find("    lock: d365-env\n").unwrap() + 19;
+        let without = format!("{}{}", &text[..start], &text[end..]);
+        std::fs::write(&m, &without).unwrap();
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains("gates.dbsync: environment gate 'dbsync' is not defined on this machine")
+                && e.contains("add `environment_gates.dbsync` to the machine config")
+                && e.contains("`if_missing: skip`"),
+            "{e}"
+        );
+        let (_d2, y2, m2) = draft_repo(&[(
+            ORGCHART,
+            &draft_with(ORGCHART, "if_missing: error", "if_missing: skip"),
+        )]);
+        std::fs::write(&m2, &without).unwrap();
+        let cfg = crate::config::Effective::load(&y2, Some(&m2)).unwrap();
+        assert!(cfg.team.unwrap().gates["dbsync"].machine.is_none());
+        // the machine's command: a lock, an absolute or PATH program, absolute args outside
+        // the repository, the worktrees and the verify root
+        let (d, y, m) = draft_repo(&[]);
+        let tmp = d.path().display().to_string().replace('\\', "/");
+        let text = std::fs::read_to_string(&m).unwrap();
+        let bad = text
+            .replace("program: powershell ", "program: tools/ps.exe ")
+            .replace(
+                &format!("'{tmp}/gates/dbsync.ps1'"),
+                &format!("gates/dbsync.ps1, '{tmp}/repo/scripts/sync.ps1'"),
+            )
+            .replace("lock: d365-env", "lock: ''");
+        std::fs::write(&m, bad).unwrap();
+        let e = load_err(&y, &m);
+        for want in [
+            "environment_gates.dbsync.lock: required",
+            "environment_gates.dbsync.program: `tools/ps.exe` must be an absolute path or a bare name found on PATH",
+            "environment_gates.dbsync.args: `gates/dbsync.ps1` must be an absolute path",
+            "/repo/scripts/sync.ps1` is inside the repository",
+        ] {
+            assert!(e.contains(want), "{want}\n---\n{e}");
+        }
+    }
+
+    /// M11-B3 AC-1: the culture and instructions files exist.
+    #[test]
+    fn culture_and_instructions_must_exist() {
+        let (d, y, m) = draft_repo(&[]);
+        std::fs::remove_file(d.path().join("repo").join("CULTURE.md")).unwrap();
+        std::fs::remove_file(
+            d.path()
+                .join("repo")
+                .join(".toryo/roles/reviewer/instructions.md"),
+        )
+        .unwrap();
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains("toryo-orgchart.yaml: culture:") && e.contains("CULTURE.md not found"),
+            "{e}"
+        );
+        assert!(
+            e.contains("toryo-role.yaml: instructions:")
+                && e.contains("reviewer/instructions.md not found"),
+            "{e}"
+        );
+    }
+
+    /// M11-B3 AC-2: a file with three problems reports all three in one error.
+    #[test]
+    fn three_problems_are_reported_at_once() {
+        let role = draft_with(IMPL_ROLE, "[build, dbsync]", "[dbsync, build, nope]");
+        let org = draft_with(ORGCHART, "profile: codex-openai ", "profile: codex-opnai ");
+        let (d, y, m) = draft_repo(&[(IMPL_ROLE, &role), (ORGCHART, &org)]);
+        std::fs::remove_file(d.path().join("repo").join("CULTURE.md")).unwrap();
+        let e = load_err(&y, &m);
+        for want in [
+            "profile 'codex-opnai' is not defined",
+            "gate 'nope' is not declared",
+            "check gate 'build' comes after environment gate 'dbsync'",
+            "CULTURE.md not found",
+        ] {
+            assert!(e.contains(want), "{want}\n---\n{e}");
+        }
+        assert!(e.contains("invalid configuration:"), "{e}");
     }
 
     /// M11-B1 AC-2: the duration parser.

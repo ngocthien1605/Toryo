@@ -10,7 +10,7 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
 - [x] A2 — machine floor for `verify.boundary` and `verify_root` (H2)
 - [x] B1 — types for the org chart, role files and the new machine keys
 - [x] B2 — loader: discover `.toryo/`, merge, freeze and hash; `toryo config show`
-- [ ] B3 — validation pass: cross-references, kinds, order, "did you mean"
+- [x] B3 — validation pass: cross-references, kinds, order, "did you mean"
 - [ ] C1 — layered instructions and `culture` in the context loader
 - [ ] C2 — the implementer's write fence (`writes` / `never`)
 - [ ] C3 — `checks.reviewer-differs-from-builder`: off / warn / error
@@ -161,6 +161,47 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   through the CLI, a task frozen and reloaded with the same digest, a fake run to the final gate —
   AC-1, AC-4; `toryo.yaml only` without an org chart). `tests/common::setup_orgchart` builds the
   fixture repository in org chart mode for the later groups.
+
+### B3 — validation pass: cross-references, kinds, order, "did you mean"
+
+- **`team::problems(cfg, root, machine)`** — a pure pass over the loaded configuration, called from
+  `Effective::validate_with` in org chart mode, so its problems are reported **with** the loader's
+  (B2) and `config::problems`, all in one `invalid configuration:` error. Every message starts with
+  the file and the key path (`…\toryo-orgchart.yaml: seats.implementer.profile: …`,
+  `…\roles\implementer\toryo-role.yaml: before_handoff: …`, `<machine config>:
+  environment_gates.dbsync.args: …`). Rules, as listed in the task: instructions files exist (and
+  stay inside the repository); seat `profile`/`fallback` names exist in the machine profiles (the
+  message points at the machine config, R60 — in org chart mode this replaces the M10 one-at-a-time
+  `role … refers to unknown profile` bail); `before_handoff` names a declared gate; only the
+  implementer has `before_handoff`, `writes`, `never`; a check gate is exactly one of `program` and
+  `tool` (the same `verify_command_problems` as `commands.verify[]`, now `pub(crate)` with a full
+  label, so `tool: xpp` needs `metadata`, `projects` and the toolchain as today); an environment gate
+  has none of `program`/`args`/`tool`/`metadata`/`projects`; `if_missing` only on environment gates;
+  every check gate before every environment gate; an environment gate the machine does not define is
+  refused unless `if_missing: skip` (naming `environment_gates.<name>`); a machine `EnvGate` has a
+  `lock`, a program that is absolute or a bare PATH name, and every path-like argument absolute and
+  not inside `project.root`, `project.worktrees_root` or the verify root (also an absolute program
+  inside them is refused); the culture file exists. Skills are added in D1.
+- **Added (conservative, not in the list):** the implementer's `before_handoff` may not be empty —
+  M10 refused a configuration without verify commands, and org chart mode would otherwise review
+  unverified work. Every declared environment gate is checked against the machine, also one that no
+  `before_handoff` names.
+- In org chart mode `config::problems` skips `commands.verify[]` (they are the check gates, checked
+  as `gates.<name>`).
+- **"Did you mean"** (`team::did_you_mean`, ~20 lines of Levenshtein, no new crate): a single
+  case-insensitive match, else the single candidate within edit distance 2; a tie or nothing close
+  gives no hint. Used for unknown seats, gates, profiles (and skills in D1), for the unknown role
+  keys of `toryo.yaml` (`roles.reviwer: unknown role (valid: …) Did you mean 'reviewer'?` — the old
+  text is kept, the hint appended), and in **`team::friendly_serde`**, which rewrites serde's
+  `unknown field `x`, expected one of …` / `missing field` into `<path>.<key>: unknown key 'x'. Did
+  you mean 'y'? (valid: …)` (`seat 'reviwer' not found. Did you mean 'reviewer'?` under `seats`) for
+  the org chart, the role files and the machine config. The repository files are now typed-parsed
+  from their text (not from the YAML value) so serde reports the key path and line.
+- Tests (`team::tests`): `did_you_mean_suggests_only_one_close_candidate` (AC-3),
+  `unknown_keys_name_the_path_and_the_hint`, `a_seat_profile_must_exist_on_the_machine`,
+  `before_handoff_names_order_and_owner`, `gate_kinds_and_their_fields`,
+  `environment_gates_on_this_machine`, `culture_and_instructions_must_exist` (AC-1, one per rule),
+  `three_problems_are_reported_at_once` (AC-2, four problems from three files in one error).
 
 ## Open
 
