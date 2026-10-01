@@ -73,8 +73,8 @@ skills_dir: '@TMP@/machine-skills'
 #     absolute and must NOT be inside the repository, a task worktree or the
 #     verify root (validated): the script must be out of the agents' reach.
 #   - When it runs: only after every `check` gate of the same verify run
-#     passed. Normal user token (no Low integrity), working directory = the
-#     verify checkout, inside a Job Object (timeout kills the whole tree).
+#     passed and the checkout is exactly the checkpoint. Normal user token (no Low integrity),
+#     working directory = an EMPTY folder (M11 review X1; the code is under TORYO_VERIFY_CHECKOUT), inside a Job Object (timeout kills the whole tree).
 #     Environment built from scratch (R23) + `env` + resolved `secret_env`.
 #   - Toryo records, per lock name, which task and commit it last deployed.
 #     `toryo status` and the final approval show it, e.g.

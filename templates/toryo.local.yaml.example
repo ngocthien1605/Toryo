@@ -85,8 +85,10 @@ git:
 # M11 — environment gates: what an org chart's `kind: environment` gate runs, with YOUR normal
 # rights, so it lives only here. `program`: an absolute path or a PATH name; every path in `args`
 # absolute and outside the repository, the task worktrees and the verify root (validated).
-# Runs only after every `check` gate of the same verify run passed, in the verify checkout,
-# inside a Job Object (the timeout of the org chart kills the whole tree), with an environment
+# Runs only after every `check` gate of the same verify run passed and the verify checkout is
+# exactly the checkpoint (nothing changed, nothing added — an org chart with an environment gate
+# needs `verify.checkout: clean`), in an EMPTY working directory agent code cannot write, inside
+# a Job Object (the timeout of the org chart kills the whole tree), with an environment
 # built from scratch + TORYO_TASK, TORYO_SHA, TORYO_VERIFY_CHECKOUT, TORYO_VERIFY_BUILD + `env` +
 # the resolved `secret_env` (redacted from every log). One gate per `lock` runs at a time across
 # all tasks; `toryo status` shows which task and commit each lock's environment last received.
@@ -111,8 +113,10 @@ git:
 #   4. Print the useful error lines: the end of the output is what the implementer receives.
 #   5. Never write into $env:TORYO_VERIFY_CHECKOUT (checked afterwards: verify_mutated_tree).
 #   6. Never wait for input: with -NonInteractive a prompt fails at once instead of hanging.
-#   (M11) Call every tool by its absolute path: the working directory is the verify checkout —
-#   files the implementer committed — so a bare name or a DLL must never be found there.
+#   (M11) The working directory is an empty folder — never rely on it: find the code through
+#   $env:TORYO_VERIFY_CHECKOUT / $env:TORYO_VERIFY_BUILD, call every tool by its absolute path,
+#   and do not run `git` against the checkout (its files come from the implementer) — use
+#   $env:TORYO_SHA.
 
 # M11 (review H2) — this machine's floor for the repositories' verify sandbox, and its verify
 # root. A repository `verify.boundary: none` is refused unless `min_boundary: none` here (only

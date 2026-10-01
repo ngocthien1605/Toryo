@@ -351,6 +351,54 @@ pub fn mutated(g: &GitCmd, co: &Checkout, sha: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// The class of a checkout that holds files the checkpoint does not (M11-R2).
+pub const DIRTY: &str = "verify_checkout_dirty";
+
+/// M11-R2 (X2): `Some(reason)` when the checkout holds a file the checkpoint commit does not —
+/// untracked or ignored, i.e. written by a check gate. Environment gates deploy from the
+/// checkout, so it must be exactly the checkpoint before the first one starts. Git runs with the
+/// recorded admin dir (R47), never discovering the repository from the checkout.
+pub fn untracked(g: &GitCmd, co: &Checkout) -> Result<Option<String>> {
+    let out = g.run(
+        &co.loc(),
+        true,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored",
+        ],
+    )?;
+    let files: Vec<String> = out
+        .split(|b| *b == 0)
+        .filter(|e| e.len() > 3 && (e.starts_with(b"?? ") || e.starts_with(b"!! ")))
+        .map(|e| String::from_utf8_lossy(&e[3..]).to_string())
+        .collect();
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let shown: Vec<&String> = files.iter().take(10).collect();
+    let more = if files.len() > 10 {
+        format!(" and {} more", files.len() - 10)
+    } else {
+        String::new()
+    };
+    Ok(Some(format!(
+        "{DIRTY}: the verify checkout holds files the checkpoint does not: {shown:?}{more} — environment gates deploy from the checkout, so it must be exactly the checkpoint; a check gate must write its output under TORYO_VERIFY_BUILD"
+    )))
+}
+
+/// M11-R2 (X1): the working directory of an environment gate — `<base>/envgate`, created and
+/// emptied before each gate. It is not among the Low-labelled folders, so code a check gate ran
+/// at Low integrity cannot plant a file there; a relative argument, a bare tool name or a DLL
+/// lookup never resolves to a file of the checkout.
+pub fn envgate_dir(co: &Checkout) -> Result<PathBuf> {
+    let d = co.base.join("envgate");
+    empty_dir(&d)?;
+    Ok(d)
+}
+
 /// SHA-256 of each verify script as checked out (R29: the result names what ran).
 pub fn script_hashes(files: &[String], co: &Checkout) -> BTreeMap<String, String> {
     files

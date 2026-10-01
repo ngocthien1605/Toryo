@@ -1361,8 +1361,20 @@ impl<'a> Engine<'a> {
         else {
             return interrupted(self);
         };
+        // M11-R2 (X2): environment gates deploy from the checkout with the owner's full rights,
+        // so before the first one starts it must be exactly the checkpoint — a check gate (code
+        // the implementer wrote) may have changed or added files. Found → no environment gate
+        // runs and the task escalates (not a fix cycle: the gate setup is wrong, not the code).
+        let mut before_deploy: Option<(&str, String)> = None;
+        if failure.is_none() && self.deploys() {
+            if let Some(reason) = verify::mutated(&self.g, &co, &head)? {
+                before_deploy = Some((verify::MUTATED, reason));
+            } else if let Some(reason) = verify::untracked(&self.g, &co)? {
+                before_deploy = Some((verify::DIRTY, reason));
+            }
+        }
         // M11-E3: the environment gates, only after every check gate passed
-        if failure.is_none() {
+        if failure.is_none() && before_deploy.is_none() {
             match self.run_environment_gates(t, &co, &head, &stop, &mut results)? {
                 EnvGates::Done(f) => failure = f,
                 EnvGates::Stopped => return interrupted(self),
@@ -1372,9 +1384,12 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        let pass = failure.is_none();
+        let pass = failure.is_none() && before_deploy.is_none();
         // R29/R47: the checkout must be exactly the checkpoint after the run
-        let mutated = verify::mutated(&self.g, &co, &head)?;
+        let mutated = match &before_deploy {
+            Some((_, reason)) => Some(reason.clone()),
+            None => verify::mutated(&self.g, &co, &head)?,
+        };
         let tree = self.g.run_str(
             &Worktree::new(&self.g, &t.worktree).loc,
             true,
@@ -1404,6 +1419,10 @@ impl<'a> Engine<'a> {
             &serde_json::to_vec_pretty(&vr)?,
             "VERIFY_RESULT.json",
         )?;
+        if let Some((class, reason)) = before_deploy {
+            self.escalate_attempt(&a, class.into(), reason)?;
+            return Ok(Flow::Next);
+        }
         if let Some(reason) = mutated {
             self.escalate_attempt(&a, verify::MUTATED.into(), reason)?;
             return Ok(Flow::Next);
@@ -1575,6 +1594,16 @@ impl<'a> Engine<'a> {
 
     // ── environment gates (M11-E3) ───────────────────────────────────────────────────
 
+    /// M11-R2: this verify run will start an environment gate (the implementer's
+    /// `before_handoff` has one this machine defines).
+    fn deploys(&self) -> bool {
+        self.cfg.team.as_ref().is_some_and(|t| {
+            t.handoff_gates().iter().any(|(_, g)| {
+                g.decl.kind == crate::team::GateType::Environment && g.machine.is_some()
+            })
+        })
+    }
+
     /// The environment gates of the implementer's `before_handoff`, in order, after every
     /// check gate of the run passed: each takes its machine-wide lock (waiting while another
     /// task holds it), records the deployment **before** it starts, runs the frozen machine
@@ -1627,6 +1656,8 @@ impl<'a> Engine<'a> {
             let Some(lock) = self.env_lock(t, &m.lock, stop)? else {
                 return Ok(EnvGates::Stopped);
             };
+            // M11-R2 (X1): a fresh, empty working directory agent code cannot write
+            let cwd = verify::envgate_dir(co)?;
             // first the record: a failed or killed sync may already have changed the environment
             let (i, l, h, n, mc) = (
                 t.id.clone(),
@@ -1656,7 +1687,7 @@ impl<'a> Engine<'a> {
                 name: name.to_string(),
                 program,
                 args: m.args.clone(),
-                cwd: co.dir.clone(),
+                cwd,
                 env,
                 // the owner's normal token: the check gates' boundary is not changed (D6)
                 boundary: Boundary::None,

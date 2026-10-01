@@ -109,7 +109,7 @@ Task list: `M11-review-fixes.md` (review of 2026-10-02, built and run on Linux b
 ### Progress
 
 - [x] R1 — the test build compiles on Linux again
-- [ ] R2 — environment gates see exactly the checkpoint; neutral working directory
+- [x] R2 — environment gates see exactly the checkpoint; neutral working directory
 - [ ] R3 — environment gate `program`/`args`: validate what runs
 - [ ] R4 — fence patterns that match nothing; the culture file is protected
 - [ ] R5 — a skill that cannot be delivered stops the turn; the budget check covers the whole chain
@@ -143,6 +143,36 @@ Task list: `M11-review-fixes.md` (review of 2026-10-02, built and run on Linux b
 - **Not compiled on Linux here**: WSL exists on this machine but has no cargo (nothing installed for this). The
   reviewer's Linux run with this one line was clean (fmt, both clippy, 551 tests passed) — the first CI run
   (`ubuntu-latest`) is the real check.
+
+### R2 — environment gates see exactly the checkpoint; neutral working directory
+
+- **Before the first environment gate** of a verify run (`Engine::deploys()`: the implementer's `before_handoff`
+  has an environment gate this machine defines), `verify::mutated` and the new `verify::untracked`
+  (`status --porcelain=v1 -z --untracked-files=all --ignored` through the recorded admin dir, R47) look at the
+  checkout. Either one found → no environment gate starts, no `environment_deployments` row, `VERIFY_RESULT.json`
+  is stored with the check-gate results, `pass: false` and the reason in `mutated`, and the task **escalates**
+  (not a fix cycle): `verify_mutated_tree`, or the new class `verify_checkout_dirty` with up to 10 file names and
+  the hint to write output under `TORYO_VERIFY_BUILD`. The check after the gates stays (E3 AC-8).
+- **Load rule (B3 pass):** the implementer's `before_handoff` with an environment gate needs `verify.checkout:
+  clean`; `tracked` is a problem naming `verify.checkout` in `toryo.yaml` and `gates.<name>` of the org chart.
+- **Working directory (X1):** `verify::envgate_dir` — `<verify_root>/<task>/envgate`, created and emptied before
+  each gate. It is not among the Low-labelled folders (`dir`, `build`, `cache`, `tmp`, `home`), so Low code
+  cannot plant a file there. `NoDefaultCurrentDirectoryInExePath=1` stays; the gate variables are unchanged.
+- Wording updated: `templates/toryo.local.yaml.example` (the contract: empty working directory, no `git`
+  against the checkout, use `TORYO_SHA`), `tests/fixtures/m11/toryo.local.yaml` (the fixture's comment), README,
+  HUONG-DAN §5.9.
+- No M11 E3 test relied on the working directory being the checkout (they use `TORYO_VERIFY_CHECKOUT` or
+  absolute paths); all pass unchanged.
+- Tests: `team::tests::an_environment_gate_needs_a_clean_checkout` (AC-5), `tests/m11_env_gates.rs` —
+  `a_check_gate_that_adds_a_file_stops_the_deploy` (AC-1), `a_check_gate_that_edits_a_tracked_file_stops_the_
+  deploy` (AC-2), `an_environment_gate_runs_in_a_neutral_folder` (AC-3), `a_low_integrity_check_gate_cannot_
+  write_the_envgate_folder` (AC-4, Windows only).
+- **Open (owner, on the UDE machine):** the built-in `tool: xpp` check gate passes `OutputDirectory` /
+  `CompilerMetadata` under `TORYO_VERIFY_BUILD`, but MSBuild's own intermediate folder (`obj\` next to the
+  `.rnrproj`) is not redirected. If MSBuild writes it into the checkout, an org chart with `tool: xpp` + an
+  environment gate would always stop with `verify_checkout_dirty`. Not changed here (the X++ command line is M9's);
+  the template's default `build` gate is the owner's script, which must write under `TORYO_VERIFY_BUILD`. Check
+  with the first real xpp + dbsync run; the fix would be `/p:BaseIntermediateOutputPath=<build>\obj\`.
 
 ## Progress
 

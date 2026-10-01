@@ -687,7 +687,10 @@ trượt đầu tiên; exit code quyết định; mọi gate có `TORYO_TASK`, `
   Script của gate được bảo vệ kể cả khi chưa tồn tại (M18), và `task create` từ chối nếu commit gốc chưa có nó.
 - `kind: environment` — **thay đổi môi trường D365FO** của máy này (deploy, DB sync), chạy bằng **quyền bình thường
   của anh**, nên lệnh chỉ nằm trong machine config (`environment_gates`), ngoài tầm với của mọi agent. Chỉ chạy
-  sau khi **mọi** check gate cùng lượt đã qua; mỗi `lock` chỉ một gate chạy một lúc trên cả máy (task thứ hai chờ:
+  sau khi **mọi** check gate cùng lượt đã qua **và checkout đúng y commit checkpoint** (check gate sửa hay thêm file vào
+  checkout → không gate môi trường nào chạy, task escalate `verify_mutated_tree` / `verify_checkout_dirty`; vì vậy org
+  chart có gate môi trường phải để `verify.checkout: clean`); chạy trong một **thư mục làm việc trống** mà code của
+  agent không ghi được (`envgate`); mỗi `lock` chỉ một gate chạy một lúc trên cả máy (task thứ hai chờ:
   `waiting for lock d365-env (held by T-12)`; `toryo stop` dừng việc chờ). Trước khi chạy, Toryo ghi lại task và
   commit mà môi trường sắp nhận; `toryo status` luôn cho biết môi trường đang chạy code nào:
   `environment    d365-env holds BR-001 @ 1a2b3c4d5e6f (not approved yet)`. Huỷ task hay `task cleanup` **không**
@@ -734,7 +737,8 @@ environment_gates:
 `$env:TORYO_VERIFY_CHECKOUT` (commit `$env:TORYO_SHA`) và/hoặc gói đã build từ `$env:TORYO_VERIFY_BUILD`, **không bao
 giờ** từ thư mục repo chính; (3) chạy lại nhiều lần vẫn đúng (idempotent); (4) in rõ dòng lỗi — phần cuối output được
 gửi cho implementer sửa; (5) không ghi vào `$env:TORYO_VERIFY_CHECKOUT`; (6) không chờ nhập liệu; và (M11) gọi mọi công
-cụ bằng **đường dẫn tuyệt đối** — thư mục làm việc là checkout, chứa file do implementer viết.
+cụ bằng **đường dẫn tuyệt đối**; thư mục làm việc là một thư mục trống — đừng dựa vào nó, đừng chạy `git` trên checkout
+(file trong đó do implementer viết), hãy dùng `$env:TORYO_SHA`.
 
 Lưu ý trên máy Tokyo (tiếng Nhật): output DB sync có thể bị lỗi mã cp932 (review M13 — việc tiếp theo sau M11).
 

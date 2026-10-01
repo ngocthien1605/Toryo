@@ -812,3 +812,186 @@ fn a_stop_during_an_environment_gate_interrupts_it() {
         status_out(&env, "ST-1")
     );
 }
+
+/// The fixture with a repository check gate `probe` (the script `ps1` / `sh`) between
+/// `divide-present` and the environment gate `dbsync`, whose machine script writes a marker.
+fn probe_then_dbsync(ps1: &str, sh: &str) -> (Env, PathBuf) {
+    let (decl, file, body) = if cfg!(windows) {
+        (
+            "  probe: { kind: check, program: pwsh, args: [-NoProfile, -NonInteractive, -File, scripts/probe.ps1], timeout: 2m }\n",
+            "scripts/probe.ps1",
+            ps1,
+        )
+    } else {
+        (
+            "  probe: { kind: check, program: sh, args: [scripts/probe.sh], timeout: 2m }\n",
+            "scripts/probe.sh",
+            sh,
+        )
+    };
+    let org = ORGCHART.replace("IMPLEMENTER", "codex-openai").replacen(
+        "gates:\n",
+        &format!(
+            "gates:\n{decl}  dbsync: {{ kind: environment, timeout: 2m, if_missing: error }}\n"
+        ),
+        1,
+    );
+    let env = setup_orgchart(
+        "codex-openai",
+        "",
+        &[
+            (".toryo/toryo-orgchart.yaml", &org),
+            (
+                ".toryo/roles/implementer/toryo-role.yaml",
+                "toryo: 1\npurpose: Change the code.\nbefore_handoff: [divide-present, probe, dbsync]\n",
+            ),
+            (file, body),
+        ],
+    );
+    let marker = env.root.join("gates").join("deployed");
+    let m = fwd(&marker);
+    define_gates(
+        &env,
+        &machine_gate(
+            &env,
+            "dbsync",
+            "d365-env",
+            &format!("Set-Content -Path '{m}' -Value x\n\"cwd=$((Get-Location).Path)\"\n\"repo-file=$(Test-Path src/Calculator.psm1)\"\nexit 0\n"),
+            &format!("echo x > '{m}'\necho \"cwd=$(pwd)\"\nif [ -e src/Calculator.psm1 ]; then echo repo-file=True; else echo repo-file=False; fi\nexit 0\n"),
+            "",
+        ),
+    );
+    (env, marker)
+}
+
+fn one_turn(env: &Env, id: &str) -> String {
+    create(env, id);
+    let s = script(
+        env,
+        &format!("{id}.json"),
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(env, &["run", id, "--yes", "--fake-agents", &s], &[]);
+    err
+}
+
+/// M11-R2 AC-1: a check gate that adds a file to the checkout → no environment gate starts, no
+/// deployment record, `Escalated` with `verify_checkout_dirty`, no fix cycle used.
+#[test]
+fn a_check_gate_that_adds_a_file_stops_the_deploy() {
+    let (env, marker) = probe_then_dbsync(
+        "Set-Content -Path (Join-Path $env:TORYO_VERIFY_CHECKOUT 'stray.txt') -Value x\nexit 0\n",
+        "echo x > \"$TORYO_VERIFY_CHECKOUT/stray.txt\"\nexit 0\n",
+    );
+    let err = one_turn(&env, "R2-1");
+    let t = task(&env, "R2-1");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(t.fix_cycle, 0, "not sent back to the implementer");
+    assert!(err.contains("verify_checkout_dirty"), "{err}");
+    assert!(
+        err.contains("stray.txt") && err.contains("TORYO_VERIFY_BUILD"),
+        "{err}"
+    );
+    assert!(!marker.exists(), "the environment gate never started");
+    assert!(deployments(&env).is_empty());
+    let ev = events(&env, "R2-1");
+    assert!(ev
+        .iter()
+        .any(|e| e["type"] == "escalated" && e["reason_class"] == "verify_checkout_dirty"));
+    let vr = verify_result(&env, "R2-1");
+    assert_eq!(vr["pass"], false);
+    assert!(vr["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|c| c["kind"] != "environment"));
+}
+
+/// M11-R2 AC-2: a check gate that edits a tracked file → `verify_mutated_tree`, no environment
+/// gate.
+#[test]
+fn a_check_gate_that_edits_a_tracked_file_stops_the_deploy() {
+    let (env, marker) = probe_then_dbsync(
+        "Add-Content -Path (Join-Path $env:TORYO_VERIFY_CHECKOUT 'src/Calculator.psm1') -Value '# edited'\nexit 0\n",
+        "echo '# edited' >> \"$TORYO_VERIFY_CHECKOUT/src/Calculator.psm1\"\nexit 0\n",
+    );
+    let err = one_turn(&env, "R2-2");
+    assert_eq!(task(&env, "R2-2").state, St::Escalated, "{err}");
+    assert!(err.contains("verify_mutated_tree"), "{err}");
+    assert!(!marker.exists());
+    assert!(deployments(&env).is_empty());
+}
+
+/// M11-R2 AC-3 (X1): the environment gate runs in the empty `envgate` folder — a file that
+/// exists only in the checkout is not found relative to it.
+#[test]
+fn an_environment_gate_runs_in_a_neutral_folder() {
+    let (env, marker) = probe_then_dbsync("exit 0\n", "exit 0\n");
+    let err = one_turn(&env, "R2-3");
+    assert_eq!(task(&env, "R2-3").state, St::Completed, "{err}");
+    assert!(marker.exists());
+    let vr = verify_result(&env, "R2-3");
+    let tail = vr["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["kind"] == "environment")
+        .unwrap()["output_tail"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let checkout = PathBuf::from(vr["verify_checkout"].as_str().unwrap());
+    let envgate = checkout.parent().unwrap().join("envgate");
+    let cwd = tail
+        .lines()
+        .find_map(|l| l.strip_prefix("cwd="))
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(
+        std::fs::canonicalize(&cwd).unwrap(),
+        std::fs::canonicalize(&envgate).unwrap(),
+        "{tail}"
+    );
+    assert!(tail.contains("repo-file=False"), "{tail}");
+}
+
+/// M11-R2 AC-4 (Windows): a check gate at Low integrity cannot create a file in the `envgate`
+/// folder (nor the folder itself).
+#[cfg(windows)]
+#[test]
+fn a_low_integrity_check_gate_cannot_write_the_envgate_folder() {
+    let (env, _) = probe_then_dbsync(
+        "$d = Join-Path (Split-Path $env:TORYO_VERIFY_BUILD -Parent) 'envgate'\ntry { New-Item -ItemType Directory -Force -Path $d -ErrorAction Stop | Out-Null; Set-Content -Path (Join-Path $d 'planted.exe') -Value x -ErrorAction Stop; 'PLANTED' } catch { 'DENIED' }\nexit 0\n",
+        "",
+    );
+    let cfg = std::fs::read_to_string(&env.config)
+        .unwrap()
+        .replace("boundary: none", "boundary: low_integrity");
+    std::fs::write(&env.config, cfg).unwrap();
+    let err = one_turn(&env, "R2-4");
+    assert_eq!(task(&env, "R2-4").state, St::Completed, "{err}");
+    let vr = verify_result(&env, "R2-4");
+    assert_eq!(vr["boundary"], "low_integrity");
+    let probe = vr["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "probe")
+        .unwrap()["output_tail"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(probe.contains("DENIED"), "{probe}");
+    let checkout = PathBuf::from(vr["verify_checkout"].as_str().unwrap());
+    assert!(!checkout
+        .parent()
+        .unwrap()
+        .join("envgate")
+        .join("planted.exe")
+        .exists());
+}

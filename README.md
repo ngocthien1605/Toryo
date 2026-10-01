@@ -276,8 +276,12 @@ from the repository checkout (`project.root`), never from a task worktree, and e
     a configuration whose base commit lacks it.
   - `kind: environment` — the repository only declares it (`timeout`, `if_missing: error | skip`); the command is
     `environment_gates.<name>` in the machine config (`program`, `args`, `lock`, `env`, `secret_env`), frozen with the
-    task. It runs only after every check gate passed, with **your normal rights** (no Low integrity), in the verify
-    checkout, inside a Job Object, with an environment from scratch + the gate variables + `env` + the resolved
+    task. It runs only after every check gate passed **and the verify checkout is exactly the checkpoint** (a check
+    gate that changed or added a file there → no environment gate starts, the task escalates with
+    `verify_mutated_tree` / `verify_checkout_dirty`; so an org chart with an environment gate needs `verify.checkout:
+    clean`), with **your normal rights** (no Low integrity), in an **empty working directory** that agent code cannot
+    write (`<verify_root>\<task>\envgate`; the code is under `TORYO_VERIFY_CHECKOUT`), inside a Job Object, with an
+    environment from scratch + the gate variables + `env` + the resolved
     `secret_env` (redacted everywhere). The program and every script path must be absolute (or a PATH name) and
     outside the repository, the worktrees and the verify root. One gate per `lock` runs at a time across all tasks;
     a second waits (`status`: `waiting for lock d365-env (held by T-12)`), `toryo stop` ends the wait. A failure
@@ -286,8 +290,9 @@ from the repository checkout (`project.root`), never from a task worktree, and e
   - **The script contract** (`templates/toryo.local.yaml.example`): exit code decides (PowerShell: `$ErrorActionPreference
     = 'Stop'` and `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }` after every native call); deploy only
     `$env:TORYO_VERIFY_CHECKOUT` / `$env:TORYO_VERIFY_BUILD`, never your main repository folder; idempotent; print
-    the useful error lines; never write into the checkout (`verify_mutated_tree`); never wait for input; call every
-    tool by its absolute path (the working directory holds the implementer's files).
+    the useful error lines; never write into the checkout (`verify_mutated_tree`); never wait for input; the working
+    directory is an empty folder — never rely on it, call every tool by its absolute path and do not run `git`
+    against the checkout (use `TORYO_SHA`).
 - **What is deployed.** Before an environment gate starts, Toryo records per lock which task and commit the
   environment receives (`environment_deployments`), and updates it at the end. `toryo status` shows one line per
   lock (`environment    d365-env holds BR-001 @ 1a2b3c4d5e6f (not approved yet)` — `approved` once that task's

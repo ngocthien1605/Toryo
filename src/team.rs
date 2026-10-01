@@ -1008,6 +1008,21 @@ pub fn problems(cfg: &Effective, root: &Path, machine: &str) -> Vec<String> {
                 org.display()
             ));
         }
+        // M11-R2 (X2): environment gates deploy from the checkout, which must then be exactly
+        // the checkpoint — in `tracked` mode ignored files of earlier runs stay in it
+        let env_gate = imp.before_handoff.iter().find(|n| {
+            team.gates
+                .get(*n)
+                .is_some_and(|g| g.decl.kind == GateType::Environment)
+        });
+        if let (Some(g), false) = (env_gate, cfg.repo.verify.checkout == "clean") {
+            out.push(format!(
+                "{}: verify.checkout: `{}` — the implementer's before_handoff has the environment gate '{g}' ({}: gates.{g}); environment gates deploy from the checkout, so it must be exactly the checkpoint: set `verify.checkout: clean`",
+                cfg.repo_path.display(),
+                cfg.repo.verify.checkout,
+                org.display()
+            ));
+        }
         let mut first_env: Option<&str> = None;
         for n in &imp.before_handoff {
             match team.gates.get(n) {
@@ -1910,6 +1925,31 @@ mod tests {
         }
         assert!(!e.contains("`/c`"), "a switch is not a path: {e}");
         assert!(!e.contains("gates/ok.ps1"), "{e}");
+    }
+
+    /// M11-R2 AC-5 (X2): an environment gate needs `verify.checkout: clean` — `tracked` is a
+    /// load problem naming `verify.checkout` in toryo.yaml and the gate.
+    #[test]
+    fn an_environment_gate_needs_a_clean_checkout() {
+        let (_d, y, m) = draft_repo(&[]);
+        let text = std::fs::read_to_string(&y).unwrap();
+        std::fs::write(&y, format!("{text}verify: {{ checkout: tracked }}\n")).unwrap();
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains(&format!("{}: verify.checkout: `tracked`", y.display()))
+                && e.contains("the environment gate 'dbsync'")
+                && e.contains("gates.dbsync")
+                && e.contains("set `verify.checkout: clean`"),
+            "{e}"
+        );
+        // without an environment gate in before_handoff, `tracked` is fine
+        let (_d, y, m) = draft_repo(&[(
+            IMPL_ROLE,
+            &draft_with(IMPL_ROLE, "[build, dbsync]", "[build]"),
+        )]);
+        let text = std::fs::read_to_string(&y).unwrap();
+        std::fs::write(&y, format!("{text}verify: {{ checkout: tracked }}\n")).unwrap();
+        crate::config::Effective::load(&y, Some(&m)).unwrap();
     }
 
     /// M11-B3 AC-1: which fields each gate kind has.
