@@ -318,6 +318,47 @@ pub struct Timeouts {
     pub agent_stage_max_min: Option<u64>,
 }
 
+/// The repository `toryo.yaml` as written (review C1): exactly the keys a repository may set.
+/// It has no `profiles` / `toolchains` fields, so a key that slips past the raw-text check of
+/// [`machine_only_part`] (a YAML tag, an alias) is still an unknown field, never a profile.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepoFile {
+    version: u32,
+    project: Project,
+    #[serde(default)]
+    roles: BTreeMap<String, Role>,
+    #[serde(default)]
+    pipeline: Pipeline,
+    #[serde(default)]
+    policy: Policy,
+    #[serde(default)]
+    verify: Verify,
+    #[serde(default)]
+    commands: Commands,
+    #[serde(default)]
+    timeouts: Timeouts,
+    #[serde(default)]
+    context: ContextCfg,
+}
+
+impl From<RepoFile> for RepoConfig {
+    fn from(f: RepoFile) -> Self {
+        Self {
+            version: f.version,
+            project: f.project,
+            profiles: BTreeMap::new(),
+            roles: f.roles,
+            pipeline: f.pipeline,
+            policy: f.policy,
+            verify: f.verify,
+            commands: f.commands,
+            timeouts: f.timeouts,
+            context: f.context,
+        }
+    }
+}
+
 /// Repo-level `toryo.yaml`, and — once merged — the effective configuration of a task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -507,8 +548,13 @@ impl Effective {
                 part.refusal(repo_path, &machine_config_hint(machine_path))
             );
         }
-        let mut repo: RepoConfig = serde_yaml::from_str(&text)
+        // C1: a YAML tag hides a key from lookups by name — refused before the typed parse
+        let doc: serde_yaml::Value = serde_yaml::from_str(&text)
             .with_context(|| format!("parsing {}", repo_path.display()))?;
+        refuse_tags(&doc, repo_path)?;
+        let file: RepoFile = serde_yaml::from_str(&text)
+            .with_context(|| format!("parsing {}", repo_path.display()))?;
+        let mut repo = RepoConfig::from(file);
         if repo.version != 1 {
             bail!("unsupported toryo.yaml version {}", repo.version);
         }
@@ -888,17 +934,68 @@ impl MachineOnlyPart {
     }
 }
 
+/// The text of a YAML value with any tags taken off (`!x profiles` → `profiles`), for a
+/// lookup by name that a tag cannot hide from (review C1).
+pub fn untagged(v: &serde_yaml::Value) -> &serde_yaml::Value {
+    match v {
+        serde_yaml::Value::Tagged(t) => untagged(&t.value),
+        other => other,
+    }
+}
+
+/// C1: every YAML tag on a top-level key or value of a repository file (`!x profiles:`,
+/// `roles: !x {…}`), refused in one error that names the file and each key. A tag makes a key
+/// invisible to a lookup by name while a typed parse still reads it, so repository files —
+/// `toryo.yaml`, the org chart, the role files — carry none.
+pub fn refuse_tags(doc: &serde_yaml::Value, file: &Path) -> Result<()> {
+    let Some(map) = untagged(doc).as_mapping() else {
+        return Ok(());
+    };
+    let mut out = Vec::new();
+    if let serde_yaml::Value::Tagged(t) = doc {
+        out.push(format!("the document has the tag `{}`", t.tag));
+    }
+    for (k, v) in map {
+        let name = match untagged(k) {
+            serde_yaml::Value::String(s) => s.clone(),
+            other => serde_yaml::to_string(other)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        };
+        if let serde_yaml::Value::Tagged(t) = k {
+            out.push(format!("key `{name}` has the tag `{}`", t.tag));
+        }
+        if let serde_yaml::Value::Tagged(t) = v {
+            out.push(format!("the value of `{name}` has the tag `{}`", t.tag));
+        }
+    }
+    if out.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{}: YAML tags are not allowed in a repository file (review C1: a tag hides a key from Toryo's checks) — remove them:\n  - {}",
+        file.display(),
+        out.join("\n  - ")
+    )
+}
+
 /// The machine-only part of a repository `toryo.yaml` text; `None` when it has none (R60).
-/// Only the top level counts: a key of that name inside another block is not one.
+/// Only the top level counts: a key of that name inside another block is not one. A tagged
+/// key (`!x profiles:`) counts like the plain one (review C1).
 pub fn machine_only_part(text: &str) -> Result<Option<MachineOnlyPart>> {
     let doc: serde_yaml::Value = serde_yaml::from_str(text)?;
-    let Some(map) = doc.as_mapping() else {
+    let Some(map) = untagged(&doc).as_mapping() else {
         return Ok(None);
     };
     let mut part = serde_yaml::Mapping::new();
     let mut keys = Vec::new();
     for key in MACHINE_ONLY_KEYS {
-        if let Some(v) = map.get(key) {
+        let found = map
+            .iter()
+            .find(|(k, _)| untagged(k).as_str() == Some(key))
+            .map(|(_, v)| v);
+        if let Some(v) = found {
             part.insert(key.into(), v.clone());
             keys.push(key.to_string());
         }
@@ -913,7 +1010,7 @@ pub fn machine_only_part(text: &str) -> Result<Option<MachineOnlyPart>> {
 }
 
 /// How to name the machine config in a message: the path in use, else the default one.
-fn machine_config_hint(machine_path: Option<&Path>) -> String {
+pub fn machine_config_hint(machine_path: Option<&Path>) -> String {
     machine_path
         .map(Path::to_path_buf)
         .or_else(default_machine_config_path)
@@ -1177,6 +1274,65 @@ policy:
             machine_only_part("version: 1\nproject: { root: r, profiles: x }\n").unwrap(),
             None
         );
+    }
+
+    /// Review C1 (M11-A1 AC-1): a YAML tag on `profiles:` hid it from the raw-text check while
+    /// the typed parse still read it — the reproduction is refused, naming `profiles` and the
+    /// machine config, and no repository profile ever reaches the effective configuration.
+    #[test]
+    fn a_tagged_profiles_key_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let (p, m) = (d.path().join("toryo.yaml"), d.path().join("machine.yaml"));
+        std::fs::write(
+            &m,
+            "profiles:\n  claude-max: { kind: claude, billing: subscription, exe: claude }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &p,
+            "version: 1\nproject: { root: r, worktrees_root: w }\n!x profiles:\n  evil: { kind: codex, billing: subscription, exe: 'tools\\evil.exe', secret_env: { K: 'credman:toryo/foundry-openai' } }\nroles:\n  planner: { profile: claude-max }\n  implementer: { profile: evil }\n",
+        )
+        .unwrap();
+        let e = format!("{:#}", Effective::load(&p, Some(&m)).unwrap_err());
+        assert!(
+            e.contains("`profiles:` may not be defined in the repository config (R60"),
+            "{e}"
+        );
+        assert!(
+            e.contains(&format!("Move this block to {}", m.display())),
+            "{e}"
+        );
+        assert!(e.contains("evil:"), "the block to move: {e}");
+        // a tag on any other top-level key or value is refused too, all at once
+        std::fs::write(
+            &p,
+            "version: 1\nproject: { root: r, worktrees_root: w }\n!x roles:\n  planner: { profile: claude-max }\npolicy: !y { deny_paths: [] }\n",
+        )
+        .unwrap();
+        let e = format!("{:#}", Effective::load(&p, Some(&m)).unwrap_err());
+        assert!(e.contains(&p.display().to_string()), "{e}");
+        assert!(e.contains("key `roles` has the tag `!x`"), "{e}");
+        assert!(e.contains("the value of `policy` has the tag `!y`"), "{e}");
+        // and `toolchains` behind a tag is a machine-only key as well
+        assert_eq!(
+            machine_only_part("version: 1\n!t toolchains: { xpp: { msbuild: m } }\n")
+                .unwrap()
+                .unwrap()
+                .keys,
+            ["toolchains"]
+        );
+    }
+
+    /// Review C1: the repository file is parsed without the machine-only fields, so whatever
+    /// gets past the raw-text check is an unknown field, never a profile.
+    #[test]
+    fn the_repository_file_has_no_profile_fields() {
+        let e = serde_yaml::from_str::<RepoFile>(
+            "version: 1\nproject: { root: r, worktrees_root: w }\nprofiles: {}\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("unknown field `profiles`"), "{e}");
     }
 
     /// R60 AC-2: the same profiles from the machine config give the same effective
@@ -1613,6 +1769,37 @@ commands:
         .unwrap();
         let e = format!("{:#}", Effective::load(&p, Some(&m)).unwrap_err());
         assert!(e.contains("sound"), "{e}");
+    }
+
+    /// M11-A1 AC-2 / B2 AC-2: every shipped template hashes as it did in M10 (values computed
+    /// with `main` @ aa0be03): the new loader, the repository-file struct and every M11 key
+    /// leave a configuration without them byte for byte the same.
+    #[test]
+    fn templates_keep_their_m10_hash() {
+        let t = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
+        let d = tempfile::tempdir().unwrap();
+        let m = d.path().join("machine.yaml");
+        std::fs::write(&m, "profiles:\n  claude-max: { kind: claude, billing: subscription, exe: claude }\n  codex-openai: { kind: codex, billing: subscription, exe: codex, codex: { windows_sandbox: unelevated } }\n").unwrap();
+        for (repo, machine, want) in [
+            (
+                t.join("toryo.yaml.example"),
+                t.join("toryo.local.yaml.example"),
+                "7e2e52195e51597e2b220e46c99dc6fa8aa2c6b9e08e4707da102b4bcf087e0f",
+            ),
+            (
+                t.join("d365fo").join("toryo.yaml.example"),
+                t.join("d365fo").join("toryo.local.yaml.example"),
+                "fd5f27ff14d049d67848df01c4054a141ca02c0fb36b3ed1cf0e0dec0792bd91",
+            ),
+            (
+                t.join("dogfood").join("toryo.yaml.example"),
+                m.clone(),
+                "29303e317d9e6055a8f98863a14140fca260d45300f00024827db971e743862d",
+            ),
+        ] {
+            let cfg = Effective::load(&repo, Some(&machine)).unwrap();
+            assert_eq!(cfg.sha256(), want, "{}", repo.display());
+        }
     }
 
     /// The shipped templates keep loading under the checks.
