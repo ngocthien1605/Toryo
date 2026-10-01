@@ -18,7 +18,7 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
 - [x] E1 — check gates: mapping, gate variables, M18
 - [x] E2 — verify output redacted with the task's secrets (M2)
 - [x] E3 — environment gates: run, lock, record what is deployed
-- [ ] D1 — skill lookup (repo, then machine) and the menu
+- [x] D1 — skill lookup (repo, then machine) and the menu
 - [ ] D2 — the plan's `skills` field and its checks
 - [ ] D3 — skills delivered through the context loader
 - [ ] F1 — templates
@@ -465,6 +465,31 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   (never committed; same as `deny_paths` in M10); after `resume --note` with split limits the
   escalation text counts the limit, not the cycles run (`2 gate retries used` after 3 cycles), and
   says `1 review rounds`.
+
+## D — Skills
+
+### D1 — skill lookup and the menu
+
+- `team::resolve_skill(name, repo, machine_dir)`: first match wins —
+  `<project.root>/.toryo/skills/<name>/SKILL.md`, then `<skills_dir>/<name>/SKILL.md` (the frozen
+  `team.skill_roots.machine`, `%VAR%` expanded). Not found: a message naming **both** paths (or
+  "no `skills_dir` in the machine config"). Each resolved skill is `{ name, origin: repo | machine,
+  path, sha256, bytes }` plus its `description` and text (CRLF folded to LF, like the other context
+  sources). A name must be a folder name — no `/`, `\`, `:`, `..` (a path in a name could otherwise
+  escape both folders).
+- **Front matter** (`team::front_matter` / `skill_description`): the YAML mapping between the first
+  two `---` lines; a UTF-8 BOM and CRLF are accepted; no opening `---` on the first line, an
+  unclosed block or a non-mapping is "no front matter".
+- **Validation (B3 pass):** every skill of every role file resolves (with a "did you mean" over the
+  skill folders found in both places); a skill on the **implementer's** menu needs a
+  `description` (the planner chooses by it). Planner and reviewer skills need none.
+- **Only `SKILL.md` is delivered** (D3). Files next to it (scripts, examples) are readable by the
+  agents **only for repository skills** — they are in the worktree; a machine skill's other files
+  are outside every worktree (and Codex's sandbox). README says so (F2).
+- The draft fixture gets the two skills of the draft role file: `xpp-axclass` in the repository,
+  `xpp-batch` in the machine folder.
+- Tests: `team::tests::skills_resolve_repository_first` (AC-1), `skill_front_matter` (AC-2),
+  `skills_are_validated_at_load`.
 
 ## Open
 

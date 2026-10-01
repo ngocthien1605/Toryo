@@ -1031,6 +1031,33 @@ pub fn problems(cfg: &Effective, root: &Path, machine: &str) -> Vec<String> {
             }
         }
     }
+    // M11-D1: every skill name resolves (the repository, then the machine's `skills_dir`); a
+    // skill on the implementer's menu has a `description` — the planner chooses by it
+    let machine_dir = machine_skills_dir(&team.skill_roots);
+    let names = skill_names(root, machine_dir.as_deref());
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    for seat in SEATS {
+        let Some(r) = team.role(seat) else {
+            continue;
+        };
+        let rf = role_file(seat);
+        for s in &r.skills {
+            match resolve_skill(s, root, machine_dir.as_deref()) {
+                Err(why) => out.push(format!(
+                    "{}: skills: {why}.{}",
+                    rf.display(),
+                    hint(s, &name_refs)
+                )),
+                Ok(k) if seat == "implementer" && k.description.is_none() => out.push(format!(
+                    "{}: skills: skill '{s}' ({}) has no `description` in its front matter — the planner chooses the implementer's skills by it; start {} with `---`, `description: <one line>`, `---`",
+                    rf.display(),
+                    k.origin.as_str(),
+                    k.path.display()
+                )),
+                Ok(_) => {}
+            }
+        }
+    }
     if let Some(c) = &team.culture {
         match crate::config::not_a_repo_path(c) {
             Some(why) => out.push(format!("{}: `{c}` {why}", org_at("culture"))),
@@ -1042,6 +1069,169 @@ pub fn problems(cfg: &Effective, root: &Path, machine: &str) -> Vec<String> {
             None => {}
         }
     }
+    out
+}
+
+// ── D1: skills ───────────────────────────────────────────────────────────────────────
+
+/// Where a skill was found (owner decision D3: the repository first, then the machine).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillOrigin {
+    Repo,
+    Machine,
+}
+
+impl SkillOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Repo => "repo",
+            Self::Machine => "machine",
+        }
+    }
+}
+
+/// A skill as resolved for one attempt (M11-D1): `{ name, origin, path, sha256, bytes }`, the
+/// `description` of its front matter and its text. Only `SKILL.md` itself is delivered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Skill {
+    pub name: String,
+    pub origin: SkillOrigin,
+    pub path: PathBuf,
+    pub sha256: String,
+    pub bytes: usize,
+    pub description: Option<String>,
+    #[serde(skip)]
+    pub text: String,
+}
+
+/// The front matter of a SKILL.md: the YAML mapping between the first two `---` lines (a UTF-8
+/// BOM and CRLF line ends allowed). `None` without front matter, or when it is not a mapping.
+pub fn front_matter(text: &str) -> Option<serde_yaml::Mapping> {
+    let t = text
+        .strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .replace("\r\n", "\n");
+    let mut lines = t.lines();
+    if lines.next()?.trim_end() != "---" {
+        return None;
+    }
+    let mut yaml = String::new();
+    for l in lines {
+        if l.trim_end() == "---" {
+            let v: serde_yaml::Value = serde_yaml::from_str(&yaml).ok()?;
+            return v.as_mapping().cloned();
+        }
+        yaml.push_str(l);
+        yaml.push('\n');
+    }
+    None
+}
+
+/// The `description` of a SKILL.md's front matter, trimmed; `None` when missing or empty.
+pub fn skill_description(text: &str) -> Option<String> {
+    front_matter(text)?
+        .get("description")?
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// A skill name is a folder name: not empty, no separator, no `..`, no drive.
+pub fn valid_skill_name(name: &str) -> bool {
+    !name.trim().is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\', ':'])
+        && name.trim() == name
+}
+
+/// The machine's skills folder of the frozen roots, expanded (`%VAR%`).
+pub fn machine_skills_dir(roots: &SkillRoots) -> Option<PathBuf> {
+    roots
+        .machine
+        .as_deref()
+        .map(|m| PathBuf::from(crate::config::expand_vars(m).unwrap_or_else(|_| m.to_string())))
+}
+
+/// Where `name` is looked up, in order (D3): `<repo>/.toryo/skills/<name>/SKILL.md`, then
+/// `<machine>/<name>/SKILL.md`.
+pub fn skill_candidates(
+    name: &str,
+    repo: &Path,
+    machine: Option<&Path>,
+) -> Vec<(SkillOrigin, PathBuf)> {
+    let mut out = vec![(
+        SkillOrigin::Repo,
+        repo.join(".toryo")
+            .join("skills")
+            .join(name)
+            .join("SKILL.md"),
+    )];
+    if let Some(m) = machine {
+        out.push((SkillOrigin::Machine, m.join(name).join("SKILL.md")));
+    }
+    out
+}
+
+/// Resolve `name`: the first place that has its SKILL.md wins. `Err`: why not, naming both
+/// places.
+pub fn resolve_skill(
+    name: &str,
+    repo: &Path,
+    machine: Option<&Path>,
+) -> std::result::Result<Skill, String> {
+    if !valid_skill_name(name) {
+        return Err(format!(
+            "skill '{name}' is not a folder name — a skill is `<name>/SKILL.md`; use a name without `/`, `\\`, `:` or `..`"
+        ));
+    }
+    let places = skill_candidates(name, repo, machine);
+    for (origin, path) in &places {
+        if let Ok(bytes) = std::fs::read(path) {
+            let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
+            return Ok(Skill {
+                name: name.to_string(),
+                origin: *origin,
+                path: path.clone(),
+                sha256: crate::engine::task::sha256_hex(text.as_bytes()),
+                bytes: text.len(),
+                description: skill_description(&text),
+                text,
+            });
+        }
+    }
+    let shown: Vec<String> = places
+        .iter()
+        .map(|(_, p)| p.display().to_string())
+        .collect();
+    let machine_hint = if machine.is_none() {
+        " (no `skills_dir` in the machine config)"
+    } else {
+        ""
+    };
+    Err(format!(
+        "skill '{name}' not found: neither {}{machine_hint}",
+        shown.join(" nor ")
+    ))
+}
+
+/// The skill names that exist under the roots (folders with a SKILL.md), for "did you mean".
+pub fn skill_names(repo: &Path, machine: Option<&Path>) -> Vec<String> {
+    let mut out = Vec::new();
+    let dirs =
+        std::iter::once(repo.join(".toryo").join("skills")).chain(machine.map(Path::to_path_buf));
+    for d in dirs {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            if e.path().join("SKILL.md").is_file() {
+                let n = e.file_name().to_string_lossy().to_string();
+                if !out.contains(&n) {
+                    out.push(n);
+                }
+            }
+        }
+    }
+    out.sort();
     out
 }
 
@@ -1218,8 +1408,20 @@ mod tests {
                 format!("toryo: 1\npurpose: {purpose}\ninstructions: ./instructions.md\n"),
             ));
         }
-        // what the drafts name: the culture and each role's instructions
+        // what the drafts name: the culture, each role's instructions, the implementer's two
+        // skills (xpp-axclass in the repository, xpp-batch in the machine's skills_dir)
         all.push(("CULTURE.md".into(), "Be careful.\n".into()));
+        all.push((
+            ".toryo/skills/xpp-axclass/SKILL.md".into(),
+            "---\nname: xpp-axclass\ndescription: Create or change an X++ class (AxClass).\n---\n# AxClass\n".into(),
+        ));
+        let batch = d.path().join("machine-skills").join("xpp-batch");
+        std::fs::create_dir_all(&batch).unwrap();
+        std::fs::write(
+            batch.join("SKILL.md"),
+            "---\nname: xpp-batch\ndescription: Write a SysOperation batch job.\n---\n# Batch\n",
+        )
+        .unwrap();
         for seat in SEATS {
             all.push((
                 format!(".toryo/roles/{seat}/instructions.md"),
@@ -1839,6 +2041,131 @@ mod tests {
             assert!(e.contains(want), "{want}\n---\n{e}");
         }
         assert!(e.contains("invalid configuration:"), "{e}");
+    }
+
+    /// M11-D1 AC-1: a name in both places resolves to the repository copy; only in the
+    /// machine folder → machine; nowhere → an error naming both paths.
+    #[test]
+    fn skills_resolve_repository_first() {
+        let d = tempfile::tempdir().unwrap();
+        let (repo, machine) = (d.path().join("repo"), d.path().join("shared"));
+        let put = |p: PathBuf, body: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        put(
+            repo.join(".toryo/skills/both/SKILL.md"),
+            "---\ndescription: repo copy\n---\nR\n",
+        );
+        put(
+            machine.join("both/SKILL.md"),
+            "---\ndescription: machine copy\n---\nM\n",
+        );
+        put(
+            machine.join("only-machine/SKILL.md"),
+            "---\ndescription: m\n---\nX\n",
+        );
+        let s = resolve_skill("both", &repo, Some(&machine)).unwrap();
+        assert_eq!(
+            (s.origin, s.description.as_deref(), s.text.as_str()),
+            (
+                SkillOrigin::Repo,
+                Some("repo copy"),
+                "---\ndescription: repo copy\n---\nR\n"
+            )
+        );
+        assert_eq!(s.sha256, crate::engine::task::sha256_hex(s.text.as_bytes()));
+        assert_eq!(s.bytes, s.text.len());
+        let m = resolve_skill("only-machine", &repo, Some(&machine)).unwrap();
+        assert_eq!(m.origin, SkillOrigin::Machine);
+        assert_eq!(m.path, machine.join("only-machine").join("SKILL.md"));
+        let e = resolve_skill("nowhere", &repo, Some(&machine)).unwrap_err();
+        for want in [
+            "skill 'nowhere' not found",
+            &repo
+                .join(".toryo")
+                .join("skills")
+                .join("nowhere")
+                .join("SKILL.md")
+                .display()
+                .to_string(),
+            &machine
+                .join("nowhere")
+                .join("SKILL.md")
+                .display()
+                .to_string(),
+        ] {
+            assert!(e.contains(want), "{want}: {e}");
+        }
+        let e = resolve_skill("nowhere", &repo, None).unwrap_err();
+        assert!(e.contains("no `skills_dir` in the machine config"), "{e}");
+        for bad in ["../x", "a/b", r"a\b", "C:x", "", ".."] {
+            assert!(resolve_skill(bad, &repo, Some(&machine)).is_err(), "{bad}");
+        }
+        assert_eq!(skill_names(&repo, Some(&machine)), ["both", "only-machine"]);
+    }
+
+    /// M11-D1 AC-2: front matter — missing, without `description`, CRLF line ends, a UTF-8
+    /// BOM, an unclosed block.
+    #[test]
+    fn skill_front_matter() {
+        assert_eq!(skill_description("# no front matter\n"), None);
+        assert_eq!(skill_description("---\nname: x\n---\nbody\n"), None);
+        assert_eq!(skill_description("---\ndescription: '  '\n---\n"), None);
+        assert_eq!(
+            skill_description(
+                "---\r\nname: x\r\ndescription: Make a batch job.\r\n---\r\nbody\r\n"
+            ),
+            Some("Make a batch job.".into())
+        );
+        assert_eq!(
+            skill_description("\u{feff}---\ndescription: with a BOM\n---\n"),
+            Some("with a BOM".into())
+        );
+        assert_eq!(skill_description("---\ndescription: never closed\n"), None);
+        assert_eq!(
+            skill_description("text\n---\ndescription: later\n---\n"),
+            None
+        );
+        let fm = front_matter("---\nname: xpp-batch\ndescription: d\n---\n").unwrap();
+        assert_eq!(fm.get("name").and_then(|v| v.as_str()), Some("xpp-batch"));
+    }
+
+    /// M11-D1 (B3): an unknown skill names both places with a hint; an implementer skill without
+    /// a description is refused.
+    #[test]
+    fn skills_are_validated_at_load() {
+        let (_d, y, m) = draft_repo(&[(
+            IMPL_ROLE,
+            &draft_with(
+                IMPL_ROLE,
+                "[xpp-axclass, xpp-batch]",
+                "[xpp-axclass, xpp-bach]",
+            ),
+        )]);
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains("toryo-role.yaml: skills: skill 'xpp-bach' not found: neither")
+                && e.contains("Did you mean 'xpp-batch'?"),
+            "{e}"
+        );
+        let (_d, y, m) =
+            draft_repo(&[(".toryo/skills/xpp-axclass/SKILL.md", "# no front matter\n")]);
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains("skill 'xpp-axclass' (repo) has no `description` in its front matter"),
+            "{e}"
+        );
+        // planner and reviewer skills need no description
+        let (d, y, m) = draft_repo(&[
+            (".toryo/skills/review-checklist/SKILL.md", "# checklist\n"),
+            (
+                ".toryo/roles/reviewer/toryo-role.yaml",
+                "toryo: 1\npurpose: Review it.\ninstructions: ./instructions.md\nskills: [review-checklist]\n",
+            ),
+        ]);
+        crate::config::Effective::load(&y, Some(&m)).unwrap();
+        drop(d);
     }
 
     /// M11-B1 AC-2: the duration parser.
