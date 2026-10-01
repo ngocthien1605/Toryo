@@ -9,7 +9,7 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
 - [x] A1 — repository files parsed without machine-only keys; tagged keys refused (C1)
 - [x] A2 — machine floor for `verify.boundary` and `verify_root` (H2)
 - [x] B1 — types for the org chart, role files and the new machine keys
-- [ ] B2 — loader: discover `.toryo/`, merge, freeze and hash; `toryo config show`
+- [x] B2 — loader: discover `.toryo/`, merge, freeze and hash; `toryo config show`
 - [ ] B3 — validation pass: cross-references, kinds, order, "did you mean"
 - [ ] C1 — layered instructions and `culture` in the context loader
 - [ ] C2 — the implementer's write fence (`writes` / `never`)
@@ -120,6 +120,47 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   `C:\.thien\toryo-gates\dbsync.ps1`) are `'@TMP@/…'`, which the B2 tests replace with a temp
   folder. Tests: `team::tests::{the_owner_drafts_parse, removed_keys_have_their_own_message,
   seats_are_exactly_three, durations}`, `config::tests::machine_seats_are_the_new_spelling_of_roles`.
+
+### B2 — the loader: discover `.toryo/`, merge, freeze and hash; `toryo config show`
+
+- **Discovery** (`team::org_chart_root`): after `toryo.yaml` is parsed, `<project.root>/.toryo/
+  toryo-orgchart.yaml` (with `project.root` expanded; a root that does not expand is `toryo.yaml`-only
+  mode, as before). Read from the repository checkout, never a task worktree. Note: `task create --repo
+  X` does not change where the org chart is read from (it is a property of the configuration, like
+  `toryo.yaml` itself).
+- **Merge** (`team::load` → `team::Loaded`, applied in `Effective::load`): the seats become
+  `repo.roles` (an omitted `fallback` is `Some([])` — a chain of one); the implementer's `before_handoff`
+  check gates become `repo.commands.verify`, in that order (`team::gate_command`, `timeout_sec` from
+  the gate's `timeout`); a lone `limits.max_fix_cycles` becomes `repo.pipeline.max_fix_cycles`. So the
+  engine reads the same fields as in M10. Machine `seats:` / `roles:` replace repository seats
+  afterwards (`RepoOverriddenByMachine`). `verify_commands` never falls back to `scripts/build.ps1` in
+  org chart mode.
+- **Freeze and hash**: `Effective.team: Option<team::Team>` — team name, culture path, every gate
+  (declaration + the machine's `EnvGate` for an environment gate, so the command that will run with
+  full rights is the one the task was created with), limits, checks, each role file's parsed content
+  (purpose, instructions path relative to the repo root, skills, writes, never, before_handoff) and
+  the skill roots (`.toryo/skills`, the machine's `skills_dir`). Serialised as `team` only in org
+  chart mode — M10 configurations keep their hash (`templates_keep_their_m10_hash`). `from_frozen`
+  reads `team` back without touching `.toryo/` (tested by deleting `.toryo/` before the reload).
+- **Errors** (all at once, with the other validation problems): `roles:`, `commands:` or
+  `pipeline.max_fix_cycles` in `toryo.yaml` (each names both files and where the setting lives now);
+  a missing role file; a role file that does not parse; a leftover `.toryo/roles/<role>.md` ("move it
+  to `.toryo/roles/<role>/instructions.md`"); a non-empty `fallback` on the planner or reviewer, in the
+  org chart or from a machine seat override (an explicit `fallback: []` is accepted — it says
+  nothing); `max_fix_cycles` together with a split limit; a bad `timeout`; `toryo:` other than 1. The
+  org chart itself must parse (YAML, tags, removed keys, serde) before anything else is reported.
+- **Origins**: `Origins.gates` (`repo` = a check gate or an environment gate this machine does not
+  define; `machine` = an environment gate whose command is the machine's) and `Origins.skills_dir`.
+  `Effective.files`: every file read (toryo.yaml, machine config, org chart, role files) with its
+  SHA-256 — not hashed, empty for a frozen configuration.
+- **`toryo config show [--json]`** (`src/config_show.rs`, new top-level `config` command): the text
+  form and the JSON document (schema 1, in README "The effective configuration (M11)"). In
+  `toryo.yaml`-only mode the verify commands are listed as `kind: check` gates.
+- Tests: `team::tests::{the_draft_set_loads_freezes_and_reloads, a_setting_in_both_places_is_refused,
+  fallbacks_overrides_and_leftover_role_files}` (AC-1, AC-3) and `tests/m11_orgchart.rs` (`config show`
+  through the CLI, a task frozen and reloaded with the same digest, a fake run to the final gate —
+  AC-1, AC-4; `toryo.yaml only` without an org chart). `tests/common::setup_orgchart` builds the
+  fixture repository in org chart mode for the later groups.
 
 ## Open
 

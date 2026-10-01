@@ -92,6 +92,47 @@ commands:
     env
 }
 
+/// The org chart of [`setup_orgchart`]: the fixture's verify command as a check gate.
+pub const ORGCHART: &str = "toryo: 1\nteam: calc-team\ngates:\n  divide-present: { kind: check, program: git, args: [grep, -q, Divide-Numbers, --, src], timeout: 5m }\nseats:\n  planner: { profile: claude-max }\n  implementer: { profile: IMPLEMENTER }\n  reviewer: { profile: claude-max }\n";
+
+/// M11: the fixture in org chart mode. The fixture repository gets `.toryo/` (the org chart
+/// [`ORGCHART`] and three role files; the implementer's `before_handoff: [divide-present]`),
+/// then `files` (which may replace any of them), all committed on main; `toryo.yaml` keeps only
+/// `project` and `verify` (+ `extra`) — no `roles:`, `commands:` or `pipeline.max_fix_cycles`.
+pub fn setup_orgchart(implementer: &str, extra: &str, files: &[(&str, &str)]) -> Env {
+    let env = setup(implementer);
+    let fwd = |p: &Path| p.display().to_string().replace('\\', "/");
+    let org = ORGCHART.replace("IMPLEMENTER", implementer);
+    let mut all: Vec<(&str, &str)> = vec![
+        (".toryo/toryo-orgchart.yaml", &org),
+        (
+            ".toryo/roles/planner/toryo-role.yaml",
+            "toryo: 1\npurpose: Plan the change.\n",
+        ),
+        (
+            ".toryo/roles/implementer/toryo-role.yaml",
+            "toryo: 1\npurpose: Change the code.\nbefore_handoff: [divide-present]\n",
+        ),
+        (
+            ".toryo/roles/reviewer/toryo-role.yaml",
+            "toryo: 1\npurpose: Review the checkpoint.\n",
+        ),
+    ];
+    all.extend_from_slice(files);
+    commit_repo(&env, &all, "m11: the org chart");
+    std::fs::write(
+        &env.config,
+        format!(
+            "version: 1\nproject:\n  root: \"{}\"\n  worktrees_root: \"{}\"\nverify: {{ boundary: none, verify_root: \"{}\" }}\n{extra}",
+            fwd(&env.repo),
+            fwd(&env.root.join("wts")),
+            fwd(&env.root.join("verify")),
+        ),
+    )
+    .unwrap();
+    env
+}
+
 pub fn command(env: &Env, args: &[&str], extra: &[(&str, &str)]) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_toryo"));
     c.arg("--config")

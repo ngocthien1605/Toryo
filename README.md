@@ -206,6 +206,33 @@ a command line or a script; it never blocks or fails the run, and toryo waits fo
 Known limit: under PowerShell Constrained Language Mode (AppLocker/WDAC policies) the script cannot load the
 WinRT types — `notify-test` then fails and says so. Elsewhere than Windows: nothing is shown.
 
+## The effective configuration (M11)
+
+`toryo config show [--json]` prints the configuration `task create` would freeze for this repository and
+machine: the mode (`toryo.yaml only`, or `org chart` when `<project.root>/.toryo/toryo-orgchart.yaml` exists),
+every file read with its SHA-256, and where each seat, profile, gate, toolchain, `skills_dir` and verify setting
+came from. Sources: `repo`, `machine`, `repo_overridden_by_machine` (a machine seat override, or the machine's
+`verify.verify_root`), `null` (not set). `--json` (schema 1):
+
+```jsonc
+{ "schema": 1, "mode": "org chart",                 // or "toryo.yaml only"
+  "config_sha256": "…",                             // what `task create` records as tasks.config_sha256
+  "team": "d365fo-dev",                             // null in toryo.yaml-only mode
+  "files": [ { "what": "toryo.yaml", "path": "…", "sha256": "…" } ],   // + machine config, org chart, role <seat>
+  "seats": [ { "seat": "implementer", "profile": "codex-openai", "model": null, "fallback": ["claude-max"], "source": "repo" } ],
+  "profiles": [ { "name": "claude-max", "kind": "claude", "billing": "subscription", "exe": "…", "source": "machine" } ],
+  "gates": [ { "name": "dbsync", "kind": "environment", "timeout": "30m", "lock": "d365-env", "if_missing": "error",
+               "defined_on_this_machine": true, "source": "machine" } ],   // toryo.yaml only: the verify commands, kind "check"
+  "before_handoff": ["build", "dbsync"],             // the implementer's gate order; null without an org chart
+  "toolchains": [ { "name": "xpp", "source": "machine" } ],
+  "skills_dir": { "path": "C:/Temp/AgentShare/skills", "source": "machine" },   // null when unset
+  "verify": { "boundary": { "value": "low_integrity", "source": "repo" },
+              "min_boundary": { "value": null, "source": null },          // null: the default floor low_integrity
+              "verify_root": { "value": "%LOCALAPPDATA%\\toryo-verify", "source": "repo" } },
+  "limits": { "max_gate_retries": 3, "max_review_rounds": 3 },            // null without an org chart
+  "checks": { "reviewer-differs-from-builder": "warn" } }
+```
+
 ## Build and test
 
 ```powershell

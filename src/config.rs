@@ -589,6 +589,11 @@ pub struct Origins {
     /// M11-A2: `boundary`, `min_boundary` and `verify_root` (the machine's replaces the
     /// repository's).
     pub verify: BTreeMap<String, Origin>,
+    /// M11-B2: each gate of the org chart — `Repo` (a check gate, or an environment gate this
+    /// machine does not define), `Machine` (an environment gate whose command is the machine's).
+    pub gates: BTreeMap<String, Origin>,
+    /// M11-B2: the machine's `skills_dir`, in org chart mode.
+    pub skills_dir: Option<Origin>,
 }
 
 /// Effective configuration = repo config with machine overrides applied.
@@ -604,6 +609,11 @@ pub struct Effective {
     /// out of the canonical JSON when unset, so a configuration without it keeps its hash.
     #[serde(skip_serializing_if = "MachineVerify::is_empty")]
     pub machine_verify: MachineVerify,
+    /// M11-B2: org chart mode — the parsed `.toryo/` (gates, limits, checks, role files,
+    /// skill roots), frozen and hashed with the task; `None` (left out) in `toryo.yaml`-only
+    /// mode, so an M10 configuration keeps its hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub team: Option<crate::team::Team>,
     #[serde(skip)]
     pub repo_path: PathBuf,
     #[serde(skip)]
@@ -614,11 +624,16 @@ pub struct Effective {
     /// M10-D1: the machine's `notify:`; not frozen, not hashed.
     #[serde(skip)]
     pub notify: Notify,
+    /// M11-B2: the files read, with their SHA-256 (`config show`); empty when frozen.
+    #[serde(skip)]
+    pub files: Vec<crate::team::FileRead>,
 }
 
 impl Effective {
     pub fn load(repo_path: &Path, machine_path: Option<&Path>) -> Result<Self> {
-        let text = std::fs::read_to_string(repo_path)
+        let bytes =
+            std::fs::read(repo_path).with_context(|| format!("reading {}", repo_path.display()))?;
+        let text = String::from_utf8(bytes.clone())
             .with_context(|| format!("reading {}", repo_path.display()))?;
         // R60 (ARCH-05): the repository file never defines an agent's program, environment
         // or secrets — checked on the raw text, before anything is merged
@@ -640,6 +655,28 @@ impl Effective {
         if repo.version != 1 {
             bail!("unsupported toryo.yaml version {}", repo.version);
         }
+        let mut files = vec![crate::team::FileRead::of("toryo.yaml", repo_path, &bytes)];
+        let machine = match machine_path {
+            Some(mp) if mp.exists() => {
+                let b = std::fs::read(mp).with_context(|| format!("reading {}", mp.display()))?;
+                files.push(crate::team::FileRead::of("machine config", mp, &b));
+                Some((mp.to_path_buf(), MachineConfig::load(mp)?))
+            }
+            _ => None,
+        };
+        // M11-B2: org chart mode when `<project.root>/.toryo/toryo-orgchart.yaml` exists
+        let mut team = None;
+        let mut team_problems = Vec::new();
+        if let Some(root) = crate::team::org_chart_root(&repo.project.root) {
+            let loaded =
+                crate::team::load(&root, repo_path, &doc, machine.as_ref().map(|(_, m)| m))?;
+            repo.roles = loaded.roles;
+            repo.commands.verify = loaded.verify;
+            repo.pipeline.max_fix_cycles = loaded.team.limits.max_fix_cycles;
+            files.extend(loaded.files);
+            team_problems = loaded.problems;
+            team = Some(loaded.team);
+        }
         let mut trusted_filters = BTreeMap::new();
         let mut toolchains = Toolchains::default();
         let mut used_machine = None;
@@ -652,40 +689,51 @@ impl Effective {
         for k in ["boundary", "verify_root"] {
             origins.verify.insert(k.into(), Origin::Repo);
         }
-        if let Some(mp) = machine_path {
-            if mp.exists() {
-                let machine = MachineConfig::load(mp)?;
-                for (k, v) in machine.roles {
-                    let o = if repo.roles.contains_key(&k) {
-                        Origin::RepoOverriddenByMachine
-                    } else {
-                        Origin::Machine
-                    };
-                    origins.roles.insert(k.clone(), o);
-                    repo.roles.insert(k, v);
-                }
-                for (k, v) in machine.profiles {
-                    origins.profiles.insert(k.clone(), Origin::Machine);
-                    repo.profiles.insert(k, v);
-                }
-                trusted_filters = machine.git.trusted_filters;
-                toolchains = machine.toolchains;
-                notify = machine.notify;
-                machine_verify = machine.verify;
-                if machine_verify.min_boundary.is_some() {
-                    origins
-                        .verify
-                        .insert("min_boundary".into(), Origin::Machine);
-                }
-                if machine_verify.verify_root.is_some() {
-                    origins
-                        .verify
-                        .insert("verify_root".into(), Origin::RepoOverriddenByMachine);
-                }
-                for name in toolchains.names() {
-                    origins.toolchains.insert(name.into(), Origin::Machine);
-                }
-                used_machine = Some(mp.to_path_buf());
+        if let Some((mp, machine)) = machine {
+            for (k, v) in machine.roles {
+                let o = if repo.roles.contains_key(&k) {
+                    Origin::RepoOverriddenByMachine
+                } else {
+                    Origin::Machine
+                };
+                origins.roles.insert(k.clone(), o);
+                repo.roles.insert(k, v);
+            }
+            for (k, v) in machine.profiles {
+                origins.profiles.insert(k.clone(), Origin::Machine);
+                repo.profiles.insert(k, v);
+            }
+            trusted_filters = machine.git.trusted_filters;
+            toolchains = machine.toolchains;
+            notify = machine.notify;
+            machine_verify = machine.verify;
+            if machine_verify.min_boundary.is_some() {
+                origins
+                    .verify
+                    .insert("min_boundary".into(), Origin::Machine);
+            }
+            if machine_verify.verify_root.is_some() {
+                origins
+                    .verify
+                    .insert("verify_root".into(), Origin::RepoOverriddenByMachine);
+            }
+            for name in toolchains.names() {
+                origins.toolchains.insert(name.into(), Origin::Machine);
+            }
+            if team.is_some() && machine.skills_dir.is_some() {
+                origins.skills_dir = Some(Origin::Machine);
+            }
+            used_machine = Some(mp);
+        }
+        if let Some(t) = &team {
+            for (name, g) in &t.gates {
+                let o = match g.decl.kind {
+                    crate::team::GateType::Check => Origin::Repo,
+                    // declared in the repository, its command from the machine config
+                    crate::team::GateType::Environment if g.machine.is_some() => Origin::Machine,
+                    crate::team::GateType::Environment => Origin::Repo,
+                };
+                origins.gates.insert(name.clone(), o);
             }
         }
         for (name, role) in &repo.roles {
@@ -703,15 +751,18 @@ impl Effective {
             trusted_filters,
             toolchains,
             machine_verify,
+            team,
             repo_path: repo_path.to_path_buf(),
             machine_path: used_machine,
             origins,
             notify,
+            files,
         };
-        eff.validate().with_context(|| match &eff.machine_path {
-            Some(m) => format!("{} (with {})", repo_path.display(), m.display()),
-            None => repo_path.display().to_string(),
-        })?;
+        eff.validate_with(team_problems)
+            .with_context(|| match &eff.machine_path {
+                Some(m) => format!("{} (with {})", repo_path.display(), m.display()),
+                None => repo_path.display().to_string(),
+            })?;
         Ok(eff)
     }
 
@@ -720,11 +771,29 @@ impl Effective {
     /// `codex.overrides` that would re-set what toryo sets itself. A frozen configuration
     /// ([`Effective::from_frozen`]) is not re-checked: it is what its task was created with.
     pub fn validate(&self) -> Result<()> {
+        self.validate_with(Vec::new())
+    }
+
+    /// [`Self::validate`] with the problems the org chart loader found (M11-B2), first.
+    fn validate_with(&self, mut problems: Vec<String>) -> Result<()> {
         let hint = machine_config_hint(self.machine_path.as_deref());
-        let mut problems = problems(&self.repo, &self.toolchains, &hint);
+        problems.extend(self::problems(&self.repo, &self.toolchains, &hint));
         if let Some(b) = &self.machine_verify.min_boundary {
             let key = format!("verify.min_boundary (machine config {hint})");
             one_of(&mut problems, &key, b, VERIFY_BOUNDARIES);
+        }
+        if self.team.is_some() {
+            // M11-B2: a machine seat override cannot give the planner or reviewer a fallback
+            for seat in ["planner", "reviewer"] {
+                let fb = self.repo.roles.get(seat).and_then(|r| r.fallback.as_ref());
+                if fb.is_some_and(|f| !f.is_empty())
+                    && self.origins.roles.get(seat) != Some(&Origin::Repo)
+                {
+                    problems.push(format!(
+                        "seats.{seat}.fallback (machine config {hint}): a fallback on the {seat} is not supported yet — only the implementer may switch profiles (R49); remove it"
+                    ));
+                }
+            }
         }
         if problems.is_empty() {
             return Ok(());
@@ -733,7 +802,8 @@ impl Effective {
     }
 
     /// Rebuild the configuration frozen by `toryo task create` (R35): a task never re-reads
-    /// `toryo.yaml`; the frozen copy hashes to the same `config_sha256`.
+    /// `toryo.yaml`; the frozen copy hashes to the same `config_sha256`. Org chart mode comes
+    /// back from the frozen `team` section, without reading `.toryo/` again (M11-B2).
     pub fn from_frozen(canonical_json: &str, origin: &Path) -> Result<Self> {
         #[derive(Deserialize)]
         struct Frozen {
@@ -744,6 +814,8 @@ impl Effective {
             toolchains: Toolchains,
             #[serde(default)]
             machine_verify: MachineVerify,
+            #[serde(default)]
+            team: Option<crate::team::Team>,
         }
         let f: Frozen =
             serde_json::from_str(canonical_json).context("parsing the frozen config.json")?;
@@ -752,10 +824,12 @@ impl Effective {
             trusted_filters: f.trusted_filters,
             toolchains: f.toolchains,
             machine_verify: f.machine_verify,
+            team: f.team,
             repo_path: origin.to_path_buf(),
             machine_path: None,
             origins: Origins::default(),
             notify: Notify::default(),
+            files: Vec::new(),
         })
     }
 
@@ -1459,10 +1533,12 @@ policy:
             trusted_filters: BTreeMap::new(),
             toolchains: Toolchains::default(),
             machine_verify: MachineVerify::default(),
+            team: None,
             repo_path: PathBuf::new(),
             machine_path: None,
             origins: Origins::default(),
             notify: Notify::default(),
+            files: Vec::new(),
         };
         let (_d, p, m) = write_split(SAMPLE);
         let new = Effective::load(&p, Some(&m)).unwrap();

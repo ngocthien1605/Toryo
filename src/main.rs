@@ -55,6 +55,12 @@ enum Cmd {
         #[arg(long, value_enum, default_value = "restricted", requires = "canaries")]
         claude_mode: LaunchMode,
     },
+    /// The effective configuration (M11): mode, files read, and where each seat, profile,
+    /// gate, toolchain and verify setting came from.
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
     /// Create, list, show or clean up tasks.
     Task {
         #[command(subcommand)]
@@ -191,6 +197,16 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum ConfigCmd {
+    /// Print the effective configuration of this repository and machine (M11-B2).
+    Show {
+        /// One JSON document on stdout (schema in the README)
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum SecretsCmd {
     /// Store a secret read from stdin (one line), e.g. `Read-Host -MaskInput | toryo secrets set toryo/foundry-openai`.
     Set { target: String },
@@ -266,6 +282,20 @@ fn run(cli: Cli) -> Result<i32> {
         }
         #[cfg(feature = "m0-kit")]
         Cmd::Spike { cmd } => spike(&cli, cmd),
+        Cmd::Config {
+            cmd: ConfigCmd::Show { json },
+        } => {
+            let cfg = load_config(&cli)?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&toryo::config_show::json(&cfg))?
+                );
+            } else {
+                print!("{}", toryo::config_show::text(&cfg));
+            }
+            Ok(0)
+        }
         Cmd::Task { cmd } => engine_cli::task(&cli, cmd),
         Cmd::Run { id, drive } => engine_cli::run(id, &drive_with(&cli, drive)),
         Cmd::Approve {

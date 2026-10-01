@@ -400,7 +400,9 @@ pub fn which(name: &str) -> Option<PathBuf> {
 
 /// `commands.verify` from the config, else `scripts/build.ps1` + `scripts/test.ps1` if they exist.
 pub fn verify_commands(cfg: &Effective, repo: &Path) -> Result<Vec<CommandSpec>> {
-    if !cfg.repo.commands.verify.is_empty() {
+    // M11: in org chart mode the check gates are the verify commands — never the scripts
+    // fallback below
+    if cfg.team.is_some() || !cfg.repo.commands.verify.is_empty() {
         return Ok(cfg.repo.commands.verify.clone());
     }
     let mut v = Vec::new();

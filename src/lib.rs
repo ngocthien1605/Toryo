@@ -11,6 +11,7 @@
 
 pub mod agents;
 pub mod config;
+pub mod config_show;
 pub mod doctor;
 pub mod domain;
 pub mod engine;
