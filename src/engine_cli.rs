@@ -1128,18 +1128,49 @@ fn print_json(v: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// M11-E3: what each environment lock's environment holds — every lock, or only the locks
+/// `task` deployed to — with its status in words and whether that task's final gate is
+/// approved.
+fn environments(
+    st: &Store,
+    task: Option<&str>,
+) -> Result<Vec<(store::Deployment, &'static str, bool)>> {
+    let rows = st.read(store::deployments)?;
+    let mut out = Vec::new();
+    for d in rows
+        .into_iter()
+        .filter(|d| task.is_none_or(|i| d.task == i))
+    {
+        let i = d.task.clone();
+        let state = st.read(move |tx| Ok(store::get_task(tx, &i).ok().map(|t| t.state)))?;
+        let active = driven_owner(st, &d.task).ok().flatten().is_some();
+        let status = views::deployment_status(&d, state, active);
+        out.push((d, status, state == Some(PipelineState::Completed)));
+    }
+    Ok(out)
+}
+
 pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
     let st = store()?;
     let tasks = match id {
         Some(i) => vec![read_task(&st, i)?],
         None => st.read(store::list_tasks)?,
     };
+    let envs = environments(&st, id)?;
     if json {
         let list = tasks
             .iter()
             .map(|t| Ok(views::task_json(t, &facts(&st, t)?)))
             .collect::<Result<Vec<_>>>()?;
-        print_json(&serde_json::json!({ "tasks": list }))?;
+        let mut doc = serde_json::json!({ "tasks": list });
+        // M11-E3: only when an environment gate has deployed (the M10 document otherwise)
+        if !envs.is_empty() {
+            doc["environments"] = envs
+                .iter()
+                .map(|(d, s, a)| views::deployment_json(d, s, *a))
+                .collect();
+        }
+        print_json(&doc)?;
         return Ok(0);
     }
     if tasks.is_empty() {
@@ -1172,7 +1203,24 @@ pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
         if f.compile_only == Some(true) {
             println!("               {}", toryo::engine::xpp::COMPILE_ONLY);
         }
+        // M11-E3: an environment gate waiting for its machine-wide lock
+        if t.state == PipelineState::Verifying {
+            let i = t.id.clone();
+            if let Some(lock) = st.read(move |tx| store::env_wait(tx, &i))? {
+                let holder = st
+                    .read(store::deployments)?
+                    .into_iter()
+                    .find(|d| d.lock == lock && d.finished_at.is_none() && d.task != t.id)
+                    .map(|d| format!(" (held by {})", d.task))
+                    .unwrap_or_default();
+                println!("               waiting for lock {lock}{holder}");
+            }
+        }
         println!("               next: {}", f.next_action);
+    }
+    // M11-E3: one line per environment lock — what code that environment runs
+    for (d, s, _) in &envs {
+        println!("environment    {}", views::deployment_line(d, s));
     }
     Ok(0)
 }
@@ -1220,7 +1268,16 @@ fn show(id: &str, json: bool) -> Result<i32> {
     if json {
         let task = views::task_json(&t, &facts(&st, &t)?);
         let events = toryo::engine::flight::events_path(&t);
-        print_json(&views::show_json(task, &t, &atts, &usage, &ap, &events))?;
+        let mut doc = views::show_json(task, &t, &atts, &usage, &ap, &events);
+        // M11-E3: the environments this task deployed to (only then)
+        let envs = environments(&st, Some(id))?;
+        if !envs.is_empty() {
+            doc["environments"] = envs
+                .iter()
+                .map(|(d, s, a)| views::deployment_json(d, s, *a))
+                .collect();
+        }
+        print_json(&doc)?;
         return Ok(0);
     }
     status(Some(id), false)?;

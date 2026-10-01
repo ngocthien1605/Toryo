@@ -810,6 +810,12 @@ fn env_gate_problems(
         out.push(format!(
             "{key}.lock: required — the machine-wide lock name (e.g. d365-env): one environment gate per lock runs at a time"
         ));
+    } else if !crate::engine::lock::valid_lock_name(&g.lock) {
+        // M11-E3: the name is part of the lock's file name
+        out.push(format!(
+            "{key}.lock: `{}` — use letters, digits, `-`, `_` and `.` only (e.g. d365-env)",
+            g.lock
+        ));
     }
     let expand = |s: &str| crate::config::expand_vars(s).map(PathBuf::from).ok();
     let roots: Vec<(&str, PathBuf)> = [

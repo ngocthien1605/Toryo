@@ -203,6 +203,74 @@ impl Drop for StopWatch {
     }
 }
 
+/// M11-E3: the file of an environment gate's machine-wide lock, `<data_dir>/locks/env-<lock>.lock`.
+pub fn env_lock_path(lock: &str) -> PathBuf {
+    data_dir().join("locks").join(format!("env-{lock}.lock"))
+}
+
+/// An environment-gate lock name is part of a file name: letters, digits, `-`, `_`, `.`
+/// (not only dots).
+pub fn valid_lock_name(lock: &str) -> bool {
+    !lock.is_empty()
+        && lock.chars().any(|c| c != '.')
+        && lock
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// M11-E3: an environment gate's machine-wide lock — one gate per lock name runs at a time,
+/// across all tasks (they share one environment). An exclusive OS file lock like
+/// [`TaskLock`]: the OS releases it when the holder exits or crashes; the holder's label is
+/// written inside (for a human; Windows does not let other processes read a locked file, so
+/// `status` names the holder from `environment_deployments`). Held only while the gate runs.
+pub struct EnvLock {
+    file: File,
+    pub name: String,
+}
+
+impl EnvLock {
+    /// Take the lock if it is free (non-blocking); `None` while another process holds it.
+    pub fn try_acquire(lock: &str, holder: &str) -> Result<Option<EnvLock>> {
+        if !valid_lock_name(lock) {
+            anyhow::bail!(
+                "environment gate lock `{lock}`: use letters, digits, `-`, `_` and `.` only"
+            );
+        }
+        let p = env_lock_path(lock);
+        std::fs::create_dir_all(p.parent().expect("parent"))?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&p)
+            .with_context(|| format!("opening {}", p.display()))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("locking {}", p.display()))
+            }
+        }
+        use std::io::{Seek, Write};
+        let _ = file.set_len(0);
+        let _ = file.seek(std::io::SeekFrom::Start(0));
+        let _ = writeln!(file, "{holder}");
+        Ok(Some(EnvLock {
+            file,
+            name: lock.to_string(),
+        }))
+    }
+}
+
+impl Drop for EnvLock {
+    fn drop(&mut self) {
+        // explicitly, not only by closing the handle (review L9: Windows may release a
+        // closed handle's lock asynchronously)
+        let _ = self.file.unlock();
+    }
+}
+
 /// Is the task lock free right now? A probe: taken and released at once, never a mutation.
 pub fn probe_free(task: &str) -> Result<bool> {
     let f = open_lock_file(task)?;

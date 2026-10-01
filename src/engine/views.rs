@@ -31,6 +31,53 @@ pub fn fix_cycles(t: &TaskRow, sep: &str) -> String {
     }
 }
 
+/// M11-E3: what an environment holds, in words: `approved` once the holder's final gate is
+/// approved, else `not approved yet`; `deploying now` while the gate runs (`active`: the
+/// holder's run is alive), `interrupted …` when it was killed or stopped, `the deploy failed`.
+pub fn deployment_status(
+    d: &super::store::Deployment,
+    holder: Option<super::state::PipelineState>,
+    active: bool,
+) -> &'static str {
+    use super::state::PipelineState as St;
+    match (d.finished_at.as_ref(), d.ok, holder) {
+        (None, _, _) if active => "deploying now",
+        (None, _, _) | (Some(_), None, _) => {
+            "interrupted — the environment may hold a partial deploy"
+        }
+        (Some(_), Some(false), _) => "the deploy failed",
+        (_, _, Some(St::Completed)) => "approved",
+        (_, _, Some(St::Cancelled)) => "not approved — the task was cancelled",
+        _ => "not approved yet",
+    }
+}
+
+/// M11-E3: `d365-env holds BR-001 @ 1a2b3c4 (not approved yet)`.
+pub fn deployment_line(d: &super::store::Deployment, status: &str) -> String {
+    format!(
+        "{} holds {} @ {} ({status})",
+        d.lock,
+        d.task,
+        crate::git::short(&d.sha)
+    )
+}
+
+/// M11-E3: one entry of `environments[]` in `status --json` / `task show --json`.
+pub fn deployment_json(d: &super::store::Deployment, status: &str, approved: bool) -> Value {
+    json!({
+        "lock": d.lock,
+        "task": d.task,
+        "sha": d.sha,
+        "gate": d.gate,
+        "machine": d.machine,
+        "started_at": d.started_at,
+        "finished_at": d.finished_at,
+        "ok": d.ok,
+        "approved": approved,
+        "status": status,
+    })
+}
+
 /// One task of `status --json`. With split limits (M11-C4) it also has `gate_retries`,
 /// `max_gate_retries`, `review_rounds`, `max_review_rounds` — only then, so the document of a
 /// single-bound task is unchanged.
@@ -242,5 +289,70 @@ mod tests {
         assert_eq!(v["usage"][0]["reservation_tokens"], 200_000);
         assert_eq!(v["gates"][0]["status"], "approved");
         assert_eq!(v["events_file"], "C:/d/runs/T-1/events.jsonl");
+    }
+
+    /// M11-E3: what an environment holds, in words, for each state of its record and of the
+    /// holder task; and the line `status` prints.
+    #[test]
+    fn deployment_status_in_words() {
+        use crate::engine::state::PipelineState as St;
+        use crate::engine::store::Deployment;
+        let d = |finished: bool, ok: Option<bool>| Deployment {
+            lock: "d365-env".into(),
+            task: "BR-001".into(),
+            sha: "1a2b3c4d5e6f7a8b".into(),
+            gate: "dbsync".into(),
+            machine: "UDE-1".into(),
+            started_at: "t0".into(),
+            finished_at: finished.then(|| "t1".into()),
+            ok,
+        };
+        let cases = [
+            (d(false, None), Some(St::Verifying), true, "deploying now"),
+            (
+                d(false, None),
+                Some(St::Verifying),
+                false,
+                "interrupted — the environment may hold a partial deploy",
+            ),
+            (
+                d(true, None),
+                Some(St::Verifying),
+                false,
+                "interrupted — the environment may hold a partial deploy",
+            ),
+            (
+                d(true, Some(false)),
+                Some(St::Fixing),
+                false,
+                "the deploy failed",
+            ),
+            (d(true, Some(true)), Some(St::Completed), false, "approved"),
+            (
+                d(true, Some(true)),
+                Some(St::Cancelled),
+                false,
+                "not approved — the task was cancelled",
+            ),
+            (
+                d(true, Some(true)),
+                Some(St::WaitingFinalApproval),
+                false,
+                "not approved yet",
+            ),
+            (d(true, Some(true)), None, false, "not approved yet"),
+        ];
+        for (dep, state, active, want) in cases {
+            assert_eq!(deployment_status(&dep, state, active), want, "{dep:?}");
+        }
+        assert_eq!(
+            deployment_line(&d(true, Some(true)), "not approved yet"),
+            "d365-env holds BR-001 @ 1a2b3c4d5e6f (not approved yet)"
+        );
+        assert!(crate::engine::lock::valid_lock_name("d365-env"));
+        assert!(crate::engine::lock::valid_lock_name("env_1.a"));
+        for bad in ["", "..", "a/b", r"a\b", "c:x", "x y"] {
+            assert!(!crate::engine::lock::valid_lock_name(bad), "{bad}");
+        }
     }
 }

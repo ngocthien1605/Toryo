@@ -36,7 +36,7 @@ use super::checks::{
 use super::context;
 use super::contracts;
 use super::flight::{EngineEvent, Recorder, TurnUsage};
-use super::lock::{StopWatch, TaskLock};
+use super::lock::{EnvLock, StopWatch, TaskLock};
 use super::protect;
 use super::state::{GateKind, Machine, PipelineEvent as Ev, PipelineState as St};
 use super::store::{self, AttemptEnd, AttemptRow, AttemptStatus, NewAttempt, Store, TaskRow};
@@ -1250,18 +1250,32 @@ impl<'a> Engine<'a> {
             Some(format!("{} in {}", verify::describe(b), co.dir.display())),
         );
         let stop = self.lock.watch_stop();
-        let Some((results, failure)) =
-            self.run_verify_commands(b, &co, &head, &stop, xpp.as_ref())?
-        else {
-            self.finish_and(
+        let interrupted = |e: &Self| -> Result<Flow> {
+            e.finish_and(
                 &a,
                 AttemptStatus::Interrupted,
                 AttemptEnd::default(),
                 None,
                 None,
             )?;
-            return self.stopped();
+            e.stopped()
         };
+        let Some((mut results, mut failure)) =
+            self.run_verify_commands(b, &co, &head, &stop, xpp.as_ref())?
+        else {
+            return interrupted(self);
+        };
+        // M11-E3: the environment gates, only after every check gate passed
+        if failure.is_none() {
+            match self.run_environment_gates(t, &co, &head, &stop, &mut results)? {
+                EnvGates::Done(f) => failure = f,
+                EnvGates::Stopped => return interrupted(self),
+                EnvGates::Unavailable(reason) => {
+                    self.escalate_attempt(&a, ENV_UNAVAILABLE.into(), reason)?;
+                    return Ok(Flow::Next);
+                }
+            }
+        }
         let pass = failure.is_none();
         // R29/R47: the checkout must be exactly the checkpoint after the run
         let mutated = verify::mutated(&self.g, &co, &head)?;
@@ -1436,6 +1450,17 @@ impl<'a> Engine<'a> {
     /// One verify process through `LocalRunner`, with its ✔/✘ line; `None` when a stop
     /// request ended it (R38). R50: LocalRunner strips ANSI (CSI/OSC) from what it captures.
     fn run_verify_command(&self, run: RunSpec, stop: &StopWatch) -> Result<Option<CommandResult>> {
+        self.run_gate_command(run, stop, None)
+    }
+
+    /// [`Self::run_verify_command`] for a gate of `kind` (`environment`, M11-E3: shown in its
+    /// `verify_command` event; `None` keeps the M10 event).
+    fn run_gate_command(
+        &self,
+        run: RunSpec,
+        stop: &StopWatch,
+        kind: Option<&str>,
+    ) -> Result<Option<CommandResult>> {
         let name = run.name.clone();
         let res = self.hub.block_on(LocalRunner.run(run, None))?;
         if res.cancelled || stop.stopped() {
@@ -1447,8 +1472,165 @@ impl<'a> Engine<'a> {
             timed_out: res.timed_out,
             ok: res.ok(),
             duration_ms: res.duration_ms as u64,
+            kind: kind.map(str::to_string),
         });
         Ok(Some(res))
+    }
+
+    // ── environment gates (M11-E3) ───────────────────────────────────────────────────
+
+    /// The environment gates of the implementer's `before_handoff`, in order, after every
+    /// check gate of the run passed: each takes its machine-wide lock (waiting while another
+    /// task holds it), records the deployment **before** it starts, runs the frozen machine
+    /// command with the owner's normal token in the verify checkout (Job Object, timeout,
+    /// environment from scratch + gate variables + `env` + resolved `secret_env`, redacted
+    /// output), records the end and releases the lock. A gate this machine does not define
+    /// (`if_missing: skip`) gets a skipped entry. Stops at the first failure.
+    fn run_environment_gates(
+        &self,
+        t: &TaskRow,
+        co: &verify::Checkout,
+        head: &str,
+        stop: &StopWatch,
+        results: &mut Vec<Value>,
+    ) -> Result<EnvGates> {
+        let Some(team) = &self.cfg.team else {
+            return Ok(EnvGates::Done(None));
+        };
+        let machine = computer_name();
+        let gates: Vec<(&str, &crate::team::Gate)> = team
+            .handoff_gates()
+            .into_iter()
+            .filter(|(_, g)| g.decl.kind == crate::team::GateType::Environment)
+            .collect();
+        for (name, g) in gates {
+            let Some(m) = &g.machine else {
+                eprintln!("  – {name}: skipped — not defined on this machine (if_missing: skip)");
+                results.push(json!({"name": name, "kind": "environment", "skipped": true, "reason": SKIPPED_REASON}));
+                continue;
+            };
+            let unavailable = |what: String| {
+                Ok(EnvGates::Unavailable(format!(
+                    "{ENV_UNAVAILABLE}: environment gate `{name}`: {what} — fix the machine config ({}), then `toryo resume {} --note …`",
+                    crate::config::machine_config_hint(None),
+                    t.id
+                )))
+            };
+            let mut secrets = BTreeMap::new();
+            for (k, r) in &m.secret_env {
+                match crate::config::resolve_secret(r) {
+                    Ok(v) => {
+                        secrets.insert(k.clone(), v);
+                    }
+                    Err(e) => return unavailable(format!("secret_env.{k}: {e:#}")),
+                }
+            }
+            let Some(program) = env_gate_program(&m.program) else {
+                return unavailable(format!("program `{}` not found", m.program));
+            };
+            let Some(lock) = self.env_lock(t, &m.lock, stop)? else {
+                return Ok(EnvGates::Stopped);
+            };
+            // first the record: a failed or killed sync may already have changed the environment
+            let (i, l, h, n, mc) = (
+                t.id.clone(),
+                m.lock.clone(),
+                head.to_string(),
+                name.to_string(),
+                machine.clone(),
+            );
+            self.store
+                .call(move |tx| store::deployment_start(tx, &l, &i, &h, &n, &mc))?;
+            crash_point("verify:environment_gate_started");
+            let mut env = crate::process::env::build_env(std::env::vars(), &m.env, &secrets);
+            verify::set_gate_vars(&mut env, &t.id, head, co);
+            let mut redact = super::flight::task_secrets(&self.cfg, t);
+            redact.extend(secrets.iter().map(|(k, v)| crate::process::redact::Secret {
+                name: k.clone(),
+                value: v.clone(),
+            }));
+            let timeout = Duration::from_secs(
+                crate::team::parse_duration(&g.decl.timeout).unwrap_or(30 * 60),
+            );
+            let run = RunSpec {
+                name: name.to_string(),
+                program,
+                args: m.args.clone(),
+                cwd: co.dir.clone(),
+                env,
+                // the owner's normal token: the check gates' boundary is not changed (D6)
+                boundary: Boundary::None,
+                timeout,
+                cancel: Some(stop.flag.clone()),
+                redact: crate::process::redact::Redactions::new(&redact),
+            };
+            let res = self.run_gate_command(run, stop, Some("environment"))?;
+            let ok = res.as_ref().map(|r| r.ok());
+            let (i, l) = (t.id.clone(), m.lock.clone());
+            self.store
+                .call(move |tx| store::deployment_end(tx, &l, &i, ok))?;
+            drop(lock);
+            let Some(res) = res else {
+                return Ok(EnvGates::Stopped);
+            };
+            self.rec.emit(EngineEvent::EnvironmentDeployed {
+                lock: m.lock.clone(),
+                sha: head.to_string(),
+                ok: res.ok(),
+            });
+            let argv: Vec<String> = std::iter::once(m.program.clone())
+                .chain(m.args.iter().cloned())
+                .collect();
+            results.push(json!({"name": name, "kind": "environment", "lock": m.lock, "machine": machine, "argv": argv, "exit": res.exit, "timed_out": res.timed_out, "ms": res.duration_ms, "output_tail": res.tail(40)}));
+            if !res.ok() {
+                // R61: the output comes from code that ran on the checkpoint — data
+                let f = verify_feedback(&res, "");
+                return Ok(EnvGates::Done(Some(untrusted::wrap("verify", None, &f))));
+            }
+        }
+        Ok(EnvGates::Done(None))
+    }
+
+    /// Take the machine-wide lock `lock` for task `t`, waiting while another task holds it:
+    /// one `lock_waiting` event, `status` shows the wait, a `toryo stop` ends it (`None`).
+    fn env_lock(&self, t: &TaskRow, lock: &str, stop: &StopWatch) -> Result<Option<EnvLock>> {
+        let label = format!("{} ({})", t.id, super::lock::owner_label());
+        let mut waiting = false;
+        loop {
+            if let Some(l) = EnvLock::try_acquire(lock, &label)? {
+                if waiting {
+                    let i = t.id.clone();
+                    self.store
+                        .call(move |tx| store::set_env_wait(tx, &i, None))?;
+                }
+                return Ok(Some(l));
+            }
+            if !waiting {
+                waiting = true;
+                let (i, l) = (t.id.clone(), lock.to_string());
+                let holder = self.store.call(move |tx| {
+                    store::set_env_wait(tx, &i, Some(&l))?;
+                    Ok(store::deployments(tx)?
+                        .into_iter()
+                        .find(|d| d.lock == l && d.finished_at.is_none() && d.task != i)
+                        .map(|d| d.task))
+                })?;
+                self.rec.emit(EngineEvent::LockWaiting {
+                    lock: lock.to_string(),
+                    holder,
+                });
+            }
+            // poll about every 2 s; a stop request ends the wait at once
+            for _ in 0..(env_lock_poll_ms() / 100).max(1) {
+                if stop.stopped() {
+                    let i = t.id.clone();
+                    self.store
+                        .call(move |tx| store::set_env_wait(tx, &i, None))?;
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
     }
 
     // ── Reviewing ────────────────────────────────────────────────────────────────────
@@ -2279,7 +2461,6 @@ fn plan_files(plan: &Value) -> Vec<String> {
         .collect()
 }
 
-/// An Implementer turn as prepared before admission (R48, R49).
 /// M11-C2: the plan-time feedback when a planned path breaks the implementer's write fence —
 /// each such path with its rule, then any protected or denied ones; `None` when no path breaks
 /// the fence (the M10 message is used).
@@ -2331,6 +2512,7 @@ fn change_fence_feedback(paths: &[String], protect: &Protected) -> Option<String
     ))
 }
 
+/// An Implementer turn as prepared before admission (R48, R49).
 struct ImplementTurn {
     /// `implement` or `fix-N`.
     stage: String,
@@ -3394,6 +3576,50 @@ fn verify_program(program: &str, checkout: &Path) -> PathBuf {
         .fold(checkout.to_path_buf(), |dir, c| dir.join(c))
 }
 
+/// What the environment gates of a verify run led to (M11-E3).
+enum EnvGates {
+    /// All ran (or were skipped); `Some(feedback)` when one failed.
+    Done(Option<String>),
+    /// A stop request ended the wait for the lock or the gate.
+    Stopped,
+    /// The machine cannot run a gate (an unresolved secret, a program not found): escalate —
+    /// not something another fix cycle can repair.
+    Unavailable(String),
+}
+
+/// The escalation class of an environment gate this machine cannot run (M11-E3).
+pub const ENV_UNAVAILABLE: &str = "environment_gate_unavailable";
+
+/// The `reason` of a skipped environment gate's `VERIFY_RESULT.json` entry (`if_missing: skip`).
+pub const SKIPPED_REASON: &str = "not defined on this machine";
+
+/// This machine's name for the records (`COMPUTERNAME`, else `HOSTNAME`).
+pub fn computer_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "this machine".into())
+}
+
+/// The program of an environment gate (M11-E3): an absolute path as written, a bare name
+/// through PATH — resolved here, so it is never looked up in the verify checkout (the
+/// working directory). `None` when a bare name is not on PATH.
+fn env_gate_program(program: &str) -> Option<PathBuf> {
+    let p = expand_vars(program).ok()?;
+    if p.contains('/') || p.contains('\\') || Path::new(&p).is_absolute() {
+        return Some(PathBuf::from(p));
+    }
+    super::checks::which(&p)
+}
+
+/// How often a waiting environment gate tries its lock again: about every 2 s
+/// (`TORYO_TEST_ENV_LOCK_POLL_MS` for tests).
+fn env_lock_poll_ms() -> u64 {
+    std::env::var("TORYO_TEST_ENV_LOCK_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2000)
+}
+
 /// The error class of a prefixed reason: `artifact_tampered: …` → `artifact_tampered`.
 fn reason_class(reason: &str, default: &str) -> String {
     reason.split(':').next().unwrap_or(default).to_string()
@@ -3427,8 +3653,56 @@ pub fn non_blocking(review: &Value) -> Vec<String> {
 pub fn final_gate_notes(store: &Store, t: &TaskRow) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let cfg = frozen_config(t)?;
-    if xpp::compile_only(&cfg) {
-        out.push(xpp::COMPILE_ONLY.to_string());
+    // M11-E3: what the environment gates of the verify result in force did
+    let (mut passed, mut skipped, mut machine) = (Vec::new(), Vec::new(), String::new());
+    if cfg.team.is_some() {
+        if let Some((_, b)) = super::artifacts::read_head(store, t, "verify-result")? {
+            let vr: Value = serde_json::from_slice(&b).unwrap_or_default();
+            for c in vr["commands"].as_array().into_iter().flatten() {
+                if c["kind"] != "environment" {
+                    continue;
+                }
+                let name = c["name"].as_str().unwrap_or_default().to_string();
+                if c["skipped"] == true {
+                    skipped.push(name);
+                } else if c["exit"] == 0 {
+                    machine = c["machine"].as_str().unwrap_or_default().to_string();
+                    passed.push(name);
+                }
+            }
+        }
+    }
+    match (xpp::compile_only(&cfg), passed.is_empty()) {
+        (true, true) => out.push(xpp::COMPILE_ONLY.to_string()),
+        (true, false) => out.push(format!(
+            "verify: compile + {} on {machine}",
+            passed.join(" + ")
+        )),
+        (false, false) => out.push(format!(
+            "verify: {} on {machine} (environment gate)",
+            passed.join(" + ")
+        )),
+        (false, true) => {}
+    }
+    for s in &skipped {
+        out.push(format!(
+            "{s} did not run on this machine (environment gate not defined here, if_missing: skip)"
+        ));
+    }
+    // M11-E3: the environments this task's checkpoints were deployed to
+    let i = t.id.clone();
+    let deployed = store.call(move |tx| {
+        Ok(store::deployments(tx)?
+            .into_iter()
+            .filter(|d| d.task == i)
+            .collect::<Vec<_>>())
+    })?;
+    for d in deployed {
+        let status = super::views::deployment_status(&d, Some(t.state), false);
+        out.push(format!(
+            "environment: {}",
+            super::views::deployment_line(&d, status)
+        ));
     }
     if let Some((_, b)) = super::artifacts::read_head(store, t, "review")? {
         let v: Value = serde_json::from_slice(&b)?;

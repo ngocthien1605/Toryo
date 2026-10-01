@@ -97,6 +97,22 @@ pub enum EngineEvent {
         timed_out: bool,
         ok: bool,
         duration_ms: u64,
+        /// M11-E3: `environment` for an environment gate; absent otherwise (the M10 shape).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+    },
+    /// M11-E3: an environment gate waits for its machine-wide lock (once per wait);
+    /// `holder`: the task whose deployment holds it, when known.
+    LockWaiting {
+        lock: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        holder: Option<String>,
+    },
+    /// M11-E3: an environment gate ended; `sha` is what the environment of `lock` received.
+    EnvironmentDeployed {
+        lock: String,
+        sha: String,
+        ok: bool,
     },
     GateOpened {
         gate: String,
@@ -149,6 +165,8 @@ impl EngineEvent {
             Self::TurnFinished { .. } => "turn_finished",
             Self::CheckpointCreated { .. } => "checkpoint_created",
             Self::VerifyCommand { .. } => "verify_command",
+            Self::LockWaiting { .. } => "lock_waiting",
+            Self::EnvironmentDeployed { .. } => "environment_deployed",
             Self::GateOpened { .. } => "gate_opened",
             Self::BudgetWarning { .. } => "budget_warning",
             Self::Escalated { .. } => "escalated",
@@ -317,6 +335,7 @@ pub fn render(env: &Envelope) -> String {
             timed_out,
             ok,
             duration_ms,
+            kind,
         } => {
             let exit = match exit {
                 Some(code) => format!("exit {code}"),
@@ -324,11 +343,27 @@ pub fn render(env: &Envelope) -> String {
                 None => "no exit code".to_string(),
             };
             format!(
-                "  {} {name} ({exit}, {:.1}s)",
+                "  {} {name} ({exit}, {:.1}s){}",
                 if *ok { "✔" } else { "✘" },
-                secs(*duration_ms)
+                secs(*duration_ms),
+                kind.as_deref()
+                    .map(|k| format!(" — {k} gate"))
+                    .unwrap_or_default()
             )
         }
+        E::LockWaiting { lock, holder } => format!(
+            "   waiting for lock {lock}{}",
+            holder
+                .as_deref()
+                .map(|h| format!(" (held by {h})"))
+                .unwrap_or_default()
+        ),
+        E::EnvironmentDeployed { lock, sha, ok } => format!(
+            "   {lock}: {} {} ({})",
+            if *ok { "deployed" } else { "deploy failed for" },
+            crate::git::short(sha),
+            if *ok { "gate passed" } else { "gate failed" }
+        ),
         E::GateOpened { gate, occurrence } => {
             format!("   gate open: {gate} (occurrence {occurrence})")
         }
@@ -681,6 +716,11 @@ pub fn ms_since(rfc3339: &str) -> u64 {
 /// A profile whose secret cannot be resolved here contributes nothing (the run would fail
 /// on it anyway).
 pub fn task_redactions(cfg: &Effective, t: &TaskRow) -> Redactions {
+    Redactions::new(&task_secrets(cfg, t))
+}
+
+/// The secrets of [`task_redactions`] (M11-E3: an environment gate adds its own).
+pub fn task_secrets(cfg: &Effective, t: &TaskRow) -> Vec<Secret> {
     let mut names: Vec<&str> = vec![&t.planner, &t.reviewer];
     names.extend(t.implementers.iter().map(String::as_str));
     names.sort_unstable();
@@ -700,7 +740,7 @@ pub fn task_redactions(cfg: &Effective, t: &TaskRow) -> Redactions {
             value: v,
         });
     }
-    Redactions::new(&secrets)
+    secrets
 }
 
 /// Every string field of the event, redacted in place (R6: fails closed). The enum fields
@@ -745,7 +785,18 @@ fn redact_event(r: &Redactions, mut e: EngineEvent) -> EngineEvent {
             s(head);
             s(kind);
         }
-        E::VerifyCommand { name, .. } => s(name),
+        E::VerifyCommand { name, kind, .. } => {
+            s(name);
+            o(kind);
+        }
+        E::LockWaiting { lock, holder } => {
+            s(lock);
+            o(holder);
+        }
+        E::EnvironmentDeployed { lock, sha, .. } => {
+            s(lock);
+            s(sha);
+        }
         E::GateOpened { gate, .. } => s(gate),
         E::BudgetWarning { .. } => {}
         E::Escalated {
@@ -987,6 +1038,24 @@ mod tests {
                 timed_out: false,
                 ok: true,
                 duration_ms: 100,
+                kind: None,
+            },
+            EngineEvent::VerifyCommand {
+                name: "dbsync".into(),
+                exit: Some(0),
+                timed_out: false,
+                ok: true,
+                duration_ms: 100,
+                kind: Some("environment".into()),
+            },
+            EngineEvent::LockWaiting {
+                lock: "d365-env".into(),
+                holder: Some("T-12".into()),
+            },
+            EngineEvent::EnvironmentDeployed {
+                lock: "d365-env".into(),
+                sha: "1a2b3c4d5e6f".into(),
+                ok: true,
             },
             EngineEvent::GateOpened {
                 gate: "plan".into(),
@@ -1170,7 +1239,8 @@ mod tests {
                     exit,
                     timed_out,
                     ok,
-                    duration_ms: 1234
+                    duration_ms: 1234,
+                    kind: None,
                 }),
                 format!(
                     "  {} {name} ({text}, {:.1}s)",
@@ -1617,7 +1687,14 @@ mod tests {
                     timed_out: _,
                     ok: _,
                     duration_ms: _,
+                    kind: _,
                 } => "verify_command",
+                E::LockWaiting { lock: _, holder: _ } => "lock_waiting",
+                E::EnvironmentDeployed {
+                    lock: _,
+                    sha: _,
+                    ok: _,
+                } => "environment_deployed",
                 E::GateOpened {
                     gate: _,
                     occurrence: _,
@@ -1637,7 +1714,7 @@ mod tests {
             }
         }
         /// The number of arms of `fields_named`.
-        const VARIANTS: usize = 12;
+        const VARIANTS: usize = 14;
         let all = vec![
             EngineEvent::RunStarted { owner: "o".into() },
             EngineEvent::StateChanged {
@@ -1681,6 +1758,16 @@ mod tests {
                 timed_out: false,
                 ok: true,
                 duration_ms: 1,
+                kind: Some("k".into()),
+            },
+            EngineEvent::LockWaiting {
+                lock: "l".into(),
+                holder: Some("h".into()),
+            },
+            EngineEvent::EnvironmentDeployed {
+                lock: "l".into(),
+                sha: "s".into(),
+                ok: false,
             },
             EngineEvent::GateOpened {
                 gate: "g".into(),

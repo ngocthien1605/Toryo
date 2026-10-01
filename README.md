@@ -136,7 +136,10 @@ print one JSON document on stdout and nothing else there. Field names are snake_
     "active_owner": null,          // "user pid N" while a live process holds the task lock (never a lock probe)
     "compile_only": false,         // R59: an X++ verify proves compile level only; null: frozen config unreadable
     "next_action": "review the branch toryo/BR-003 …"   // what `status` prints after `next:`
-} ] }
+} ],
+  // M11, only once an environment gate has deployed (task show --json: this task's rows):
+  "environments": [ { "lock": "d365-env", "task": "BR-001", "sha": "<sha>", "gate": "dbsync", "machine": "UDE-1",
+                      "started_at": "…", "finished_at": "…", "ok": true, "approved": false, "status": "not approved yet" } ] }
 // task show ID --json: the task object above, plus
 { "worktree": "…", "branch": "toryo/BR-003", "run_store": "…\\runs\\BR-003",
   "attempts": [ { "id": "BR-003/implement/1", "stage": "implement", "attempt": 1, "status": "succeeded",
@@ -158,7 +161,8 @@ recorded them — a cumulative adapter's delta —, or `reserved_tokens` for a t
 `gate_opened` (`gate`, `occurrence`), `budget_warning` (`used`, `cap`), `escalated` (`reason_class` — a typed
 snake_case class such as `max_fix_cycles`, `review_blocked`, `protected_config_changed` —, `reason`),
 `paused` (`reason`), `run_ended` (`state`, `next_action`, `from` = the state when the drive started, `error` when
-it stopped with one). Every drive command ends its lines with one `run_ended`, also when it fails before the
+it stopped with one); M11: `lock_waiting` (`lock`, `holder`) and `environment_deployed` (`lock`, `sha`, `ok`) for
+environment gates, whose `verify_command` also has `kind: "environment"` (absent for every other command). Every drive command ends its lines with one `run_ended`, also when it fails before the
 first stage. `seq` grows across runs; `generation` is the task lock generation of the writing command. Reasons
 are redacted like captures. `task cleanup` removes the file with the run store. The engine's own stderr lines
 (`[state] …`, stage headers, `✔ checkpoint …`, verify commands, `!! budget: …`, and the reason of every

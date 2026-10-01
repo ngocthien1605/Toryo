@@ -17,7 +17,7 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
 - [x] C4 — split limits: `max_gate_retries`, `max_review_rounds`
 - [x] E1 — check gates: mapping, gate variables, M18
 - [x] E2 — verify output redacted with the task's secrets (M2)
-- [ ] E3 — environment gates: run, lock, record what is deployed
+- [x] E3 — environment gates: run, lock, record what is deployed
 - [ ] D1 — skill lookup (repo, then machine) and the menu
 - [ ] D2 — the plan's `skills` field and its checks
 - [ ] D3 — skills delivered through the context loader
@@ -387,6 +387,84 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   passes, so there is a reviewer pack; every file of the run store and stderr are free of it, the
   tail shows `[REDACTED:TORYO_M11_TOKEN]`), `output_without_secrets_is_unchanged_by_redaction`
   (AC-2).
+
+### E3 — environment gates: run, lock, record what is deployed
+
+- **When** (`runner::run_environment_gates`): inside `Verifying`, after **every** check gate of the
+  same run passed, in the implementer's `before_handoff` order, stopping at the first failure. A
+  failing check gate means no environment gate runs.
+- **How**: the **frozen** machine command (`team.gates.<name>.machine`, B2 — the command that runs
+  with full rights is the one the task was created with), `Boundary::None` (the owner's normal
+  token; the check gates' boundary is unchanged), working directory = the verify checkout, the
+  Job Object and timeout of `LocalRunner` (`timeout:` of the gate), environment from scratch (R23,
+  `process::env::build_env`) + the gate variables (E1) + `env` + resolved `secret_env`
+  (`config::resolve_secret`). The output is redacted with the task's secrets **plus** the gate's
+  own (`flight::task_secrets` is new, `task_redactions` builds on it). **The program is resolved
+  before it starts** (`env_gate_program`): an absolute path as written, a bare name through PATH —
+  never looked up in the verify checkout. A secret that cannot be resolved, or a program not on
+  PATH, escalates with the class `environment_gate_unavailable` (not something a fix cycle can
+  repair). A failure goes back to the implementer as untrusted data (R61, the same
+  `untrusted::wrap("verify", …)` as check gates) and counts against `max_gate_retries` (C4).
+- **Lock** (`lock::EnvLock`): `<data_dir>\locks\env-<lock>.lock`, an exclusive OS file lock like
+  `TaskLock`, the holder's label written inside, released explicitly on drop (review L9). While
+  another task holds it: one `lock_waiting { lock, holder }` event, a row in the new table
+  `environment_waits` so `status` shows `waiting for lock d365-env (held by T-12)`, a try about
+  every 2 s (`TORYO_TEST_ENV_LOCK_POLL_MS` in tests), and `toryo stop` ends the wait at once (the
+  verify attempt is `interrupted`, as for any stop). **Deviation:** Windows does not let another
+  process read a locked file, so the holder is named from `environment_deployments` (the row with
+  no `finished_at` for that lock), not from the lock file. Lock names are letters, digits, `-`,
+  `_`, `.` (B3 refuses others).
+- **Record** (new table `environment_deployments(lock PRIMARY KEY, task, sha, gate, machine,
+  started_at, finished_at, ok)` — `gate` and `machine` added to the listed columns): written
+  **before** the gate starts, updated at its end (`ok` empty for a stopped gate). Never deleted
+  (cancel, `task cleanup`). Shown in `toryo status` (`environment    d365-env holds BR-001 @
+  1a2b3c4d5e6f (not approved yet)` — all locks; `status ID` / `task show ID`: the locks that task
+  deployed to), in both `--json` documents (`environments[]`, **only when there is a row**, so an
+  M10 document is unchanged) and in the final gate notes. Status words (`views::deployment_status`):
+  `deploying now` (the holder's run is alive), `interrupted — the environment may hold a partial
+  deploy`, `the deploy failed`, `approved` (the holder is `Completed`), `not approved — the task
+  was cancelled`, `not approved yet`.
+- **Result**: one `VERIFY_RESULT.json` entry per environment gate: `name`, `kind: environment`,
+  `lock`, `machine` (`COMPUTERNAME`, else `HOSTNAME`), `argv` (the frozen program and args — the
+  secrets are environment variables, never in argv), `exit`, `timed_out`, `ms`, `output_tail`.
+  `if_missing: skip` and not defined here: `{name, kind: environment, skipped: true, reason: "not
+  defined on this machine"}` and the final-gate note `dbsync did not run on this machine …`. The
+  R47 mutation check runs after all gates (`verify_mutated_tree` when a gate changed a tracked file
+  of the checkout).
+- **Final gate wording**: with an X++ compile and environment gates that passed, `verify: compile +
+  dbsync on <machine>` replaces `COMPILE_ONLY`; without X++, `verify: dbsync on <machine>
+  (environment gate)`; `COMPILE_ONLY` stays when none ran. Plus `environment: <the deployment
+  line>` for each lock this task deployed to.
+- **Events**: `lock_waiting`, `environment_deployed { lock, sha, ok }`; `verify_command` gets an
+  optional `kind` serialised only for environment gates (M10 event shapes unchanged — tested). The
+  flight tests' exhaustive variant list is extended (14 variants).
+- **Recovery** needs nothing special: a killed toryo leaves the attempt `running` and the row
+  without `finished_at`; `resume` re-runs `Verifying` from the check gates. Crash test: the real
+  kill of a `toryo run` during the gate (Windows: the Job Object kills the script with it).
+- The script contract (owner draft `toryo-local.yaml`) is documented in F1/F2. Added to it:
+  name scripts by absolute path (a bare-name argument is resolved by the program against its
+  working directory, the verify checkout).
+- Tests (`tests/m11_env_gates.rs`, scripts `pwsh` on Windows / `sh` elsewhere in `<root>/gates/`):
+  `an_environment_gate_runs_after_the_checks_and_its_exit_code_decides` (AC-1, AC-4 with the Claude
+  implementer's `<untrusted_data>` block and `gate_retries`, AC-6 in every view, after `task
+  cleanup`), `cancelling_keeps_the_deployment_record` (AC-6), `an_environment_gate_has_the_normal_
+  token_a_check_gate_low_integrity` (AC-2, `#[cfg(windows)]`), `two_tasks_share_one_environment_lock`
+  (AC-3, with `toryo stop` while waiting and a later `resume`), `an_environment_gate_secret_is_
+  redacted_everywhere` (AC-5), `a_skipped_environment_gate_is_recorded_and_noted` (AC-7; the
+  `error` case is B3's), `an_environment_gate_that_writes_into_the_checkout_mutates_the_tree`
+  (AC-8), `a_crash_during_the_environment_gate_is_recovered_by_resume` (AC-9);
+  `views::tests::deployment_status_in_words`, the extended flight tests.
+- Also in this commit: the group C review nit (a doc comment had moved off `ImplementTurn`).
+
+### Group C review (independent subagent)
+
+- Nothing serious. Fixed: the misplaced doc comment. Recorded, not changed: after a
+  `same_vendor_review` escalation `resume --note` costs one more implementer turn before the
+  review is refused again (see C3); fence violations found by crash recovery are worded "protected
+  paths" and escalate (as M10 does for protected paths); ignored files outside `writes` are not seen
+  (never committed; same as `deny_paths` in M10); after `resume --note` with split limits the
+  escalation text counts the limit, not the cycles run (`2 gate retries used` after 3 cycles), and
+  says `1 review rounds`.
 
 ## Open
 
