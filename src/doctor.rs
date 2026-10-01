@@ -104,6 +104,22 @@ pub fn origin_checks(cfg: &Effective) -> Vec<Check> {
             source,
         });
     }
+    // M11-A2: the verify boundary, the machine's floor and the verify root in force
+    for (key, source) in &cfg.origins.verify {
+        let value = match key.as_str() {
+            "boundary" => cfg.repo.verify.boundary.clone(),
+            "min_boundary" => cfg.machine_verify.min_boundary.clone().unwrap_or_default(),
+            _ => crate::engine::verify::verify_root(cfg)
+                .display()
+                .to_string(),
+        };
+        out.push(Check {
+            level: Level::Info,
+            area: format!("verify {key}"),
+            message: format!("{value} — source: {}", place(*source)),
+            source: Some(*source),
+        });
+    }
     out
 }
 

@@ -35,11 +35,36 @@ pub const UNAVAILABLE: &str = "verify_boundary_unavailable";
 pub const MUTATED: &str = "verify_mutated_tree";
 
 /// `verify.verify_root`, expanded (default `%LOCALAPPDATA%\toryo-verify`; `<data>/verify`
-/// where `LOCALAPPDATA` does not exist).
+/// where `LOCALAPPDATA` does not exist). The machine's `verify.verify_root` replaces the
+/// repository's (review H2, M11-A2).
 pub fn verify_root(cfg: &Effective) -> PathBuf {
-    expand_vars(&cfg.repo.verify.verify_root)
+    let root = cfg
+        .machine_verify
+        .verify_root
+        .as_deref()
+        .unwrap_or(&cfg.repo.verify.verify_root);
+    expand_vars(root)
         .map(PathBuf::from)
         .unwrap_or_else(|_| data_dir().join("verify"))
+}
+
+/// Review H2 (M11-A2): the reason a repository's `verify.boundary` is below this machine's
+/// floor (`verify.min_boundary`, default `low_integrity`), or `None`. Asked at `task create`
+/// (and at `task config --reload`), before anything is created.
+pub fn below_floor(cfg: &Effective) -> Option<String> {
+    let floor = cfg
+        .machine_verify
+        .min_boundary
+        .as_deref()
+        .unwrap_or("low_integrity");
+    if cfg.repo.verify.boundary != "none" || floor == "none" {
+        return None;
+    }
+    let machine = crate::config::machine_config_hint(cfg.machine_path.as_deref());
+    let repo = cfg.repo_path.display();
+    Some(format!(
+        "verify_boundary_below_floor: {repo} sets `verify.boundary: none` (trusted-code mode: the code under test runs with your full rights), below this machine's floor `low_integrity` (review H2). Either keep `verify.boundary: low_integrity` in {repo}, or — only if you trust this repository's code — let the machine's owner set `verify: {{ min_boundary: none }}` in {machine}. Environment gates (`kind: environment`, commands in the machine config) are the only sanctioned way to run something with your full rights."
+    ))
 }
 
 /// The configured boundary; `separate_user` is not in v0.1.

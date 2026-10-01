@@ -108,6 +108,10 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         .map(|l| l.trim_start_matches("# ").trim().to_string())
         .unwrap_or_else(|| id.clone());
     let (planner, implementers, reviewer) = roles(cfg)?;
+    // review H2 (M11-A2): the repository chooses its verify sandbox only above the floor
+    if let Some(reason) = super::verify::below_floor(cfg) {
+        bail!("{reason}");
+    }
 
     let g = task_git(cfg, &repo)?;
     // R36/R45 admission: the verify boundary must be available before anything is created

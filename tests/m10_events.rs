@@ -231,7 +231,7 @@ fn a_profile_secret_never_reaches_the_flight_recorder() {
         MACHINE_PROFILES.replace(
             "exe: codex-not-installed }",
             "exe: codex-not-installed, secret_env: { TORYO_M10_TOKEN: \"env:TORYO_M10_SECRET\" } }",
-        ),
+        ) + MACHINE_FLOOR,
     )
     .unwrap();
     create(&env, "EV-4");

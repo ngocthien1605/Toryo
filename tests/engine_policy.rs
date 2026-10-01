@@ -703,8 +703,9 @@ fn git_filter_textconv_canary() {
     std::fs::write(
         &env.machine,
         format!(
-            "{}git:\n  trusted_filters:\n    lfs:\n      process: \"'{exe}' spike filter-process --marker '{}'\"\n      required: true\n",
+            "{}{}git:\n  trusted_filters:\n    lfs:\n      process: \"'{exe}' spike filter-process --marker '{}'\"\n      required: true\n",
             common::MACHINE_PROFILES,
+            common::MACHINE_FLOOR,
             trusted_marker.display().to_string().replace('\\', "/")
         ),
     )

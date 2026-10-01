@@ -25,6 +25,10 @@ pub struct Env {
 /// The fake profiles of the fixture, in the machine config (R60).
 pub const MACHINE_PROFILES: &str = "profiles:\n  claude-max: { kind: claude, billing: subscription, exe: claude-not-installed }\n  codex-openai: { kind: codex, billing: subscription, exe: codex-not-installed }\n";
 
+/// The verify floor of the fixture machine (review H2, M11-A2): the fixture repository verifies
+/// in trusted-code mode (`verify.boundary: none`), which the machine must allow.
+pub const MACHINE_FLOOR: &str = "verify: { min_boundary: none }\n";
+
 pub fn setup(implementer: &str) -> Env {
     setup_with(implementer, "")
 }
@@ -37,7 +41,7 @@ pub fn setup_with(implementer: &str, extra: &str) -> Env {
     let data = root.join("data");
     let config = root.join("toryo.yaml");
     let machine = root.join("machine.yaml");
-    std::fs::write(&machine, MACHINE_PROFILES).unwrap();
+    std::fs::write(&machine, format!("{MACHINE_PROFILES}{MACHINE_FLOOR}")).unwrap();
     let fwd = |p: &Path| p.display().to_string().replace('\\', "/");
     std::fs::write(
         &config,

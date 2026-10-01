@@ -462,6 +462,30 @@ pub struct MachineConfig {
     /// profiles' origins: not frozen with a task and not hashed.
     #[serde(default)]
     pub notify: Notify,
+    /// Review H2 (M11-A2): the machine's floor for the verify boundary and its verify root.
+    #[serde(default)]
+    pub verify: MachineVerify,
+}
+
+/// `verify:` in the machine config (review H2, M11-A2): the repository chooses the sandbox its
+/// own code runs in only above this floor. Frozen and hashed with a task only when set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachineVerify {
+    /// The lowest `verify.boundary` a repository may ask for: `low_integrity` (the default
+    /// when unset) or `none` (this machine trusts the repositories' verify code).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_boundary: Option<String>,
+    /// Replaces the repository's `verify.verify_root`: where the Low-labelled checkouts live
+    /// and what toryo empties and removes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_root: Option<String>,
+}
+
+impl MachineVerify {
+    pub fn is_empty(&self) -> bool {
+        self.min_boundary.is_none() && self.verify_root.is_none()
+    }
 }
 
 /// `notify:` in the machine config (M10-D1).
@@ -511,6 +535,9 @@ pub struct Origins {
     pub profiles: BTreeMap<String, Origin>,
     pub roles: BTreeMap<String, Origin>,
     pub toolchains: BTreeMap<String, Origin>,
+    /// M11-A2: `boundary`, `min_boundary` and `verify_root` (the machine's replaces the
+    /// repository's).
+    pub verify: BTreeMap<String, Origin>,
 }
 
 /// Effective configuration = repo config with machine overrides applied.
@@ -522,6 +549,10 @@ pub struct Effective {
     /// canonical JSON when empty, so a configuration without them keeps its hash.
     #[serde(skip_serializing_if = "Toolchains::is_empty")]
     pub toolchains: Toolchains,
+    /// M11-A2: the machine's `verify:` floor and root, frozen and hashed with the task; left
+    /// out of the canonical JSON when unset, so a configuration without it keeps its hash.
+    #[serde(skip_serializing_if = "MachineVerify::is_empty")]
+    pub machine_verify: MachineVerify,
     #[serde(skip)]
     pub repo_path: PathBuf,
     #[serde(skip)]
@@ -563,8 +594,12 @@ impl Effective {
         let mut used_machine = None;
         let mut origins = Origins::default();
         let mut notify = Notify::default();
+        let mut machine_verify = MachineVerify::default();
         for k in repo.roles.keys() {
             origins.roles.insert(k.clone(), Origin::Repo);
+        }
+        for k in ["boundary", "verify_root"] {
+            origins.verify.insert(k.into(), Origin::Repo);
         }
         if let Some(mp) = machine_path {
             if mp.exists() {
@@ -585,6 +620,17 @@ impl Effective {
                 trusted_filters = machine.git.trusted_filters;
                 toolchains = machine.toolchains;
                 notify = machine.notify;
+                machine_verify = machine.verify;
+                if machine_verify.min_boundary.is_some() {
+                    origins
+                        .verify
+                        .insert("min_boundary".into(), Origin::Machine);
+                }
+                if machine_verify.verify_root.is_some() {
+                    origins
+                        .verify
+                        .insert("verify_root".into(), Origin::RepoOverriddenByMachine);
+                }
                 for name in toolchains.names() {
                     origins.toolchains.insert(name.into(), Origin::Machine);
                 }
@@ -605,6 +651,7 @@ impl Effective {
             repo,
             trusted_filters,
             toolchains,
+            machine_verify,
             repo_path: repo_path.to_path_buf(),
             machine_path: used_machine,
             origins,
@@ -623,7 +670,11 @@ impl Effective {
     /// ([`Effective::from_frozen`]) is not re-checked: it is what its task was created with.
     pub fn validate(&self) -> Result<()> {
         let hint = machine_config_hint(self.machine_path.as_deref());
-        let problems = problems(&self.repo, &self.toolchains, &hint);
+        let mut problems = problems(&self.repo, &self.toolchains, &hint);
+        if let Some(b) = &self.machine_verify.min_boundary {
+            let key = format!("verify.min_boundary (machine config {hint})");
+            one_of(&mut problems, &key, b, VERIFY_BOUNDARIES);
+        }
         if problems.is_empty() {
             return Ok(());
         }
@@ -640,6 +691,8 @@ impl Effective {
             trusted_filters: BTreeMap<String, TrustedFilter>,
             #[serde(default)]
             toolchains: Toolchains,
+            #[serde(default)]
+            machine_verify: MachineVerify,
         }
         let f: Frozen =
             serde_json::from_str(canonical_json).context("parsing the frozen config.json")?;
@@ -647,6 +700,7 @@ impl Effective {
             repo: f.repo,
             trusted_filters: f.trusted_filters,
             toolchains: f.toolchains,
+            machine_verify: f.machine_verify,
             repo_path: origin.to_path_buf(),
             machine_path: None,
             origins: Origins::default(),
@@ -1343,6 +1397,7 @@ policy:
             repo: serde_yaml::from_str(SAMPLE).unwrap(),
             trusted_filters: BTreeMap::new(),
             toolchains: Toolchains::default(),
+            machine_verify: MachineVerify::default(),
             repo_path: PathBuf::new(),
             machine_path: None,
             origins: Origins::default(),
@@ -1735,6 +1790,82 @@ commands:
         let back = Effective::from_frozen(&frozen, Path::new("config.json")).unwrap();
         assert_eq!(back.canonical_json(), frozen);
         assert!(back.toolchains.is_empty());
+    }
+
+    /// Review H2 (M11-A2): the machine's `verify:` floor and root. Unset, nothing changes (the
+    /// hash above); set, they are frozen and hashed with the task, the root replaces the
+    /// repository's, and each says where it came from.
+    #[test]
+    fn the_machine_verify_floor_and_root() {
+        let d = tempfile::tempdir().unwrap();
+        let (p, m) = (d.path().join("toryo.yaml"), d.path().join("machine.yaml"));
+        let profiles =
+            "profiles:\n  claude-max: { kind: claude, billing: subscription, exe: claude }\n";
+        std::fs::write(&p, "version: 1\nproject: { root: D:\\\\R, worktrees_root: D:\\\\W }\nroles:\n  planner: { profile: claude-max }\nverify: { boundary: none, verify_root: 'D:\\repo-verify' }\n").unwrap();
+        std::fs::write(&m, profiles).unwrap();
+        let without = Effective::load(&p, Some(&m)).unwrap();
+        assert!(without.machine_verify.is_empty());
+        assert!(!without.canonical_json().contains("machine_verify"));
+        assert_eq!(without.origins.verify["boundary"], Origin::Repo);
+        assert_eq!(without.origins.verify["verify_root"], Origin::Repo);
+        // below the default floor: refused, naming both files and both ways out
+        let why = crate::engine::verify::below_floor(&without).unwrap();
+        for want in [
+            "verify_boundary_below_floor",
+            &p.display().to_string(),
+            &m.display().to_string(),
+            "keep `verify.boundary: low_integrity`",
+            "min_boundary: none",
+            "Environment gates",
+        ] {
+            assert!(why.contains(want), "{want}: {why}");
+        }
+        std::fs::write(
+            &m,
+            format!(
+                "{profiles}verify: {{ min_boundary: none, verify_root: 'E:\\machine-verify' }}\n"
+            ),
+        )
+        .unwrap();
+        let with = Effective::load(&p, Some(&m)).unwrap();
+        assert_eq!(crate::engine::verify::below_floor(&with), None);
+        assert_ne!(with.sha256(), without.sha256());
+        assert!(with.canonical_json().contains(
+            r#""machine_verify":{"min_boundary":"none","verify_root":"E:\\machine-verify"}"#
+        ));
+        assert_eq!(
+            crate::engine::verify::verify_root(&with),
+            PathBuf::from("E:\\machine-verify")
+        );
+        assert_eq!(with.origins.verify["min_boundary"], Origin::Machine);
+        assert_eq!(
+            with.origins.verify["verify_root"],
+            Origin::RepoOverriddenByMachine
+        );
+        let back = Effective::from_frozen(&with.canonical_json(), &p).unwrap();
+        assert_eq!(back.sha256(), with.sha256());
+        assert_eq!(
+            crate::engine::verify::verify_root(&back),
+            PathBuf::from("E:\\machine-verify")
+        );
+        // the repository's own low_integrity is never below the floor
+        std::fs::write(&p, "version: 1\nproject: { root: D:\\\\R, worktrees_root: D:\\\\W }\nroles:\n  planner: { profile: claude-max }\n").unwrap();
+        std::fs::write(&m, profiles).unwrap();
+        assert_eq!(
+            crate::engine::verify::below_floor(&Effective::load(&p, Some(&m)).unwrap()),
+            None
+        );
+        // a misspelt value or key is refused
+        std::fs::write(&m, format!("{profiles}verify: {{ min_boundary: off }}\n")).unwrap();
+        let e = format!("{:#}", Effective::load(&p, Some(&m)).unwrap_err());
+        assert!(
+            e.contains("verify.min_boundary (machine config")
+                && e.contains("`off` is not a valid value (valid: low_integrity, none)"),
+            "{e}"
+        );
+        std::fs::write(&m, format!("{profiles}verify: {{ boundary: none }}\n")).unwrap();
+        let e = format!("{:#}", Effective::load(&p, Some(&m)).unwrap_err());
+        assert!(e.contains("boundary"), "{e}");
     }
 
     /// M10-D1 AC-3: `notify:` is read from the machine config, and it is not part of the
