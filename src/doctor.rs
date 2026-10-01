@@ -464,7 +464,8 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
 /// where this account may set a Low label (WRITE_OWNER). Probe it with a scratch dir.
 fn verify_root_check(r: &mut Report, cfg: &Effective) {
     let area = "verify root";
-    let root = match expand_vars(&cfg.repo.verify.verify_root) {
+    // M11-A2: the machine's `verify.verify_root` replaces the repository's
+    let root = match expand_vars(crate::engine::verify::verify_root_setting(cfg)) {
         Ok(v) => PathBuf::from(v),
         Err(e) => return r.add(Level::Fail, area, format!("{e:#}")),
     };
@@ -476,10 +477,17 @@ fn verify_root_check(r: &mut Report, cfg: &Effective) {
         );
     }
     if cfg.repo.verify.boundary == "none" {
+        // M11-A2: say when `task create` will refuse it
+        let floor = match crate::engine::verify::below_floor(cfg) {
+            Some(_) => " — below this machine's floor `low_integrity`: `task create` refuses it (the machine config may allow it with `verify: { min_boundary: none }`)",
+            None => "",
+        };
         return r.add(
             Level::Warn,
             area,
-            "verify.boundary: none — trusted-code mode, verification is NOT isolated (R36)",
+            format!(
+                "verify.boundary: none — trusted-code mode, verification is NOT isolated (R36){floor}"
+            ),
         );
     }
     match crate::engine::verify::probe(cfg) {
@@ -916,6 +924,55 @@ fn finish(r: Report, json: bool) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M11-A2 (group A review): the verify-root check probes the root in force — the machine's
+    /// — not the repository's, which may not even expand on this machine.
+    #[test]
+    fn the_verify_root_check_uses_the_machine_root() {
+        let d = tempfile::tempdir().unwrap();
+        let (p, m) = (d.path().join("toryo.yaml"), d.path().join("machine.yaml"));
+        std::fs::write(
+            &p,
+            "version: 1\nproject: { root: r, worktrees_root: w }\nverify: { verify_root: '%TORYO_TEST_NEVER_SET%\\vr' }\n",
+        )
+        .unwrap();
+        let mvr = d.path().join("machine-vr");
+        std::fs::write(
+            &m,
+            format!(
+                "verify: {{ verify_root: '{}' }}\n",
+                mvr.display().to_string().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        let cfg = Effective::load(&p, Some(&m)).unwrap();
+        let mut r = Report::default();
+        verify_root_check(&mut r, &cfg);
+        let c = &r.0[0];
+        assert!(
+            !c.message.contains("TORYO_TEST_NEVER_SET"),
+            "{:?}: {}",
+            c.level,
+            c.message
+        );
+        // a boundary below the floor says that `task create` refuses it
+        std::fs::write(
+            &p,
+            "version: 1\nproject: { root: r, worktrees_root: w }\nverify: { boundary: none }\n",
+        )
+        .unwrap();
+        std::fs::write(&m, "").unwrap();
+        let cfg = Effective::load(&p, Some(&m)).unwrap();
+        let mut r = Report::default();
+        verify_root_check(&mut r, &cfg);
+        if cfg!(windows) {
+            assert!(
+                r.0[0].message.contains("`task create` refuses it"),
+                "{}",
+                r.0[0].message
+            );
+        }
+    }
 
     /// R60 (M9-A2, B1): each profile, toolchain and role says where it came from, in text and in `--json`;
     /// the config hash does not depend on it.

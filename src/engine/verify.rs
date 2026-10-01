@@ -38,14 +38,17 @@ pub const MUTATED: &str = "verify_mutated_tree";
 /// where `LOCALAPPDATA` does not exist). The machine's `verify.verify_root` replaces the
 /// repository's (review H2, M11-A2).
 pub fn verify_root(cfg: &Effective) -> PathBuf {
-    let root = cfg
-        .machine_verify
-        .verify_root
-        .as_deref()
-        .unwrap_or(&cfg.repo.verify.verify_root);
-    expand_vars(root)
+    expand_vars(verify_root_setting(cfg))
         .map(PathBuf::from)
         .unwrap_or_else(|_| data_dir().join("verify"))
+}
+
+/// The `verify_root` in force, as written: the machine's, else the repository's (M11-A2).
+pub fn verify_root_setting(cfg: &Effective) -> &str {
+    cfg.machine_verify
+        .verify_root
+        .as_deref()
+        .unwrap_or(&cfg.repo.verify.verify_root)
 }
 
 /// Review H2 (M11-A2): the reason a repository's `verify.boundary` is below this machine's

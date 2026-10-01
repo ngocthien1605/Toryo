@@ -77,6 +77,19 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   append it too. No assertion changed. New: `config::tests::the_machine_verify_floor_and_root`,
   `tests/m11_trust.rs` (AC-1, AC-2).
 
+### Group A review (independent subagent) — follow-up commit
+
+- Fixed: `doctor`'s verify-root check and `spike lowil-canary` used the repository's
+  `verify_root`; both now use the root in force (`verify::verify_root_setting`: the machine's, else
+  the repository's), so the Low-label evidence is gathered where the tasks will run. `doctor`'s
+  `boundary: none` warning says when `task create` will refuse it. Tests:
+  `doctor::tests::the_verify_root_check_uses_the_machine_root`,
+  `config::tests::a_tagged_document_is_refused`.
+- Not changed (recorded): a task created **before** M11 with `boundary: none` keeps verifying that
+  way — its configuration is frozen (R35) and `toryo run` never re-reads the machine floor. The
+  floor applies at `task create` and `task config --reload`. `verify_root` is shown as "repo,
+  overridden by machine" also when the repository only had the default.
+
 ## B — The `.toryo/` loader
 
 ### B1 — types for the org chart, role files and the new machine keys

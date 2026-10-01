@@ -1428,6 +1428,16 @@ policy:
         );
     }
 
+    /// Review C1 (group A review): a tag on the whole document is refused too.
+    #[test]
+    fn a_tagged_document_is_refused() {
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str("!x\nversion: 1\nproject: { root: r, worktrees_root: w }\n")
+                .unwrap();
+        let e = format!("{:#}", refuse_tags(&doc, Path::new("t.yaml")).unwrap_err());
+        assert!(e.contains("the document has the tag `!x`"), "{e}");
+    }
+
     /// Review C1: the repository file is parsed without the machine-only fields, so whatever
     /// gets past the raw-text check is an unknown field, never a profile.
     #[test]
