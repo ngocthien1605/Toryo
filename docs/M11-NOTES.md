@@ -21,7 +21,7 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
 - [x] D1 — skill lookup (repo, then machine) and the menu
 - [x] D2 — the plan's `skills` field and its checks
 - [x] D3 — skills delivered through the context loader
-- [ ] F1 — templates
+- [x] F1 — templates
 - [ ] F2 — docs, migration guide, morning summary
 
 ## A — Trust floor
@@ -582,6 +582,34 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   `a_changed_skill_changes_the_context_hash` (AC-2, through the `context show` preview — exactly
   what the next attempt gets), `the_claude_implementer_gets_skills_in_its_context_file` (AC-3, and
   the reviewer's skill reached the reviewer).
+
+## F — Wrap-up
+
+### F1 — templates
+
+- `templates/d365fo/.toryo/toryo-orgchart.yaml` and `…/roles/implementer/toryo-role.yaml`: the
+  owner's drafts **verbatim** (all comments kept; the drafts have no personal paths), each with a
+  `TODO(owner)` header in front. `…/roles/{planner,reviewer}/toryo-role.yaml` (purpose,
+  `instructions`, empty `skills`), `…/roles/*/instructions.md` (short, `TODO(owner)` — the D365 notes
+  per role stay in `.toryo/context/50-xpp-roles.md`), `templates/d365fo/CULTURE.md` (the draft names
+  `culture: ./CULTURE.md`), and stubs of the draft implementer's two skills in
+  `.toryo/skills/{xpp-axclass,xpp-batch}/SKILL.md` (with a `description`, as the menu needs) — added
+  so the set loads as shipped; the draft also allows them in the machine's `skills_dir`.
+- **A second example** `templates/d365fo/toryo.orgchart.yaml.example` is the `toryo.yaml` of org
+  chart mode (no `roles:`, `commands:` or `pipeline.max_fix_cycles`); its header says the pair loads
+  together and that `toryo.yaml.example` (the M9/M10 layout, unchanged, same hash) does not load next
+  to an org chart.
+- The draft's `build` gate (`pwsh -File scripts/build-model.ps1`) is kept; the template's
+  `TODO(owner)` says the script must be committed before a task (M18) or to switch to the
+  `tool: xpp` alternative the draft shows.
+- `templates/toryo.local.yaml.example`: commented `seats:`, `skills_dir:`, `environment_gates:` with
+  the six-point script contract of the owner's draft (plus: call tools by absolute path — the
+  working directory is the verify checkout) and `verify:` (A2). `templates/d365fo/
+  toryo.local.yaml.example`: a short commented pointer. Comments only: both keep their hash.
+- Test: `team::tests::the_d365fo_org_chart_templates_load` (the set loads with fake profiles and a
+  machine `environment_gates.dbsync`; every new file starts with its `TODO(owner)` items; the old
+  example next to the org chart is refused, one place per setting). The existing template tests
+  pass unchanged (AC-1).
 
 ## Open
 

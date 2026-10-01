@@ -1,0 +1,57 @@
+# D365FO repository config for ORG CHART MODE (M11-F1) — copy to the root of the D365FO repository
+# as `toryo.yaml`, together with templates/d365fo/.toryo/ (the org chart, the role files, the
+# skills) and templates/d365fo/CULTURE.md. This pair loads together; toryo.yaml.example is the
+# toryo.yaml-only layout of M9/M10 and does NOT load next to an org chart.
+#
+# With .toryo/toryo-orgchart.yaml present, `roles:`, `commands:` and `pipeline.max_fix_cycles`
+# live there (seats, gates + the implementer's before_handoff, limits) — setting them here too
+# is an error. Everything else stays here. No `profiles:` / `toolchains:` (R60): machine config.
+#
+# TODO(owner):
+#   1. project.root / project.worktrees_root — the repository and a worktree folder on the UDE machine.
+#   2. policy.deny_paths — the exact ZZZ rule (the folder pattern of local-only models).
+#   3. verify.checkout — `clean` until Open decision 9 is closed (V08-VERIFY 2 measures `tracked`).
+#   4. verify.boundary — `low_integrity` (the machine floor refuses `none` unless the machine
+#      config says `verify: { min_boundary: none }`).
+#   5. context.budget_kb.implementer — the chosen skills must fit it (never trimmed).
+version: 1
+project:
+  root: D:\D365-Git                         # TODO(owner) 1
+  worktrees_root: D:\D365-worktrees         # TODO(owner) 1
+  runs_root: '%LOCALAPPDATA%\toryo\runs'
+  base_branch: main
+
+pipeline:
+  budget_tokens: 2000000                    # the retry limits are `limits:` in the org chart
+
+policy:
+  deny_paths: ["**/ZZZ/**", "**/*.pfx", "**/.env*"]   # TODO(owner) 2
+  protected_paths:
+    - "@verify-scripts"                     # the check gates' scripts and projects, every Directory.Build.* (R59)
+    - "toryo.yaml"
+    - ".toryo/**"                           # the org chart, the role files, the repository skills
+    - "AGENTS.md"
+    - "CLAUDE.md"
+    - ".claude/**"
+    - ".codex/**"
+    - ".mcp.json"
+    - ".gitattributes"
+    - ".githooks/**"
+    - "toryo.local.yaml"
+    - ".gitmodules"
+  neutralize_untrusted_filters: false
+  allow_submodules: false
+  allow_codex_project_config: false
+
+verify:
+  checkout: clean                           # TODO(owner) 3
+  boundary: low_integrity                   # TODO(owner) 4
+  verify_root: '%LOCALAPPDATA%\toryo-verify'
+  final_clean: true
+
+timeouts:
+  agent_stall_min: 10
+  agent_stage_max_min: 60
+
+context:
+  budget_kb: { implementer: 60 }            # TODO(owner) 5 — policy, culture, instructions, skills are never trimmed

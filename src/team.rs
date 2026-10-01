@@ -2168,6 +2168,96 @@ mod tests {
         drop(d);
     }
 
+    /// Copy the directory tree `from` into `to`.
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap().flatten() {
+            let (src, dst) = (e.path(), to.join(e.file_name()));
+            if src.is_dir() {
+                copy_tree(&src, &dst);
+            } else {
+                std::fs::copy(&src, &dst).unwrap();
+            }
+        }
+    }
+
+    /// M11-F1 AC-1: the D365FO org chart template set — `.toryo/` (org chart, three role
+    /// files, instructions, skills), CULTURE.md and toryo.orgchart.yaml.example — loads with
+    /// fake profiles and a machine `environment_gates.dbsync`; every new file starts with its
+    /// TODO(owner) items.
+    #[test]
+    fn the_d365fo_org_chart_templates_load() {
+        let t = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("templates")
+            .join("d365fo");
+        let d = tempfile::tempdir().unwrap();
+        let tmp = d.path().display().to_string().replace('\\', "/");
+        let repo = d.path().join("repo");
+        copy_tree(&t.join(".toryo"), &repo.join(".toryo"));
+        std::fs::copy(t.join("CULTURE.md"), repo.join("CULTURE.md")).unwrap();
+        let yaml = std::fs::read_to_string(t.join("toryo.orgchart.yaml.example"))
+            .unwrap()
+            .replace(r"root: D:\D365-Git", &format!("root: '{tmp}/repo'"))
+            .replace(
+                r"worktrees_root: D:\D365-worktrees",
+                &format!("worktrees_root: '{tmp}/wts'"),
+            );
+        let y = d.path().join("toryo.yaml");
+        std::fs::write(&y, yaml).unwrap();
+        let m = d.path().join("machine.yaml");
+        std::fs::write(
+            &m,
+            format!("profiles:\n  claude-max: {{ kind: claude, billing: subscription, exe: claude }}\n  codex-openai: {{ kind: codex, billing: subscription, exe: codex, codex: {{ windows_sandbox: unelevated }} }}\nenvironment_gates:\n  dbsync: {{ program: powershell, args: [-NoProfile, -File, '{tmp}/gates/dbsync.ps1'], lock: d365-env }}\n"),
+        )
+        .unwrap();
+        let cfg = crate::config::Effective::load(&y, Some(&m)).unwrap();
+        let team = cfg.team.as_ref().expect("org chart mode");
+        assert_eq!(team.name, "d365fo-dev");
+        assert_eq!(
+            team.role("implementer").unwrap().skills,
+            ["xpp-axclass", "xpp-batch"]
+        );
+        assert!(team.gates["dbsync"].machine.is_some());
+        assert_eq!(cfg.repo.commands.verify[0].name, "build");
+        // the TODO(owner) items at the top of every new file
+        let new_files = [
+            t.join(".toryo/toryo-orgchart.yaml"),
+            t.join(".toryo/roles/planner/toryo-role.yaml"),
+            t.join(".toryo/roles/implementer/toryo-role.yaml"),
+            t.join(".toryo/roles/reviewer/toryo-role.yaml"),
+            t.join(".toryo/roles/planner/instructions.md"),
+            t.join(".toryo/roles/implementer/instructions.md"),
+            t.join(".toryo/roles/reviewer/instructions.md"),
+            t.join("CULTURE.md"),
+            t.join("toryo.orgchart.yaml.example"),
+        ];
+        for f in new_files {
+            let text = std::fs::read_to_string(&f).unwrap();
+            let head: Vec<&str> = if f.extension().is_some_and(|x| x == "md") {
+                text.lines().take(1).collect()
+            } else {
+                text.lines().take_while(|l| l.starts_with('#')).collect()
+            };
+            assert!(
+                head.iter().any(|l| l.contains("TODO(owner)")),
+                "{}: TODO(owner) items at the top",
+                f.display()
+            );
+        }
+        for s in ["xpp-axclass", "xpp-batch"] {
+            let text =
+                std::fs::read_to_string(t.join(".toryo/skills").join(s).join("SKILL.md")).unwrap();
+            assert!(skill_description(&text).is_some_and(|d| d.contains("TODO(owner)")));
+        }
+        // the toryo.yaml-only example does not load next to the org chart: one place per setting
+        let old = std::fs::read_to_string(t.join("toryo.yaml.example"))
+            .unwrap()
+            .replace(r"root: D:\D365-Git", &format!("root: '{tmp}/repo'"));
+        std::fs::write(&y, old).unwrap();
+        let e = load_err(&y, &m);
+        assert!(e.contains("one place per setting"), "{e}");
+    }
+
     /// M11-B1 AC-2: the duration parser.
     #[test]
     fn durations() {

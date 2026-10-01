@@ -1,0 +1,223 @@
+# toryo-orgchart.yaml template (M11-F1) — copy templates/d365fo/.toryo/ to the root of the D365FO
+# repository (next to toryo.yaml), with templates/d365fo/CULTURE.md, then use
+# templates/d365fo/toryo.orgchart.yaml.example as its toryo.yaml (the pair loads together).
+#
+# TODO(owner):
+#   1. seats.*.profile / fallback — names of profiles YOUR machine config defines (R60).
+#   2. gates.build — write scripts/build-model.ps1 (it must be committed before a task is
+#      created, M18), or switch to the built-in `tool: xpp` alternative shown below.
+#   3. gates.dbsync — define `environment_gates.dbsync` in the machine config, or set
+#      `if_missing: skip` on machines without a D365FO environment.
+#   4. limits / checks — the defaults proposed on 2026-10-01.
+#   5. culture — CULTURE.md at the repository root, or remove the key.
+#
+# =============================================================================
+# toryo-orgchart.yaml  --  location: .toryo/toryo-orgchart.yaml
+#
+# WHAT THIS FILE IS
+#   The org chart: WHO sits in which seat, plus the team-wide rules around
+#   the fixed handoffs (gates, limits, checks). It answers "who".
+#   The sibling files roles/<name>/toryo-role.yaml answer "what" and "how".
+#
+#   Analogy: the org chart assigns people to positions; the role file is the
+#   job card for each position. Swapping the person must not change the job.
+#
+# HOW TO READ THIS FILE (for the implementer)
+#   - Unknown fields must be a hard error (serde deny_unknown_fields), with a
+#     friendly message and a "did you mean ...?" hint, e.g.
+#         seat 'reviwer' not found. Did you mean 'reviewer'?
+#   - Every cross-reference must be validated BEFORE anything is launched:
+#     seat -> role folder, role gate names -> gates below (or the machine's
+#     environment_gates), role skills -> repo .toryo/skills/ or the
+#     machine's skills_dir, seat profiles -> the machine's profiles.
+#   - Paths are relative to the repository root unless stated otherwise.
+#   - When this file exists, toryo.yaml must not also set `roles:`,
+#     `commands:` or `pipeline.max_fix_cycles` -- they live here now.
+#     The same setting in two places is an error.
+#   - Everything under .toryo/ is a protected path: no agent can edit this
+#     file, the role files or the repo skills.
+#
+# THE FLOW IS FIXED (not configurable)
+#   Toryo always runs:   plan -> build -> review
+#     plan    the planner writes the plan         -> human approves the plan
+#     build   the implementer changes the code    -> Toryo commits a checkpoint
+#             and runs the implementer's gates (see GATES)
+#     review  the reviewer reads the checkpoint   -> human gives final approval
+#   A rejected review always goes back to build. There is no `flow:` key; a
+#   file that has one is rejected. The retry knobs are under `limits:` below.
+# =============================================================================
+
+# Schema version. Lets Toryo reject or migrate files if the format changes.
+# Required. Currently must be 1.
+toryo: 1
+
+# Team name. Used in logs, checkpoints and reports. Required.
+team: d365fo-dev
+
+# Optional. Markdown file with team-wide working norms (how careful to be,
+# how to treat evidence, tone). Shared by every seat. Omit if not needed.
+culture: ./CULTURE.md              # optional team-wide norms
+
+# Skills (each skill = a folder with a SKILL.md inside) are NOT set here.
+# Role files list skills by NAME, and Toryo looks each name up in this order:
+#   1. the repository:  .toryo/skills/<name>/SKILL.md   (project-specific)
+#   2. the machine:     <skills_dir>/<name>/SKILL.md     (your shared folder,
+#                       set in %USERPROFILE%\.toryo\toryo.local.yaml)
+# The first match wins; `toryo context show` says which one was used.
+# A name found in neither place is a validation error.
+
+# -----------------------------------------------------------------------------
+# GATES  --  named checks that Toryo runs ITSELF (never the agent)
+# -----------------------------------------------------------------------------
+# A role's `before_handoff: [build, dbsync]` refers to the names below.
+# When: after build, once Toryo has committed the checkpoint, before review.
+# Every gate works on the CHECKPOINT COMMIT -- the exact code the reviewer will
+# read -- never on your main repository folder.
+# Pass/fail is decided by the EXIT CODE (0 = pass), never by what an agent
+# claims. Gates run in the order the role lists them and stop at the first
+# failure; the failing gate's output goes back to the implementer as DATA (not
+# as instructions) to fix. Retry limit: limits.max_gate_retries.
+#
+# Two kinds, because they carry different risks:
+#
+#   kind: check        Proves something WITHOUT changing this machine.
+#                      Runs in a fresh, clean checkout of the checkpoint
+#                      commit with a Low-integrity token: it can write only
+#                      inside that checkout and the build/tmp folders next to
+#                      it. No secrets. Fully defined HERE, in the repository.
+#                      Typical: X++ compile, tests that need no database.
+#
+#   kind: environment  CHANGES this machine's D365FO environment (deploys the
+#                      package, syncs AxDB). Runs with your normal user
+#                      rights, so its command must be out of every agent's
+#                      reach: the command is defined ONLY in the machine
+#                      config (%USERPROFILE%\.toryo\toryo.local.yaml, key
+#                      `environment_gates`). Here the team only declares that
+#                      the gate is required.
+#
+# Order rule (validated): in a role's before_handoff, every `check` gate comes
+# before every `environment` gate -- never deploy code that does not compile.
+#
+# Fields:
+#   kind        check | environment. Required.
+#   program     check only. The executable: pwsh (PowerShell 7) or
+#               powershell (Windows PowerShell 5.1). No shell string:
+#               arguments are a list, so there are no quoting problems.
+#   args        check only. Argument list; paths relative to the checkout.
+#               A script named here is protected automatically: no agent
+#               can edit it (@verify-scripts).
+#   tool        check only, instead of program/args: a built-in kind.
+#               `xpp` = headless X++ compile with this machine's toolchain
+#               (needs `metadata` and `projects`).
+#   timeout     give up after this long and kill the whole process tree.
+#               Format: 30s, 20m, 1h. Required.
+#   if_missing  environment only. What to do on a machine whose config does
+#               not define this gate (e.g. a laptop with no D365 environment):
+#                 error (default)  refuse to start the task
+#                 skip             run without it; the final approval says so
+#
+# Variables Toryo sets for every gate:
+#   TORYO_TASK             task id
+#   TORYO_SHA              the checkpoint commit being verified
+#   TORYO_VERIFY_CHECKOUT  the clean checkout of TORYO_SHA (read only)
+#   TORYO_VERIFY_BUILD     build output folder: check gates write here,
+#                          environment gates read the compiled package here
+gates:
+  build:
+    kind: check
+    program: pwsh
+    args: [-NoProfile, -NonInteractive, -File, scripts/build-model.ps1]
+    timeout: 20m
+    # build-model.ps1 must write its output under $env:TORYO_VERIFY_BUILD.
+    # At Low integrity it CANNOT write to PackagesLocalDirectory. If your
+    # script can only build in place, declare it `kind: environment` instead
+    # (then a compile error also touches your environment).
+    #
+    # Alternative with no script to maintain (already built into Toryo):
+    #   kind: check
+    #   tool: xpp
+    #   metadata: Metadata
+    #   projects: [Projects/Build/ContosoCore.Build.rnrproj]
+    #   timeout: 90m
+
+  dbsync:
+    kind: environment     # command: toryo.local.yaml -> environment_gates.dbsync
+    timeout: 30m
+    if_missing: error
+
+# -----------------------------------------------------------------------------
+# SEATS  --  who sits where
+# -----------------------------------------------------------------------------
+# Exactly three seats, because the flow is fixed: planner, implementer,
+# reviewer. A missing or extra seat is an error.
+# The seat name IS the role folder name:
+#     seat `implementer`  ->  .toryo/roles/implementer/toryo-role.yaml
+#
+# Fields per seat:
+#   profile   which Toryo profile sits here. Required. Profiles are defined
+#             ONLY in the machine config (%USERPROFILE%\.toryo\toryo.local.yaml,
+#             key `profiles`), never in the repository (R60). A profile holds
+#             everything about the agent: kind (claude | codex), the .exe,
+#             the login (CODEX_HOME, OAuth or Foundry key) and the sandbox.
+#             So this file works unchanged on your PC and on the company
+#             laptop: each machine defines its own profiles.
+#             (Toryo ignores ~/.codex/config.toml on purpose, so
+#             `codex --profile openai` becomes the Toryo profile codex-openai.)
+#   model     optional. Overrides the profile's default model.
+#   fallback  optional ORDERED list of profile names to switch to when the
+#             primary cannot run (quota exhausted, rate limit after retries).
+#             The switch is sticky for the task. Omitted = no fallback.
+#             (Today's toryo.yaml treats omitted as "the planner's profile";
+#             the new loader maps omitted to `fallback: []`.)
+#             Today only the implementer may have a fallback; on the planner
+#             or reviewer it is a validation error until Toryo supports it.
+#
+# The machine config may override a seat for that machine only (key `seats`,
+# same fields), e.g. the company laptop uses claude-foundry for the planner.
+# `toryo config show` says where each seat came from (repo / machine).
+seats:
+  planner:
+    profile: claude-max
+    model: opus
+
+  implementer:
+    profile: codex-openai          # ChatGPT Plus login (was: codex --profile openai)
+    fallback: [claude-max]         # takes over if Codex is out of quota
+
+  reviewer:
+    profile: claude-max            # no fallback: the reviewer never changes
+    # RULE: a fallback on one seat must NEVER change another seat. If the
+    # reviewer cannot run, STOP and tell the human (the task pauses); never
+    # substitute silently.
+
+# -----------------------------------------------------------------------------
+# LIMITS  --  how often work may bounce before a human decides
+# -----------------------------------------------------------------------------
+#   max_gate_retries   build: how many times failing gates are sent back to
+#                      the implementer to fix. Then stop and ask the human.
+#   max_review_rounds  review: how many rejections (review -> build) are
+#                      allowed. Then stop and hand the decision to the human.
+# Both optional. Toryo today has ONE counter for both (max_fix_cycles, R4).
+# Splitting it is a small state-machine change; to keep one counter instead,
+# replace both keys with `max_fix_cycles: 3`.
+limits:
+  max_gate_retries: 3
+  max_review_rounds: 3
+
+# -----------------------------------------------------------------------------
+# CHECKS  --  team-wide sanity rules, evaluated by Toryo
+# -----------------------------------------------------------------------------
+# Value is one of:  off | warn | error
+#   off    do not evaluate
+#   warn   record it in the log and the final report, keep going
+#   error  refuse to start the stage
+#
+# reviewer-differs-from-builder
+#   Independent review only works if the reviewer is a different agent from
+#   the one that wrote the code. Evaluate this at RUNTIME using the agent that
+#   ACTUALLY ran the build stage (after any fallback), not the configured one,
+#   by comparing the profiles' `kind` (claude | codex).
+#   Example: Codex runs out of quota -> Claude builds -> reviewer is also
+#   Claude -> same agent reviewing its own work -> this check fires.
+checks:
+  reviewer-differs-from-builder: warn

@@ -1,0 +1,7 @@
+# toryo-role.yaml template of the reviewer (M11-F1) — .toryo/roles/reviewer/toryo-role.yaml
+# TODO(owner): purpose in your words; skills the reviewer always gets (e.g. a review checklist).
+# No writes / never / before_handoff: the reviewer is read-only.
+toryo: 1
+purpose: Review the checkpoint against TASK.md's acceptance criteria.
+instructions: ./instructions.md
+skills: []

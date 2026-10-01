@@ -69,3 +69,54 @@ git:
 # A machine setting: not frozen with a task, not hashed. Check it with `toryo notify-test`.
 # notify:
 #   toast: true
+
+# M11 — the org chart (.toryo/toryo-orgchart.yaml in a repository). `seats:` is the new spelling
+# of `roles:` (same fields; one of the two per file): a seat set here replaces the repository's
+# seat on this machine, and `toryo config show` marks it "repo, overridden by machine".
+# seats:
+#   planner:  { profile: claude-foundry, model: opus }
+#   reviewer: { profile: claude-foundry, model: opus }
+
+# M11 — this machine's shared skills folder: <skills_dir>/<name>/SKILL.md, looked up AFTER the
+# repository's .toryo/skills/<name>/. Only SKILL.md is delivered (the files next to it are
+# readable only for repository skills). Forward slashes work on Windows.
+# skills_dir: C:/Temp/AgentShare/skills
+
+# M11 — environment gates: what an org chart's `kind: environment` gate runs, with YOUR normal
+# rights, so it lives only here. `program`: an absolute path or a PATH name; every path in `args`
+# absolute and outside the repository, the task worktrees and the verify root (validated).
+# Runs only after every `check` gate of the same verify run passed, in the verify checkout,
+# inside a Job Object (the timeout of the org chart kills the whole tree), with an environment
+# built from scratch + TORYO_TASK, TORYO_SHA, TORYO_VERIFY_CHECKOUT, TORYO_VERIFY_BUILD + `env` +
+# the resolved `secret_env` (redacted from every log). One gate per `lock` runs at a time across
+# all tasks; `toryo status` shows which task and commit each lock's environment last received.
+# environment_gates:
+#   dbsync:
+#     program: powershell                 # Windows PowerShell 5.1; pwsh for 7
+#     args: [-NoProfile, -NonInteractive, -File, 'C:\toryo-gates\dbsync.ps1']
+#     lock: d365-env
+#     env:
+#       D365_PACKAGES: 'K:\AosService\PackagesLocalDirectory'
+#     secret_env:
+#       D365_SYNC_SECRET: credman:toryo/d365-sync
+#
+# The contract of a gate script (e.g. dbsync.ps1):
+#   1. The exit code decides: 0 = pass, anything else = fail. PowerShell exits 0 even when a
+#      native .exe failed, so start with `$ErrorActionPreference = 'Stop'` and after every native
+#      call (SyncEngine.exe, msbuild.exe, …): `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`.
+#   2. Deploy what Toryo verified, nothing else: the source from $env:TORYO_VERIFY_CHECKOUT
+#      (commit $env:TORYO_SHA) and/or the compiled package from $env:TORYO_VERIFY_BUILD — never
+#      from your main repository folder.
+#   3. Idempotent: Toryo runs it again in the next fix cycle and after a crash.
+#   4. Print the useful error lines: the end of the output is what the implementer receives.
+#   5. Never write into $env:TORYO_VERIFY_CHECKOUT (checked afterwards: verify_mutated_tree).
+#   6. Never wait for input: with -NonInteractive a prompt fails at once instead of hanging.
+#   (M11) Call every tool by its absolute path: the working directory is the verify checkout —
+#   files the implementer committed — so a bare name or a DLL must never be found there.
+
+# M11 (review H2) — this machine's floor for the repositories' verify sandbox, and its verify
+# root. A repository `verify.boundary: none` is refused unless `min_boundary: none` here (only
+# for repositories whose code you trust). `verify_root` replaces the repository's.
+# verify:
+#   min_boundary: low_integrity
+#   verify_root: '%LOCALAPPDATA%\toryo-verify'
