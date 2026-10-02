@@ -1073,21 +1073,6 @@ pub fn problems(cfg: &Effective, root: &Path, machine: &str) -> Vec<String> {
                 org.display()
             ));
         }
-        // M11-R2 (X2): environment gates deploy from the checkout, which must then be exactly
-        // the checkpoint — in `tracked` mode ignored files of earlier runs stay in it
-        let env_gate = imp.before_handoff.iter().find(|n| {
-            team.gates
-                .get(*n)
-                .is_some_and(|g| g.decl.kind == GateType::Environment)
-        });
-        if let (Some(g), false) = (env_gate, cfg.repo.verify.checkout == "clean") {
-            out.push(format!(
-                "{}: verify.checkout: `{}` — the implementer's before_handoff has the environment gate '{g}' ({}: gates.{g}); environment gates deploy from the checkout, so it must be exactly the checkpoint: set `verify.checkout: clean`",
-                cfg.repo_path.display(),
-                cfg.repo.verify.checkout,
-                org.display()
-            ));
-        }
         let mut first_env: Option<&str> = None;
         for n in &imp.before_handoff {
             match team.gates.get(n) {
@@ -2184,22 +2169,23 @@ mod tests {
         assert!(e.contains("not found on PATH"), "{e}");
     }
 
-    /// M11-R2 AC-5 (X2): an environment gate needs `verify.checkout: clean` — `tracked` is a
-    /// load problem naming `verify.checkout` in toryo.yaml and the gate.
+    /// M11-R9 (X6 replaces X2; was `an_environment_gate_needs_a_clean_checkout`): the
+    /// environment gates deploy from a fresh export of the commit, not from the checkout, so a
+    /// `tracked` checkout with an environment gate loads.
     #[test]
-    fn an_environment_gate_needs_a_clean_checkout() {
+    fn a_tracked_checkout_with_an_environment_gate_loads() {
         let (_d, y, m) = draft_repo(&[]);
         let text = std::fs::read_to_string(&y).unwrap();
         std::fs::write(&y, format!("{text}verify: {{ checkout: tracked }}\n")).unwrap();
-        let e = load_err(&y, &m);
-        assert!(
-            e.contains(&format!("{}: verify.checkout: `tracked`", y.display()))
-                && e.contains("the environment gate 'dbsync'")
-                && e.contains("gates.dbsync")
-                && e.contains("set `verify.checkout: clean`"),
-            "{e}"
-        );
-        // without an environment gate in before_handoff, `tracked` is fine
+        let cfg = crate::config::Effective::load(&y, Some(&m)).unwrap();
+        assert_eq!(cfg.repo.verify.checkout, "tracked");
+        assert!(cfg
+            .team
+            .unwrap()
+            .handoff_gates()
+            .iter()
+            .any(|(n, _)| *n == "dbsync"));
+        // without an environment gate in before_handoff, `tracked` is fine too
         let (_d, y, m) = draft_repo(&[(
             IMPL_ROLE,
             &draft_with(IMPL_ROLE, "[build, dbsync]", "[build]"),

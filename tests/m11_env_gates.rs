@@ -850,18 +850,47 @@ fn probe_then_dbsync(ps1: &str, sh: &str) -> (Env, PathBuf) {
     );
     let marker = env.root.join("gates").join("deployed");
     let m = fwd(&marker);
+    // M11-R9: the gate also writes what it sees as TORYO_VERIFY_CHECKOUT to `gates/seen.txt` —
+    // `co=<path>`, then its files (relative, `/`), hidden ones included
+    let seen = fwd(&env.root.join("gates").join("seen.txt"));
     define_gates(
         &env,
         &machine_gate(
             &env,
             "dbsync",
             "d365-env",
-            &format!("Set-Content -Path '{m}' -Value x\n\"cwd=$((Get-Location).Path)\"\n\"repo-file=$(Test-Path src/Calculator.psm1)\"\nexit 0\n"),
-            &format!("echo x > '{m}'\necho \"cwd=$(pwd)\"\nif [ -e src/Calculator.psm1 ]; then echo repo-file=True; else echo repo-file=False; fi\nexit 0\n"),
+            &format!("Set-Content -Path '{m}' -Value x\n\"cwd=$((Get-Location).Path)\"\n\"repo-file=$(Test-Path src/Calculator.psm1)\"\n$c = $env:TORYO_VERIFY_CHECKOUT\nSet-Content -Path '{seen}' -Value \"co=$c\"\nGet-ChildItem -LiteralPath $c -Recurse -Force | Where-Object {{ -not $_.PSIsContainer -or $_.Name -eq '.git' }} | ForEach-Object {{ $_.FullName.Substring($c.Length + 1).Replace('\\', '/') }} | Add-Content -Path '{seen}'\nexit 0\n"),
+            &format!("echo x > '{m}'\necho \"cwd=$(pwd)\"\nif [ -e src/Calculator.psm1 ]; then echo repo-file=True; else echo repo-file=False; fi\nc=\"$TORYO_VERIFY_CHECKOUT\"\necho \"co=$c\" > '{seen}'\n(cd \"$c\" && find . \\( -type f -o -name .git \\) | sed 's|^\\./||') >> '{seen}'\nexit 0\n"),
             "",
         ),
     );
     (env, marker)
+}
+
+/// What the environment gate of [`probe_then_dbsync`] saw: its TORYO_VERIFY_CHECKOUT and the
+/// files there, sorted.
+fn seen_by_the_gate(env: &Env) -> (PathBuf, Vec<String>) {
+    let text = std::fs::read_to_string(env.root.join("gates").join("seen.txt")).unwrap();
+    let mut lines = text
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty());
+    let co = PathBuf::from(lines.next().unwrap().strip_prefix("co=").unwrap());
+    let mut files: Vec<String> = lines.collect();
+    files.sort();
+    (co, files)
+}
+
+/// The files of the task's checkpoint commit, sorted.
+fn checkpoint_files(env: &Env, id: &str) -> Vec<String> {
+    let t = task(env, id);
+    let head = t.machine.checkpoint().unwrap().to_string();
+    let mut files: Vec<String> = git(&wt(env, id), &["ls-tree", "-r", "--name-only", &head])
+        .lines()
+        .map(str::to_string)
+        .collect();
+    files.sort();
+    files
 }
 
 fn one_turn(env: &Env, id: &str) -> String {
@@ -879,36 +908,59 @@ fn one_turn(env: &Env, id: &str) -> String {
     err
 }
 
-/// M11-R2 AC-1: a check gate that adds a file to the checkout → no environment gate starts, no
-/// deployment record, `Escalated` with `verify_checkout_dirty`, no fix cycle used.
+/// M11-R9 AC-2 (X6; was `a_check_gate_that_adds_a_file_stops_the_deploy`, R2 AC-1): a check gate
+/// that adds a file to the Low checkout no longer stops the deploy — the environment gate runs
+/// from a fresh export of the commit: its TORYO_VERIFY_CHECKOUT is under `deploy`, differs from
+/// the check gate's, holds exactly the commit's files and no `.git`. The extra file is a warning
+/// and `checkout_extra` in VERIFY_RESULT.json.
 #[test]
-fn a_check_gate_that_adds_a_file_stops_the_deploy() {
+fn a_check_gate_that_adds_a_file_is_not_deployed() {
     let (env, marker) = probe_then_dbsync(
         "Set-Content -Path (Join-Path $env:TORYO_VERIFY_CHECKOUT 'stray.txt') -Value x\nexit 0\n",
         "echo x > \"$TORYO_VERIFY_CHECKOUT/stray.txt\"\nexit 0\n",
     );
     let err = one_turn(&env, "R2-1");
     let t = task(&env, "R2-1");
-    assert_eq!(t.state, St::Escalated, "{err}");
-    assert_eq!(t.fix_cycle, 0, "not sent back to the implementer");
-    assert!(err.contains("verify_checkout_dirty"), "{err}");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert!(marker.exists(), "the environment gate ran");
     assert!(
-        err.contains("stray.txt") && err.contains("TORYO_VERIFY_BUILD"),
+        err.contains("!! a check gate left files in the verify checkout — they are not deployed")
+            && err.contains("stray.txt"),
         "{err}"
     );
-    assert!(!marker.exists(), "the environment gate never started");
-    assert!(deployments(&env).is_empty());
-    let ev = events(&env, "R2-1");
-    assert!(ev
-        .iter()
-        .any(|e| e["type"] == "escalated" && e["reason_class"] == "verify_checkout_dirty"));
     let vr = verify_result(&env, "R2-1");
-    assert_eq!(vr["pass"], false);
-    assert!(vr["commands"]
+    assert_eq!(vr["pass"], true);
+    assert_eq!(vr["checkout_extra"], json!(["stray.txt"]));
+    let gate = vr["commands"]
         .as_array()
         .unwrap()
         .iter()
-        .all(|c| c["kind"] != "environment"));
+        .find(|c| c["kind"] == "environment")
+        .unwrap()
+        .clone();
+    assert_eq!(gate["source"], "export");
+    let head = t.machine.checkpoint().unwrap().to_string();
+    let tree = git(
+        &wt(&env, "R2-1"),
+        &["rev-parse", &format!("{head}^{{tree}}")],
+    );
+    assert_eq!(gate["source_tree"].as_str().unwrap(), tree.trim());
+    let (co, files) = seen_by_the_gate(&env);
+    assert_eq!(co.file_name().unwrap(), "deploy", "{}", co.display());
+    let checkout = PathBuf::from(vr["verify_checkout"].as_str().unwrap());
+    assert_ne!(
+        std::fs::canonicalize(&co).ok(),
+        std::fs::canonicalize(&checkout).ok(),
+        "not the check gates' checkout"
+    );
+    assert_eq!(
+        files,
+        checkpoint_files(&env, "R2-1"),
+        "exactly the commit's files"
+    );
+    assert!(!files.iter().any(|f| f == ".git" || f.contains("stray")));
+    let d = deployments(&env);
+    assert_eq!((d.len(), d[0].ok), (1, Some(true)));
 }
 
 /// M11-R2 AC-2: a check gate that edits a tracked file → `verify_mutated_tree`, no environment
@@ -1041,11 +1093,11 @@ fn an_environment_gate_variable_is_expanded_once_at_create() {
     assert!(gates.join("deployed").exists(), "the script ran: {err}");
 }
 
-/// M11-R2 review: what `git status` cannot see stops the deploy too — a gitlink in the
-/// checkpoint (Git never looks inside it) that a check gate fills, and an entry named `.git`
-/// below the root (Git skips it).
+/// M11-R2 review, M11-R9 (was `files_git_cannot_see_stop_the_deploy`): what `git status` cannot
+/// see is not deployed — a gitlink in the checkpoint (Git never looks inside it) that a check
+/// gate fills, and an entry named `.git` below the root (Git skips it).
 #[test]
-fn files_git_cannot_see_stop_the_deploy() {
+fn files_git_cannot_see_are_not_deployed() {
     let (env, marker) = probe_then_dbsync(
         "$c = $env:TORYO_VERIFY_CHECKOUT\nNew-Item -ItemType Directory -Force (Join-Path $c 'deploy') | Out-Null\nSet-Content -Path (Join-Path $c 'deploy/evil.xml') -Value x\nNew-Item -ItemType Directory -Force (Join-Path $c 'src/.git') | Out-Null\nSet-Content -Path (Join-Path $c 'src/.git/payload') -Value x\nexit 0\n",
         "c=\"$TORYO_VERIFY_CHECKOUT\"\nmkdir -p \"$c/deploy\" \"$c/src/.git\"\necho x > \"$c/deploy/evil.xml\"\necho x > \"$c/src/.git/payload\"\nexit 0\n",
@@ -1064,17 +1116,30 @@ fn files_git_cannot_see_stop_the_deploy() {
     git(&env.repo, &["commit", "-q", "-m", "a gitlink"]);
     let err = one_turn(&env, "R2-G");
     let t = task(&env, "R2-G");
-    assert_eq!(t.state, St::Escalated, "{err}");
-    let reason = t.machine.reason().unwrap_or_default().to_string();
+    // M11-R9 (X6; this R2-review test stopped the deploy): what Git cannot see is listed and
+    // not deployed — the gate reads the export, which has neither file
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert!(marker.exists(), "the environment gate ran");
+    let vr = verify_result(&env, "R2-G");
+    let extra: Vec<String> = vr["checkout_extra"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
     assert!(
-        reason.starts_with("verify_checkout_dirty:")
-            && reason.contains("deploy (a gitlink")
-            && reason.contains("deploy/evil.xml")
-            && reason.contains("src/.git (a `.git` entry"),
-        "{reason}"
+        extra.iter().any(|x| x == "deploy (a gitlink)")
+            && extra.iter().any(|x| x == "deploy/evil.xml")
+            && extra.iter().any(|x| x == "src/.git (a `.git` entry)"),
+        "{extra:?}"
     );
-    assert!(!marker.exists(), "the environment gate never started");
-    assert!(deployments(&env).is_empty());
+    let (_, files) = seen_by_the_gate(&env);
+    assert!(
+        !files
+            .iter()
+            .any(|f| f.contains("evil") || f.contains("payload") || f.ends_with(".git")),
+        "{files:?}"
+    );
 }
 
 /// M11-R8: an environment gate that runs past its timeout (6 s: room for two pwsh start-ups)
@@ -1193,4 +1258,105 @@ fn a_lock_name_is_stored_in_lower_case() {
         out.contains("d365-env holds LC-1 @") && out.contains("(approved)"),
         "{out}"
     );
+}
+
+/// The `output_tail` of the gate `name` in the latest VERIFY_RESULT.json of `id`.
+fn gate_tail(env: &Env, id: &str, name: &str) -> String {
+    verify_result(env, id)["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == name)
+        .map(|c| c["output_tail"].as_str().unwrap_or_default().to_string())
+        .unwrap_or_default()
+}
+
+/// M11-R9 AC-3 (Windows): the forgery R9 is about — a check gate overwrites a tracked file with
+/// content of the same length and puts its timestamps back. Whatever `mutated` says, what the
+/// environment gate reads has the committed bytes: either the task escalates before any deploy,
+/// or the deployed file's SHA-256 is the original's, never the forged one's.
+#[cfg(windows)]
+#[test]
+fn a_same_length_forgery_in_the_checkout_is_never_deployed() {
+    let (env, marker) = probe_then_dbsync(
+        "$f = Join-Path $env:TORYO_VERIFY_CHECKOUT 'src/Calculator.psm1'\n$i = Get-Item $f\n$w = $i.LastWriteTimeUtc\n$c = $i.CreationTimeUtc\n\"orig=$((Get-FileHash $f -Algorithm SHA256).Hash)\"\n$b = [IO.File]::ReadAllBytes($f)\n$b[0] = if ($b[0] -eq 35) { 36 } else { 35 }\n[IO.File]::WriteAllBytes($f, $b)\n$i = Get-Item $f\n$i.LastWriteTimeUtc = $w\n$i.CreationTimeUtc = $c\n\"forged=$((Get-FileHash $f -Algorithm SHA256).Hash)\"\nexit 0\n",
+        "",
+    );
+    // the environment gate records the hash of the file it would deploy
+    let got = env.root.join("gates").join("deployed-hash.txt");
+    std::fs::write(
+        env.root.join("gates").join("dbsync.ps1"),
+        format!(
+            "Set-Content -Path '{}' -Value x\n(Get-FileHash (Join-Path $env:TORYO_VERIFY_CHECKOUT 'src/Calculator.psm1') -Algorithm SHA256).Hash | Set-Content -Path '{}'\nexit 0\n",
+            fwd(&marker),
+            fwd(&got)
+        ),
+    )
+    .unwrap();
+    let err = one_turn(&env, "R9-F");
+    let tail = gate_tail(&env, "R9-F", "probe");
+    let line = |k: &str| {
+        tail.lines()
+            .find_map(|l| l.trim().strip_prefix(k))
+            .unwrap_or_else(|| panic!("{k}: {tail}"))
+            .to_string()
+    };
+    let (orig, forged) = (line("orig="), line("forged="));
+    assert_ne!(orig, forged, "the probe forged the file");
+    let t = task(&env, "R9-F");
+    eprintln!("R9-F: {:?}", t.state);
+    if t.state == St::Escalated {
+        // Git saw it: no environment gate started
+        assert!(err.contains("verify_mutated_tree"), "{err}");
+        assert!(!marker.exists() && deployments(&env).is_empty());
+    } else {
+        assert_eq!(t.state, St::Completed, "{err}");
+        let deployed = std::fs::read_to_string(&got).unwrap().trim().to_string();
+        assert_eq!(deployed, orig, "the export holds the committed bytes");
+    }
+}
+
+/// M11-R9 AC-4 (Windows): a check gate at Low integrity cannot create a file in `deploy` (also
+/// once it exists, on the second verify run) nor next to the scratch index.
+#[cfg(windows)]
+#[test]
+fn a_low_integrity_check_gate_cannot_write_the_export() {
+    let (env, _) = probe_then_dbsync(
+        "$b = Split-Path $env:TORYO_VERIFY_BUILD -Parent\nforeach ($p in @((Join-Path $b 'deploy/planted.exe'), (Join-Path $b 'deploy.index'), (Join-Path $b 'planted.index'))) {\n  try { New-Item -ItemType Directory -Force -Path (Split-Path $p) -ErrorAction Stop | Out-Null; Set-Content -Path $p -Value x -ErrorAction Stop; \"PLANTED $p\" } catch { 'DENIED' }\n}\nexit 0\n",
+        "",
+    );
+    let cfg = std::fs::read_to_string(&env.config)
+        .unwrap()
+        .replace("boundary: none", "boundary: low_integrity");
+    std::fs::write(&env.config, cfg).unwrap();
+    create(&env, "R9-L");
+    // two verify runs: the second one finds `deploy` and `deploy.index` from the first
+    let s = script(
+        &env,
+        "r9l.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()]),
+                turn(vec![implementation()]),
+            ],
+            "reviewer": [turn(vec![changes()]), turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R9-L", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "R9-L").state, St::Completed, "{err}");
+    let vr = verify_result(&env, "R9-L");
+    assert_eq!(vr["boundary"], "low_integrity");
+    let probe = gate_tail(&env, "R9-L", "probe");
+    assert!(
+        probe.matches("DENIED").count() == 3 && !probe.contains("PLANTED"),
+        "{probe}"
+    );
+    let base = PathBuf::from(vr["verify_checkout"].as_str().unwrap())
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    assert!(base.join("deploy").is_dir() && base.join("deploy.index").is_file());
+    assert!(!base.join("deploy").join("planted.exe").exists());
+    assert!(!base.join("planted.index").exists());
 }

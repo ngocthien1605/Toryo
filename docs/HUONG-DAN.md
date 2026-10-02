@@ -706,9 +706,12 @@ trượt đầu tiên; exit code quyết định; mọi gate có `TORYO_TASK`, `
   Giới hạn còn lại: script không có đuôi, nằm ở gốc repo, chạy bằng chương trình ngoài bảng.
 - `kind: environment` — **thay đổi môi trường D365FO** của máy này (deploy, DB sync), chạy bằng **quyền bình thường
   của anh**, nên lệnh chỉ nằm trong machine config (`environment_gates`), ngoài tầm với của mọi agent. Chỉ chạy
-  sau khi **mọi** check gate cùng lượt đã qua **và checkout đúng y commit checkpoint** (check gate sửa hay thêm file vào
-  checkout → không gate môi trường nào chạy, task escalate `verify_mutated_tree` / `verify_checkout_dirty`; vì vậy org
-  chart có gate môi trường phải để `verify.checkout: clean`); chạy trong một **thư mục làm việc trống** mà code của
+  sau khi **mọi** check gate cùng lượt đã qua (check gate sửa file đã track trong checkout → không gate môi trường
+  nào chạy, `verify_mutated_tree`), và **không bao giờ đọc bản checkout mà check gate đã dùng** (X6): khi đã giữ lock,
+  Toryo xuất lại commit checkpoint từ kho object của repo vào `<verify_root>\<task>\deploy`, thư mục mà code agent không
+  ghi được — bản xuất đó là `TORYO_VERIFY_CHECKOUT` của gate (không có `.git`; tree id ghi trong `VERIFY_RESULT.json`).
+  File check gate để lại trong checkout chỉ được liệt kê (`checkout_extra`, một dòng cảnh báo), không bao giờ được
+  deploy; `verify.checkout: tracked` dùng được cùng gate môi trường. Gate chạy trong một **thư mục làm việc trống** mà code của
   agent không ghi được (`envgate`). `%VAR%` trong `program`/`args` được thay **một lần, lúc nạp config** (`task create`;
   biến chưa đặt → lỗi nạp): chuỗi đã thay là thứ được kiểm tra, đóng băng và chạy (`toryo config show` in ra); tên
   chương trình tìm qua PATH mà nằm trong repo / worktrees / verify root → bị từ chối lúc chạy. Mỗi `lock` chỉ một gate
@@ -759,8 +762,10 @@ environment_gates:
 `$env:TORYO_VERIFY_CHECKOUT` (commit `$env:TORYO_SHA`) và/hoặc gói đã build từ `$env:TORYO_VERIFY_BUILD`, **không bao
 giờ** từ thư mục repo chính; (3) chạy lại nhiều lần vẫn đúng (idempotent); (4) in rõ dòng lỗi — phần cuối output được
 gửi cho implementer sửa; (5) không ghi vào `$env:TORYO_VERIFY_CHECKOUT`; (6) không chờ nhập liệu; và (M11) gọi mọi công
-cụ bằng **đường dẫn tuyệt đối**; thư mục làm việc là một thư mục trống — đừng dựa vào nó, đừng chạy `git` trên checkout
-(file trong đó do implementer viết), hãy dùng `$env:TORYO_SHA`.
+cụ bằng **đường dẫn tuyệt đối**; thư mục làm việc là một thư mục trống — đừng dựa vào nó, đừng chạy `git` trong đó, hãy dùng
+`$env:TORYO_SHA`. `TORYO_VERIFY_CHECKOUT` của gate môi trường là bản sao mới của commit mà không code agent nào chạm được;
+`TORYO_VERIFY_BUILD` do check gate ghi ở Low integrity — khi check gate chạy code do agent viết (test), coi thư mục này là
+không tin cậy và build lại từ `TORYO_VERIFY_CHECKOUT` ngay trong script.
 
 Lưu ý trên máy Tokyo (tiếng Nhật): output DB sync có thể bị lỗi mã cp932 (review M13 — việc tiếp theo sau M11).
 
@@ -1002,7 +1007,7 @@ CI chạy: `cargo fmt --check`, `clippy -D warnings` (có và không có M0 kit)
 | `protected_config_changed` | Mở file diff được nêu trong lý do; khôi phục rồi `toryo resume ID`, hoặc `--accept-protected-change <path>` |
 | `verify_boundary_unavailable` | `verify_root` không gán được Low label (thiếu WRITE_OWNER) → để mặc định `%LOCALAPPDATA%\toryo-verify`; `toryo doctor` nêu nguyên nhân |
 | `verify_mutated_tree` | Script verify đã sửa file đã track / `.git` của bản checkout → sửa script (hoặc code agent viết), rồi `toryo resume ID --note "…"` |
-| `verify_checkout_dirty` (M11) | Trước gate môi trường, bản checkout có file checkpoint không có (check gate ghi vào checkout, thư mục `.git` lồng, nested repository/gitlink, link/junction) → cho check gate ghi output vào `TORYO_VERIFY_BUILD`; bỏ nested repo khỏi commit; rồi `toryo resume ID --note "…"` |
+| `!! a check gate left files in the verify checkout — they are not deployed` (M11) | Chỉ là cảnh báo: gate môi trường deploy từ bản xuất mới của commit, không từ checkout. Nên cho check gate ghi output vào `TORYO_VERIFY_BUILD`; danh sách nằm ở `checkout_extra` trong `VERIFY_RESULT.json` |
 | `environment_gate_unavailable` (M11) | Máy không chạy được gate môi trường: secret chưa có, chương trình không tìm thấy hoặc nằm trong repo/worktrees/verify root → sửa machine config; task tạo trước bản này mà có `%VAR%` trong `program` → `toryo task config ID --reload` |
 | `skill_unavailable` / `context_over_budget` (M11) | Skill cần cho lượt này không tìm thấy (lý do nêu cả hai đường dẫn) → đặt lại rồi `toryo resume ID --note "…"`; ngữ cảnh có skill vẫn quá ngân sách → tăng `context.budget_kb.<role>` hoặc chọn ít skill hơn |
 | `artifact_tampered` / `artifact_missing` | Có người sửa/xoá file trong `runstore\artifacts\` → khôi phục file, hoặc `toryo task cleanup ID` |

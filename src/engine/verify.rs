@@ -313,12 +313,19 @@ pub fn env(co: &Checkout) -> BTreeMap<String, String> {
 /// M11-E1: the variables every gate gets (check and environment gates, and the verify
 /// commands of `toryo.yaml`-only mode), next to `TORYO_VERIFY_BUILD`: `TORYO_TASK` (the task
 /// id), `TORYO_SHA` (the checkpoint commit being verified) and `TORYO_VERIFY_CHECKOUT` (the
-/// clean checkout of that commit).
-pub fn set_gate_vars(env: &mut BTreeMap<String, String>, task: &str, sha: &str, co: &Checkout) {
+/// clean checkout of that commit: `checkout` — the Low verify checkout for a check gate, the
+/// fresh export for an environment gate, M11-R9).
+pub fn set_gate_vars(
+    env: &mut BTreeMap<String, String>,
+    task: &str,
+    sha: &str,
+    co: &Checkout,
+    checkout: &Path,
+) {
     for (k, v) in [
         ("TORYO_TASK", task.to_string()),
         ("TORYO_SHA", sha.to_string()),
-        ("TORYO_VERIFY_CHECKOUT", co.dir.display().to_string()),
+        ("TORYO_VERIFY_CHECKOUT", checkout.display().to_string()),
         ("TORYO_VERIFY_BUILD", co.build().display().to_string()),
     ] {
         env.retain(|e, _| !e.eq_ignore_ascii_case(k));
@@ -364,49 +371,13 @@ pub fn mutated(g: &GitCmd, co: &Checkout, sha: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// The class of a checkout that holds files the checkpoint does not (M11-R2).
-pub const DIRTY: &str = "verify_checkout_dirty";
-
-/// M11-R2 (X2): `Some(reason)` when the checkout holds a file the checkpoint commit does not —
-/// untracked or ignored, i.e. written by a check gate. Environment gates deploy from the
-/// checkout, so it must be exactly the checkpoint before the first one starts. Git runs with the
-/// recorded admin dir (R47), never discovering the repository from the checkout.
-pub fn untracked(g: &GitCmd, co: &Checkout) -> Result<Option<String>> {
-    let out = g.run(
-        &co.loc(),
-        true,
-        &[
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--ignored",
-        ],
-    )?;
-    let files: Vec<String> = out
-        .split(|b| *b == 0)
-        .filter(|e| e.len() > 3 && (e.starts_with(b"?? ") || e.starts_with(b"!! ")))
-        .map(|e| String::from_utf8_lossy(&e[3..]).to_string())
-        .collect();
-    if files.is_empty() {
-        return Ok(None);
-    }
-    let shown: Vec<&String> = files.iter().take(10).collect();
-    let more = if files.len() > 10 {
-        format!(" and {} more", files.len() - 10)
-    } else {
-        String::new()
-    };
-    Ok(Some(format!(
-        "{DIRTY}: the verify checkout holds files the checkpoint does not: {shown:?}{more} — environment gates deploy from the checkout, so it must be exactly the checkpoint; a check gate must write its output under TORYO_VERIFY_BUILD"
-    )))
-}
-
-/// M11-R2 review: what `git status` cannot see in the checkout — a gitlink (a nested repository:
-/// Git never looks inside it, and `git clean` leaves it), an entry named `.git` below the root
-/// (Git skips it), a link or junction that is not tracked, any file that is not tracked. The
-/// checkout is walked without following links and compared with `git ls-files`.
-pub fn hidden(g: &GitCmd, co: &Checkout) -> Result<Option<String>> {
+/// M11-R9 (X6): what a check gate left in the Low verify checkout that the checkpoint does not
+/// hold — untracked or ignored files, a gitlink (Git never looks inside it), an entry named
+/// `.git` below the root, a link or junction that is not tracked. It is **not deployed**: the
+/// environment gates read a fresh export of the commit ([`deploy_source`]), so this is one
+/// warning and `checkout_extra` in `VERIFY_RESULT.json`, never an escalation. The checkout is
+/// walked without following links and compared with `git ls-files` (explicit admin dir, R47).
+pub fn checkout_extra(g: &GitCmd, co: &Checkout) -> Result<Vec<String>> {
     let key = |p: &str| {
         if cfg!(windows) {
             p.to_lowercase()
@@ -423,7 +394,7 @@ pub fn hidden(g: &GitCmd, co: &Checkout) -> Result<Option<String>> {
             continue;
         };
         if meta.starts_with("160000 ") {
-            found.push(format!("{path} (a gitlink — Git does not see inside it)"));
+            found.push(format!("{path} (a gitlink)"));
         }
         tracked.insert(key(path));
     }
@@ -448,7 +419,7 @@ pub fn hidden(g: &GitCmd, co: &Checkout) -> Result<Option<String>> {
             };
             let ft = e.file_type()?;
             if name.eq_ignore_ascii_case(".git") {
-                found.push(format!("{r} (a `.git` entry — Git skips it)"));
+                found.push(format!("{r} (a `.git` entry)"));
             } else if ft.is_symlink() {
                 if !tracked.contains(&key(&r)) {
                     found.push(format!("{r} (a link or junction)"));
@@ -462,31 +433,105 @@ pub fn hidden(g: &GitCmd, co: &Checkout) -> Result<Option<String>> {
         Ok(())
     }
     walk(&co.dir, "", &tracked, &key, &mut found)?;
-    if found.is_empty() {
-        return Ok(None);
-    }
-    let shown: Vec<&String> = found.iter().take(10).collect();
-    let more = if found.len() > 10 {
-        format!(" and {} more", found.len() - 10)
-    } else {
-        String::new()
-    };
-    Ok(Some(format!(
-        "{DIRTY}: the verify checkout holds what the checkpoint does not, or what Git cannot see: {shown:?}{more} — environment gates deploy from the checkout, so it must be exactly the checkpoint; a check gate must write its output under TORYO_VERIFY_BUILD, and a checkpoint may not hold a nested repository"
-    )))
+    Ok(found)
 }
 
-/// M11-R2: may an environment gate deploy from this checkout — `(class, reason)` when not:
-/// a changed tracked file or pointer ([`mutated`]), an untracked or ignored file
-/// ([`untracked`]), or what Git cannot see ([`hidden`]).
-pub fn deployable(g: &GitCmd, co: &Checkout, head: &str) -> Result<Option<(&'static str, String)>> {
-    if let Some(r) = mutated(g, co, head)? {
-        return Ok(Some((MUTATED, r)));
+/// M11-R9: a fresh export of a checkpoint commit — what the environment gates read as
+/// `TORYO_VERIFY_CHECKOUT`. `dir` has no `.git` entry; `index` is the scratch index it was
+/// checked out from; `tree` the tree id it holds.
+#[derive(Debug, Clone)]
+pub struct Export {
+    pub dir: PathBuf,
+    pub index: PathBuf,
+    pub tree: String,
+}
+
+/// M11-R9 (X6): export commit `head` into `<base>/deploy` from the repository's **object
+/// store** — nothing is copied from the Low checkout, which Low code may have forged (Git's
+/// "unchanged" is a size and timestamp test). The folder is emptied link-safely, then a scratch
+/// index next to it (`deploy.index`, `GIT_INDEX_FILE`) gets `read-tree <head>` and
+/// `checkout-index -a`. Git runs with the admin dir recorded when the checkout was created (R47)
+/// and the hardened prefix of `g` (hooks off, fsmonitor off, the filter plan R37) and reads the
+/// repository's own config, so the bytes are those of a clean checkout. Neither `deploy` nor
+/// the index is Low-labelled. The export is accepted only when `write-tree` of the index equals
+/// `<head>^{tree}`.
+pub fn deploy_source(g: &GitCmd, co: &Checkout, head: &str) -> Result<Export> {
+    let dir = co.base.join("deploy");
+    let index = co.base.join("deploy.index");
+    empty_dir(&dir)?;
+    if std::fs::symlink_metadata(&index).is_ok() {
+        // a link is removed as a link (its target is left alone)
+        remove_link(&index).with_context(|| format!("removing {}", index.display()))?;
     }
-    if let Some(r) = untracked(g, co)? {
-        return Ok(Some((DIRTY, r)));
+    let loc = Loc::Explicit {
+        git_dir: co.admin.clone(),
+        work_tree: dir.clone(),
+    };
+    let scratch = [("GIT_INDEX_FILE", index.as_path())];
+    let git = |args: &[&str]| -> Result<String> {
+        let o = g.output_env(&loc, false, args, &scratch)?;
+        if !o.status.success() {
+            bail!(
+                "git {} failed ({}): {}",
+                args.join(" "),
+                o.status,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    git(&["read-tree", head])?;
+    git(&["checkout-index", "-a", "-f", "-u"])?;
+    let tree = git(&["write-tree"])?;
+    let want = git(&["rev-parse", &format!("{head}^{{tree}}")])?;
+    if tree != want {
+        bail!(
+            "the export of {} holds tree {tree}, not the commit's {want}",
+            short(head)
+        );
     }
-    Ok(hidden(g, co)?.map(|r| (DIRTY, r)))
+    Ok(Export { dir, index, tree })
+}
+
+/// M11-R9 (E3 AC-8 against the export): after an environment gate, `Some(reason)` when the
+/// export no longer holds exactly the commit — a tracked file changed (stat refreshed, then
+/// compared by content) or a file added. The gate runs with the owner's rights, so this
+/// catches a script that writes into `TORYO_VERIFY_CHECKOUT`, not a forgery.
+pub fn export_changed(g: &GitCmd, co: &Checkout, e: &Export) -> Result<Option<String>> {
+    let loc = Loc::Explicit {
+        git_dir: co.admin.clone(),
+        work_tree: e.dir.clone(),
+    };
+    let scratch = [("GIT_INDEX_FILE", e.index.as_path())];
+    // a timestamp-only touch is no change: refresh the stat data, then compare by content
+    let _ = g.output_env(&loc, false, &["update-index", "-q", "--refresh"], &scratch)?;
+    let mut files = Vec::new();
+    for args in [
+        &["diff-files", "--name-only", "-z"][..],
+        &["ls-files", "--others", "-z"][..],
+    ] {
+        let o = g.output_env(&loc, true, args, &scratch)?;
+        if !o.status.success() {
+            bail!(
+                "git {} failed ({}): {}",
+                args.join(" "),
+                o.status,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+        files.extend(
+            o.stdout
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).to_string()),
+        );
+    }
+    if files.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "{MUTATED}: an environment gate changed the export of the checkpoint it deploys from (TORYO_VERIFY_CHECKOUT): {files:?} — a gate script must never write there"
+    )))
 }
 
 /// M11-R2 (X1): the working directory of an environment gate — `<base>/envgate`, created and
@@ -540,13 +585,14 @@ pub fn cleanup(g: &GitCmd, t: &TaskRow, cfg: Option<&Effective>) -> Result<()> {
     Ok(())
 }
 
-// Windows only: junctions (`mklink /J`) need no privilege there
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     /// M11-R2 review: emptying a folder never goes through a link — a junction put in place of
     /// the folder, or inside it, is removed as a link and its target keeps its files.
+    // Windows only: junctions (`mklink /J`) need no privilege there
+    #[cfg(windows)]
     #[test]
     fn emptying_a_folder_never_follows_a_junction() {
         let d = tempfile::tempdir().unwrap();
@@ -583,5 +629,117 @@ mod tests {
         empty_dir(&envgate).unwrap();
         assert_eq!(std::fs::read_dir(&envgate).unwrap().count(), 0);
         assert!(target.join("keep.txt").exists());
+    }
+
+    /// A repository with one commit and a verify-style checkout of it (as `prepare` makes it:
+    /// a detached worktree, its admin dir and pointer recorded), under `d`.
+    fn repo_and_checkout(d: &Path) -> (GitCmd, Checkout, String) {
+        let repo = d.join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        let sh = |dir: &Path, args: &[&str]| {
+            let o = std::process::Command::new(crate::git::git_exe())
+                .arg("-C")
+                .arg(dir)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "core.autocrlf=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        sh(&repo, &["init", "-q", "-b", "main"]);
+        sh(&repo, &["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join("app.txt"), "committed\n").unwrap();
+        std::fs::write(repo.join("src").join("lib.txt"), "library\n").unwrap();
+        sh(&repo, &["add", "-A"]);
+        sh(&repo, &["commit", "-q", "-m", "one"]);
+        let head = sh(&repo, &["rev-parse", "HEAD"]);
+        let base = d.join("vr").join("T-1");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = base.join("T-1.verify");
+        sh(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                &dir.display().to_string(),
+                &head,
+            ],
+        );
+        let admin = PathBuf::from(sh(&dir, &["rev-parse", "--absolute-git-dir"]));
+        let pointer = std::fs::read_to_string(dir.join(".git")).unwrap();
+        let g = GitCmd::new(crate::git::git_exe(), d.join("hooks")).unwrap();
+        let co = Checkout {
+            base,
+            dir,
+            admin,
+            pointer,
+            low: false,
+        };
+        (g, co, head)
+    }
+
+    /// M11-R9 AC-1: the export holds the committed bytes — not what a check gate wrote into the
+    /// checkout — and no added file and no `.git`; its tree is the commit's. A gate that then
+    /// writes into it is seen (`export_changed`); a fresh export is clean again.
+    #[test]
+    fn the_export_holds_the_commit_not_the_checkout() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, co, head) = repo_and_checkout(d.path());
+        // a forged tracked file (same length) and an added one, in the checkout
+        std::fs::write(co.dir.join("app.txt"), "FORGED!!!\n").unwrap();
+        std::fs::write(co.dir.join("added.txt"), "x").unwrap();
+        let e = deploy_source(&g, &co, &head).unwrap();
+        assert_eq!(e.dir, co.base.join("deploy"));
+        assert_eq!(
+            std::fs::read_to_string(e.dir.join("app.txt")).unwrap(),
+            "committed\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(e.dir.join("src").join("lib.txt")).unwrap(),
+            "library\n"
+        );
+        assert!(!e.dir.join("added.txt").exists() && !e.dir.join(".git").exists());
+        let mut names: Vec<String> = std::fs::read_dir(&e.dir)
+            .unwrap()
+            .map(|x| x.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["app.txt", "src"]);
+        let want = g
+            .run_str(&co.loc(), true, &["rev-parse", &format!("{head}^{{tree}}")])
+            .unwrap();
+        assert_eq!(e.tree, want);
+        assert_eq!(export_changed(&g, &co, &e).unwrap(), None);
+        // the checkout itself still says what it holds: the forged file is not hidden from
+        // `checkout_extra`'s view of added files
+        assert_eq!(checkout_extra(&g, &co).unwrap(), ["added.txt"]);
+        // a gate that writes into the export: a changed and an added file are seen
+        std::fs::write(e.dir.join("app.txt"), "synced\n").unwrap();
+        std::fs::write(e.dir.join("new.txt"), "x").unwrap();
+        let why = export_changed(&g, &co, &e).unwrap().expect("changed");
+        assert!(
+            why.starts_with("verify_mutated_tree:")
+                && why.contains("app.txt")
+                && why.contains("new.txt"),
+            "{why}"
+        );
+        // the next export starts from scratch
+        let e = deploy_source(&g, &co, &head).unwrap();
+        assert!(!e.dir.join("new.txt").exists());
+        assert_eq!(export_changed(&g, &co, &e).unwrap(), None);
     }
 }

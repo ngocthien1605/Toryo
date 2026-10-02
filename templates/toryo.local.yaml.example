@@ -90,11 +90,13 @@ git:
 # %VAR% in `program`/`args` is expanded ONCE, when the config is loaded (`task create`): the
 # expanded text is what is checked, frozen and run (`toryo config show` prints it); an unset
 # variable is a load error. A PATH name that resolves inside those folders is refused at run time.
-# Runs only after every `check` gate of the same verify run passed and the verify checkout is
-# exactly the checkpoint (nothing changed, nothing added — an org chart with an environment gate
-# needs `verify.checkout: clean`), in an EMPTY working directory agent code cannot write, inside
-# a Job Object (the timeout of the org chart kills the whole tree), with an environment
-# built from scratch + TORYO_TASK, TORYO_SHA, TORYO_VERIFY_CHECKOUT, TORYO_VERIFY_BUILD + `env` +
+# Runs only after every `check` gate of the same verify run passed (a check gate that changed a
+# tracked file of the checkout stops it: verify_mutated_tree). It never reads the verify checkout
+# the check gates used: once it holds its lock, Toryo exports the checkpoint commit afresh from
+# the repository's object store into a folder no agent code can write (`<verify_root>\<task>\deploy`)
+# — that export is its TORYO_VERIFY_CHECKOUT. It runs in an EMPTY working directory agent code
+# cannot write, inside a Job Object (the timeout of the org chart kills the whole tree), with an
+# environment built from scratch + TORYO_TASK, TORYO_SHA, TORYO_VERIFY_CHECKOUT, TORYO_VERIFY_BUILD + `env` +
 # the resolved `secret_env` (redacted from every log). One gate per `lock` runs at a time across
 # all tasks; `toryo status` shows which task and commit each lock's environment last received.
 # Lock names ignore case (D365-Env is d365-env); Windows device names (con, nul, com1, …) are
@@ -122,14 +124,14 @@ git:
 #   6. Never wait for input: with -NonInteractive a prompt fails at once instead of hanging.
 #   (M11) The working directory is an empty folder — never rely on it: find the code through
 #   $env:TORYO_VERIFY_CHECKOUT / $env:TORYO_VERIFY_BUILD, call every tool by its absolute path,
-#   and do not run `git` against the checkout (its files come from the implementer) — use
-#   $env:TORYO_SHA.
-#   (M11) Both folders hold what the implementer wrote: TORYO_VERIFY_BUILD is written by the
-#   check gates at Low integrity and is NOT covered by the "exactly the checkpoint" check.
-#   Anything your script interprets from them (a .ps1 it dot-sources, a project or
-#   Directory.Build.* file msbuild reads, an .exe it starts) runs agent-written logic with your
-#   full rights — deploy their files, do not execute them. A checkpoint with a nested repository
-#   (gitlink) is refused before any environment gate (verify_checkout_dirty).
+#   and do not run `git` there — use $env:TORYO_SHA.
+#   (M11) TORYO_VERIFY_CHECKOUT — for an environment gate: a fresh copy of the commit that no
+#   agent code could touch (no `.git`; checked after the gate: write nothing there).
+#   TORYO_VERIFY_BUILD — written by the check gates at Low integrity. When a check gate runs
+#   agent-written code (tests), treat this folder as untrusted and build again from
+#   TORYO_VERIFY_CHECKOUT inside the script. Anything your script interprets from it (a .ps1 it
+#   dot-sources, a project file msbuild reads, an .exe it starts) runs agent-written logic with
+#   your full rights.
 
 # M11 (review H2) — this machine's floor for the repositories' verify sandbox, and its verify
 # root. A repository `verify.boundary: none` is refused unless `min_boundary: none` here (only

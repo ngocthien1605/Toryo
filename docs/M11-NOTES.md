@@ -194,9 +194,9 @@ Task list: `M11-review-fixes.md` (review of 2026-10-02, built and run on Linux b
 
 ### Decisions of the list (X1–X5) and the answers to "Open"
 
-- **X1** an environment gate's working directory is an empty folder agent code cannot write (R2); **X2** before
-  the first environment gate the checkout must be exactly the checkpoint, so an org chart with an environment
-  gate needs `verify.checkout: clean` (R2); **X3** `%VAR%` in an environment gate's `program`/`args` is expanded
+- **X1** an environment gate's working directory is an empty folder agent code cannot write (R2); **X2** (replaced by
+  X6 in round 2) before the first environment gate the checkout must be exactly the checkpoint, so an org chart
+  with an environment gate needs `verify.checkout: clean` (R2); **X3** `%VAR%` in an environment gate's `program`/`args` is expanded
   once, at load (R3); **X4** `reviewer-differs-from-builder` counts every implementer turn that ran (R7); **X5**
   the same-vendor note keeps `(Claude both)` (R7).
 - Answers to the M11 "Open" list: a pre-M11 task with `boundary: none` keeps it — accepted; the extra turn after
@@ -498,6 +498,80 @@ M10 behaviour/hash without an org chart. Fixed:
   allows counting them); (d) `EnvGates::Dirty` after the lock wait uses the pre-deploy wording ("a check gate must
   write …") although, with two environment gates, the first gate's script may be the writer; (e) a secret split
   across two live chunks of `LocalRunner` (no engine caller; predates M11).
+
+### Round 2
+
+Task list: `M11-review-fixes-2.md` (re-review of R1–R8 on 2026-10-02; the reviewer built `f77fc49` on Linux: fmt
+and both clippy clean, 587 tests passed). Same branch, from `f77fc49`. One commit per task; this round ends with
+the push and the pull request.
+
+#### Progress (round 2)
+
+- [x] R9 — environment gates deploy from a fresh export of the commit
+- [ ] R10 — M18 script detection, second pass
+- [ ] R11 — `resume` after a machine-caused escalation costs no fix cycle
+- [ ] R12 — cheap Low fixes
+- [ ] Finish — notes, README, HUONG-DAN, templates
+- [ ] Push and pull request
+
+#### Decisions X6–X8 (binding)
+
+- **X6 — replaces X2.** An environment gate no longer reads the Low-integrity verify checkout at all: it gets a
+  fresh export of the checkpoint commit in a folder agent code cannot write (R9). `verify_checkout_dirty` is no
+  longer an escalation (extra files are a warning, not deployed); `verify.checkout: clean` is no longer required;
+  the MSBuild `obj\` Open item of R2 is closed by it. **X1 stays** (the empty `envgate` working directory).
+- **X7** M18 refuses only a gate's entry script, and only when the implementer could write it; other arguments are
+  protected when they exist, never refused (R10).
+- **X8** leaving an escalation the machine caused (a missing skill, a context over budget, a gate the machine cannot
+  run) costs no fix cycle: plain `toryo resume <id>` goes back into the stage (R11).
+
+#### R9 — environment gates deploy from a fresh export of the commit
+
+- **The export:** `verify::deploy_source(g, co, head) -> Export { dir, index, tree }` — `<base>/deploy`, emptied with
+  the link-safe `empty_dir`; a scratch index `<base>/deploy.index` (`GIT_INDEX_FILE`; a link there is removed as a
+  link); `read-tree <head>`, `checkout-index -a -f -u`, `write-tree` must equal `<head>^{tree}`. Git runs with
+  `Loc::Explicit { git_dir: co.admin (recorded at creation, R47), work_tree: deploy }` and the hardened prefix of
+  the task's `GitCmd` (hooks, fsmonitor off, the R37 filter plan) and the repository's own config, so the bytes are
+  those of a clean checkout. Nothing is read from `co.dir`. Neither `deploy` nor the index is in the Low label list.
+  An export that fails → the gate does not start, `environment_gate_unavailable` ("the checkpoint … could not be
+  exported").
+- **When:** in `run_environment_gates`, once the gate holds its lock, for every environment gate; then the
+  deployment row, then the gate. `set_gate_vars` gained the `checkout` path: check gates keep `co.dir`, environment
+  gates get the export. The working directory stays `envgate` (X1). The export has no `.git`.
+- **After each environment gate:** `verify::export_changed` — `update-index -q --refresh` on the scratch index, then
+  `diff-files` (content after a stat refresh) and `ls-files --others` → `EnvGates::Mutated` → `verify_mutated_tree`
+  (E3 AC-8, now against the export; `an_environment_gate_that_writes_into_the_checkout_mutates_the_tree` unchanged).
+- **X2 withdrawn:** before the first environment gate only `verify::mutated` decides (it still escalates, R29); the
+  call after the lock wait is gone with `deployable` and `EnvGates::Dirty`. `untracked` + `hidden` became
+  `verify::checkout_extra` (the walk without following links, plus gitlinks from `ls-files -s`): one stderr line
+  `!! a check gate left files in the verify checkout — they are not deployed: […]` and `checkout_extra` (first 10)
+  in `VERIFY_RESULT.json`. `verify_checkout_dirty` (`verify::DIRTY`) is gone. The B3 rule "an environment gate
+  needs `verify.checkout: clean`" is removed.
+- **Record:** each environment gate's `VERIFY_RESULT.json` entry has `source: "export"` and `source_tree`.
+- **Round-1 tests changed** (named in the commit body): `a_check_gate_that_adds_a_file_stops_the_deploy` →
+  `a_check_gate_that_adds_a_file_is_not_deployed` (AC-2); `files_git_cannot_see_stop_the_deploy` →
+  `files_git_cannot_see_are_not_deployed` (the gitlink and `.git` entry are listed, not deployed);
+  `an_environment_gate_needs_a_clean_checkout` → `a_tracked_checkout_with_an_environment_gate_loads` (AC-7). The
+  test helper `probe_then_dbsync`'s environment gate also writes what it sees (`gates/seen.txt`); its other output is
+  unchanged.
+- **Tests:** `verify::tests::the_export_holds_the_commit_not_the_checkout` (AC-1, also `export_changed` and
+  `checkout_extra`), `a_check_gate_that_adds_a_file_is_not_deployed` (AC-2: under `deploy`, not the check gates'
+  checkout, exactly the commit's files, no `.git`, the warning, `checkout_extra`, `source_tree`),
+  `a_same_length_forgery_in_the_checkout_is_never_deployed` (AC-3, Windows), `a_low_integrity_check_gate_cannot_
+  write_the_export` (AC-4, Windows, on the second verify run when `deploy` and `deploy.index` exist),
+  `an_environment_gate_that_writes_into_the_checkout_mutates_the_tree` (AC-5), `a_check_gate_that_edits_a_tracked_
+  file_stops_the_deploy` (AC-6, unchanged), `a_tracked_checkout_with_an_environment_gate_loads` and
+  `two_tasks_share_one_environment_lock` (AC-7).
+- **AC-3 on this machine:** Git for Windows **does** see the same-length forgery with restored timestamps (the
+  task escalates `verify_mutated_tree` before any deploy) — so on Windows the test takes the "no deploy" branch; the
+  other branch (Git fooled, as the reviewer showed on Linux with `core.trustctime=false`) is covered by AC-1: the
+  export is made from the object store and never holds the checkout's bytes.
+- Docs: the machine template (the paragraph and the script contract: the two variables), the fixture's comment,
+  README, HUONG-DAN §5.9 and its troubleshooting row.
+- **Open (not fixed, the list says so):** the Low verify checkouts of different tasks share one integrity label, so
+  one task's check gates can write another task's checkout and build folder (a separate user or AppContainer per
+  task would be needed). The export closes this for what an environment gate deploys from
+  `TORYO_VERIFY_CHECKOUT`, not for `TORYO_VERIFY_BUILD`.
 
 ## Progress
 

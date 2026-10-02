@@ -1430,16 +1430,25 @@ impl<'a> Engine<'a> {
         else {
             return interrupted(self);
         };
-        // M11-R2 (X2): environment gates deploy from the checkout with the owner's full rights,
-        // so before the first one starts it must be exactly the checkpoint — a check gate (code
-        // the implementer wrote) may have changed or added files. Found → no environment gate
-        // runs and the task escalates (not a fix cycle: the gate setup is wrong, not the code).
-        // (checked again once each gate holds its lock — the wait may be long)
-        let mut before_deploy: Option<(&str, String)> = None;
+        // M11-R9 (X6, replaces X2): the environment gates read a fresh export of the commit,
+        // never the Low checkout. Before the first one, a check gate that changed a tracked file
+        // is still wrong (R29: escalate, no environment gate); what it left besides is not
+        // deployed — one warning and `checkout_extra` in VERIFY_RESULT.json
+        let mut before_deploy: Option<String> = None;
+        let mut extra: Option<Vec<String>> = None;
         if failure.is_none() && self.deploys() {
-            before_deploy = verify::deployable(&self.g, &co, &head)?;
+            before_deploy = verify::mutated(&self.g, &co, &head)?;
+            let found = verify::checkout_extra(&self.g, &co)?;
+            if !found.is_empty() {
+                eprintln!(
+                    "!! a check gate left files in the verify checkout — they are not deployed: {:?}",
+                    found.iter().take(10).collect::<Vec<_>>()
+                );
+                extra = Some(found.into_iter().take(10).collect());
+            }
         }
         // M11-E3: the environment gates, only after every check gate passed
+        let mut export_mutated: Option<String> = None;
         if failure.is_none() && before_deploy.is_none() {
             match self.run_environment_gates(t, &co, &head, &stop, &mut results)? {
                 EnvGates::Done(f) => failure = f,
@@ -1448,13 +1457,14 @@ impl<'a> Engine<'a> {
                     self.escalate_attempt(&a, ENV_UNAVAILABLE.into(), reason)?;
                     return Ok(Flow::Next);
                 }
-                EnvGates::Dirty(class, reason) => before_deploy = Some((class, reason)),
+                EnvGates::Mutated(reason) => export_mutated = Some(reason),
             }
         }
         let pass = failure.is_none() && before_deploy.is_none();
-        // R29/R47: the checkout must be exactly the checkpoint after the run
-        let mutated = match &before_deploy {
-            Some((_, reason)) => Some(reason.clone()),
+        // R29/R47: the checkout must be exactly the checkpoint after the run; M11-R9: the
+        // export too, after each environment gate (E3 AC-8)
+        let mutated = match before_deploy.or(export_mutated) {
+            Some(reason) => Some(reason),
             None => verify::mutated(&self.g, &co, &head)?,
         };
         let tree = self.g.run_str(
@@ -1478,6 +1488,9 @@ impl<'a> Engine<'a> {
         if results.iter().any(|r| r["kind"] == "xpp") {
             vr["scope"] = json!("compile");
         }
+        if let Some(x) = extra {
+            vr["checkout_extra"] = json!(x);
+        }
         self.put(
             t,
             &a,
@@ -1486,10 +1499,6 @@ impl<'a> Engine<'a> {
             &serde_json::to_vec_pretty(&vr)?,
             "VERIFY_RESULT.json",
         )?;
-        if let Some((class, reason)) = before_deploy {
-            self.escalate_attempt(&a, class.into(), reason)?;
-            return Ok(Flow::Next);
-        }
         if let Some(reason) = mutated {
             self.escalate_attempt(&a, verify::MUTATED.into(), reason)?;
             return Ok(Flow::Next);
@@ -1550,7 +1559,7 @@ impl<'a> Engine<'a> {
     ) -> Result<Option<(Vec<Value>, Option<String>)>> {
         let mut env = verify::env(co);
         // M11-E1: TORYO_TASK, TORYO_SHA, TORYO_VERIFY_CHECKOUT for every command
-        verify::set_gate_vars(&mut env, &self.id, head, co);
+        verify::set_gate_vars(&mut env, &self.id, head, co, &co.dir);
         let t = self.task()?;
         let at = VerifyAt {
             co,
@@ -1675,7 +1684,7 @@ impl<'a> Engine<'a> {
     /// check gate of the run passed: each takes its machine-wide lock (waiting while another
     /// task holds it), records the deployment **before** it starts, runs the frozen machine
     /// command with the owner's normal token in an empty working directory (`envgate`, M11-R2;
-    /// the checkout is re-checked once the lock is held) (Job Object, timeout,
+    /// it deploys from a fresh export of the commit made once the lock is held, M11-R9) (Job Object, timeout,
     /// environment from scratch + gate variables + `env` + resolved `secret_env`, redacted
     /// output), records the end and releases the lock. A gate this machine does not define
     /// (`if_missing: skip`) gets a skipped entry. Stops at the first failure.
@@ -1731,12 +1740,18 @@ impl<'a> Engine<'a> {
             let Some(lock) = self.env_lock(t, &lock_name, stop)? else {
                 return Ok(EnvGates::Stopped);
             };
-            // M11-R2 review: the wait for the lock may have been long — the checkout must still be
-            // exactly the checkpoint when the gate starts
-            if let Some((class, reason)) = verify::deployable(&self.g, co, head)? {
-                drop(lock);
-                return Ok(EnvGates::Dirty(class, reason));
-            }
+            // M11-R9 (X6): what the gate deploys — a fresh export of the commit from the object
+            // store, made once the lock is held, into a folder Low code cannot write
+            let export = match verify::deploy_source(&self.g, co, head) {
+                Ok(e) => e,
+                Err(e) => {
+                    drop(lock);
+                    return unavailable(format!(
+                        "the checkpoint {} could not be exported for it: {e:#}",
+                        short(head)
+                    ));
+                }
+            };
             // M11-R2 (X1): a fresh, empty working directory agent code cannot write
             let cwd = verify::envgate_dir(co)?;
             // first the record: a failed or killed sync may already have changed the environment
@@ -1755,7 +1770,7 @@ impl<'a> Engine<'a> {
             // directory (the empty `envgate` folder, M11-R2: it was the checkout) — cmd.exe and
             // CreateProcess honour this; DLL loading does not (documented in the script contract)
             env.insert("NoDefaultCurrentDirectoryInExePath".into(), "1".into());
-            verify::set_gate_vars(&mut env, &t.id, head, co);
+            verify::set_gate_vars(&mut env, &t.id, head, co, &export.dir);
             let mut redact = super::flight::task_secrets(&self.cfg, t);
             redact.extend(secrets.iter().map(|(k, v)| crate::process::redact::Secret {
                 name: k.clone(),
@@ -1817,7 +1832,11 @@ impl<'a> Engine<'a> {
             let argv: Vec<String> = std::iter::once(m.program.clone())
                 .chain(m.args.iter().cloned())
                 .collect();
-            results.push(json!({"name": name, "kind": "environment", "lock": lock_name, "machine": machine, "argv": argv, "exit": res.exit, "timed_out": res.timed_out, "ms": res.duration_ms, "output_tail": res.tail(40)}));
+            results.push(json!({"name": name, "kind": "environment", "lock": lock_name, "machine": machine, "argv": argv, "exit": res.exit, "timed_out": res.timed_out, "ms": res.duration_ms, "output_tail": res.tail(40), "source": "export", "source_tree": export.tree}));
+            // M11-R9: the gate must not have written into what it deploys from (E3 AC-8)
+            if let Some(reason) = verify::export_changed(&self.g, co, &export)? {
+                return Ok(EnvGates::Mutated(reason));
+            }
             if !res.ok() {
                 // R61: the output comes from code that ran on the checkpoint — data
                 let f = verify_feedback(&res, "");
@@ -3837,9 +3856,9 @@ enum EnvGates {
     /// The machine cannot run a gate (an unresolved secret, a program not found): escalate —
     /// not something another fix cycle can repair.
     Unavailable(String),
-    /// M11-R2 review: once the gate held its lock the checkout was no longer exactly the
-    /// checkpoint — `(class, reason)`; nothing was deployed by this gate.
-    Dirty(&'static str, String),
+    /// M11-R9: an environment gate wrote into the export it deploys from — the reason
+    /// (`verify_mutated_tree`).
+    Mutated(String),
 }
 
 /// The escalation class of an environment gate this machine cannot run (M11-E3).
