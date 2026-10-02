@@ -571,7 +571,18 @@ the push and the pull request.
 - [x] R11 — `resume` after a machine-caused escalation costs no fix cycle
 - [x] R12 — cheap Low fixes
 - [x] Finish — notes, README, HUONG-DAN, templates
-- [~] Push and pull request — BLOCKED: `git push` denied by the environment permission layer (not a credentials problem); the branch is ready
+- [x] Push and pull request — `git push` was denied here by the environment permission layer; the owner pushed
+  `m11/orgchart` and opened https://github.com/ngocthien1605/Toryo/pull/3
+- [~] CI — round 1 on `b7046ab`: both `test` jobs red, `toryo.exe (release)` skipped. Fixed in three `M11-ci` commits:
+  - `512708d` **windows-latest**, 4 `team::tests`: the reach check failed open when the path did not exist yet and
+    the root was spelled another way (the runner temp folder is `C:\Users\RUNNER~1\…`, an 8.3 name; a junction or
+    symlink does the same anywhere). `lexical()` now canonicalises the longest existing ancestor. New test
+    `a_path_spelled_another_way_is_still_inside` fails before the fix.
+  - `062938b` **windows-latest**, `a_check_gate_that_adds_a_file_is_not_deployed`: the test probe cut FullName by
+    the length of the short-named path (`oy/` prefix); it now lists with `Get-ChildItem -Name`. Test-only.
+  - `f5ad5e1` **ubuntu-latest**, clippy: Rust 1.99 (the new CI stable) deprecates `AtomicU64::fetch_update`;
+    `try_update` is newer than `rust-version = 1.89`, so a `compare_exchange_weak` loop (all Linux tests had passed).
+  Windows here: 570 passed, 0 failed, 6 ignored. CI round 2 runs on the next push.
 
 #### Decisions X6–X8 (binding)
 
