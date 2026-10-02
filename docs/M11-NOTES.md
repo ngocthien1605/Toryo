@@ -113,7 +113,7 @@ Task list: `M11-review-fixes.md` (review of 2026-10-02, built and run on Linux b
 - [x] R3 — environment gate `program`/`args`: validate what runs
 - [x] R4 — fence patterns that match nothing; the culture file is protected
 - [x] R5 — a skill that cannot be delivered stops the turn; the budget check covers the whole chain
-- [ ] R6 — M18 script detection: no false refusals, no missed scripts
+- [x] R6 — M18 script detection: no false refusals, no missed scripts
 - [ ] R7 — the same-vendor check counts every turn that ran
 - [ ] R8 — cheap Low fixes and test gaps
 
@@ -289,6 +289,35 @@ AC of R1–R3 was confirmed met (R2 AC-4 is a property test: `base` was never Lo
   implementer attempt, resume with the skill in the context), `::the_budget_check_covers_every_implementer_of_the_
   chain` (AC-2: `[codex-openai, claude-max]`, the feedback names `claude-max` only),
   `context::tests::with_skills_the_inlined_task_pack_is_never_trimmed` (attempt time).
+
+### R6 — M18 script detection: no false refusals, no missed scripts (applies to everyone)
+
+- New `checks::script_of(program, args) -> Option<String>`: `pwsh`/`powershell` — `-File x` as before, else the first
+  token of `-Command` / `-c` (after an optional `&` / `.`, quotes and a trailing `;` removed) when it has a script
+  extension, else the first positional argument ending in `.ps1`; `cmd` — the first token after `/c` (`/k`);
+  interpreters — `INTERPRETERS` gained a third list, the flags that take a value (`sh`/`bash`/`zsh`/`dash`/`ksh`
+  `-o -O`, `python`/`python3`/`py` `-W -X`, `node` `-r --require --import --loader`, `ruby` `-I -r`, `perl` `-I`),
+  whose value is skipped. **A candidate is a script only with a path separator or a script extension** — otherwise
+  `None`, never a refusal (an existing file is still protected, as any existing argument; this is how "or exists at
+  the base commit" is honoured). `dash` got `-o -O` too (same shell family).
+- `script_arg` keeps its signature (`Option<&String>`; the M18 tests call it) and returns the argument when
+  `script_of` names a whole argument. `verify_files` and `verify_entry_points` use `script_of`.
+- **The net:** `checks::script_like_args` — every argument (or its first token) that is a repository path with
+  extension `.ps1 .psm1 .cmd .bat .sh .py .js .ts .rb .pl .exe`. `task::check_entry_points` refuses one missing at
+  the base commit: `verify_script_missing: <gate|verify command> `<name>` passes `<path>` (a script or program file),
+  which is not in the base commit …`. Arguments starting with `-` or `/` are not looked at, nor absolute paths.
+- **Remaining limit (recorded):** a script without an extension, in the repository root, run by a program outside the
+  table (e.g. `make` with a root `Makefile`, `dotnet tool run x later`) is neither protected before it exists nor
+  refused when missing. Also not parsed: `pwsh -EncodedCommand`, `--flag=path` forms.
+- What changed without an org chart: `task create` / `task config --reload` admit `bash -o pipefail x.sh` (and the
+  other value flags) that were refused; they refuse a positional `pwsh x.ps1`, a `-Command ./x.ps1`, `cmd /c "x.cmd
+  arg"` and any script-extension argument missing at base that were admitted; those scripts are now protected. The
+  config hash does not change (nothing new is stored).
+- Tests: `checks::tests::script_detection_skips_flag_values_and_finds_more_scripts` (AC-1 table, incl. `dotnet test -f
+  net8.0`, and the net), `tests/m11_gates.rs::script_detection_admits_flag_values_and_refuses_a_positional_script`
+  (AC-2 in a toryo.yaml-only repository, plus the net). AC-3: `m18_script_arguments_per_program`,
+  `m18_entry_points_are_protected_before_they_exist`, `a_gate_script_missing_from_the_base_commit_is_refused_at_
+  admission` and the EC-07 tests pass unchanged.
 
 ## Progress
 

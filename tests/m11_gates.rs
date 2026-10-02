@@ -334,3 +334,62 @@ fn a_configured_secret_does_not_reorder_stdout_and_stderr() {
         .collect();
     assert_eq!(order, ["o1", "e1", "o2"], "{out:?}");
 }
+
+/// M11-R6 AC-2 (applies to everyone — a toryo.yaml-only repository here): `bash -o pipefail
+/// scripts/x.sh` with the script at the base commit is admitted (`pipefail` was taken for the
+/// script and refused); `pwsh scripts/new.ps1` (positional, no `-File`) missing at the base
+/// commit is refused, naming the command.
+#[test]
+fn script_detection_admits_flag_values_and_refuses_a_positional_script() {
+    let with_command = |env: &Env, line: &str| {
+        let y = std::fs::read_to_string(&env.config).unwrap();
+        let old = r#"    - { name: divide-present, program: git, args: ["grep", "-q", "Divide-Numbers", "--", "src"] }"#;
+        assert!(y.contains(old), "{y}");
+        std::fs::write(&env.config, y.replace(old, line)).unwrap();
+    };
+    let env = setup("codex-openai");
+    commit_repo(&env, &[("scripts/x.sh", "exit 0\n")], "a gate script");
+    with_command(
+        &env,
+        r#"    - { name: strict, program: bash, args: ["-o", "pipefail", "scripts/x.sh"] }"#,
+    );
+    let (code, err) = toryo(
+        &env,
+        &["task", "create", "--file", "TASK.md", "--id", "R6-1"],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let env = setup("codex-openai");
+    with_command(
+        &env,
+        r#"    - { name: newgate, program: pwsh, args: ["-NoProfile", "scripts/new.ps1"] }"#,
+    );
+    let (code, err) = toryo(
+        &env,
+        &["task", "create", "--file", "TASK.md", "--id", "R6-2"],
+        &[],
+    );
+    assert_ne!(code, 0);
+    assert!(
+        err.contains(
+            "verify_script_missing: verify command `newgate` runs `scripts/new.ps1`, which is not in the base commit"
+        ),
+        "{err}"
+    );
+    // the net: a script passed to a program outside the table
+    let env = setup("codex-openai");
+    with_command(
+        &env,
+        r#"    - { name: wrapped, program: dotnet, args: ["tool", "run", "runner", "scripts/gen.ps1"] }"#,
+    );
+    let (code, err) = toryo(
+        &env,
+        &["task", "create", "--file", "TASK.md", "--id", "R6-3"],
+        &[],
+    );
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("verify command `wrapped` passes `scripts/gen.ps1` (a script or program file), which is not in the base commit"),
+        "{err}"
+    );
+}

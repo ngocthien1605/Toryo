@@ -85,7 +85,12 @@ pub fn new_machine(cfg: &Effective, cli_max: Option<u32>) -> Result<Machine> {
 pub fn check_entry_points(cfg: &Effective, g: &GitCmd, repo: &Path, base: &str) -> Result<()> {
     let cmds = super::checks::verify_commands(cfg, repo).unwrap_or_default();
     let entry = super::checks::verify_entry_points(&cmds, repo);
-    if entry.is_empty() {
+    // M11-R6: the net under the table — an argument naming a repository script or program
+    let net: Vec<(String, String)> = super::checks::script_like_args(&cmds, repo)
+        .into_iter()
+        .filter(|e| !entry.contains(e))
+        .collect();
+    if entry.is_empty() && net.is_empty() {
         return Ok(());
     }
     let repol = Loc::Discover(repo.to_path_buf());
@@ -104,6 +109,15 @@ pub fn check_entry_points(cfg: &Effective, g: &GitCmd, repo: &Path, base: &str) 
         if !tree.contains(&path.to_lowercase()) {
             bail!(
                 "verify_script_missing: {what} `{name}` runs `{path}`, which is not in the base commit {} of {} — commit it before creating the task (M18: a verify script the task itself creates could be written by the implementer)",
+                crate::git::short(base),
+                repo.display()
+            );
+        }
+    }
+    for (name, path) in net {
+        if !tree.contains(&path.to_lowercase()) {
+            bail!(
+                "verify_script_missing: {what} `{name}` passes `{path}` (a script or program file), which is not in the base commit {} of {} — commit it before creating the task (M18: a verify script the task itself creates could be written by the implementer)",
                 crate::git::short(base),
                 repo.display()
             );

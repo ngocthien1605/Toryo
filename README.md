@@ -281,9 +281,13 @@ from the repository checkout (`project.root`), never from a task worktree, and e
   (legacy verify commands too).
   - `kind: check` — defined in the repository (`program`/`args` or `tool: xpp` + `metadata`/`projects`, `timeout:
     30s | 20m | 1h`), runs exactly like a verify command: clean checkout, Low integrity, no secrets, its script
-    protected. (M18, for everyone) a repository program or script (`-File` of PowerShell, the script of
-    `sh`/`bash`/`python`/`node`/…, the file after `cmd /c`) is protected before it exists, and `task create` refuses
-    a configuration whose base commit lacks it.
+    protected. (M18, for everyone) a repository program or script (`-File` of PowerShell, else the first token of
+    `-Command` or the first positional `.ps1`; the script of `sh`/`bash`/`python`/`node`/…, skipping the values of
+    `-o`, `-W`, `-r`, `-I`, …; the first token after `cmd /c`) is protected before it exists, and `task create` refuses
+    a configuration whose base commit lacks it. A candidate without a path separator or a script extension is never
+    refused; any argument naming a repository `.ps1 .psm1 .cmd .bat .sh .py .js .ts .rb .pl .exe` file missing at the
+    base commit is (M11-R6). Not caught: a script without an extension, in the repository root, run by a program
+    outside this table.
   - `kind: environment` — the repository only declares it (`timeout`, `if_missing: error | skip`); the command is
     `environment_gates.<name>` in the machine config (`program`, `args`, `lock`, `env`, `secret_env`), frozen with the
     task. It runs only after every check gate passed **and the verify checkout is exactly the checkpoint** (a check

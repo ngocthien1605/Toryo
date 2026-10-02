@@ -695,6 +695,10 @@ trượt đầu tiên; exit code quyết định; mọi gate có `TORYO_TASK`, `
 `TORYO_VERIFY_BUILD`):
 - `kind: check` — khai báo đầy đủ trong repo, chạy trong checkout sạch với quyền **Low integrity**, không có secret.
   Script của gate được bảo vệ kể cả khi chưa tồn tại (M18), và `task create` từ chối nếu commit gốc chưa có nó.
+  (M11-R6, áp dụng cho mọi repo) Toryo nhận ra script cả khi viết `pwsh scripts\x.ps1` (không `-File`), `pwsh -Command
+  ./x.ps1`, `cmd /c "x.cmd arg"`, và bỏ qua giá trị của cờ (`bash -o pipefail x.sh`, `python -W error x.py`). Đối số
+  nào chỉ tới file `.ps1 .psm1 .cmd .bat .sh .py .js .ts .rb .pl .exe` trong repo mà commit gốc chưa có → bị từ chối.
+  Giới hạn còn lại: script không có đuôi, nằm ở gốc repo, chạy bằng chương trình ngoài bảng.
 - `kind: environment` — **thay đổi môi trường D365FO** của máy này (deploy, DB sync), chạy bằng **quyền bình thường
   của anh**, nên lệnh chỉ nằm trong machine config (`environment_gates`), ngoài tầm với của mọi agent. Chỉ chạy
   sau khi **mọi** check gate cùng lượt đã qua **và checkout đúng y commit checkpoint** (check gate sửa hay thêm file vào
