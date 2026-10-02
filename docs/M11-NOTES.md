@@ -2,6 +2,65 @@
 
 Every entry: what was decided, why, and where. The owner folds these into plan v0.9.
 
+## Morning summary — review fixes round 2 (2026-10-02, after `M11-review-fixes-2.md`)
+
+**R9–R12 of `M11-review-fixes-2.md` are DONE.** Branch `m11/orgchart`, from `f77fc49` (round 1); this round adds
+the commits below and ends with a push and a pull request. The re-review built `f77fc49` on **Linux** (fmt, both
+clippy, 587 tests passed), closing the round-1 Linux blocker. After R9 and again after R12 an independent review
+subagent read the diff against the list; its findings were fixed (the R9 review in `e9a5b0c`; the R10–R12 review
+after R12).
+
+| Commit | Task | Tests (Windows) |
+|---|---|---|
+| `29226ec` | R9 — environment gates deploy from a fresh export of the commit (X6 replaces X2) | 560 |
+| `5192b56` | R10 — M18 script detection, second pass (X7; applies to everyone) | 563 |
+| `e9a5b0c` | R9 review — harden the export against links and replace objects | 564 |
+| `341673a` | R11 — plain `resume` after a machine-caused escalation costs no fix cycle (X8) | 567 |
+| `be494d4` | R12 — cheap Low fixes (gate `%VAR%`, `dead_pattern`, fence syntax) | 569 |
+| (this) | Finish — the round-2 summary, docs | 569 |
+
+**Checks** (§0.2) green before every commit **on this Windows machine**: `cargo fmt --check`, both
+`clippy --all-targets -D warnings`, `cargo test --locked`. Tests: **569 passed, 0 failed, 6 ignored** (round 1 ended
+at 557). **The round-2 commits were not compiled on Linux here** (WSL has no cargo); every Unix-only block touched
+and every Unix-only use of a changed signature was read by hand, and the R9/R10–R12 reviewers checked Linux by
+reading — but **the `ubuntu-latest` job of the pull request is their first Linux build**.
+
+**Windows-only tests, by name, on this machine (all `ok`):**
+- `tests/m11_env_gates.rs::a_same_length_forgery_in_the_checkout_is_never_deployed` (R9 AC-3)
+- `tests/m11_env_gates.rs::a_low_integrity_check_gate_cannot_write_the_export` (R9 AC-4)
+- `tests/m11_env_gates.rs::a_low_integrity_check_gate_cannot_write_the_envgate_folder` (R2 AC-4, still)
+- `tests/m11_env_gates.rs::an_environment_gate_has_the_normal_token_a_check_gate_low_integrity` (E3 AC-2)
+- `engine::verify::tests::emptying_a_folder_never_follows_a_junction` (R1–R3 review)
+- the toast tests of `m10_notify` as in round 1 (`notify_test_shows_a_real_toast` stays ignored).
+- 5 Unix-only tests remain `ignored` here (sh scripts / Unix symlinks); they run on CI.
+
+**What changed for a repository without an org chart** (R10, "applies to everyone"; the config hash is unchanged):
+- M18 now refuses only a gate's **entry script** when the base commit lacks it (and the repository does not ignore
+  it): the program when it is a repository path; `-File x`, or a literal `/`-path with a script extension in a
+  `-Command` / `cmd /c` / shell `-c` line; the first non-flag argument of a table interpreter (protected even
+  without an extension, `sh check`). A missing ignored path (build output) is admitted; the value of `KEY=value` /
+  `--flag=value` / `-Flag:value` / `/p:Name=value` is looked at; every other argument is protected when it exists and
+  never refused, a missing one with a script/program extension gets a `note:` at `task create` and in `doctor`. So a
+  legitimate `pwsh -Command "msbuild.exe App.sln"`, `make SCRIPT=ci/x.sh test`, `node dist/cli.js` (with `dist/`
+  ignored) or `pwsh -File smoke.ps1 -Exe build/app.exe` is admitted, where round 1 refused some of them.
+- `doctor` no longer warns "protects nothing" about a legacy `deny_paths` / `protected_paths` pattern using `{ } [ ]
+  ! % ~ $` (the legacy matcher matches those literally); it still warns about `./` / `//` / trailing-`/` and
+  absolute / `..` / empty patterns.
+- R11 is org-chart-only (the five machine-caused classes arise only there); an M10 machine JSON round-trips and
+  behaves identically.
+
+**Open (unchanged choice in place) — carried from round 1 and added this round:**
+- X6 leaves one gap (R9, recorded): the Low verify checkouts of different tasks share one integrity label, so one
+  task's check gates can write another task's checkout and `TORYO_VERIFY_BUILD` (a separate user or AppContainer per
+  task would be needed). The export closes it for what an environment gate deploys from `TORYO_VERIFY_CHECKOUT`.
+- `ExitInfo.tree_gone` is still ignored by `LocalRunner` (review M7); an empty folder or an alternate data stream in
+  the Low checkout is seen by no check (harmless after R9: the gate reads the export).
+- R10 limit: a file a gate script itself loads (dot-sourced, imported) is not seen; a script without an extension in
+  the repository root run by a program outside the interpreter table is neither protected-before-it-exists nor
+  refused-when-missing.
+- Round-1 Open items still stand (the `tool: xpp` `obj\` question is **closed** by X6; the rest — `verify_root` under
+  a Low tree, `which_in` PATHEXT, the `toryo spike pipeline` boundary — are unchanged).
+
 ## Morning summary — review fixes (2026-10-02, rewritten after `M11-review-fixes.md`)
 
 **R1–R8 of `M11-review-fixes.md` are DONE; nothing PARTIAL or NOT STARTED.** Branch `m11/orgchart`, from
@@ -511,7 +570,7 @@ the push and the pull request.
 - [x] R10 — M18 script detection, second pass
 - [x] R11 — `resume` after a machine-caused escalation costs no fix cycle
 - [x] R12 — cheap Low fixes
-- [ ] Finish — notes, README, HUONG-DAN, templates
+- [x] Finish — notes, README, HUONG-DAN, templates
 - [ ] Push and pull request
 
 #### Decisions X6–X8 (binding)
