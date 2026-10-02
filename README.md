@@ -264,7 +264,12 @@ from the repository checkout (`project.root`), never from a task worktree, and e
   (never, even inside `writes`) — case-insensitive, `/` and `\` alike. A planned file outside the fence sends the
   plan back; a changed file outside it is restored and sent back to the implementer, with the rule named. The
   fence only narrows `toryo.yaml`: protected and denied paths stay so; `## Allow protected` in TASK.md opens a fence
-  entry like a protected path.
+  entry like a protected path. Patterns are normalised at load (`./src/**`, `src/` and `src` all mean `src/**`: the
+  path and everything under it); an absolute pattern, `..`, an empty one or syntax the matcher lacks (`{ } [ ] !`;
+  it has `*`, `**`, `?`) is a load error. (`policy.deny_paths` / `protected_paths` keep their M10 behaviour;
+  `toryo doctor` warns about a pattern there that can never match.)
+- **The culture file is protected** (org chart mode) like the verify files: an agent's change is restored, unless
+  TASK.md lists it under `## Allow protected`.
 - **Gates.** The implementer's `before_handoff` lists gates by name, every `check` gate before every `environment`
   gate, at least one check gate. They run on the checkpoint commit, in that order, and stop at the first failure;
   the exit code decides. Every gate gets `TORYO_TASK`, `TORYO_SHA`, `TORYO_VERIFY_CHECKOUT`, `TORYO_VERIFY_BUILD`

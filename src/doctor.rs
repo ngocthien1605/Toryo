@@ -123,6 +123,31 @@ pub fn origin_checks(cfg: &Effective) -> Vec<Check> {
     out
 }
 
+/// M11-R4: a WARN for each `policy.deny_paths` / `protected_paths` glob that can never match a
+/// repository path (`./x/**`, `x/`, `/x/**`, `{a,b}` …). They keep their behaviour — and the
+/// config its hash; the org chart's `writes` / `never` are normalised or refused at load.
+pub fn policy_checks(cfg: &Effective) -> Vec<Check> {
+    let p = &cfg.repo.policy;
+    [
+        ("deny_paths", &p.deny_paths),
+        ("protected_paths", &p.protected_paths),
+    ]
+    .into_iter()
+    .flat_map(|(key, list)| list.iter().map(move |g| (key, g)))
+    .filter_map(|(key, g)| {
+        crate::engine::checks::dead_pattern(g).map(|why| Check {
+            level: Level::Warn,
+            area: "policy".into(),
+            message: format!(
+                "{}: policy.{key}: `{g}` {why} (this pattern protects nothing)",
+                cfg.repo_path.display()
+            ),
+            source: None,
+        })
+    })
+    .collect()
+}
+
 /// Minimum Claude Code versions for flags the plan relies on (§14).
 const CLAUDE_MIN_RESTRICTED: (u64, u64, u64) = (2, 1, 248);
 const CLAUDE_MIN_PERMISSION_PROMPTS: (u64, u64, u64) = (2, 1, 259);
@@ -235,6 +260,7 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
     }
     verify_root_check(&mut r, cfg);
     r.0.extend(origin_checks(cfg));
+    r.0.extend(policy_checks(cfg));
 
     // Profiles
     let records = results::load();
@@ -976,6 +1002,41 @@ mod tests {
                 r.0[0].message
             );
         }
+    }
+
+    /// M11-R4 AC-3: a legacy `deny_paths` / `protected_paths` glob that can never match is a
+    /// WARN; the pattern is kept as written, so the configuration's hash does not change.
+    #[test]
+    fn a_legacy_pattern_that_never_matches_is_a_warning() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("toryo.yaml");
+        let base = "version: 1\nproject: { root: r, worktrees_root: w }\n";
+        std::fs::write(
+            &p,
+            format!("{base}policy: {{ deny_paths: ['./x/**', '**/ZZZ/**'], protected_paths: ['@verify-scripts', 'cfg/'] }}\n"),
+        )
+        .unwrap();
+        let cfg = Effective::load(&p, None).unwrap();
+        let w: Vec<String> = policy_checks(&cfg)
+            .into_iter()
+            .inspect(|c| assert_eq!(c.level, Level::Warn))
+            .map(|c| c.message)
+            .collect();
+        assert_eq!(w.len(), 2, "{w:#?}");
+        assert!(
+            w[0].contains("policy.deny_paths: `./x/**` never matches")
+                && w[0].contains("write `x/**`"),
+            "{w:#?}"
+        );
+        assert!(w[1].contains("policy.protected_paths: `cfg/`"), "{w:#?}");
+        // kept as written: what is hashed is what was hashed before M11-R4
+        assert_eq!(cfg.repo.policy.deny_paths, ["./x/**", "**/ZZZ/**"]);
+        assert!(cfg
+            .canonical_json()
+            .contains(r#""deny_paths":["./x/**","**/ZZZ/**"]"#));
+        // a clean policy: no warning
+        std::fs::write(&p, format!("{base}policy: {{ deny_paths: ['x/**'] }}\n")).unwrap();
+        assert!(policy_checks(&Effective::load(&p, None).unwrap()).is_empty());
     }
 
     /// R60 (M9-A2, B1): each profile, toolchain and role says where it came from, in text and in `--json`;

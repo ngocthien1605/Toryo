@@ -111,7 +111,7 @@ Task list: `M11-review-fixes.md` (review of 2026-10-02, built and run on Linux b
 - [x] R1 — the test build compiles on Linux again
 - [x] R2 — environment gates see exactly the checkpoint; neutral working directory
 - [x] R3 — environment gate `program`/`args`: validate what runs
-- [ ] R4 — fence patterns that match nothing; the culture file is protected
+- [x] R4 — fence patterns that match nothing; the culture file is protected
 - [ ] R5 — a skill that cannot be delivered stops the turn; the budget check covers the whole chain
 - [ ] R6 — M18 script detection: no false refusals, no missed scripts
 - [ ] R7 — the same-vendor check counts every turn that ran
@@ -199,6 +199,33 @@ Task list: `M11-review-fixes.md` (review of 2026-10-02, built and run on Linux b
   only for `task create`; `config.json` holds the expanded path; `run` without the variable deploys). The B2 test
   `the_draft_set_loads_freezes_and_reloads` gained the `runs:` line (added assertions only).
 - Docs: the template's `environment_gates` paragraph, README, HUONG-DAN §5.9.
+
+### R4 — fence patterns that match nothing; the culture file is protected
+
+- **Normalised at load:** `checks::fence_pattern` — `\` → `/`; a leading `./` and empty or `.` segments go (`a//b`
+  is `a/b`; the list said "a leading `./`", the middle ones are the same mistake); a trailing `/`, or a pattern
+  without `*` / `?`, becomes `x/**` (the path itself and everything under it — `glob_ci` already matched `dir` for
+  `dir/**`). `team::load` rewrites the role's `writes` / `never` in place, so the frozen config holds the normalised
+  form. Messages quote what was written (`<role file>: never: `/secrets/**` is absolute …`).
+- **Refused (B3, in `load`):** empty / names no path (`./`), absolute (`/x`, `C:\x`, `\\server\x`), a `..` segment,
+  and `{ } [ ] !` — "only `*` (within one folder), `**` (any depth) and `?` (one character)". `!` is refused
+  anywhere in the pattern (a file name with `!` cannot be fenced; conservative — recorded under Open).
+- **Legacy (`policy.deny_paths` / `protected_paths`):** unchanged and still compared as written; `toryo doctor`
+  (`doctor::policy_checks`) adds a WARN `policy.<key>: `<p>` never matches … write `<fix>`` for `./` / `//` /
+  trailing `/` and for the forms `fence_pattern` refuses. `@verify-scripts` is not a pattern. The hash of such a
+  configuration is unchanged (the test checks the canonical JSON keeps `./x/**`).
+- **Culture:** `task_policy` adds `team.culture` (repository-relative, normalised at load) to the protected exact
+  files in org chart mode; `## Allow protected` opens it like any protected path. A repository without an org chart
+  has no culture, so nothing changes there.
+- Config hash in org chart mode: a role file with `src` / `./x` / `x/` now freezes `x/**` (different hash than at
+  4bfa291 for such a file; the drafts and the template use the normal form, their hash is unchanged).
+- Tests: `checks::tests::fence_patterns_are_normalised_or_refused` (AC-1: the five forms, `\`, `//`, the refusals),
+  `checks::tests::legacy_patterns_that_never_match_are_named`, `team::tests::fence_patterns_are_normalised_at_load`
+  (frozen form; problems name file, key, pattern), `doctor::tests::a_legacy_pattern_that_never_matches_is_a_warning`
+  (AC-3), `tests/m11_roles.rs::the_culture_file_is_protected_unless_the_task_allows_it` (AC-2: restored + fix note;
+  with `## Allow protected` committed). No existing test changed.
+- Docs: README, HUONG-DAN §5.9, the d365fo template's implementer role file (pattern rules) and org chart
+  (`culture` is protected).
 
 ## Progress
 

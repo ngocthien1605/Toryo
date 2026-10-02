@@ -274,6 +274,66 @@ fn glob_ci(g: &str) -> regex::Regex {
     regex::Regex::new(&re).unwrap_or_else(|_| glob_to_regex(&g))
 }
 
+/// M11-R4: a `writes` / `never` pattern in the form the matcher compares paths in, or why it
+/// is refused. `\` is `/`; a leading `./` and empty or `.` segments go; a trailing `/` — or a
+/// pattern without `*` and `?` — matches that path and everything under it (`x/**`). Refused:
+/// empty, absolute, `..`, and syntax the matcher does not have.
+pub fn fence_pattern(p: &str) -> std::result::Result<String, String> {
+    let t = p.trim().replace('\\', "/");
+    if t.is_empty() {
+        return Err("is empty".into());
+    }
+    if t.starts_with('/') || t.chars().nth(1) == Some(':') {
+        return Err("is absolute — a pattern is relative to the repository root".into());
+    }
+    if let Some(c) = t.chars().find(|c| "{}[]!".contains(*c)) {
+        return Err(format!(
+            "uses `{c}`, which the matcher does not support — only `*` (within one folder), `**` (any depth) and `?` (one character)"
+        ));
+    }
+    let parts: Vec<&str> = t
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    if parts.contains(&"..") {
+        return Err("may not contain `..`".into());
+    }
+    if parts.is_empty() {
+        return Err("names no path".into());
+    }
+    let mut out = parts.join("/");
+    if (t.ends_with('/') || !out.contains(['*', '?'])) && !out.ends_with("/**") && out != "**" {
+        out.push_str("/**");
+    }
+    Ok(out)
+}
+
+/// M11-R4: why a `policy.deny_paths` / `protected_paths` glob (compared as written) can never
+/// match a repository path, or None. Those keep their behaviour; `doctor` warns.
+pub fn dead_pattern(p: &str) -> Option<String> {
+    let t = p.trim().replace('\\', "/");
+    if t == VERIFY_SCRIPTS {
+        return None;
+    }
+    if let Err(why) = fence_pattern(&t) {
+        return Some(format!("{why}, so it never matches"));
+    }
+    let tidy = t.split('/').all(|c| !c.is_empty() && c != ".");
+    (!tidy).then(|| {
+        let fix = t
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect::<Vec<_>>()
+            .join("/");
+        let fix = if t.ends_with('/') {
+            format!("{fix}/**")
+        } else {
+            fix
+        };
+        format!("never matches — paths are compared without `./`, `//` or a trailing `/`; write `{fix}`")
+    })
+}
+
 /// The form `git status` prints a path in: `/` separators, `.` and `..` segments resolved
 /// (`./gradlew` is `gradlew`). A leading `/` (an absolute path, never a repo path) and a
 /// trailing `/` (a directory, as `ls-files` prints a nested repository) are kept.
@@ -916,6 +976,75 @@ mod tests {
             assert!(!p.is_denied(path), "{path}");
         }
         assert!(p.is_allowed("docs") && p.is_allowed("DOCS/a.md") && !p.is_allowed("docsx"));
+    }
+
+    /// M11-R4 AC-1: the five forms that matched nothing — each one either matches
+    /// `secrets/key.pfx` once normalised (as `never` and as `writes`) or is refused at load.
+    #[test]
+    fn fence_patterns_are_normalised_or_refused() {
+        let ok = [
+            ("./secrets/**", "secrets/**"),
+            ("secrets/", "secrets/**"),
+            ("secrets", "secrets/**"),
+            (r".\secrets\", "secrets/**"),
+            ("secrets//*.pfx", "secrets/*.pfx"),
+            ("**/*.pfx", "**/*.pfx"),
+            ("**", "**"),
+            ("CULTURE.md", "CULTURE.md/**"),
+        ];
+        for (written, want) in ok {
+            let n = fence_pattern(written).unwrap();
+            assert_eq!(n, want, "{written}");
+            if n.starts_with("secrets") || n.starts_with("**") {
+                let never = Protected::new(vec![], &[]).with_fence(&[], std::slice::from_ref(&n));
+                assert!(never.violates("secrets/key.pfx"), "never {written}");
+                assert!(never.violates(r"Secrets\Key.PFX"), "never {written}");
+                let writes = Protected::new(vec![], &[]).with_fence(std::slice::from_ref(&n), &[]);
+                assert!(!writes.violates("secrets/key.pfx"), "writes {written}");
+            }
+        }
+        // a pattern without a wildcard: the path itself and everything under it
+        let f =
+            Protected::new(vec![], &[]).with_fence(&[], &[fence_pattern("CULTURE.md").unwrap()]);
+        assert!(f.violates("culture.md"));
+        assert!(!f.violates("CULTURE.md.bak"));
+        for (written, why) in [
+            ("/secrets/**", "is absolute"),
+            (r"C:\secrets\**", "is absolute"),
+            (r"\\server\share", "is absolute"),
+            (
+                "**/*.{pfx,key}",
+                "uses `{`, which the matcher does not support — only `*`",
+            ),
+            ("secrets/[ab].pfx", "uses `[`"),
+            ("!secrets/**", "uses `!`"),
+            ("src/../secrets/**", "may not contain `..`"),
+            ("", "is empty"),
+            ("  ", "is empty"),
+            ("./", "names no path"),
+        ] {
+            let e = fence_pattern(written).unwrap_err();
+            assert!(e.contains(why), "{written}: {e}");
+        }
+    }
+
+    /// M11-R4 AC-3: the legacy `deny_paths` / `protected_paths` forms that can never match.
+    #[test]
+    fn legacy_patterns_that_never_match_are_named() {
+        for (p, want) in [
+            ("./x/**", "write `x/**`"),
+            ("x/", "write `x/**`"),
+            ("a//b", "write `a/b`"),
+            ("/x/**", "is absolute"),
+            ("**/*.{pfx,key}", "uses `{`"),
+            ("../x", "may not contain `..`"),
+        ] {
+            let w = dead_pattern(p).unwrap_or_else(|| panic!("{p}"));
+            assert!(w.contains(want), "{p}: {w}");
+        }
+        for p in ["**/ZZZ/**", "secrets", "docs/*.md", VERIFY_SCRIPTS] {
+            assert_eq!(dead_pattern(p), None, "{p}");
+        }
     }
 
     /// M11-C2 AC-3/AC-4: the write fence — outside `writes` or inside `never` violates, `never`

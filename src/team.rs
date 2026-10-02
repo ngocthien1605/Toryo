@@ -551,13 +551,24 @@ pub fn load(
         let c = org.culture.as_deref().unwrap_or_default();
         problems.push(format!("{}: `{c}` {why}", at("culture")));
     }
-    for (seat, r) in &roles {
+    for (seat, r) in roles.iter_mut() {
+        let rf = dir.join(seat.as_str()).join(ROLE_FILE);
         if let Some(i) = &r.instructions {
             if let Some(why) = crate::config::not_a_repo_path(i) {
                 problems.push(format!(
                     "{}: instructions: `{i}` {why} (it is relative to the role folder)",
-                    dir.join(seat).join(ROLE_FILE).display()
+                    rf.display()
                 ));
+            }
+        }
+        // M11-R4: the fence patterns in the form they are matched in (and frozen in); a
+        // pattern that could never match is refused instead of failing open
+        for (key, list) in [("writes", &mut r.writes), ("never", &mut r.never)] {
+            for p in list.iter_mut() {
+                match crate::engine::checks::fence_pattern(p) {
+                    Ok(n) => *p = n,
+                    Err(why) => problems.push(format!("{}: {key}: `{p}` {why}", rf.display())),
+                }
             }
         }
     }
@@ -2011,6 +2022,38 @@ mod tests {
             .unwrap();
         assert_eq!(g.args[3], format!("{tmp}/gates/dbsync.ps1"));
         assert_eq!(g.program, "powershell");
+    }
+
+    /// M11-R4: `writes` / `never` are normalised at load (the frozen config holds the
+    /// normalised form); a pattern that could never match is a problem naming the role file,
+    /// the key and the pattern as written.
+    #[test]
+    fn fence_patterns_are_normalised_at_load() {
+        let role = draft_with(
+            IMPL_ROLE,
+            "writes: [Metadata/**]",
+            "writes: ['./Metadata/', src]",
+        );
+        let (_d, y, m) = draft_repo(&[(IMPL_ROLE, &role)]);
+        let cfg = crate::config::Effective::load(&y, Some(&m)).unwrap();
+        let r = cfg.team.as_ref().unwrap().role("implementer").unwrap();
+        assert_eq!(r.writes, ["Metadata/**", "src/**"]);
+        assert!(cfg
+            .canonical_json()
+            .contains(r#""writes":["Metadata/**","src/**"]"#));
+        let role = draft_with(
+            IMPL_ROLE,
+            r#"never:  ["**/Descriptor/*.xml"]"#,
+            r#"never: ['/secrets/**', '**/*.{pfx,key}', '**/Descriptor/*.xml']"#,
+        );
+        let (_d, y, m) = draft_repo(&[(IMPL_ROLE, &role)]);
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains("toryo-role.yaml: never: `/secrets/**` is absolute")
+                && e.contains("toryo-role.yaml: never: `**/*.{pfx,key}` uses `{`")
+                && !e.contains("Descriptor"),
+            "{e}"
+        );
     }
 
     /// M11-R3 AC-4: a bare environment-gate program is resolved through PATH at run time; when

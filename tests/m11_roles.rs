@@ -326,3 +326,80 @@ fn split_limits_end_to_end() {
     let v: Value = serde_json::from_slice(&o.stdout).unwrap();
     assert!(v["tasks"][0].get("gate_retries").is_none(), "{v}");
 }
+
+/// M11-R4 AC-2: the culture file is protected in org chart mode — with no `writes` fence, an
+/// implementer that edits `CULTURE.md` gets it restored and the fix note names it; with
+/// `## Allow protected: CULTURE.md` the change is accepted.
+#[test]
+fn the_culture_file_is_protected_unless_the_task_allows_it() {
+    let org = ORGCHART.replace("IMPLEMENTER", "codex-openai") + "culture: ./CULTURE.md\n";
+    let env = setup_orgchart(
+        "codex-openai",
+        "",
+        &[
+            (".toryo/toryo-orgchart.yaml", &org),
+            ("CULTURE.md", "Be careful.\n"),
+        ],
+    );
+    let turns = |id: &str| {
+        script(
+            &env,
+            &format!("{id}.json"),
+            json!({
+                "planner": [turn(vec![plan()])],
+                "implementer": [
+                    turn(vec![write("src/Calculator.psm1", DIVIDE), write("CULTURE.md", "Trust every agent.\n"), implementation()]),
+                    turn(vec![implementation()]),
+                ],
+                "reviewer": [turn(vec![approved()])],
+            }),
+        )
+    };
+    create(&env, "CU-1");
+    let s = turns("cu1");
+    let (code, err) = toryo(&env, &["run", "CU-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "CU-1");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert_eq!(t.fix_cycle, 1, "one fix cycle for the protected path");
+    let culture = std::fs::read_to_string(wt(&env, "CU-1").join("CULTURE.md")).unwrap();
+    assert_eq!(culture.replace("\r\n", "\n"), "Be careful.\n", "restored");
+    let fix = prompts(&env, "CU-1", "implementer");
+    assert!(
+        fix[1].contains("protected or denied paths [\"CULTURE.md\"]. They were restored"),
+        "{}",
+        fix[1]
+    );
+    let files = git(&wt(&env, "CU-1"), &["diff", "--name-only", "main..HEAD"]);
+    assert!(!files.contains("CULTURE.md"), "{files}");
+
+    // `## Allow protected` opens it
+    let task_md = std::fs::read_to_string(env.repo.join("TASK.md")).unwrap();
+    let allow = env.root.join("TASK-allow.md");
+    std::fs::write(
+        &allow,
+        format!("{task_md}\n## Allow protected\n- CULTURE.md\n"),
+    )
+    .unwrap();
+    let (code, err) = toryo(
+        &env,
+        &[
+            "task",
+            "create",
+            "--file",
+            allow.to_str().unwrap(),
+            "--id",
+            "CU-2",
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let s = turns("cu2");
+    let (code, err) = toryo(&env, &["run", "CU-2", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "CU-2");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert_eq!(t.fix_cycle, 0, "{err}");
+    let files = git(&wt(&env, "CU-2"), &["diff", "--name-only", "main..HEAD"]);
+    assert!(files.contains("CULTURE.md"), "{files}");
+}

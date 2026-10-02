@@ -673,6 +673,11 @@ Bộ mẫu: `templates\d365fo\.toryo\`, `templates\d365fo\CULTURE.md`, `template
 - **Hàng rào ghi (write fence)** của implementer: `writes:` = chỉ được sửa các file này; `never:` = không bao giờ,
   kể cả trong `writes`. Kế hoạch đụng file ngoài hàng rào → lập lại kế hoạch; implementer sửa file ngoài hàng rào →
   khôi phục và trả lại, nêu rõ luật. `## Allow protected` trong TASK.md mở được một mục, như file được bảo vệ.
+  Mẫu được chuẩn hoá lúc nạp: `./src/**`, `src/` và `src` đều là `src/**` (thư mục và mọi thứ bên trong); mẫu tuyệt
+  đối, có `..`, rỗng, hoặc dùng cú pháp không hỗ trợ (`{ } [ ] !` — chỉ có `*`, `**`, `?`) → lỗi nạp. (`policy.deny_paths`
+  / `protected_paths` giữ hành vi M10; `toryo doctor` cảnh báo mẫu không bao giờ khớp.)
+- **File `culture` được bảo vệ** (chế độ org chart) như script của gate: agent sửa → khôi phục, trừ khi TASK.md
+  liệt kê nó dưới `## Allow protected`.
 - **Giới hạn**: `limits: { max_gate_retries, max_review_rounds }` — gate trượt tính vào cái đầu, review bị từ chối
   tính vào cái sau. `toryo status`: `fix 1 (gate retries 1/3, review rounds 0/3)`.
 - **`checks.reviewer-differs-from-builder`**: `off` / `warn` (mặc định: ghi chú ở cổng cuối) / `error` (escalate

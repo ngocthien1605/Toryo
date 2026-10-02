@@ -56,6 +56,8 @@ team: d365fo-dev
 
 # Optional. Markdown file with team-wide working norms (how careful to be,
 # how to treat evidence, tone). Shared by every seat. Omit if not needed.
+# Protected like the gate scripts: an agent's change to it is restored, unless
+# the task lists it under `## Allow protected`.
 culture: ./CULTURE.md              # optional team-wide norms
 
 # Skills (each skill = a folder with a SKILL.md inside) are NOT set here.

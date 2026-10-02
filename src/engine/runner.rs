@@ -109,6 +109,11 @@ pub fn task_policy(t: &TaskRow, cfg: &Effective) -> Result<(GitCmd, Protected, V
     if let Ok(r) = rel(&t.repo, &t.task_file) {
         exact.push(r); // the task is the contract: agents may not edit it
     }
+    // M11-R4: the culture goes into every seat's instructions — protected like the verify files
+    // (`## Allow protected` can open it)
+    if let Some(c) = cfg.team.as_ref().and_then(|t| t.culture.clone()) {
+        exact.push(c);
+    }
     // the allow list comes from the TASK.md snapshot (hashed at create, R28), not the repo
     let task_md = std::fs::read(t.artifacts().join("TASK.md")).unwrap_or_default();
     if sha256_hex(&task_md) != t.task_sha256 {
