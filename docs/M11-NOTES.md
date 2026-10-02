@@ -2,7 +2,82 @@
 
 Every entry: what was decided, why, and where. The owner folds these into plan v0.9.
 
-## Morning summary (2026-10-02)
+## Morning summary — review fixes (2026-10-02, rewritten after `M11-review-fixes.md`)
+
+**R1–R8 of `M11-review-fixes.md` are DONE; nothing PARTIAL or NOT STARTED.** Branch `m11/orgchart`, from
+`4bfa291`: 10 commits in the table + this summary (`docs: …`), **not pushed, not merged, main untouched**. After R3 and after R8 an independent review
+subagent read the diffs against the list; its findings were fixed in one follow-up commit each (sections "Review of
+R1–R3" and "Review of R4–R8" below; what was only recorded is under Open).
+
+| Commit | Task | Tests (passed) |
+|---|---|---|
+| `3b273a9` | R1 — the Unix-only LocalRunner test builds again | 519 (Windows compiles it out) |
+| `1253ccb` | R2 — environment gates see exactly the checkpoint, in an empty folder | 524 |
+| `2dc01ab` | R3 — environment gate program/args: validate what runs | 527 |
+| `10e8269` | R4 — fence patterns that match nothing; the culture file is protected | 532 |
+| `d97a897` | R5 — a skill that cannot be delivered stops the turn; budget for the whole chain | 535 |
+| `3f7e447` | review of R1–R3: what Git cannot see, links, the lock wait | 537 |
+| `af07042` | R6 — M18 script detection (applies to everyone) | 539 |
+| `759483c` | R7 — the same-vendor check counts every turn that ran (applies to everyone) | 541 |
+| `e7e755c` | R8 — cheap Low fixes and test gaps | 553 |
+| `056e98d` | review of R4–R8: the M18 net, fence forms, the skills budget | 557 |
+
+**Checks** (§0.2) green before every commit — **on this Windows machine only**: `cargo fmt --check`, both `clippy
+--all-targets -D warnings` (default and `--no-default-features`), `cargo test --locked`. Tests: **557 passed, 0
+failed, 6 ignored** (before: 519 / 6 at `4bfa291`; 441 / 6 at `aa0be03`). **Not compiled on Linux here** (WSL has
+no cargo): every Unix-only block touched, and every Unix-only use of a changed type or signature, was read by hand
+(§0.3; the R4–R8 reviewer did the same), but **the first push / PR is the real Linux check** (CI `ubuntu-latest`).
+No real agent was run, nothing ran against a D365FO environment, your configs and data dirs were not touched.
+
+**Windows-only tests, by name, on this machine:**
+- `tests/m11_env_gates.rs::an_environment_gate_has_the_normal_token_a_check_gate_low_integrity` (E3 AC-2) — ok
+- `tests/m11_env_gates.rs::a_low_integrity_check_gate_cannot_write_the_envgate_folder` (R2 AC-4) — ok
+- `engine::verify::tests::emptying_a_folder_never_follows_a_junction` (review of R1–R3, `mklink /J`) — ok
+- toasts: `notify::tests::a_toast_process_is_killed_at_its_deadline` — ok; `tests/m10_notify.rs::notify_test_builds_
+  the_toast` — ok; `notify_test_shows_a_real_toast` — ignored (it shows a real toast: `cargo test --test m10_notify
+  -- --ignored`)
+- older Windows-only tests, unchanged: `the_real_script_takes_hostile_text_as_data`, `notify::tests::a_non_unicode_
+  parent_variable_is_kept`, `review_tests::a_rooted_or_drive_relative_program_is_not_anchored`,
+  `verify_boundary_writes` — ok
+- the other 5 ignored tests are Unix-only (`sh` scripts, Unix symlinks: `item10_…`, `ec07_…`, `ec08_…`, `ec20_…`,
+  `r35_…`) — not run here; they run on CI.
+
+**What changed for a repository without an org chart** (the list: "applies to everyone"; the config hash does not
+change):
+- R6: `task create` / `task config --reload` now **admit** `bash -o pipefail x.sh`, `python -W error x.py`, `node -r
+  …`, `ruby -I lib …`, `bash -euo pipefail …` (refused before); they **refuse** a script missing at the base commit
+  when it is a positional `pwsh x.ps1`, `pwsh -Command ./x.ps1`, `cmd /c "x.cmd arg"`, or a literal repository path
+  with a separator and a script extension (also inside a `-c` command line); those scripts are now protected.
+- R7: the same-vendor note at the final gate also counts an implementer turn that failed or was interrupted after
+  writing, so it appears in more cases; its text is `(Claude both)` (main printed `("Claude" both)`).
+- Also visible without an org chart: R8 — `LocalRunner` strips colour codes before redacting; a misspelt seat in the
+  machine config names that file; `doctor` warns about a `deny_paths` / `protected_paths` pattern that can never
+  match (R4).
+
+**Decisions X1–X5** are in force (section below, with the answers to the old Open list). **Deviations** worth
+knowing: `verify.checkout: clean` is required with an environment gate (X2); a fence pattern without a wildcard in
+its last segment covers what is under it and a wildcard pattern without `/` matches at any depth (gitignore-like,
+from the second review); the skills text is not frozen (draft deviation, R8); R7 "turn started" is read from the
+stored context (the `pid` column is never filled).
+
+**Open (your decision or a later milestone; the conservative choice is in place):**
+- `tool: xpp` + an environment gate: MSBuild's own `obj\` may land in the checkout and stop every deploy with
+  `verify_checkout_dirty` — check on the first real UDE run; the fix would be `/p:BaseIntermediateOutputPath`.
+- `envgate` relies on `<verify_root>/<task>` not being Low-writable — a `verify_root` under `AppData\LocalLow` is not
+  refused. `verify.boundary: none` with an environment gate gets no warning.
+- Tasks created before R3 with `%VAR%` in an environment gate's `program` escalate `environment_gate_unavailable` —
+  `toryo task config <id> --reload`.
+- A fence pattern with `!` anywhere is refused (a file name with `!` cannot be fenced).
+- M18 limits: a script without an extension, in the repository root, run by a program outside the table;
+  `pwsh -EncodedCommand`, `--flag=path`, `pwsh -WorkingDirectory dir x.ps1`.
+- `skills_dir` that *contains* an agent root is not refused; R7 counts an attempt whose agent process could not
+  start; the post-lock `verify_checkout_dirty` wording blames a check gate even when a first environment gate wrote.
+- `which_in` ignores PATHEXT; `named_path` reads `a;b` as one path; a secret split across two live chunks (no engine
+  caller) — all predate M11.
+- `toryo spike pipeline` (M0 kit) runs verify commands with `Boundary::None` (the list: record, do not fix).
+- **Next after M11: review M13** — cp932 output on Japanese Windows will also garble DB-sync output.
+
+## Morning summary of the M11 run (2026-10-02, before the review fixes)
 
 **All 17 tasks of `M11_task.md` are DONE; nothing PARTIAL or NOT STARTED.** Branch `m11/orgchart` from
 `main` @ `aa0be03`, 21 commits, **not pushed, not merged**. After each group (A, B, C, E, D) an independent
