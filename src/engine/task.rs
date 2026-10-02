@@ -83,15 +83,30 @@ pub fn new_machine(cfg: &Effective, cli_max: Option<u32>) -> Result<Machine> {
 /// be written by the implementer before verify runs it. At `task create` and at `task config
 /// --reload` (group E review).
 pub fn check_entry_points(cfg: &Effective, g: &GitCmd, repo: &Path, base: &str) -> Result<()> {
+    for n in entry_point_notes(cfg, g, repo, base)? {
+        eprintln!("note: {n}");
+    }
+    Ok(())
+}
+
+/// [`check_entry_points`]: refuses a refusable entry script missing at `base` (M11-R10, X7:
+/// only when the repository does not ignore it — an ignored one is build output a gate creates
+/// in the clean verify checkout, never the implementer's); returns the notes for the other
+/// arguments the base commit lacks (the net: never a refusal). Also used by `doctor`.
+pub fn entry_point_notes(
+    cfg: &Effective,
+    g: &GitCmd,
+    repo: &Path,
+    base: &str,
+) -> Result<Vec<String>> {
     let cmds = super::checks::verify_commands(cfg, repo).unwrap_or_default();
     let entry = super::checks::verify_entry_points(&cmds, repo);
-    // M11-R6: the net under the table — an argument naming a repository script or program
     let net: Vec<(String, String)> = super::checks::script_like_args(&cmds, repo)
         .into_iter()
         .filter(|e| !entry.contains(e))
         .collect();
     if entry.is_empty() && net.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let repol = Loc::Discover(repo.to_path_buf());
     let listing = g.run(
@@ -109,8 +124,17 @@ pub fn check_entry_points(cfg: &Effective, g: &GitCmd, repo: &Path, base: &str) 
     } else {
         "verify command"
     };
+    let ignored = |path: &str| {
+        g.output(
+            &repol,
+            true,
+            &["check-ignore", "--no-index", "-q", "--", path],
+        )
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    };
     for (name, path) in entry {
-        if !tree.contains(&path.to_lowercase()) {
+        if !tree.contains(&path.to_lowercase()) && !ignored(&path) {
             bail!(
                 "verify_script_missing: {what} `{name}` runs `{path}`, which is not in the base commit {} of {} — commit it before creating the task (M18: a verify script the task itself creates could be written by the implementer)",
                 crate::git::short(base),
@@ -118,16 +142,13 @@ pub fn check_entry_points(cfg: &Effective, g: &GitCmd, repo: &Path, base: &str) 
             );
         }
     }
-    for (name, path) in net {
-        if !tree.contains(&path.to_lowercase()) {
-            bail!(
-                "verify_script_missing: {what} `{name}` passes `{path}` (a script or program file), which is not in the base commit {} of {} — commit it before creating the task (M18: a verify script the task itself creates could be written by the implementer)",
-                crate::git::short(base),
-                repo.display()
-            );
-        }
-    }
-    Ok(())
+    Ok(net
+        .into_iter()
+        .filter(|(_, path)| !tree.contains(&path.to_lowercase()))
+        .map(|(name, path)| {
+            format!("{what} `{name}` passes `{path}`, which is not in the base commit — fine for build output; if the {what} runs it as its script, commit it first")
+        })
+        .collect())
 }
 
 /// Git for this task's repository, with the R37 filter plan admitted.

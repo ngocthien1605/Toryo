@@ -376,7 +376,8 @@ fn script_detection_admits_flag_values_and_refuses_a_positional_script() {
         ),
         "{err}"
     );
-    // the net: a script passed to a program outside the table
+    // the net: a script passed to a program outside the table — M11-R10 (X7, changed): never
+    // a refusal, a note
     let env = setup("codex-openai");
     with_command(
         &env,
@@ -387,9 +388,9 @@ fn script_detection_admits_flag_values_and_refuses_a_positional_script() {
         &["task", "create", "--file", "TASK.md", "--id", "R6-3"],
         &[],
     );
-    assert_ne!(code, 0);
+    assert_eq!(code, 0, "{err}");
     assert!(
-        err.contains("verify command `wrapped` passes `scripts/gen.ps1` (a script or program file), which is not in the base commit"),
+        err.contains("note: verify command `wrapped` passes `scripts/gen.ps1`, which is not in the base commit — fine for build output"),
         "{err}"
     );
     // R4–R8 review: a glob, an output and a command line are no scripts — admitted
@@ -404,4 +405,151 @@ fn script_detection_admits_flag_values_and_refuses_a_positional_script() {
         &[],
     );
     assert_eq!(code, 0, "{err}");
+}
+
+/// The fixture's verify command replaced by `line` (a toryo.yaml-only repository).
+fn with_verify_command(env: &Env, line: &str) {
+    let y = std::fs::read_to_string(&env.config).unwrap();
+    let old = r#"    - { name: divide-present, program: git, args: ["grep", "-q", "Divide-Numbers", "--", "src"] }"#;
+    assert!(y.contains(old), "{y}");
+    std::fs::write(&env.config, y.replace(old, line)).unwrap();
+}
+
+fn create_as(env: &Env, id: &str) -> (i32, String) {
+    toryo(
+        env,
+        &["task", "create", "--file", "TASK.md", "--id", id],
+        &[],
+    )
+}
+
+/// M11-R10 AC-2 (X7, applies to everyone): admission refuses only an entry script the
+/// implementer could write — `pwsh -Command "msbuild.exe App.sln"` is admitted; `make
+/// SCRIPT=ci/x.sh test` with the file at base is admitted and `ci/x.sh` protected; `node
+/// dist/cli.js` is admitted when `dist/` is ignored and refused when it is not; `pwsh -File
+/// scripts/smoke.ps1 -Exe build/app.exe` is admitted with a note; `bash -ec "./ci/new.sh"`
+/// missing at base is refused.
+#[test]
+fn admission_refuses_only_entry_scripts_the_implementer_could_write() {
+    let env = setup("codex-openai");
+    with_verify_command(
+        &env,
+        r#"    - { name: build, program: pwsh, args: ["-Command", "msbuild.exe App.sln"] }"#,
+    );
+    let (code, err) = create_as(&env, "R10-1");
+    assert_eq!(code, 0, "{err}");
+
+    let env = setup("codex-openai");
+    commit_repo(&env, &[("ci/x.sh", "exit 0\n")], "a script");
+    with_verify_command(
+        &env,
+        r#"    - { name: mk, program: make, args: ["SCRIPT=ci/x.sh", "test"] }"#,
+    );
+    let (code, err) = create_as(&env, "R10-2");
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R10-2");
+    let cfgv = toryo::engine::task::frozen_config(&t).unwrap();
+    let (_, prot, _) = toryo::engine::runner::task_policy(&t, &cfgv).unwrap();
+    assert!(
+        prot.violates("ci/x.sh"),
+        "the value of SCRIPT= is protected"
+    );
+
+    let node = r#"    - { name: cli, program: node, args: ["dist/cli.js"] }"#;
+    let env = setup("codex-openai");
+    commit_repo(
+        &env,
+        &[(".gitignore", "dist/\n")],
+        "build output is ignored",
+    );
+    with_verify_command(&env, node);
+    let (code, err) = create_as(&env, "R10-3");
+    assert_eq!(code, 0, "ignored build output is admitted: {err}");
+    let t = task(&env, "R10-3");
+    let cfgv = toryo::engine::task::frozen_config(&t).unwrap();
+    let (_, prot, _) = toryo::engine::runner::task_policy(&t, &cfgv).unwrap();
+    assert!(prot.violates("dist/cli.js"), "and stays protected");
+    let env = setup("codex-openai");
+    with_verify_command(&env, node);
+    let (code, err) = create_as(&env, "R10-4");
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("verify_script_missing: verify command `cli` runs `dist/cli.js`, which is not in the base commit"),
+        "{err}"
+    );
+
+    let env = setup("codex-openai");
+    commit_repo(&env, &[("scripts/smoke.ps1", "exit 0\n")], "a smoke script");
+    with_verify_command(
+        &env,
+        r#"    - { name: smoke, program: pwsh, args: ["-File", "scripts/smoke.ps1", "-Exe", "build/app.exe"] }"#,
+    );
+    let (code, err) = create_as(&env, "R10-5");
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("note: verify command `smoke` passes `build/app.exe`, which is not in the base commit — fine for build output; if the verify command runs it as its script, commit it first"),
+        "{err}"
+    );
+    // `doctor` says the same
+    let o = command(&env, &["doctor"], &[]).output().unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        out.contains(
+            "note: verify command `smoke` passes `build/app.exe`, which is not in the base commit"
+        ),
+        "{out}"
+    );
+
+    let env = setup("codex-openai");
+    with_verify_command(
+        &env,
+        r#"    - { name: fast, program: bash, args: ["-ec", "./ci/new.sh"] }"#,
+    );
+    let (code, err) = create_as(&env, "R10-6");
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("verify_script_missing: verify command `fast` runs `ci/new.sh`, which is not in the base commit"),
+        "{err}"
+    );
+}
+
+/// M11-R10 AC-3: `sh check` (no separator, no extension) missing at the base commit is
+/// admitted — and protected: a fake implementer that creates `check` cannot pass its own gate.
+/// (Deviation, recorded: a new untracked protected file is caught by the R35 protected-state
+/// snapshot — `protected_config_changed: added check`, escalated, nothing committed — not by the
+/// path-policy restore with a fix note the list describes.)
+#[test]
+fn an_extensionless_entry_script_is_admitted_and_protected() {
+    let env = setup("codex-openai");
+    with_verify_command(
+        &env,
+        r#"    - { name: check, program: sh, args: ["check"] }"#,
+    );
+    let (code, err) = create_as(&env, "R10-C");
+    assert_eq!(code, 0, "{err}");
+    let s = script(
+        &env,
+        "r10c.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write("src/Calculator.psm1", DIVIDE), write("check", "exit 0\n"), implementation()]),
+                turn(vec![implementation()]),
+            ],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R10-C", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R10-C");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    let why = t.machine.reason().unwrap_or_default().to_string();
+    assert!(
+        why.starts_with("protected_config_changed: added check"),
+        "{why}"
+    );
+    let files = git(&wt(&env, "R10-C"), &["diff", "--name-only", "main..HEAD"]);
+    assert!(
+        !files.lines().any(|f| f == "check"),
+        "never committed: {files}"
+    );
+    // without the protection the same run would commit `check` and pass its own gate
 }

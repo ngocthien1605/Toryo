@@ -508,7 +508,7 @@ the push and the pull request.
 #### Progress (round 2)
 
 - [x] R9 — environment gates deploy from a fresh export of the commit
-- [ ] R10 — M18 script detection, second pass
+- [x] R10 — M18 script detection, second pass
 - [ ] R11 — `resume` after a machine-caused escalation costs no fix cycle
 - [ ] R12 — cheap Low fixes
 - [ ] Finish — notes, README, HUONG-DAN, templates
@@ -572,6 +572,46 @@ the push and the pull request.
   one task's check gates can write another task's checkout and build folder (a separate user or AppContainer per
   task would be needed). The export closes this for what an environment gate deploys from
   `TORYO_VERIFY_CHECKOUT`, not for `TORYO_VERIFY_BUILD`.
+
+#### R10 — M18 script detection, second pass (applies to everyone)
+
+- **Entry scripts (X7):** `checks::entry_scripts(_with)` → `Vec<Entry { path, refusable }>`. PowerShell: `-File x`;
+  else every literal path with a separator and a script extension in the `-Command` / `-c` line (the rest of the
+  arguments, joined; tokens split at whitespace and `; & | ( ) { }`); else the first positional `.ps1`. `cmd /c`
+  (`/k`): the same in its command line, plus a bare first name (after an optional `call`) with a script extension
+  when no program of that name is on PATH (`which`, injectable for the test). Table interpreters: the first argument
+  that is not a flag or a flag's value — protected **also without a separator or an extension** (`sh check`),
+  refusable only with one; a shell's `-c`, also inside a short-flag cluster (`-ec`, `-lc`, `-euxc`), gives the
+  entries of its command line; new value flags `--env-file` (node), `--rcfile`, `--init-file` (bash). Folders, globs
+  and variables are never scripts. `script_of` / `script_arg` stay (the first entry), so the M18 tests keep calling
+  them.
+- **Refusal** (`task::entry_point_notes`, called by `check_entry_points`): a refusable entry script missing at the
+  base commit **and not ignored** (`git check-ignore --no-index -q`, run in the repository itself) → `verify_script_
+  missing`. An ignored one (build output such as `dist/cli.js`) is admitted and stays protected (`verify_files`
+  protects every entry script, whether or not it exists).
+- **The net** (`script_like_args`): every other argument, the **value** of `KEY=value` / `--flag=value` /
+  `-Flag:value` / `/p:Name=value` (not the whole argument), and the tokens of a command line, when it is a literal
+  repository path with a separator and a script or program extension (output-flag values skipped). Never a
+  refusal: protected when it exists; missing → `note: <gate|verify command> `x` passes `p`, which is not in the base
+  commit — fine for build output; if the … runs it as its script, commit it first` at `task create` and as an Info
+  line in `doctor` (repo checks, at `HEAD`; a refusal there is a WARN).
+- **Decision (not in the list, conservative):** for `cmd`, a bare first name counts only with a script extension —
+  `cmd /c echo hi` stays no script (the round-1/M11 tables pin it), `cmd /c x.cmd arg` is one.
+- **Round-1 tests changed** (named in the commit body): `script_detection_skips_flag_values_and_finds_more_scripts` —
+  `sh --posix later` now yields `later` (protected, not refusable; was `None`), and its net case: `bash -c
+  "./ci/x.sh --fast"` is an entry script now (in `verify_entry_points`), no longer a net candidate;
+  `script_detection_admits_flag_values_and_refuses_a_positional_script` — `dotnet tool run runner scripts/gen.ps1`
+  missing at base is admitted with a note (it was refused by the net).
+- **Deviation from AC-3:** an implementer that creates the missing `check` is stopped by the R35 protected-state
+  snapshot — the task escalates `protected_config_changed: added check` and nothing is committed — not by the
+  path-policy restore with a fix note the list describes (a new untracked protected file has always gone that way).
+  The protection AC-3 is about holds; the test asserts what happens.
+- **Tests:** `checks::tests::entry_scripts_refusals_and_protection` (AC-1: all 20 command lines — entries, refusable,
+  net, protected; plus `cmd` with the name on PATH), `tests/m11_gates.rs::admission_refuses_only_entry_scripts_the_
+  implementer_could_write` (AC-2, incl. the `doctor` note), `::an_extensionless_entry_script_is_admitted_and_
+  protected` (AC-3). AC-4: the M11 M18 tests (`m18_script_arguments_per_program`, `m18_entry_points_are_protected_
+  before_they_exist`, `a_gate_script_missing_from_the_base_commit_is_refused_at_admission`, EC-07) pass unchanged.
+- Docs: README (the M18 paragraph rewritten with these rules and the remaining limits) and HUONG-DAN §5.9.
 
 ## Progress
 

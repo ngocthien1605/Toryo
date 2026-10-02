@@ -667,6 +667,16 @@ fn repo_checks(r: &mut Report, cfg: &Effective, root: &Path, gc: Option<GitCmd>)
         r.add(Level::Fail, area, format!("{e:#}"));
     }
     if let Some(g) = gc {
+        // M11-R10: M18 at HEAD — a missing entry script (the refusal `task create` would give)
+        // and the notes for other arguments the commit lacks
+        match crate::engine::task::entry_point_notes(cfg, &g, root, "HEAD") {
+            Ok(notes) => {
+                for n in notes {
+                    r.add(Level::Info, "M18", format!("note: {n}"));
+                }
+            }
+            Err(e) => r.add(Level::Warn, "M18", format!("{e:#}")),
+        }
         match g.plan_filters(
             root,
             &cfg.trusted_filters,

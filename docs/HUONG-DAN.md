@@ -699,11 +699,16 @@ trượt đầu tiên; exit code quyết định; mọi gate có `TORYO_TASK`, `
 `TORYO_VERIFY_BUILD`):
 - `kind: check` — khai báo đầy đủ trong repo, chạy trong checkout sạch với quyền **Low integrity**, không có secret.
   Script của gate được bảo vệ kể cả khi chưa tồn tại (M18), và `task create` từ chối nếu commit gốc chưa có nó.
-  (M11-R6, áp dụng cho mọi repo) Toryo nhận ra script cả khi viết `pwsh scripts\x.ps1` (không `-File`), `pwsh -Command
-  ./x.ps1`, `cmd /c "x.cmd arg"`, và bỏ qua giá trị của cờ (`bash -o pipefail x.sh`, `python -W error x.py`). Đối số
-  nào là đường dẫn cụ thể (có `/` hoặc `\`) tới file `.ps1 .psm1 .cmd .bat .sh .py .js .ts .rb .pl .exe` trong repo mà
-  commit gốc chưa có → bị từ chối (glob, biến, cả một dòng lệnh, hay giá trị của `-o` / `--out…` thì không).
-  Giới hạn còn lại: script không có đuôi, nằm ở gốc repo, chạy bằng chương trình ngoài bảng.
+  (M11-R10, X7, áp dụng cho mọi repo) Chỉ **script đầu vào** của gate (file quyết định đạt/không đạt) mới bị từ chối khi
+  commit gốc chưa có, vì implementer có thể tự viết nó: `-File x` của PowerShell, các đường dẫn có `/` hoặc `\` và đuôi
+  script trong dòng `-Command` (`& { ./x.ps1 }`), dòng `cmd /c` (`call scripts\x.cmd`; tên trần có đuôi script cũng tính,
+  trừ khi PATH có chương trình cùng tên), dòng `-c` của shell (cả `-ec`, `-euxc`), và đối số đầu tiên không phải cờ của
+  `sh`/`bash`/`python`/`node`/… (bỏ qua giá trị của `-o`, `-W`, `-r`, `--env-file`, `--rcfile`…). Script đầu vào thiếu
+  chỉ bị từ chối khi có `/`/`\` hoặc đuôi script **và** repo không ignore nó (`node dist/cli.js` với `dist/` bị ignore là
+  output build: cho qua, vẫn được bảo vệ); `sh check` được bảo vệ, không bị từ chối. **Mọi đối số khác** (cả giá trị của
+  `KEY=value`, `--flag=value`, `/p:Name=value`) được bảo vệ nếu có trong commit gốc và không bao giờ bị từ chối; thiếu thì
+  chỉ in một dòng `note:` khi `task create` và trong `doctor`. Giới hạn còn lại: file mà script tự nạp (dot-source,
+  import) không được nhìn thấy; script không có đuôi, ở gốc repo, chạy bằng chương trình ngoài bảng.
 - `kind: environment` — **thay đổi môi trường D365FO** của máy này (deploy, DB sync), chạy bằng **quyền bình thường
   của anh**, nên lệnh chỉ nằm trong machine config (`environment_gates`), ngoài tầm với của mọi agent. Chỉ chạy
   sau khi **mọi** check gate cùng lượt đã qua (check gate sửa file đã track trong checkout → không gate môi trường

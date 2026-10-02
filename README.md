@@ -285,14 +285,20 @@ from the repository checkout (`project.root`), never from a task worktree, and e
   (legacy verify commands too).
   - `kind: check` — defined in the repository (`program`/`args` or `tool: xpp` + `metadata`/`projects`, `timeout:
     30s | 20m | 1h`), runs exactly like a verify command: clean checkout, Low integrity, no secrets, its script
-    protected. (M18, for everyone) a repository program or script (`-File` of PowerShell, else the first token of
-    `-Command` or the first positional `.ps1`; the script of `sh`/`bash`/`python`/`node`/…, skipping the values of
-    `-o`, `-W`, `-r`, `-I`, …; the first token after `cmd /c`) is protected before it exists, and `task create` refuses
-    a configuration whose base commit lacks it. A candidate without a path separator or a script extension is never
-    refused; an argument (or the first token of a `-c` / `-Command` / `/c` command line) that is a literal repository
-    path with a separator and a `.ps1 .psm1 .cmd .bat .sh .py .js .ts .rb .pl .exe` extension, missing at the base
-    commit, is (M11-R6; a glob, a variable, a whole command line or the value of `-o` / `--out…` / `-OutFile` is not). Not caught: a script without an extension, in the repository root, run by a program
-    outside this table.
+    protected. (M18, for everyone; M11-R10, X7) a gate's **entry script** — the file that decides pass or fail — is
+    protected before it exists, and `task create` refuses a configuration whose base commit lacks it, because the
+    implementer could write it: the program when it is a repository path; `-File x` of PowerShell, else every literal
+    path with a separator and a script extension in a `-Command` line (`& { ./x.ps1 }`), else the first positional
+    `.ps1`; the same in a `cmd /c` line (`call scripts\x.cmd`), where a bare first name with a script extension counts
+    too unless a program of that name is on PATH; in a shell's `-c` line (also `-ec`, `-euxc`); the first argument of
+    `sh`/`bash`/`python`/`node`/`ruby`/`perl` that is not a flag or a flag's value (`-o`, `-W`, `-r`, `-I`,
+    `--env-file`, `--rcfile`, …). A missing entry script is refused only when it has a separator or a script extension
+    (`sh check` is protected, not refused) and the repository does not ignore it (`node dist/cli.js` with `dist/`
+    ignored is build output: admitted, still protected). **Every other argument** — also the value of `KEY=value`,
+    `--flag=value`, `-Flag:value`, `/p:Name=value` — is protected when it names a file of the base commit and never
+    refused; a missing one with a script or program extension gets a `note:` at `task create` and in `doctor`.
+    Remaining limits: a file a gate script itself loads (dot-sourced, imported) is not seen; a script without an
+    extension, in the repository root, run by a program outside this table.
   - `kind: environment` — the repository only declares it (`timeout`, `if_missing: error | skip`); the command is
     `environment_gates.<name>` in the machine config (`program`, `args`, `lock`, `env`, `secret_env`), frozen with the
     task. It runs only after every check gate passed (a check gate that changed a tracked file of the verify checkout
