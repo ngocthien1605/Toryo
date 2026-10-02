@@ -66,6 +66,10 @@ pub fn json(cfg: &Effective) -> Value {
                     "kind": g.decl.kind,
                     "timeout": g.decl.timeout,
                     "lock": g.machine.as_ref().map(|m| m.lock.clone()),
+                    // M11-R3: what runs — program and args as expanded at load
+                    "command": g.machine.as_ref().map(|m| {
+                        std::iter::once(&m.program).chain(&m.args).collect::<Vec<_>>()
+                    }),
                     "if_missing": g.decl.if_missing,
                     "defined_on_this_machine": g.decl.kind == GateType::Check || !skipped,
                     "source": source(cfg.origins.gates.get(name).copied()),
@@ -83,6 +87,7 @@ pub fn json(cfg: &Effective) -> Value {
                     "kind": "check",
                     "timeout": c.timeout_min.map(|m| format!("{m}m")),
                     "lock": null,
+                    "command": null,
                     "if_missing": null,
                     "defined_on_this_machine": true,
                     "source": source((!cfg.origins.roles.is_empty()).then_some(Origin::Repo)),
@@ -132,6 +137,15 @@ pub fn json(cfg: &Effective) -> Value {
         "limits": team.map(|t| json!(t.limits)),
         "checks": team.map(|t| json!(t.checks)),
     })
+}
+
+/// An argument as `config show` prints it: quoted when it is empty or has a space.
+fn shown_arg(a: &str) -> String {
+    if a.is_empty() || a.contains(char::is_whitespace) {
+        format!("'{a}'")
+    } else {
+        a.to_string()
+    }
 }
 
 fn place(o: &Value) -> String {
@@ -222,6 +236,14 @@ pub fn text(cfg: &Effective) -> String {
             x["kind"].as_str().unwrap_or_default(),
             x["timeout"].as_str().unwrap_or("-"),
         ));
+        if let Some(argv) = x["command"].as_array() {
+            let argv: Vec<String> = argv
+                .iter()
+                .filter_map(Value::as_str)
+                .map(shown_arg)
+                .collect();
+            s.push_str(&format!("      runs: {}\n", argv.join(" ")));
+        }
     }
     if let Some(order) = v["before_handoff"].as_array() {
         let order: Vec<&str> = order.iter().filter_map(Value::as_str).collect();

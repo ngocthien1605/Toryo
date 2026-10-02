@@ -283,7 +283,9 @@ from the repository checkout (`project.root`), never from a task worktree, and e
     write (`<verify_root>\<task>\envgate`; the code is under `TORYO_VERIFY_CHECKOUT`), inside a Job Object, with an
     environment from scratch + the gate variables + `env` + the resolved
     `secret_env` (redacted everywhere). The program and every script path must be absolute (or a PATH name) and
-    outside the repository, the worktrees and the verify root. One gate per `lock` runs at a time across all tasks;
+    outside the repository, the worktrees and the verify root; `%VAR%` in them is expanded once, at load (an unset
+    variable is a load error) — the expanded text is what is checked, frozen and run (`config show` prints it), and a
+    PATH name that resolves inside those folders is refused at run time. One gate per `lock` runs at a time across all tasks;
     a second waits (`status`: `waiting for lock d365-env (held by T-12)`), `toryo stop` ends the wait. A failure
     goes back to the implementer as data and counts against `max_gate_retries`. A machine without the gate:
     `if_missing: error` refuses the task, `skip` runs without it and says so at the final gate.

@@ -674,8 +674,13 @@ impl Effective {
         let mut team = None;
         let mut team_problems = Vec::new();
         if let Some(root) = crate::team::org_chart_root(&repo.project.root) {
-            let loaded =
-                crate::team::load(&root, repo_path, &doc, machine.as_ref().map(|(_, m)| m))?;
+            let loaded = crate::team::load(
+                &root,
+                repo_path,
+                &doc,
+                machine.as_ref().map(|(_, m)| m),
+                &machine_config_hint(machine_path),
+            )?;
             repo.roles = loaded.roles;
             repo.commands.verify = loaded.verify;
             repo.pipeline.max_fix_cycles = loaded.team.limits.max_fix_cycles;

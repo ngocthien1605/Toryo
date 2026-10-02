@@ -1650,8 +1650,13 @@ impl<'a> Engine<'a> {
                     Err(e) => return unavailable(format!("secret_env.{k}: {e:#}")),
                 }
             }
-            let Some(program) = env_gate_program(&m.program) else {
-                return unavailable(format!("program `{}` not found", m.program));
+            let program = match env_gate_program(
+                &self.cfg,
+                &m.program,
+                std::env::var_os("PATH").as_deref(),
+            ) {
+                Ok(p) => p,
+                Err(e) => return unavailable(e),
             };
             let Some(lock) = self.env_lock(t, &m.lock, stop)? else {
                 return Ok(EnvGates::Stopped);
@@ -3742,18 +3747,36 @@ pub fn computer_name() -> String {
 }
 
 /// The program of an environment gate (M11-E3): an absolute path as written, a bare name
-/// through PATH — resolved here, so it is never looked up in the verify checkout (the
-/// working directory). `None` when a bare name is not on PATH.
-fn env_gate_program(program: &str) -> Option<PathBuf> {
-    let p = expand_vars(program).ok()?;
-    let found = if p.contains('/') || p.contains('\\') || Path::new(&p).is_absolute() {
-        PathBuf::from(p)
+/// through `path` (PATH) — resolved here, so it is never looked up in the verify checkout (the
+/// working directory). The text was expanded once at load and is not expanded again (M11-R3).
+/// A program that resolves inside the repository, the worktrees or the verify root is refused:
+/// agent code may have planted it there. `Err` is the reason for `environment_gate_unavailable`.
+pub(crate) fn env_gate_program(
+    cfg: &Effective,
+    program: &str,
+    path: Option<&std::ffi::OsStr>,
+) -> std::result::Result<PathBuf, String> {
+    let bare =
+        !(program.contains('/') || program.contains('\\') || Path::new(program).is_absolute());
+    let found = if bare {
+        path.and_then(|path| super::checks::which_in(program, path))
+            .ok_or_else(|| format!("program `{program}` not found on PATH"))?
     } else {
-        super::checks::which(&p)?
+        PathBuf::from(program)
     };
-    // a relative PATH entry would resolve against the working directory (the checkout)
-    let found = std::path::absolute(&found).ok()?;
-    found.is_file().then_some(found)
+    // a relative PATH entry would resolve against the working directory
+    let found = std::path::absolute(&found).map_err(|e| format!("program `{program}`: {e}"))?;
+    if !found.is_file() {
+        return Err(format!("program `{program}` not found"));
+    }
+    if let Some((what, root)) = crate::team::reach(cfg, &found.display().to_string()) {
+        return Err(format!(
+            "program `{program}` resolves to {}, inside {what} ({}) where agent code can write — write an absolute path outside it",
+            found.display(),
+            root.display()
+        ));
+    }
+    Ok(found)
 }
 
 /// How often a waiting environment gate tries its lock again: about every 2 s

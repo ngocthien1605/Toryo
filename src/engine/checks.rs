@@ -461,8 +461,12 @@ pub fn resolve_program(p: &str) -> PathBuf {
 
 /// First match on PATH (with `.exe` / `.cmd` on Windows).
 pub fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
+    which_in(name, &std::env::var_os("PATH")?)
+}
+
+/// [`which`] on the given `PATH` value.
+pub fn which_in(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path) {
         for ext in ["", ".exe", ".cmd"] {
             let p = dir.join(format!("{name}{ext}"));
             if p.is_file() {

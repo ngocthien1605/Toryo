@@ -110,7 +110,7 @@ Task list: `M11-review-fixes.md` (review of 2026-10-02, built and run on Linux b
 
 - [x] R1 — the test build compiles on Linux again
 - [x] R2 — environment gates see exactly the checkpoint; neutral working directory
-- [ ] R3 — environment gate `program`/`args`: validate what runs
+- [x] R3 — environment gate `program`/`args`: validate what runs
 - [ ] R4 — fence patterns that match nothing; the culture file is protected
 - [ ] R5 — a skill that cannot be delivered stops the turn; the budget check covers the whole chain
 - [ ] R6 — M18 script detection: no false refusals, no missed scripts
@@ -173,6 +173,32 @@ Task list: `M11-review-fixes.md` (review of 2026-10-02, built and run on Linux b
   environment gate would always stop with `verify_checkout_dirty`. Not changed here (the X++ command line is M9's);
   the template's default `build` gate is the owner's script, which must write under `TORYO_VERIFY_BUILD`. Check
   with the first real xpp + dbsync run; the fix would be `/p:BaseIntermediateOutputPath=<build>\obj\`.
+
+### R3 — environment gate `program`/`args`: validate what runs
+
+- **Expanded once, at load (X3):** `team::load` (new parameter: the machine config's name for messages) runs
+  `expand_env_gate` on every machine `environment_gates.<name>`: `%VAR%` in `program` and in each `args[i]` is
+  replaced; an unset variable is a load problem `"<machine config>: environment_gates.<name>.args[3]: environment
+  variable %X% is not set (in `…`) — set it, or write the path out"`. The **expanded** text is what the B3 reach check
+  sees (`env_gate_problems` no longer expands on its own), what is frozen into `config.json` and hashed, and what
+  runs: `runner::env_gate_program` no longer calls `expand_vars`. So a variable that differs between `task create`
+  and `run` cannot change the command after it was checked.
+- **PATH at run time:** a bare `program` is resolved through PATH (`checks::which_in`, the PATH value passed in so
+  the unit test does not touch the process PATH); the resolved file — and an absolute program too — goes through
+  the shared `team::reach` (project.root, worktrees_root, verify root). Inside → `environment_gate_unavailable:
+  … program `x` resolves to <file>, inside the repository (<root>) where agent code can write …` (escalate, nothing
+  deployed).
+- **`config show`:** the JSON gate entry gained `command` (`[program, args…]` as expanded, `null` for a check gate or
+  an undefined environment gate); the text form prints `      runs: <program> <args…>` under the gate line.
+- Config hash: only org chart mode has environment gates, so a repository without an org chart keeps its hash. In
+  org chart mode a machine config that used `%VAR%` in a gate now freezes the expanded text (a different hash than
+  at 4bfa291 — intended: the hash must cover what runs).
+- Tests: `team::tests::environment_gate_variables_are_expanded_at_load` (AC-2 unset, AC-3 into the repository, and
+  the stored text is expanded), `team::tests::a_bare_gate_program_found_inside_the_repository_is_refused` (AC-4),
+  `tests/m11_env_gates.rs::an_environment_gate_variable_is_expanded_once_at_create` (AC-1: `%TORYO_R3_GATES%` set
+  only for `task create`; `config.json` holds the expanded path; `run` without the variable deploys). The B2 test
+  `the_draft_set_loads_freezes_and_reloads` gained the `runs:` line (added assertions only).
+- Docs: the template's `environment_gates` paragraph, README, HUONG-DAN §5.9.
 
 ## Progress
 

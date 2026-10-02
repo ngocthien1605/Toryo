@@ -690,7 +690,10 @@ trượt đầu tiên; exit code quyết định; mọi gate có `TORYO_TASK`, `
   sau khi **mọi** check gate cùng lượt đã qua **và checkout đúng y commit checkpoint** (check gate sửa hay thêm file vào
   checkout → không gate môi trường nào chạy, task escalate `verify_mutated_tree` / `verify_checkout_dirty`; vì vậy org
   chart có gate môi trường phải để `verify.checkout: clean`); chạy trong một **thư mục làm việc trống** mà code của
-  agent không ghi được (`envgate`); mỗi `lock` chỉ một gate chạy một lúc trên cả máy (task thứ hai chờ:
+  agent không ghi được (`envgate`). `%VAR%` trong `program`/`args` được thay **một lần, lúc nạp config** (`task create`;
+  biến chưa đặt → lỗi nạp): chuỗi đã thay là thứ được kiểm tra, đóng băng và chạy (`toryo config show` in ra); tên
+  chương trình tìm qua PATH mà nằm trong repo / worktrees / verify root → bị từ chối lúc chạy. Mỗi `lock` chỉ một gate
+  chạy một lúc trên cả máy (task thứ hai chờ:
   `waiting for lock d365-env (held by T-12)`; `toryo stop` dừng việc chờ). Trước khi chạy, Toryo ghi lại task và
   commit mà môi trường sắp nhận; `toryo status` luôn cho biết môi trường đang chạy code nào:
   `environment    d365-env holds BR-001 @ 1a2b3c4d5e6f (not approved yet)`. Huỷ task hay `task cleanup` **không**

@@ -995,3 +995,48 @@ fn a_low_integrity_check_gate_cannot_write_the_envgate_folder() {
         .join("planted.exe")
         .exists());
 }
+
+/// M11-R3 AC-1 (X3): `%VAR%` in an environment gate's args is expanded once, when the task is
+/// created — the frozen config holds the expanded path, and `run` (without the variable)
+/// runs the script from it.
+#[test]
+fn an_environment_gate_variable_is_expanded_once_at_create() {
+    let env = env_gate_setup("codex-openai", "error", "");
+    let gates = env.root.join("gates");
+    let marker = fwd(&gates.join("deployed"));
+    let entry = machine_gate(
+        &env,
+        "dbsync",
+        "d365-env",
+        &format!("Set-Content -Path '{marker}' -Value x\nexit 0\n"),
+        &format!("echo x > '{marker}'\nexit 0\n"),
+        "",
+    );
+    let entry = entry.replace(&fwd(&gates), "%TORYO_R3_GATES%");
+    assert!(entry.contains("'%TORYO_R3_GATES%/dbsync."), "{entry}");
+    define_gates(&env, &entry);
+    let (code, err) = toryo(
+        &env,
+        &["task", "create", "--file", "TASK.md", "--id", "R3-1"],
+        &[("TORYO_R3_GATES", &fwd(&gates))],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R3-1");
+    let frozen = std::fs::read_to_string(t.artifacts().join("config.json")).unwrap();
+    assert!(!frozen.contains("%TORYO_R3_GATES%"), "{frozen}");
+    let ext = if cfg!(windows) { "ps1" } else { "sh" };
+    let want = serde_json::to_string(&format!("{}/dbsync.{ext}", fwd(&gates))).unwrap();
+    assert!(frozen.contains(&want), "{want}\n{frozen}");
+    let s = script(
+        &env,
+        "r3-1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R3-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "R3-1").state, St::Completed, "{err}");
+    assert!(gates.join("deployed").exists(), "the script ran: {err}");
+}

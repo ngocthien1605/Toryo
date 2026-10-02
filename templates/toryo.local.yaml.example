@@ -85,6 +85,9 @@ git:
 # M11 — environment gates: what an org chart's `kind: environment` gate runs, with YOUR normal
 # rights, so it lives only here. `program`: an absolute path or a PATH name; every path in `args`
 # absolute and outside the repository, the task worktrees and the verify root (validated).
+# %VAR% in `program`/`args` is expanded ONCE, when the config is loaded (`task create`): the
+# expanded text is what is checked, frozen and run (`toryo config show` prints it); an unset
+# variable is a load error. A PATH name that resolves inside those folders is refused at run time.
 # Runs only after every `check` gate of the same verify run passed and the verify checkout is
 # exactly the checkpoint (nothing changed, nothing added — an org chart with an environment gate
 # needs `verify.checkout: clean`), in an EMPTY working directory agent code cannot write, inside

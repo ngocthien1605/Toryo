@@ -438,6 +438,7 @@ pub fn load(
     toryo_yaml: &Path,
     doc: &serde_yaml::Value,
     machine: Option<&MachineConfig>,
+    machine_hint: &str,
 ) -> Result<Loaded> {
     use crate::config::untagged;
     let org_path = org_chart_path(root);
@@ -591,6 +592,8 @@ pub fn load(
             let machine = (d.kind == GateType::Environment)
                 .then(|| machine.and_then(|m| m.environment_gates.get(name)).cloned())
                 .flatten();
+            // M11-R3 (X3): `%VAR%` expanded once, here; what is validated, frozen and run
+            let machine = machine.map(|g| expand_env_gate(name, &g, machine_hint, &mut problems));
             (
                 name.clone(),
                 Gate {
@@ -795,6 +798,54 @@ fn inside(p: &str, root: &Path) -> bool {
     !r.is_empty() && (p == r || p.starts_with(&format!("{r}/")))
 }
 
+/// Which agent-reachable folder `p` is inside, if any: the repository (`project.root`), the
+/// task worktrees or the verify root — `(what, root)`. Used at load (B3) and, for a bare
+/// program resolved through PATH, before an environment gate runs (M11-R3).
+pub fn reach(cfg: &Effective, p: &str) -> Option<(&'static str, PathBuf)> {
+    let expand = |s: &str| crate::config::expand_vars(s).map(PathBuf::from).ok();
+    [
+        ("the repository", expand(&cfg.repo.project.root)),
+        (
+            "the task worktrees",
+            expand(&cfg.repo.project.worktrees_root),
+        ),
+        (
+            "the verify root",
+            Some(crate::engine::verify::verify_root(cfg)),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(w, r)| r.map(|r| (w, r)))
+    .find(|(_, r)| inside(p, r))
+}
+
+/// M11-R3 (X3): an environment gate's `program` and `args` with `%VAR%` expanded — once, at
+/// load; the expanded text is what the reach check sees, what is frozen and hashed, and what
+/// runs. An unset variable is a problem naming the key (the text is then kept as written).
+fn expand_env_gate(name: &str, g: &EnvGate, machine: &str, problems: &mut Vec<String>) -> EnvGate {
+    let mut one = |key: String, s: &str| match crate::config::expand_vars(s) {
+        Ok(v) => v,
+        Err(e) => {
+            problems.push(format!(
+                "{machine}: environment_gates.{name}.{key}: {e:#} — set it, or write the path out"
+            ));
+            s.to_string()
+        }
+    };
+    let program = one("program".into(), &g.program);
+    let args = g
+        .args
+        .iter()
+        .enumerate()
+        .map(|(i, a)| one(format!("args[{i}]"), a))
+        .collect();
+    EnvGate {
+        program,
+        args,
+        ..g.clone()
+    }
+}
+
 /// The problems of a machine `EnvGate` (B3): a lock; a program that is absolute or a PATH
 /// name; every path-like argument absolute and out of the agents' reach — not inside the
 /// repository, the task worktrees or the verify root.
@@ -817,23 +868,9 @@ fn env_gate_problems(
             g.lock
         ));
     }
-    let expand = |s: &str| crate::config::expand_vars(s).map(PathBuf::from).ok();
-    let roots: Vec<(&str, PathBuf)> = [
-        ("the repository", expand(&cfg.repo.project.root)),
-        (
-            "the task worktrees",
-            expand(&cfg.repo.project.worktrees_root),
-        ),
-        (
-            "the verify root",
-            Some(crate::engine::verify::verify_root(cfg)),
-        ),
-    ]
-    .into_iter()
-    .filter_map(|(w, p)| p.map(|p| (w, p)))
-    .collect();
-    let reach = |p: &str| roots.iter().find(|(_, r)| inside(p, r));
-    let program = crate::config::expand_vars(&g.program).unwrap_or_else(|_| g.program.clone());
+    // M11-R3 (X3): `program` and `args` were expanded at load — this is the text that runs
+    let reach = |p: &str| reach(cfg, p);
+    let program = g.program.clone();
     if program.contains('/') || program.contains('\\') {
         let dots = program.replace('\\', "/").split('/').any(|c| c == "..");
         if dots || !Path::new(&program).is_absolute() {
@@ -853,7 +890,7 @@ fn env_gate_problems(
         let Some(named) = named_path(a) else {
             continue;
         };
-        let x = crate::config::expand_vars(named).unwrap_or_else(|_| named.to_string());
+        let x = named.to_string();
         if x.replace('\\', "/").split('/').any(|c| c == "..") {
             out.push(format!(
                 "{key}.args: `{a}` may not contain `..` — write the absolute path of the script, outside the repository, the task worktrees and the verify root"
@@ -1530,6 +1567,8 @@ mod tests {
             "claude-max       claude, subscription — machine",
             "build        check          20m — repo",
             "dbsync       environment    30m — command: machine config `environment_gates.dbsync`, lock d365-env",
+            "      runs: powershell -NoProfile -NonInteractive -File ",
+            "/gates/dbsync.ps1\n",
             "before_handoff: build → dbsync",
             "/machine-skills — machine",
             "limits: max_gate_retries 3, max_review_rounds 3",
@@ -1925,6 +1964,101 @@ mod tests {
         }
         assert!(!e.contains("`/c`"), "a switch is not a path: {e}");
         assert!(!e.contains("gates/ok.ps1"), "{e}");
+    }
+
+    /// M11-R3 AC-2/AC-3 (X3): `%VAR%` in an environment gate's program and args is expanded
+    /// once, at load. An unset variable is a problem naming the key; a variable that expands
+    /// into the repository is a reach problem; the expanded text is what the config keeps.
+    #[test]
+    fn environment_gate_variables_are_expanded_at_load() {
+        let (d, y, m) = draft_repo(&[]);
+        let tmp = d.path().display().to_string().replace('\\', "/");
+        let text = std::fs::read_to_string(&m).unwrap();
+        let with = |program: &str, script: &str| {
+            text.replace("program: powershell ", &format!("program: '{program}' "))
+                .replace(&format!("'{tmp}/gates/dbsync.ps1'"), &format!("'{script}'"))
+        };
+        // AC-2: unset — in program and in args[3], each named
+        std::fs::write(
+            &m,
+            with("%TORYO_R3_UNSET_P%/ps.exe", "%TORYO_R3_UNSET_A%/dbsync.ps1"),
+        )
+        .unwrap();
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains("environment_gates.dbsync.program: environment variable %TORYO_R3_UNSET_P% is not set")
+                && e.contains("environment_gates.dbsync.args[3]: environment variable %TORYO_R3_UNSET_A% is not set")
+                && e.contains(&m.display().to_string()),
+            "{e}"
+        );
+        // AC-3: a variable that points into the repository
+        std::env::set_var("TORYO_R3_INTO_REPO", format!("{tmp}/repo/tools"));
+        std::fs::write(&m, with("powershell", "%TORYO_R3_INTO_REPO%/dbsync.ps1")).unwrap();
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains(&format!(
+                "`{tmp}/repo/tools/dbsync.ps1` is inside the repository"
+            )),
+            "{e}"
+        );
+        // the expanded text is stored (and so frozen and hashed)
+        std::env::set_var("TORYO_R3_GATES", format!("{tmp}/gates"));
+        std::fs::write(&m, with("powershell", "%TORYO_R3_GATES%/dbsync.ps1")).unwrap();
+        let cfg = crate::config::Effective::load(&y, Some(&m)).unwrap();
+        let g = cfg.team.as_ref().unwrap().gates["dbsync"]
+            .machine
+            .clone()
+            .unwrap();
+        assert_eq!(g.args[3], format!("{tmp}/gates/dbsync.ps1"));
+        assert_eq!(g.program, "powershell");
+    }
+
+    /// M11-R3 AC-4: a bare environment-gate program is resolved through PATH at run time; when
+    /// PATH finds it inside the repository (or the worktrees, or the verify root) it is refused,
+    /// naming the resolved file. Outside, it is used.
+    #[test]
+    fn a_bare_gate_program_found_inside_the_repository_is_refused() {
+        let (d, y, m) = draft_repo(&[]);
+        let cfg = crate::config::Effective::load(&y, Some(&m)).unwrap();
+        let exe = if cfg!(windows) {
+            "dbsync-r3.exe"
+        } else {
+            "dbsync-r3"
+        };
+        let (inside, outside) = (d.path().join("repo").join("tools"), d.path().join("bin"));
+        for dir in [&inside, &outside] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(exe), "x").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let f = dir.join(exe);
+                std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let path = |dirs: &[&std::path::PathBuf]| std::env::join_paths(dirs).unwrap();
+        let program = "dbsync-r3";
+        let e = crate::engine::runner::env_gate_program(&cfg, program, Some(&path(&[&inside])))
+            .unwrap_err();
+        assert!(
+            e.contains("program `dbsync-r3` resolves to")
+                && e.contains(&inside.join(exe).display().to_string())
+                && e.contains("inside the repository"),
+            "{e}"
+        );
+        // first on PATH wins: outside the roots it is fine
+        let ok = crate::engine::runner::env_gate_program(
+            &cfg,
+            program,
+            Some(&path(&[&outside, &inside])),
+        )
+        .unwrap();
+        assert_eq!(ok, outside.join(exe));
+        // not on PATH at all
+        let e =
+            crate::engine::runner::env_gate_program(&cfg, "no-such-r3", Some(&path(&[&outside])))
+                .unwrap_err();
+        assert!(e.contains("not found on PATH"), "{e}");
     }
 
     /// M11-R2 AC-5 (X2): an environment gate needs `verify.checkout: clean` — `tracked` is a
