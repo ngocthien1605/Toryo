@@ -731,3 +731,76 @@ fn the_plan_budget_check_uses_the_rendered_context() {
         p[1]["prompt"]
     );
 }
+
+/// M11-R11 AC-1 (X8): a machine-caused escalation (a missing skill) is left by a plain `toryo
+/// resume <id>` — no fix cycle, the stage runs as `implement` (not `fix-1`), the counters are
+/// unchanged, and the implementer's context has no "not accepted" framing.
+#[test]
+fn plain_resume_after_a_missing_skill_costs_no_fix_cycle() {
+    let env = skills_env("", &[]);
+    approved_plan(&env, "SK-RS", json!(["xpp-batch"]));
+    let dir = env.repo.join(".toryo").join("skills").join("xpp-batch");
+    let aside = env.root.join("xpp-batch-aside");
+    std::fs::rename(&dir, &aside).unwrap();
+    let turns = |name: &str| {
+        script(
+            &env,
+            name,
+            json!({
+                "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+                "reviewer": [turn(vec![approved()])],
+            }),
+        )
+    };
+    let (_, err) = toryo(
+        &env,
+        &["run", "SK-RS", "--yes", "--fake-agents", &turns("a.json")],
+        &[],
+    );
+    let t = task(&env, "SK-RS");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(t.machine.reason_class(), Some("skill_unavailable"));
+    assert_eq!(t.fix_cycle, 0);
+    // the skill is back; a PLAIN resume (no --note)
+    std::fs::rename(&aside, &dir).unwrap();
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "SK-RS",
+            "--yes",
+            "--fake-agents",
+            &turns("b.json"),
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "SK-RS");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert_eq!(t.fix_cycle, 0, "no fix cycle was spent");
+    let imp = calls_of(&env, "SK-RS", "implementer");
+    assert_eq!(imp.len(), 1);
+    // it ran as `implement`, not `fix-1`
+    assert!(
+        attempts(&env, "SK-RS")
+            .iter()
+            .any(|a| a.stage == "implement" && a.kind == "agent"),
+        "an implement attempt"
+    );
+    assert!(
+        attempts(&env, "SK-RS")
+            .iter()
+            .all(|a| !a.stage.starts_with("fix-")),
+        "no fix stage"
+    );
+    let ctx = imp[0]["context"].as_str().unwrap();
+    let prompt = imp[0]["prompt"].as_str().unwrap();
+    assert!(ctx.contains("BATCH-SKILL-BODY"), "the skill is delivered");
+    assert!(
+        !prompt.contains("not accepted") && !prompt.contains("Fix cycle"),
+        "no not-accepted framing: {prompt}"
+    );
+    // DECISIONS.md records the plain resume
+    let dec = std::fs::read_to_string(t.artifacts().join("DECISIONS.md")).unwrap_or_default();
+    assert!(dec.contains("resumed after skill_unavailable"), "{dec}");
+}

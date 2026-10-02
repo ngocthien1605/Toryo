@@ -1364,3 +1364,77 @@ fn a_low_integrity_check_gate_cannot_write_the_export() {
     assert!(!base.join("deploy").join("planted.exe").exists());
     assert!(!base.join("planted.index").exists());
 }
+
+/// M11-R11 AC-2 (X8): an environment gate the machine cannot run (an unresolved secret) →
+/// `environment_gate_unavailable`; once the machine config is fixed, a plain `toryo resume
+/// <id>` goes back into verify — the check gates run again, no implementer turn, no fix cycle.
+#[test]
+fn plain_resume_after_an_unavailable_gate_costs_no_fix_cycle() {
+    let env = env_gate_setup("codex-openai", "error", "");
+    define_gates(
+        &env,
+        &machine_gate(
+            &env,
+            "dbsync",
+            "d365-env",
+            "exit 0\n",
+            "exit 0\n",
+            "    secret_env: { K: 'env:TORYO_M11_RS_SECRET' }\n",
+        ),
+    );
+    create(&env, "RS-E");
+    let s = script(
+        &env,
+        "rse.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    // the secret is not set on this first run
+    let (_, err) = toryo(&env, &["run", "RS-E", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "RS-E");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_unavailable")
+    );
+    assert_eq!(t.fix_cycle, 0);
+    // fix the cause (the secret is now resolvable) and plain-resume
+    let (code, err) = toryo(
+        &env,
+        &["resume", "RS-E", "--yes", "--fake-agents", &s],
+        &[("TORYO_M11_RS_SECRET", "ok")],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "RS-E");
+    assert_eq!(t.state, St::Completed, "state={:?} err={err}", t.state);
+    assert_eq!(t.fix_cycle, 0, "no fix cycle was spent");
+    assert!(t.machine.reason_class().is_none(), "the class is cleared");
+    // no implementer turn ran during the resume (calls are per lock generation); the check
+    // gates ran again
+    assert_eq!(
+        calls(&env, "RS-E")
+            .iter()
+            .filter(|c| c["key"]
+                .as_str()
+                .is_some_and(|k| k.starts_with("implementer")))
+            .count(),
+        0
+    );
+    let vr = verify_result(&env, "RS-E");
+    assert_eq!(vr["commands"][0]["name"], "divide-present");
+    assert_eq!(
+        deployments(&env)
+            .iter()
+            .filter(|d| d.task == "RS-E")
+            .count(),
+        1
+    );
+    let dec = std::fs::read_to_string(t.artifacts().join("DECISIONS.md")).unwrap_or_default();
+    assert!(
+        dec.contains("resumed after environment_gate_unavailable"),
+        "{dec}"
+    );
+}

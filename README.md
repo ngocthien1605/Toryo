@@ -265,8 +265,10 @@ from the repository checkout (`project.root`), never from a task worktree, and e
   The menu lists only the skills that resolve now. The budget check covers **every profile of the implementer
   chain** (a Claude fallback has TASK.md and PLAN.md inline, never trimmed to make room for skills). Before a turn
   starts, every skill it needs must resolve: otherwise the task escalates with `skill_unavailable` (naming both
-  lookup paths; no turn, no tokens) — put it back and `toryo resume <id> --note …`. A context with skills that is
-  still over budget escalates with `context_over_budget`.
+  lookup paths; no turn, no tokens) — put it back and `toryo resume <id>`. A context with skills that is still over
+  budget escalates with `context_over_budget`. These, and a gate/toolchain/boundary the machine cannot provide, are
+  **machine-caused** (M11-R11, X8): a plain `toryo resume <id>` goes back into the stage once the cause is fixed — no
+  fix cycle, no implementer turn; `--note` is only for giving the implementer another cycle.
 - **The write fence.** The implementer's `writes:` (globs; when set, the only files it may change — `writes: []` or no
   `writes` means no allowlist: only `never` applies) and `never:`
   (never, even inside `writes`) — case-insensitive, `/` and `\` alike. A planned file outside the fence sends the

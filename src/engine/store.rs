@@ -665,6 +665,18 @@ fn gate_name(k: GateKind) -> &'static str {
 /// Apply `e` to the task's machine and persist it — state, projections, the event and the
 /// approvals rows (R44a) — in the caller's transaction. On a refused transition nothing is
 /// written.
+/// M11-R11: record the escalation class on the task's machine (the engine, right after it
+/// escalated with that class). No-op unless the task is `Escalated`.
+pub fn set_reason_class(tx: &Transaction, task_id: &str, class: &str) -> Result<()> {
+    let mut m = get_task(tx, task_id)?.machine;
+    m.set_reason_class(class);
+    tx.execute(
+        "UPDATE tasks SET machine = ?2, updated_at = ?3 WHERE id = ?1",
+        params![task_id, serde_json::to_string(&m)?, now()],
+    )?;
+    Ok(())
+}
+
 pub fn transition(tx: &Transaction, task_id: &str, e: PipelineEvent) -> Result<Machine> {
     let t = get_task(tx, task_id)?;
     let before = t.machine.clone();

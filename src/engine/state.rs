@@ -38,6 +38,23 @@ use thiserror::Error;
 /// Automatic plan rejections (protected paths in `files_likely_involved`) before `Escalated`.
 pub const MAX_PLAN_AUTO_REJECTIONS: u32 = 2;
 
+/// M11-R11 (X8): the escalation classes the **machine** caused — a missing skill, a context
+/// over budget, or a gate/toolchain/boundary the machine cannot provide. Leaving one costs no
+/// fix cycle: a plain `toryo resume <id>` goes back into the stage, which checks its
+/// precondition again (a cause still there escalates again, no turn and no cycle).
+pub const MACHINE_CAUSED: [&str; 5] = [
+    "skill_unavailable",
+    "context_over_budget",
+    "environment_gate_unavailable",
+    "xpp_toolchain_unavailable",
+    "verify_boundary_unavailable",
+];
+
+/// M11-R11: whether `class` is [`MACHINE_CAUSED`].
+pub fn is_machine_caused(class: &str) -> bool {
+    MACHINE_CAUSED.contains(&class)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PipelineState {
     New,
@@ -297,6 +314,13 @@ pub struct Machine {
     escalated_from: Option<PipelineState>,
     /// Why the task is `Escalated` / `Failed`, or what the last fix cycle is about.
     reason: Option<String>,
+    /// M11-R11 (X8): the typed class of the current `Escalated` state, when the engine set one
+    /// (`escalate` / `escalate_attempt`). A machine-caused class ([`MACHINE_CAUSED`]) lets a
+    /// plain `toryo resume` go back into the stage without a fix cycle. Set outside the pure
+    /// transition, cleared here whenever the task leaves `Escalated`; absent (and not
+    /// serialised) otherwise, so an M10 / round-1 machine reads back unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason_class: Option<String>,
     /// M11-C4: the split bounds of an org chart's `limits:` — then a failing gate counts
     /// against `max_gate_retries` and a rejected review against `max_review_rounds`, and
     /// `max_fix_cycles` bounds nothing. Absent (and not serialised) for the single bound, so a
@@ -362,12 +386,25 @@ impl Machine {
             paused_from: None,
             escalated_from: None,
             reason: None,
+            reason_class: None,
             split: None,
         }
     }
 
     pub fn state(&self) -> PipelineState {
         self.state
+    }
+
+    /// M11-R11: the typed class of the current `Escalated` state, when the engine set one.
+    pub fn reason_class(&self) -> Option<&str> {
+        self.reason_class.as_deref()
+    }
+
+    /// M11-R11: record the escalation class (engine layer, right after escalating).
+    pub fn set_reason_class(&mut self, class: &str) {
+        if self.state == PipelineState::Escalated {
+            self.reason_class = Some(class.to_string());
+        }
     }
     pub fn fix_cycle(&self) -> u32 {
         self.fix_cycle
@@ -561,6 +598,7 @@ impl Machine {
                 }
                 m.reason = Some(note.clone());
                 m.escalated_from = None;
+                m.reason_class = None;
                 if m.plan_approved {
                     // the human grants one more cycle: no bound check here
                     m.fix_cycle += 1;
@@ -581,6 +619,7 @@ impl Machine {
                     return Err(invalid);
                 }
                 m.escalated_from = None;
+                m.reason_class = None;
                 m.state = back;
             }
             (S::WaitingFinalApproval | S::Escalated | S::Reviewing, E::Reverify) => {
@@ -590,6 +629,7 @@ impl Machine {
                 m.gate = None;
                 m.verified_head = None;
                 m.escalated_from = None;
+                m.reason_class = None;
                 m.state = S::Verifying;
             }
             (S::Escalated, E::ForceFinal) => {
@@ -599,6 +639,7 @@ impl Machine {
                 m.require_verified()?;
                 let head = m.checkpoint.clone().unwrap_or_default();
                 m.escalated_from = None;
+                m.reason_class = None;
                 m.open_gate(GateKind::Final, head);
                 m.state = S::WaitingFinalApproval;
             }
@@ -614,6 +655,9 @@ impl Machine {
         self.paused_from = None;
         self.escalated_from = Some(from);
         self.reason = Some(reason);
+        // M11-R11: the engine sets the class after this (set_reason_class); start clean so a
+        // non-machine escalation never inherits a stale one
+        self.reason_class = None;
         self.state = PipelineState::Escalated;
     }
 

@@ -509,7 +509,7 @@ the push and the pull request.
 
 - [x] R9 — environment gates deploy from a fresh export of the commit
 - [x] R10 — M18 script detection, second pass
-- [ ] R11 — `resume` after a machine-caused escalation costs no fix cycle
+- [x] R11 — `resume` after a machine-caused escalation costs no fix cycle
 - [ ] R12 — cheap Low fixes
 - [ ] Finish — notes, README, HUONG-DAN, templates
 - [ ] Push and pull request
@@ -636,6 +636,30 @@ An independent review of `29226ec` found two must-fix bypasses of X6, fixed here
   protected` (AC-3). AC-4: the M11 M18 tests (`m18_script_arguments_per_program`, `m18_entry_points_are_protected_
   before_they_exist`, `a_gate_script_missing_from_the_base_commit_is_refused_at_admission`, EC-07) pass unchanged.
 - Docs: README (the M18 paragraph rewritten with these rules and the remaining limits) and HUONG-DAN §5.9.
+
+#### R11 — `resume` after a machine-caused escalation costs no fix cycle (X8)
+
+- **The class on the machine:** `Machine` gained `reason_class: Option<String>` (`#[serde(default,
+  skip_serializing_if)]`, so an M10 / round-1 machine reads back and serialises unchanged). The pure transition
+  clears it whenever the task leaves `Escalated` (`escalate`, `ResumeWithNote`, `ResumeStage`, `Reverify`,
+  `ForceFinal`); the engine sets it right after escalating (`runner::escalate` / `escalate_attempt` →
+  `store::set_reason_class`), never guessing from the text. `state::MACHINE_CAUSED` is the five classes
+  (`skill_unavailable`, `context_over_budget`, `environment_gate_unavailable`, `xpp_toolchain_unavailable`,
+  `verify_boundary_unavailable`); all five already flow through those two engine helpers.
+- **Plain `toryo resume <id>`** (no `--note`) on an `Escalated` task whose `reason_class` is machine-caused and whose
+  `escalated_from` is a running state → `PipelineEvent::ResumeStage` (it existed: back into the stage, no new fix
+  cycle), with a `DECISIONS.md` entry "resumed after `<class>`". The stage re-checks its precondition (`turn_blocked`
+  / the gate), so a cause still there escalates again with no turn and no cycle. `resume` with no id retries these
+  too (it already iterates non-terminal tasks with default args). `resume --note` is unchanged (one cycle); every
+  other class is unchanged.
+- The five reasons and `status`'s next action now say `toryo resume <id>`, not `--note …`.
+- **Tests:** `tests/m11_skills.rs::plain_resume_after_a_missing_skill_costs_no_fix_cycle` (AC-1: `implement` not
+  `fix-1`, `fix_cycle` unchanged, no "not accepted" framing, the skill delivered, the DECISIONS entry),
+  `tests/m11_env_gates.rs::plain_resume_after_an_unavailable_gate_costs_no_fix_cycle` (AC-2: an unresolved secret;
+  plain resume re-runs verify from the check gates, no implementer turn, the class cleared),
+  `state_tests.rs::a_machine_caused_class_is_recorded_and_cleared_on_resume` and the `reason_class() == None`
+  assertion added to `an_m10_machine_reads_back_and_behaves_the_same` (AC-3: a fix-cycle-bound escalation is not
+  machine-caused; AC-4: the M10 JSON round-trips and the transition tables stay exhaustive).
 
 ## Progress
 

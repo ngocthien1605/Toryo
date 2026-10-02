@@ -238,7 +238,17 @@ impl<'a> Engine<'a> {
 
     /// Escalate with `reason`, printed as `!! reason` before the `[state]` line.
     fn escalate(&self, class: &str, reason: String) -> Result<St> {
-        self.apply_with(Ev::Escalate { reason }, true, Some(class))
+        let st = self.apply_with(Ev::Escalate { reason }, true, Some(class))?;
+        self.record_reason_class(class)?;
+        Ok(st)
+    }
+
+    /// M11-R11: store the escalation class on the machine, so a plain `toryo resume` can tell a
+    /// machine-caused escalation from one a fix cycle should repair.
+    fn record_reason_class(&self, class: &str) -> Result<()> {
+        let (i, c) = (self.id.clone(), class.to_string());
+        self.store
+            .call(move |tx| store::set_reason_class(tx, &i, &c))
     }
 
     /// M11-R5: before a turn of `stage` starts (no attempt, no tokens) — every skill it needs
@@ -1715,7 +1725,7 @@ impl<'a> Engine<'a> {
             let lock_name = super::lock::lock_key(&m.lock);
             let unavailable = |what: String| {
                 Ok(EnvGates::Unavailable(format!(
-                    "{ENV_UNAVAILABLE}: environment gate `{name}`: {what} — fix the machine config ({}), then `toryo resume {} --note …`",
+                    "{ENV_UNAVAILABLE}: environment gate `{name}`: {what} — fix the machine config ({}), then `toryo resume {}`",
                     crate::config::machine_config_hint(self.cfg.machine_path.as_deref()),
                     t.id
                 )))
@@ -1747,7 +1757,7 @@ impl<'a> Engine<'a> {
                 Err(e) => {
                     drop(lock);
                     return Ok(EnvGates::Unavailable(format!(
-                        "{ENV_UNAVAILABLE}: environment gate `{name}`: the checkpoint {} could not be exported for it (nothing was deployed): {e:#} — `toryo resume {} --note …` exports it again",
+                        "{ENV_UNAVAILABLE}: environment gate `{name}`: the checkpoint {} could not be exported for it (nothing was deployed): {e:#} — `toryo resume {}` exports it again",
                         short(head),
                         t.id
                     )));
@@ -2678,12 +2688,13 @@ impl<'a> Engine<'a> {
             a,
             AttemptStatus::Failed,
             AttemptEnd {
-                error_class: Some(class),
+                error_class: Some(class.clone()),
                 ..Default::default()
             },
             None,
             Some(Ev::Escalate { reason }),
-        )
+        )?;
+        self.record_reason_class(&class)
     }
 }
 
@@ -3880,7 +3891,7 @@ fn deployment_ok(res: &CommandResult) -> Option<bool> {
 /// paths, and the way out.
 fn skill_unavailable_reason(t: &TaskRow, stage: &str, profile: &str, missing: &[String]) -> String {
     format!(
-        "{}: the {stage} turn ({profile}) was not started — {}; put the skill back, then `toryo resume {} --note …`",
+        "{}: the {stage} turn ({profile}) was not started — {}; put the skill back, then `toryo resume {}`",
         context::SKILL_UNAVAILABLE,
         missing.join("; "),
         t.id
@@ -4415,7 +4426,14 @@ pub fn next_action(t: &TaskRow) -> String {
         St::WaitingFinalApproval => format!("review the branch {} (REVIEW.md in the run store), then `toryo approve {id} --gate final` or `toryo reject {id} --gate final --reason \"…\"`", t.branch),
         St::Escalated => {
             let why = t.machine.reason().unwrap_or("");
-            if why.starts_with(protect::REASON) {
+            if t
+                .machine
+                .reason_class()
+                .is_some_and(crate::engine::state::is_machine_caused)
+            {
+                // M11-R11 (X8): the machine caused it — plain resume goes back into the stage
+                format!("{why}\n  → fix the cause, then `toryo resume {id}` (no fix cycle; the stage is checked again)")
+            } else if why.starts_with(protect::REASON) {
                 format!("{why}\n  → restore the file(s) and `toryo resume {id}`, or `toryo resume {id} --accept-protected-change <path>` (recorded in DECISIONS.md)")
             } else if why.starts_with("recovery_policy_violation") {
                 format!("{why}\n  → `toryo resume {id} --discard-partial` (after a snapshot check) or fix the worktree by hand and `toryo resume {id} --keep-partial`")

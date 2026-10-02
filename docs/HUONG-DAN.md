@@ -673,8 +673,10 @@ Bộ mẫu: `templates\d365fo\.toryo\`, `templates\d365fo\CULTURE.md`, `template
   Thực đơn chỉ liệt kê skill tìm thấy được lúc này. Kiểm tra ngân sách chạy cho **mọi profile trong chuỗi
   implementer** (Claude dự phòng nhận TASK.md và PLAN.md inline, không bao giờ bị cắt để nhường chỗ cho skill).
   Trước mỗi lượt, mọi skill cần dùng phải tìm thấy: không thì task escalate `skill_unavailable` (nêu cả hai đường
-  dẫn đã tìm; chưa chạy lượt nào, không tốn token) — đặt skill lại rồi `toryo resume <id> --note …`. Ngữ cảnh có
-  skill mà vẫn quá ngân sách → escalate `context_over_budget`.
+  dẫn đã tìm; chưa chạy lượt nào, không tốn token) — đặt skill lại rồi `toryo resume <id>`. Ngữ cảnh có skill mà vẫn
+  quá ngân sách → escalate `context_over_budget`. Các lỗi này, cùng gate/toolchain/boundary máy không cung cấp được,
+  là **do máy** (M11-R11, X8): `toryo resume <id>` (không `--note`) quay lại stage sau khi sửa nguyên nhân — không
+  tốn vòng sửa, không chạy implementer; `--note` chỉ để cấp thêm một vòng cho implementer.
 - **Hàng rào ghi (write fence)** của implementer: `writes:` = chỉ được sửa các file này (`writes: []` hoặc không ghi = không giới hạn, chỉ áp `never`); `never:` = không bao giờ,
   kể cả trong `writes`. Kế hoạch đụng file ngoài hàng rào → lập lại kế hoạch; implementer sửa file ngoài hàng rào →
   khôi phục và trả lại, nêu rõ luật. `## Allow protected` trong TASK.md mở được một mục, như file được bảo vệ.
@@ -1013,8 +1015,8 @@ CI chạy: `cargo fmt --check`, `clippy -D warnings` (có và không có M0 kit)
 | `verify_boundary_unavailable` | `verify_root` không gán được Low label (thiếu WRITE_OWNER) → để mặc định `%LOCALAPPDATA%\toryo-verify`; `toryo doctor` nêu nguyên nhân |
 | `verify_mutated_tree` | Script verify đã sửa file đã track / `.git` của bản checkout → sửa script (hoặc code agent viết), rồi `toryo resume ID --note "…"` |
 | `!! a check gate left files in the verify checkout — they are not deployed` (M11) | Chỉ là cảnh báo: gate môi trường deploy từ bản xuất mới của commit, không từ checkout. Nên cho check gate ghi output vào `TORYO_VERIFY_BUILD`; danh sách nằm ở `checkout_extra` trong `VERIFY_RESULT.json` |
-| `environment_gate_unavailable` (M11) | Máy không chạy được gate môi trường: secret chưa có, chương trình không tìm thấy hoặc nằm trong repo/worktrees/verify root → sửa machine config; task tạo trước bản này mà có `%VAR%` trong `program` → `toryo task config ID --reload` |
-| `skill_unavailable` / `context_over_budget` (M11) | Skill cần cho lượt này không tìm thấy (lý do nêu cả hai đường dẫn) → đặt lại rồi `toryo resume ID --note "…"`; ngữ cảnh có skill vẫn quá ngân sách → tăng `context.budget_kb.<role>` hoặc chọn ít skill hơn |
+| `environment_gate_unavailable` (M11) | Máy không chạy được gate môi trường: secret chưa có, chương trình không tìm thấy hoặc nằm trong repo/worktrees/verify root → sửa machine config, rồi `toryo resume ID` (do máy; không tốn vòng sửa); task tạo trước bản này mà có `%VAR%` trong `program`/`args` → `toryo task config ID --reload` |
+| `skill_unavailable` / `context_over_budget` (M11) | Skill cần cho lượt này không tìm thấy (lý do nêu cả hai đường dẫn) → đặt lại rồi `toryo resume ID` (do máy; không tốn vòng sửa); ngữ cảnh có skill vẫn quá ngân sách → tăng `context.budget_kb.<role>` hoặc chọn ít skill hơn |
 | `artifact_tampered` / `artifact_missing` | Có người sửa/xoá file trong `runstore\artifacts\` → khôi phục file, hoặc `toryo task cleanup ID` |
 | `Paused` — `admission cap reached` | `toryo budget set ID --tokens N` rồi `toryo resume ID` |
 | `unverified profiles (R51)` nhắc `claude-implementer-isolation` | `toryo spike claude-implementer-isolation --profile claude-max` (hoặc `doctor --canaries`) |

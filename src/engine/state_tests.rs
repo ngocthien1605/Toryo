@@ -746,6 +746,9 @@ fn an_m10_machine_reads_back_and_behaves_the_same() {
         "{:?}",
         m.reason()
     );
+    // M11-R11 AC-3: a fix-cycle-bound escalation is not machine-caused, so plain resume behaves
+    // as today (the CLI only takes the no-cycle path for a machine-caused class)
+    assert_eq!(m.reason_class(), None);
     // the split machine round-trips with its counters
     let mut s = Machine::with_limits(3, 1);
     to_verifying(&mut s, "c1");
@@ -754,4 +757,41 @@ fn an_m10_machine_reads_back_and_behaves_the_same() {
     assert!(text.contains(r#""split":{"max_gate_retries":3,"max_review_rounds":1,"gate_retries":1,"review_rounds":0}"#), "{text}");
     assert_eq!(serde_json::from_str::<Machine>(&text).unwrap(), s);
     assert_eq!(s.max_fix_cycles(), 4, "the sum, for display");
+}
+
+/// M11-R11 (X8): the engine records a machine-caused class on the machine; `ResumeStage` goes
+/// back into the stage with no fix cycle and clears the class, and `ResumeWithNote` clears it
+/// too. The field is not serialised when absent (an M10 / round-1 machine is unchanged).
+#[test]
+fn a_machine_caused_class_is_recorded_and_cleared_on_resume() {
+    let mut m = Machine::new(2);
+    to_verifying(&mut m, "c1");
+    m.apply(E::Escalate {
+        reason: "environment_gate_unavailable: …".into(),
+    })
+    .unwrap();
+    // absent until the engine sets it; not serialised
+    assert_eq!(m.reason_class(), None);
+    assert!(!serde_json::to_string(&m).unwrap().contains("reason_class"));
+    m.set_reason_class("environment_gate_unavailable");
+    assert_eq!(m.reason_class(), Some("environment_gate_unavailable"));
+    let fix_before = m.fix_cycle();
+    // plain resume: back into the stage it escalated from, no fix cycle, class cleared
+    assert_eq!(m.apply(E::ResumeStage), Ok(S::Verifying));
+    assert_eq!(m.fix_cycle(), fix_before);
+    assert_eq!(m.reason_class(), None);
+    // and ResumeWithNote clears it as well (a fresh machine)
+    let mut n = Machine::new(2);
+    to_verifying(&mut n, "c1");
+    n.apply(E::Escalate {
+        reason: "skill_unavailable: …".into(),
+    })
+    .unwrap();
+    n.set_reason_class("skill_unavailable");
+    n.apply(E::ResumeWithNote { note: "go".into() }).unwrap();
+    assert_eq!(n.reason_class(), None);
+    // set_reason_class is a no-op unless Escalated
+    let mut r = Machine::new(2);
+    r.set_reason_class("skill_unavailable");
+    assert_eq!(r.reason_class(), None);
 }
