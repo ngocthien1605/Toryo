@@ -1076,3 +1076,121 @@ fn files_git_cannot_see_stop_the_deploy() {
     assert!(!marker.exists(), "the environment gate never started");
     assert!(deployments(&env).is_empty());
 }
+
+/// M11-R8: an environment gate that runs past its timeout is killed with its whole process
+/// tree, and the deployment record says interrupted (the environment may hold a partial
+/// deploy) — not "the deploy failed".
+#[test]
+fn a_timed_out_environment_gate_is_recorded_as_interrupted() {
+    let env = env_gate_setup(
+        "codex-openai",
+        "error",
+        "limits:\n  max_gate_retries: 1\n  max_review_rounds: 1\n",
+    );
+    let org_path = ".toryo/toryo-orgchart.yaml";
+    let org = std::fs::read_to_string(env.repo.join(org_path)).unwrap();
+    assert!(org.contains("timeout: 2m, if_missing"), "{org}");
+    commit_repo(
+        &env,
+        &[(
+            org_path,
+            &org.replace("timeout: 2m, if_missing", "timeout: 3s, if_missing"),
+        )],
+        "a short gate timeout",
+    );
+    let hb = fwd(&env.root.join("gates").join("heartbeat.txt"));
+    let ps1 = "Start-Process -NoNewWindow -FilePath pwsh -ArgumentList '-NoProfile','-Command',\"while (`$true) { Add-Content -Path 'HB' -Value x; Start-Sleep -Milliseconds 200 }\"\nStart-Sleep -Seconds 120\n".replace("HB", &hb);
+    let sh = "( while :; do echo x >> 'HB'; sleep 0.2; done ) &\nsleep 120\n".replace("HB", &hb);
+    define_gates(
+        &env,
+        &machine_gate(&env, "dbsync", "d365-env", &ps1, &sh, ""),
+    );
+    create(&env, "TO-1");
+    let s = script(
+        &env,
+        "to.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()]),
+                turn(vec![implementation()]),
+                turn(vec![implementation()]),
+            ],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "TO-1", "--yes", "--fake-agents", &s], &[]);
+    let d = deployments(&env);
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert!(
+        d[0].finished_at.is_some() && d[0].ok.is_none(),
+        "{d:?}\n{err}"
+    );
+    let out = status_out(&env, "TO-1");
+    assert!(
+        out.contains("(interrupted — the environment may hold a partial deploy)"),
+        "{out}"
+    );
+    // the gate's child kept writing until the tree was killed: nothing writes any more
+    let size = || {
+        std::fs::metadata(env.root.join("gates").join("heartbeat.txt"))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
+    assert!(size() > 0, "the child ran");
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let before = size();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert_eq!(size(), before, "the whole process tree is gone");
+}
+
+/// M11-R8 (E3 AC-7 end to end): `if_missing: error` and a machine config without the gate →
+/// `task create` is refused, naming `environment_gates.dbsync` — no task, no worktree.
+#[test]
+fn a_missing_environment_gate_refuses_the_task() {
+    let env = env_gate_setup("codex-openai", "error", "");
+    let (code, err) = toryo(
+        &env,
+        &["task", "create", "--file", "TASK.md", "--id", "IM-1"],
+        &[],
+    );
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("environment gate 'dbsync' is not defined on this machine")
+            && err.contains("add `environment_gates.dbsync` to the machine config")
+            && err.contains(&env.machine.display().to_string()),
+        "{err}"
+    );
+    assert!(!env.data.join("runs").join("IM-1").exists());
+    assert!(!wt(&env, "IM-1").exists());
+}
+
+/// M11-R8: lock names are one lock whatever their case — `D365-Env` is stored as `d365-env`
+/// (the deployment row, `status`).
+#[test]
+fn a_lock_name_is_stored_in_lower_case() {
+    let env = env_gate_setup("codex-openai", "error", "");
+    define_gates(
+        &env,
+        &machine_gate(&env, "dbsync", "D365-Env", "exit 0\n", "exit 0\n", ""),
+    );
+    create(&env, "LC-1");
+    let s = script(
+        &env,
+        "lc.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "LC-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "LC-1").state, St::Completed, "{err}");
+    let d = deployments(&env);
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].lock, "d365-env");
+    let out = status_out(&env, "LC-1");
+    assert!(
+        out.contains("d365-env holds LC-1 @") && out.contains("(approved)"),
+        "{out}"
+    );
+}

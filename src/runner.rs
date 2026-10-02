@@ -103,9 +103,11 @@ impl CommandRunner for LocalRunner {
                     let (Chunk::Stdout(b) | Chunk::Stderr(b)) = c;
                     if let Some(tx) = &sink {
                         // live chunks (no engine caller uses them) are redacted chunk by chunk
-                        let _ = tx.send(strip_ansi(
-                            &spec.redact.redact_str(&String::from_utf8_lossy(&b)),
-                        ));
+                        // M11-R8: colour codes go first, so a secret split by one is found
+                        let _ = tx.send(
+                            spec.redact
+                                .redact_str(&strip_ansi(&String::from_utf8_lossy(&b))),
+                        );
                     }
                     out.extend(b);
                 },
@@ -120,7 +122,10 @@ impl CommandRunner for LocalRunner {
                 timed_out: info.timed_out,
                 cancelled: info.cancelled,
                 duration_ms: info.duration_ms,
-                output: strip_ansi(&String::from_utf8_lossy(&spec.redact.redact_all(&out))),
+                // M11-R8: strip the colour codes, then redact: a secret split by a colour code is found
+                output: spec
+                    .redact
+                    .redact_str(&strip_ansi(&String::from_utf8_lossy(&out))),
             })
         })
         .await?

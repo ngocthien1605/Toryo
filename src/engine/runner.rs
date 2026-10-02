@@ -621,6 +621,11 @@ impl<'a> Engine<'a> {
             .filter(|f| self.protect.violates(f))
             .collect();
         if !bad.is_empty() {
+            // M11-R8: with a fence violation, the reason (and so the escalation after the
+            // re-plan bound) names the rule, not "protected paths"
+            let fenced = bad.iter().any(|p| self.protect.fence_rule(p).is_some());
+            let reason =
+                fenced.then(|| format!("the plan lists {}", self.protect.violation_words(&bad)));
             let fb = match plan_fence_feedback(&bad, &self.protect) {
                 // M11-C2: the feedback names the fence rule each path breaks
                 Some(fb) => {
@@ -637,10 +642,7 @@ impl<'a> Engine<'a> {
                 AttemptStatus::Succeeded,
                 &r,
                 AttemptEnd::default(),
-                Some(Ev::PlanPolicyViolation {
-                    paths: bad,
-                    reason: None,
-                }),
+                Some(Ev::PlanPolicyViolation { paths: bad, reason }),
                 Some(Some(fb)),
             )?;
             return Ok(Flow::Next);
@@ -1699,6 +1701,8 @@ impl<'a> Engine<'a> {
                 results.push(json!({"name": name, "kind": "environment", "skipped": true, "reason": SKIPPED_REASON}));
                 continue;
             };
+            // M11-R8: one lock and one deployment row whatever the case it is written in
+            let lock_name = super::lock::lock_key(&m.lock);
             let unavailable = |what: String| {
                 Ok(EnvGates::Unavailable(format!(
                     "{ENV_UNAVAILABLE}: environment gate `{name}`: {what} — fix the machine config ({}), then `toryo resume {} --note …`",
@@ -1723,7 +1727,7 @@ impl<'a> Engine<'a> {
                 Ok(p) => p,
                 Err(e) => return unavailable(e),
             };
-            let Some(lock) = self.env_lock(t, &m.lock, stop)? else {
+            let Some(lock) = self.env_lock(t, &lock_name, stop)? else {
                 return Ok(EnvGates::Stopped);
             };
             // M11-R2 review: the wait for the lock may have been long — the checkout must still be
@@ -1737,7 +1741,7 @@ impl<'a> Engine<'a> {
             // first the record: a failed or killed sync may already have changed the environment
             let (i, l, h, n, mc) = (
                 t.id.clone(),
-                m.lock.clone(),
+                lock_name.clone(),
                 head.to_string(),
                 name.to_string(),
                 machine.clone(),
@@ -1771,34 +1775,48 @@ impl<'a> Engine<'a> {
                 cancel: Some(stop.flag.clone()),
                 redact: crate::process::redact::Redactions::new(&redact),
             };
-            let res = match self.run_gate_command(run, stop, Some("environment")) {
+            let res = match self.hub.block_on(LocalRunner.run(run, None)) {
                 Ok(r) => r,
                 Err(e) => {
                     // it did not start: say so in the record, not "interrupted"
-                    let (i, l) = (t.id.clone(), m.lock.clone());
+                    let (i, l) = (t.id.clone(), lock_name.clone());
                     let _ = self
                         .store
                         .call(move |tx| store::deployment_end(tx, &l, &i, Some(false)));
                     return Err(e);
                 }
             };
-            let ok = res.as_ref().map(|r| r.ok());
-            let (i, l) = (t.id.clone(), m.lock.clone());
+            // M11-R8: a timed-out or cancelled gate was killed part way — the environment may
+            // hold a partial deploy, so the record says interrupted (`ok` empty), not failed. A
+            // stop that arrived after the gate finished keeps the gate's real result.
+            let ok = (!res.timed_out && !res.cancelled).then(|| res.ok());
+            let (i, l) = (t.id.clone(), lock_name.clone());
             self.store
                 .call(move |tx| store::deployment_end(tx, &l, &i, ok))?;
             drop(lock);
-            let Some(res) = res else {
+            if res.cancelled {
                 return Ok(EnvGates::Stopped);
-            };
+            }
+            self.rec.emit(EngineEvent::VerifyCommand {
+                name: name.to_string(),
+                exit: res.exit,
+                timed_out: res.timed_out,
+                ok: res.ok(),
+                duration_ms: res.duration_ms as u64,
+                kind: Some("environment".into()),
+            });
+            if stop.stopped() {
+                return Ok(EnvGates::Stopped);
+            }
             self.rec.emit(EngineEvent::EnvironmentDeployed {
-                lock: m.lock.clone(),
+                lock: lock_name.clone(),
                 sha: head.to_string(),
                 ok: res.ok(),
             });
             let argv: Vec<String> = std::iter::once(m.program.clone())
                 .chain(m.args.iter().cloned())
                 .collect();
-            results.push(json!({"name": name, "kind": "environment", "lock": m.lock, "machine": machine, "argv": argv, "exit": res.exit, "timed_out": res.timed_out, "ms": res.duration_ms, "output_tail": res.tail(40)}));
+            results.push(json!({"name": name, "kind": "environment", "lock": lock_name, "machine": machine, "argv": argv, "exit": res.exit, "timed_out": res.timed_out, "ms": res.duration_ms, "output_tail": res.tail(40)}));
             if !res.ok() {
                 // R61: the output comes from code that ran on the checkpoint — data
                 let f = verify_feedback(&res, "");
@@ -3935,7 +3953,7 @@ pub fn final_gate_notes(store: &Store, t: &TaskRow) -> Result<Vec<String>> {
             .collect::<Vec<_>>())
     })?;
     for d in deployed {
-        let status = super::views::deployment_status(&d, Some(t.state), false);
+        let status = super::views::deployment_status(&d, Some(t.state), None, false);
         out.push(format!(
             "environment: {}",
             super::views::deployment_line(&d, status)

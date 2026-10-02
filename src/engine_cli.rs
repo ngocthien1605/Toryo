@@ -496,9 +496,24 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
             max_fix_cycles,
         } => {
             let cfg = load_config(cli)?;
+            let root = PathBuf::from(toryo::config::expand_vars(&cfg.repo.project.root)?);
             let repo = match repo {
+                // M11-R8: the org chart was validated from project.root, but instructions,
+                // culture and skills are read from the task's repository — they must be one
+                Some(r)
+                    if cfg.team.is_some()
+                        && (std::fs::canonicalize(r).ok() != std::fs::canonicalize(&root).ok()
+                            || !r.is_dir()) =>
+                {
+                    bail!(
+                        "task create --repo {}: in org chart mode the task's repository must be project.root ({}) — the org chart, the role files and the skills are read from it; change project.root in {} or leave --repo out",
+                        r.display(),
+                        root.display(),
+                        cfg.repo_path.display()
+                    );
+                }
                 Some(r) => r.clone(),
-                None => PathBuf::from(toryo::config::expand_vars(&cfg.repo.project.root)?),
+                None => root,
             };
             let st = store()?;
             let t = task::create(
@@ -1146,10 +1161,20 @@ fn environments(
         .filter(|d| task.is_none_or(|i| d.task == i))
     {
         let i = d.task.clone();
-        let state = st.read(move |tx| Ok(store::get_task(tx, &i).ok().map(|t| t.state)))?;
+        let holder = st.read(move |tx| {
+            Ok(store::get_task(tx, &i)
+                .ok()
+                .map(|t| (t.state, t.machine.checkpoint().map(str::to_string))))
+        })?;
+        let state = holder.as_ref().map(|h| h.0);
+        // M11-R8: the head the holder's final gate approved — only a completed task has one
+        let approved = holder
+            .as_ref()
+            .filter(|h| h.0 == PipelineState::Completed)
+            .and_then(|h| h.1.clone());
         let active = driven_owner(st, &d.task).ok().flatten().is_some();
-        let status = views::deployment_status(&d, state, active);
-        out.push((d, status, state == Some(PipelineState::Completed)));
+        let status = views::deployment_status(&d, state, approved.as_deref(), active);
+        out.push((d, status, status == "approved"));
     }
     Ok(out)
 }

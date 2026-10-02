@@ -461,6 +461,10 @@ pub struct MachineConfig {
     /// in one file is an error ([`MachineConfig::load`]).
     #[serde(default)]
     pub seats: BTreeMap<String, Role>,
+    /// M11-R8: the file spelled its seat overrides `seats:` (they are moved to `roles`) — for
+    /// the messages.
+    #[serde(skip)]
+    pub seats_spelling: bool,
     /// M11-D1: this machine's shared skills folder (`<skills_dir>/<name>/SKILL.md`), looked up
     /// after the repository's `.toryo/skills/`.
     #[serde(default)]
@@ -559,6 +563,7 @@ impl MachineConfig {
                 );
             }
             m.roles = std::mem::take(&mut m.seats);
+            m.seats_spelling = true;
         }
         Ok(m)
     }
@@ -601,6 +606,8 @@ pub struct Origins {
     pub gates: BTreeMap<String, Origin>,
     /// M11-B2: the machine's `skills_dir`, in org chart mode.
     pub skills_dir: Option<Origin>,
+    /// M11-R8: how the machine config spelled its role overrides (`seats` or `roles`).
+    pub machine_roles_key: Option<&'static str>,
 }
 
 /// Effective configuration = repo config with machine overrides applied.
@@ -702,6 +709,11 @@ impl Effective {
             origins.verify.insert(k.into(), Origin::Repo);
         }
         if let Some((mp, machine)) = machine {
+            origins.machine_roles_key = Some(if machine.seats_spelling {
+                "seats"
+            } else {
+                "roles"
+            });
             for (k, mut v) in machine.roles {
                 // org chart mode: a machine seat has the org chart's fields — an omitted
                 // fallback is none (D7), never the planner's profile (group B review)
@@ -800,6 +812,7 @@ impl Effective {
             &self.toolchains,
             &hint,
             self.team.is_some(),
+            &self.origins,
         ));
         if let Some(b) = &self.machine_verify.min_boundary {
             let key = format!("verify.min_boundary (machine config {hint})");
@@ -922,11 +935,25 @@ fn known_key(out: &mut Vec<String>, section: &str, name: &str, what: &str, valid
 
 /// Every semantic problem of a (merged) configuration, as `key: what is wrong`. `machine` names
 /// the machine config for the messages that send the reader there.
-fn problems(repo: &RepoConfig, toolchains: &Toolchains, machine: &str, team: bool) -> Vec<String> {
+fn problems(
+    repo: &RepoConfig,
+    toolchains: &Toolchains,
+    machine: &str,
+    team: bool,
+    origins: &Origins,
+) -> Vec<String> {
     let mut out = Vec::new();
     let roles = role_names();
     for name in repo.roles.keys() {
-        known_key(&mut out, "roles", name, "role", &roles);
+        // M11-R8: a role (seat) only the machine config names: that file, as it spells the key
+        let section = match origins.roles.get(name) {
+            Some(Origin::Machine) => format!(
+                "{machine}: {}",
+                origins.machine_roles_key.unwrap_or("roles")
+            ),
+            _ => "roles".into(),
+        };
+        known_key(&mut out, &section, name, "role", &roles);
     }
     for name in repo.context.budget_kb.keys() {
         known_key(&mut out, "context.budget_kb", name, "role", &roles);
@@ -2002,6 +2029,28 @@ commands:
         );
     }
 
+    /// M11-R8: a misspelt seat in the machine config names that file and the key as the file
+    /// spells it (`seats.x` / `roles.x`); one in toryo.yaml stays `roles.x`.
+    #[test]
+    fn a_misspelt_machine_seat_names_the_machine_config() {
+        let d = tempfile::tempdir().unwrap();
+        let (p, m) = (d.path().join("toryo.yaml"), d.path().join("machine.yaml"));
+        std::fs::write(&p, "version: 1\nproject: { root: r, worktrees_root: w }\nroles:\n  planner: { profile: a }\n").unwrap();
+        let profiles = "profiles:\n  a: { kind: claude, billing: subscription, exe: c }\n";
+        for key in ["seats", "roles"] {
+            std::fs::write(
+                &m,
+                format!("{profiles}{key}:\n  reviwer: {{ profile: a }}\n"),
+            )
+            .unwrap();
+            let e = format!("{:#}", Effective::load(&p, Some(&m)).unwrap_err());
+            assert!(
+                e.contains(&format!("{}: {key}.reviwer: unknown role", m.display())),
+                "{key}: {e}"
+            );
+        }
+    }
+
     /// Review H2 (M11-A2): the machine's `verify:` floor and root. Unset, nothing changes (the
     /// hash above); set, they are frozen and hashed with the task, the root replaces the
     /// repository's, and each says where it came from.
@@ -2141,6 +2190,61 @@ commands:
             let cfg = Effective::load(&repo, Some(&machine)).unwrap();
             assert_eq!(cfg.sha256(), want, "{}", repo.display());
         }
+    }
+
+    /// M11-R8: the commented M11 block of the machine template (`seats`, `skills_dir`,
+    /// `environment_gates`, `verify`) parses as a `MachineConfig` once uncommented — the
+    /// example cannot drift from the struct. (`seats:` replaces the active `roles:`: one of
+    /// the two per file.)
+    #[test]
+    fn the_commented_m11_machine_block_parses() {
+        let t = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
+        let text = std::fs::read_to_string(t.join("toryo.local.yaml.example"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("# M11 —"))
+            .expect("the M11 block");
+        let key = regex::Regex::new(r"^ *[A-Za-z_][A-Za-z0-9_]*:(\s|$)").unwrap();
+        let top = |l: &str| key.is_match(l) && !l.starts_with(' ');
+        // the active part without its `roles:` block
+        let mut active = Vec::new();
+        let mut in_roles = false;
+        for l in &lines[..start] {
+            if top(l) {
+                in_roles = l.starts_with("roles:");
+            }
+            if !in_roles {
+                active.push(l.to_string());
+            }
+        }
+        let mut uncommented = 0;
+        for l in &lines[start..] {
+            match l.strip_prefix("# ") {
+                Some(c) if key.is_match(c) => {
+                    active.push(c.to_string());
+                    uncommented += 1;
+                }
+                _ => active.push(l.to_string()),
+            }
+        }
+        assert!(uncommented >= 15, "{uncommented}");
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("machine.yaml");
+        std::fs::write(&p, active.join("\n")).unwrap();
+        let m = MachineConfig::load(&p).unwrap();
+        assert!(m.seats_spelling);
+        assert_eq!(m.roles["planner"].profile, "claude-foundry");
+        assert_eq!(m.skills_dir.as_deref(), Some("C:/Temp/AgentShare/skills"));
+        let g = &m.environment_gates["dbsync"];
+        assert_eq!(
+            (g.program.as_str(), g.lock.as_str()),
+            ("powershell", "d365-env")
+        );
+        assert!(g.secret_env.contains_key("D365_SYNC_SECRET"));
+        assert_eq!(m.verify.min_boundary.as_deref(), Some("low_integrity"));
     }
 
     /// The shipped templates keep loading under the checks.

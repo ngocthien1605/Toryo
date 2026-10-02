@@ -464,6 +464,28 @@ impl Protected {
         None
     }
 
+    /// M11-R8: paths that break the policy, in words — each path outside the write fence or on a
+    /// `never` path with its fence rule, the others as `protected paths [...]`.
+    pub fn violation_words(&self, paths: &[String]) -> String {
+        let (fenced, plain): (Vec<&String>, Vec<&String>) =
+            paths.iter().partition(|p| self.fence_rule(p).is_some());
+        let fence: Vec<String> = fenced
+            .iter()
+            .filter_map(|p| {
+                self.fence_rule(p)
+                    .map(|r| format!("`{p}` ({})", r.plan_reason()))
+            })
+            .collect();
+        let fence = fence.join(", ");
+        match (plain.is_empty(), fence.is_empty()) {
+            (_, true) => format!("protected paths {plain:?}"),
+            (true, false) => format!("paths the implementer may not change: {fence}"),
+            (false, false) => format!(
+                "protected paths {plain:?} and paths the implementer may not change: {fence}"
+            ),
+        }
+    }
+
     /// Add the task's `## Allow protected` list and `policy.deny_paths`.
     pub fn with_policy(mut self, allowed: &[String], deny: &[String]) -> Self {
         self.allowed = allowed.iter().map(|g| glob_ci(g)).collect();

@@ -500,3 +500,86 @@ fn the_budget_check_covers_every_implementer_of_the_chain() {
         "{fb}"
     );
 }
+
+/// M11-R8 (D2 AC-4, second half): a plan without `skills` — the implementer's context has no
+/// skill part at all (the reviewer keeps its own).
+#[test]
+fn a_plan_without_skills_gives_the_implementer_none() {
+    let env = skills_env("", &[]);
+    create(&env, "SK-R8A");
+    let s = script(&env, "r8a.json", json!({"planner": [turn(vec![plan()])]}));
+    let (code, err) = toryo(&env, &["run", "SK-R8A", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    let (code, err) = toryo(&env, &["approve", "SK-R8A", "--gate", "plan"], &[]);
+    assert_eq!(code, 0, "{err}");
+    let (err, text) = context_show(&env, "SK-R8A", "implement");
+    assert!(
+        !err.contains("] skill ") && !err.contains("skill xpp"),
+        "{err}"
+    );
+    assert!(
+        !text.contains("# Skill:") && !text.contains("SKILL-BODY"),
+        "{text}"
+    );
+    let (err, _) = context_show(&env, "SK-R8A", "review");
+    assert!(err.contains("skill review-checklist (repo)"), "{err}");
+}
+
+/// M11-R8 (D3): a `fix-1` turn and a fallback implementer get the approved plan's skills.
+#[test]
+fn fix_and_fallback_turns_get_the_approved_skills() {
+    // fix-1: the first checkpoint fails the check gate
+    let env = skills_env("", &[]);
+    approved_plan(&env, "SK-R8B", json!(["xpp-batch"]));
+    let s = script(
+        &env,
+        "r8b.json",
+        json!({
+            "implementer": [
+                turn(vec![implementation()]),
+                turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()]),
+            ],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "SK-R8B", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "SK-R8B").state, St::Completed, "{err}");
+    let stages: Vec<String> = attempts(&env, "SK-R8B")
+        .into_iter()
+        .filter(|a| a.stage.starts_with("fix-") || a.stage == "implement")
+        .map(|a| a.stage)
+        .collect();
+    assert_eq!(stages, ["implement", "fix-1"]);
+    let imp = calls_of(&env, "SK-R8B", "implementer");
+    assert_eq!(imp.len(), 2);
+    for c in &imp {
+        let ctx = c["context"].as_str().unwrap();
+        assert!(ctx.contains("BATCH-SKILL-BODY") && !ctx.contains("AXCLASS-SKILL-BODY"));
+    }
+
+    // the fallback: Codex hits its quota, the Claude implementer gets the same skills
+    let org = ORGCHART.replace("IMPLEMENTER", "codex-openai").replace(
+        "implementer: { profile: codex-openai }",
+        "implementer: { profile: codex-openai, fallback: [claude-max] }",
+    );
+    let env = skills_env("", &[(".toryo/toryo-orgchart.yaml", &org)]);
+    approved_plan(&env, "SK-R8C", json!(["xpp-batch"]));
+    let s = script(
+        &env,
+        "r8c.json",
+        json!({
+            "implementer": [turn(vec![fail("QuotaExceeded", "You've hit your usage limit")])],
+            "implementer@claude-max": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "SK-R8C", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "SK-R8C").state, St::Completed, "{err}");
+    let claude = calls_of(&env, "SK-R8C", "implementer@claude-max");
+    assert_eq!(claude.len(), 1, "{claude:?}");
+    let ctx = claude[0]["context"].as_str().unwrap();
+    assert!(
+        ctx.contains("# Skill: xpp-batch (repo)") && ctx.contains("BATCH-SKILL-BODY"),
+        "{ctx}"
+    );
+}

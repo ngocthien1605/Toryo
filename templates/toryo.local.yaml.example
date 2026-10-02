@@ -79,7 +79,9 @@ git:
 
 # M11 — this machine's shared skills folder: <skills_dir>/<name>/SKILL.md, looked up AFTER the
 # repository's .toryo/skills/<name>/. Only SKILL.md is delivered (the files next to it are
-# readable only for repository skills). Forward slashes work on Windows.
+# readable only for repository skills). Forward slashes work on Windows. Absolute, and outside
+# the repository, the task worktrees and the verify root (its text is trusted); `toryo doctor`
+# warns when the folder does not exist.
 # skills_dir: C:/Temp/AgentShare/skills
 
 # M11 — environment gates: what an org chart's `kind: environment` gate runs, with YOUR normal
@@ -95,6 +97,8 @@ git:
 # built from scratch + TORYO_TASK, TORYO_SHA, TORYO_VERIFY_CHECKOUT, TORYO_VERIFY_BUILD + `env` +
 # the resolved `secret_env` (redacted from every log). One gate per `lock` runs at a time across
 # all tasks; `toryo status` shows which task and commit each lock's environment last received.
+# Lock names ignore case (D365-Env is d365-env); Windows device names (con, nul, com1, …) are
+# refused. A gate killed by its timeout or a stop is recorded as interrupted (a partial deploy).
 # environment_gates:
 #   dbsync:
 #     program: powershell                 # Windows PowerShell 5.1; pwsh for 7

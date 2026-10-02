@@ -335,3 +335,50 @@ async fn local_runner_captures_plain_text_and_exit() {
     assert_eq!(r.exit, Some(3));
     assert_eq!(r.output.trim(), "WARNING ok");
 }
+
+/// M11-R8: LocalRunner strips the colour codes before it redacts — a secret printed as
+/// `ab\x1b[0mcd` (split by a colour reset) is `abcd` once stripped, and it is redacted.
+#[tokio::test]
+async fn local_runner_redacts_a_secret_split_by_a_colour_code() {
+    use toryo::process::redact::{Redactions, Secret};
+    use toryo::runner::{CommandRunner, LocalRunner, RunSpec};
+    let tmp = tempfile::tempdir().unwrap();
+    let (program, args): (PathBuf, Vec<String>) = if cfg!(windows) {
+        (
+            "pwsh".into(),
+            vec![
+                "-NoProfile".into(),
+                "-Command".into(),
+                "[Console]::Out.Write('key=ab' + [char]27 + '[0mcd!')".into(),
+            ],
+        )
+    } else {
+        (
+            "/bin/sh".into(),
+            vec!["-c".into(), r"printf 'key=ab\033[0mcd!'".into()],
+        )
+    };
+    let secret = Secret {
+        name: "S".into(),
+        value: "abcd".into(),
+    };
+    let r = LocalRunner
+        .run(
+            RunSpec {
+                name: "t".into(),
+                program: toryo::engine::checks::resolve_program(&program.display().to_string()),
+                args,
+                cwd: tmp.path().to_path_buf(),
+                env: std::env::vars().collect(),
+                boundary: toryo::process::Boundary::None,
+                timeout: Duration::from_secs(60),
+                cancel: None,
+                redact: Redactions::new(&[secret]),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.exit, Some(0), "{}", r.output);
+    assert_eq!(r.output.trim(), "key=[REDACTED:S]!");
+}

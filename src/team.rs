@@ -872,12 +872,9 @@ fn env_gate_problems(
         out.push(format!(
             "{key}.lock: required — the machine-wide lock name (e.g. d365-env): one environment gate per lock runs at a time"
         ));
-    } else if !crate::engine::lock::valid_lock_name(&g.lock) {
+    } else if let Some(why) = crate::engine::lock::lock_name_problem(&g.lock) {
         // M11-E3: the name is part of the lock's file name
-        out.push(format!(
-            "{key}.lock: `{}` — use letters, digits, `-`, `_` and `.` only (e.g. d365-env)",
-            g.lock
-        ));
+        out.push(format!("{key}.lock: `{}` — {why}", g.lock));
     }
     // M11-R3 (X3): `program` and `args` were expanded at load — this is the text that runs
     // (a value with a variable that is not set was reported at load, once)
@@ -987,6 +984,24 @@ pub fn problems(cfg: &Effective, root: &Path, machine: &str) -> Vec<String> {
                     out.push(format!(
                         "{}: {k}: only the implementer may have `{k}` — the {seat} is read-only; remove it",
                         rf.display()
+                    ));
+                }
+            }
+        }
+    }
+    // M11-R8: the machine's `skills_dir` holds trusted text — absolute, out of the agents' reach
+    if let Some(sd) = &team.skill_roots.machine {
+        let key = format!("{machine}: skills_dir");
+        match crate::config::expand_vars(sd) {
+            Err(e) => out.push(format!("{key}: {e:#} — set it, or write the path out")),
+            Ok(p) if !Path::new(&p).is_absolute() => out.push(format!(
+                "{key}: `{sd}` must be an absolute path (it is the machine's shared skills folder)"
+            )),
+            Ok(p) => {
+                if let Some((what, r)) = reach(cfg, &p) {
+                    out.push(format!(
+                        "{key}: `{sd}` is inside {what} ({}) — an agent could change the skills; keep the folder outside the repository, the task worktrees and the verify root",
+                        r.display()
                     ));
                 }
             }
@@ -2031,6 +2046,62 @@ mod tests {
             .unwrap();
         assert_eq!(g.args[3], format!("{tmp}/gates/dbsync.ps1"));
         assert_eq!(g.program, "powershell");
+    }
+
+    /// M11-R8: the machine's `skills_dir` is trusted text — after `%VAR%` it must be absolute
+    /// and outside the repository, the worktrees and the verify root; a folder that does not
+    /// exist is a `doctor` WARN, not a load problem.
+    #[test]
+    fn the_machine_skills_dir_is_absolute_and_out_of_reach() {
+        let (d, y, m) = draft_repo(&[]);
+        let tmp = d.path().display().to_string().replace('\\', "/");
+        let text = std::fs::read_to_string(&m).unwrap();
+        let line = format!("skills_dir: '{tmp}/machine-skills'");
+        assert!(text.contains(&line), "{text}");
+        let cfg = crate::config::Effective::load(&y, Some(&m)).unwrap();
+        let ok = crate::doctor::skills_dir_checks(&cfg);
+        assert_eq!(ok[0].level, crate::doctor::Level::Ok, "{:?}", ok[0].message);
+        for (dir, want) in [
+            ("machine-skills".to_string(), "must be an absolute path"),
+            (format!("{tmp}/repo/.toryo/x"), "is inside the repository"),
+            (format!("{tmp}/wts/shared"), "is inside the task worktrees"),
+            (
+                "%TORYO_R8_UNSET%/skills".to_string(),
+                "%TORYO_R8_UNSET% is not set",
+            ),
+        ] {
+            std::fs::write(&m, text.replace(&line, &format!("skills_dir: '{dir}'"))).unwrap();
+            let e = load_err(&y, &m);
+            assert!(
+                e.contains(&format!("{}: skills_dir:", m.display())) && e.contains(want),
+                "{dir}: {e}"
+            );
+        }
+        // (the fixture's implementer needs xpp-batch, found only in the machine folder so far)
+        let batch = d
+            .path()
+            .join("repo")
+            .join(".toryo")
+            .join("skills")
+            .join("xpp-batch");
+        std::fs::create_dir_all(&batch).unwrap();
+        std::fs::write(
+            batch.join("SKILL.md"),
+            "---\ndescription: d\n---\n# Batch\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &m,
+            text.replace(&line, &format!("skills_dir: '{tmp}/no-such-folder'")),
+        )
+        .unwrap();
+        let cfg = crate::config::Effective::load(&y, Some(&m)).unwrap();
+        let w = crate::doctor::skills_dir_checks(&cfg);
+        assert!(
+            w[0].level == crate::doctor::Level::Warn && w[0].message.contains("does not exist"),
+            "{:?}",
+            w[0].message
+        );
     }
 
     /// M11-R4: `writes` / `never` are normalised at load (the frozen config holds the

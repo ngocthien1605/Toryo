@@ -216,11 +216,40 @@ pub fn env_lock_path(lock: &str) -> PathBuf {
 /// An environment-gate lock name is part of a file name: letters, digits, `-`, `_`, `.`
 /// (not only dots).
 pub fn valid_lock_name(lock: &str) -> bool {
-    !lock.is_empty()
+    lock_name_problem(lock).is_none()
+}
+
+/// Why `lock` cannot be an environment-gate lock name, or None. M11-R8: a Windows device name
+/// (`con`, `nul`, `com1`, … — also before a dot) is not a file; names are case-insensitive
+/// (`D365-Env` is `d365-env`: one lock file and one deployment row).
+pub fn lock_name_problem(lock: &str) -> Option<&'static str> {
+    let chars = !lock.is_empty()
         && lock.chars().any(|c| c != '.')
         && lock
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !chars {
+        return Some("use letters, digits, `-`, `_` and `.` only (e.g. d365-env)");
+    }
+    let stem = lock
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let numbered = |p: &str| {
+        stem.strip_prefix(p)
+            .is_some_and(|n| n.len() == 1 && ('1'..='9').contains(&n.chars().next().unwrap()))
+    };
+    if ["con", "prn", "aux", "nul"].contains(&stem.as_str()) || numbered("com") || numbered("lpt") {
+        return Some("is a Windows device name (con, prn, aux, nul, com1–com9, lpt1–lpt9) — choose another (e.g. d365-env)");
+    }
+    None
+}
+
+/// The stored form of a lock name (M11-R8): lower case, so `D365-Env` and `d365-env` are one
+/// lock and one deployment row.
+pub fn lock_key(lock: &str) -> String {
+    lock.to_ascii_lowercase()
 }
 
 /// M11-E3: an environment gate's machine-wide lock — one gate per lock name runs at a time,
@@ -348,6 +377,32 @@ pub fn stop(store: &Store, task: &str, wait: Duration) -> Result<StopOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M11-R8: Windows device names are refused (also before a dot, any case); names are one
+    /// lock whatever their case.
+    #[test]
+    fn lock_names_refuse_device_names_and_ignore_case() {
+        for bad in [
+            "con",
+            "NUL",
+            "Aux",
+            "prn.x",
+            "com1",
+            "COM9",
+            "lpt3",
+            "lpt1.lock",
+        ] {
+            let why = lock_name_problem(bad).unwrap_or_else(|| panic!("{bad}"));
+            assert!(why.contains("Windows device name"), "{bad}: {why}");
+        }
+        for ok in [
+            "d365-env", "console", "com10", "com0", "lpt", "nul-env", "x.con",
+        ] {
+            assert_eq!(lock_name_problem(ok), None, "{ok}");
+        }
+        assert_eq!(lock_key("D365-Env"), "d365-env");
+        assert_eq!(env_lock_path("D365-Env"), env_lock_path("d365-env"));
+    }
 
     /// Group E review: an environment lock never shares a file with a task lock (task ids
     /// allow `-`, so `env-<lock>` could be one), and its name is folded to lower case.

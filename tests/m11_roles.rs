@@ -519,3 +519,55 @@ fn the_legacy_same_vendor_note_is_exact() {
         "{line:?}"
     );
 }
+
+/// M11-R8: a fence violation is named by its rule, not as "protected paths" — after the
+/// re-plan bound, and when recovery finds it after a crash.
+#[test]
+fn a_fence_violation_names_its_rule_after_the_bound_and_in_recovery() {
+    let role = fenced_role("[src/**]", "['**/Descriptor/*.xml']");
+    let env = setup_orgchart("codex-openai", "", &[(IMPL, &role)]);
+    create(&env, "WF-R8");
+    let bad = || turn(vec![plan_listing(&["docs/x.md"])]);
+    let s = script(&env, "wfr8.json", json!({"planner": [bad(), bad(), bad()]}));
+    let (_, err) = toryo(&env, &["run", "WF-R8", "--fake-agents", &s], &[]);
+    let t = task(&env, "WF-R8");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    let why = t.machine.reason().unwrap_or_default().to_string();
+    assert!(
+        why.contains("the plan lists paths the implementer may not change: `docs/x.md` (outside the implementer's write fence (`writes: [src/**]`))")
+            && why.contains("after 2 automatic re-plans")
+            && !why.contains("protected paths"),
+        "{why}"
+    );
+
+    // recovery: the owner dies after a turn that wrote outside the fence
+    let env = setup_orgchart("codex-openai", "", &[(IMPL, &role)]);
+    create(&env, "WF-R8C");
+    let s = script(
+        &env,
+        "crash.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), write("docs/x.md", "x\n"), implementation()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["run", "WF-R8C", "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "implement:after_turn")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let s = script(
+        &env,
+        "after.json",
+        json!({"implementer": [turn(vec![implementation()])], "reviewer": [turn(vec![approved()])]}),
+    );
+    let (_, err) = toryo(&env, &["run", "WF-R8C", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "WF-R8C");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    let why = t.machine.reason().unwrap_or_default().to_string();
+    assert!(
+        why.contains("left paths the implementer may not change: `docs/x.md` (outside the implementer's write fence (`writes: [src/**]`))"),
+        "{why}"
+    );
+}

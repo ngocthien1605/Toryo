@@ -244,7 +244,8 @@ from the repository checkout (`project.root`), never from a task worktree, and e
   on that machine. A setting in both `toryo.yaml` and the org chart (`roles:`, `commands:`,
   `pipeline.max_fix_cycles`) is an error.
 - **Limits.** `limits: { max_gate_retries, max_review_rounds }`: a failing gate counts against the first, a rejected
-  review (or a rejected final gate) against the second; a lone `max_fix_cycles` keeps today's single counter.
+  review (or a rejected final gate) against the second; a lone `max_fix_cycles` keeps today's single counter, and
+  an org chart without `limits:` has that single counter too (2 fix cycles) — not the split defaults.
   `status` shows `fix 1 (gate retries 1/3, review rounds 0/3)`.
 - **Checks.** `reviewer-differs-from-builder: off | warn | error` compares the `kind` of every profile whose
   implementer turn ran (also one that failed or was interrupted after writing — its work stays; M11-R7) with the
@@ -266,7 +267,8 @@ from the repository checkout (`project.root`), never from a task worktree, and e
   starts, every skill it needs must resolve: otherwise the task escalates with `skill_unavailable` (naming both
   lookup paths; no turn, no tokens) — put it back and `toryo resume <id> --note …`. A context with skills that is
   still over budget escalates with `context_over_budget`.
-- **The write fence.** The implementer's `writes:` (globs; when set, the only files it may change) and `never:`
+- **The write fence.** The implementer's `writes:` (globs; when set, the only files it may change — `writes: []` or no
+  `writes` means no allowlist: only `never` applies) and `never:`
   (never, even inside `writes`) — case-insensitive, `/` and `\` alike. A planned file outside the fence sends the
   plan back; a changed file outside it is restored and sent back to the implementer, with the rule named. The
   fence only narrows `toryo.yaml`: protected and denied paths stay so; `## Allow protected` in TASK.md opens a fence

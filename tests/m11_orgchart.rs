@@ -197,3 +197,50 @@ fn without_an_org_chart_the_mode_is_toryo_yaml_only() {
     assert_eq!(v["gates"][0]["name"], "divide-present");
     assert_eq!(v["files"].as_array().unwrap().len(), 2);
 }
+
+/// M11-R8: in org chart mode `task create --repo X` is refused unless X is `project.root` —
+/// the org chart was validated from there, and the instructions, culture and skills are read
+/// from the task's repository. `--repo` naming project.root itself is fine.
+#[test]
+fn task_create_repo_must_be_the_project_root_in_org_chart_mode() {
+    let env = setup_orgchart("codex-openai", "", &[]);
+    let other = env.root.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let (code, err) = toryo(
+        &env,
+        &[
+            "task",
+            "create",
+            "--file",
+            "TASK.md",
+            "--id",
+            "RP-1",
+            "--repo",
+            other.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("in org chart mode the task's repository must be project.root")
+            && err.contains("change project.root in")
+            && err.contains("or leave --repo out"),
+        "{err}"
+    );
+    assert!(!env.data.join("runs").join("RP-1").exists());
+    let (code, err) = toryo(
+        &env,
+        &[
+            "task",
+            "create",
+            "--file",
+            "TASK.md",
+            "--id",
+            "RP-2",
+            "--repo",
+            env.repo.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+}

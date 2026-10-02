@@ -31,12 +31,14 @@ pub fn fix_cycles(t: &TaskRow, sep: &str) -> String {
     }
 }
 
-/// M11-E3: what an environment holds, in words: `approved` once the holder's final gate is
-/// approved, else `not approved yet`; `deploying now` while the gate runs (`active`: the
-/// holder's run is alive), `interrupted …` when it was killed or stopped, `the deploy failed`.
+/// M11-E3: what an environment holds, in words: `approved` once the holder's final gate
+/// approved **this commit** (`approved_head`: the head it approved, M11-R8), else `not
+/// approved yet`; `deploying now` while the gate runs (`active`: the holder's run is alive),
+/// `interrupted …` when it was killed, stopped or timed out, `the deploy failed`.
 pub fn deployment_status(
     d: &super::store::Deployment,
     holder: Option<super::state::PipelineState>,
+    approved_head: Option<&str>,
     active: bool,
 ) -> &'static str {
     use super::state::PipelineState as St;
@@ -46,7 +48,7 @@ pub fn deployment_status(
             "interrupted — the environment may hold a partial deploy"
         }
         (Some(_), Some(false), _) => "the deploy failed",
-        (_, _, Some(St::Completed)) => "approved",
+        (_, _, Some(St::Completed)) if approved_head == Some(d.sha.as_str()) => "approved",
         (_, _, Some(St::Cancelled)) => "not approved — the task was cancelled",
         _ => "not approved yet",
     }
@@ -342,8 +344,23 @@ mod tests {
             ),
             (d(true, Some(true)), None, false, "not approved yet"),
         ];
+        // (the holder's final gate approved this row's commit)
         for (dep, state, active, want) in cases {
-            assert_eq!(deployment_status(&dep, state, active), want, "{dep:?}");
+            let head = Some(dep.sha.as_str());
+            assert_eq!(
+                deployment_status(&dep, state, head, active),
+                want,
+                "{dep:?}"
+            );
+        }
+        // M11-R8: a completed task whose final gate approved another commit, or none known
+        let done = d(true, Some(true));
+        for head in [Some("ffffffffffffffff"), None] {
+            assert_eq!(
+                deployment_status(&done, Some(St::Completed), head, false),
+                "not approved yet",
+                "{head:?}"
+            );
         }
         assert_eq!(
             deployment_line(&d(true, Some(true)), "not approved yet"),

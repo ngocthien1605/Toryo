@@ -115,7 +115,7 @@ Task list: `M11-review-fixes.md` (review of 2026-10-02, built and run on Linux b
 - [x] R5 — a skill that cannot be delivered stops the turn; the budget check covers the whole chain
 - [x] R6 — M18 script detection: no false refusals, no missed scripts
 - [x] R7 — the same-vendor check counts every turn that ran
-- [ ] R8 — cheap Low fixes and test gaps
+- [x] R8 — cheap Low fixes and test gaps
 
 ### Decisions of the list (X1–X5) and the answers to "Open"
 
@@ -333,6 +333,53 @@ AC of R1–R3 was confirmed met (R2 AC-4 is a property test: `base` was never Lo
   Claude writes and hits its quota → pause → `resume` → Codex succeeds → Claude reviews; `warn` names `claude-max`,
   `error` escalates `same_vendor_review` with no review attempt), `::the_legacy_same_vendor_note_is_exact` (the exact
   line in a toryo.yaml-only repository). AC-2: the C3 tests pass unchanged.
+
+### R8 — cheap Low fixes and test gaps (one commit)
+
+- **Timed-out / cancelled environment gate:** `run_environment_gates` runs the gate itself (not through
+  `run_gate_command`): `ok` is recorded empty when the gate timed out or was cancelled (`status`: "interrupted — the
+  environment may hold a partial deploy"); a stop that arrives after the gate finished keeps its real result (then the
+  run stops). Test `tests/m11_env_gates.rs::a_timed_out_environment_gate_is_recorded_as_interrupted` (a 3 s timeout,
+  the gate's child writes a heartbeat file: it stops growing — the whole tree is gone).
+- **"approved" means this commit:** `views::deployment_status(d, holder, approved_head, active)` — `approved` only when
+  the holder is `Completed` **and** the row's `sha` is the head its final gate approved (the completed task's
+  checkpoint). `environments()` passes it; the final-gate note passes none. M11 test changed:
+  `views::tests::deployment_status_in_words` passes the row's own sha as the approved head for its existing cases
+  (expectations unchanged) and gained two cases (another commit, none known → `not approved yet`).
+- **Lock names:** `lock::lock_name_problem` refuses Windows device names (`con prn aux nul com1–9 lpt1–9`, any case,
+  also before a dot — `con.lock` is a device); `lock::lock_key` lower-cases the name, and the runner uses that form
+  for the lock, the deployment row, the wait and `VERIFY_RESULT.json` (the frozen config keeps the text as written,
+  so its hash does not change). Tests: `lock::tests::lock_names_refuse_device_names_and_ignore_case`,
+  `tests/m11_env_gates.rs::a_lock_name_is_stored_in_lower_case`.
+- **`if_missing: error` end to end:** `tests/m11_env_gates.rs::a_missing_environment_gate_refuses_the_task`.
+- **Redaction:** `LocalRunner` strips ANSI, then redacts (the whole output and the live chunks). Test
+  `tests/adapters.rs::local_runner_redacts_a_secret_split_by_a_colour_code` (`key=ab\x1b[0mcd!` → `key=[REDACTED:S]!`;
+  Windows and Linux).
+- **`skills_dir`:** a B3 problem (`<machine config>: skills_dir: …`) when, after `%VAR%`, it is not absolute, an
+  unset variable, or inside the repository / worktrees / verify root; `doctor::skills_dir_checks` — OK when the folder
+  exists, WARN when it does not. Test `team::tests::the_machine_skills_dir_is_absolute_and_out_of_reach`.
+- **Tests the review found missing:** `tests/m11_skills.rs::a_plan_without_skills_gives_the_implementer_none`,
+  `::fix_and_fallback_turns_get_the_approved_skills` (`fix-1` and the Claude fallback both get `xpp-batch` only).
+- **Messages:** a seat only the machine config names is reported as `<machine config>: seats.<x>: unknown role …`
+  (`roles.<x>` when the file says `roles:`; new `MachineConfig::seats_spelling`, `Origins::machine_roles_key`, both
+  not serialised) — test `config::tests::a_misspelt_machine_seat_names_the_machine_config`. Fence violations name
+  their rule: `Protected::violation_words` — recovery ("the interrupted attempt … left paths the implementer may not
+  change: `docs/x.md` (outside the implementer's write fence (`writes: [src/**]`))") and the plan re-plan bound (the
+  plan-policy event now carries that reason when a path breaks the fence) — test
+  `tests/m11_roles.rs::a_fence_violation_names_its_rule_after_the_bound_and_in_recovery`.
+- **Loader:** `task create --repo X` in org chart mode is refused unless X is `project.root` (compared canonicalised):
+  "change project.root in <toryo.yaml> or leave --repo out" — test `tests/m11_orgchart.rs::task_create_repo_must_be_
+  the_project_root_in_org_chart_mode`. The template test `config::tests::the_commented_m11_machine_block_parses`
+  uncomments the M11 block of `templates/toryo.local.yaml.example` (`seats`, `skills_dir`, `environment_gates`,
+  `verify`; the active `roles:` is dropped — one of the two per file) and parses it as a `MachineConfig`.
+- **Docs:** README and HUONG-DAN §5.9 — an org chart without `limits:` has the single counter (2 fix cycles), not
+  split defaults; `writes: []` (or none) means no allowlist, only `never`. The machine template notes the lock-name
+  and `skills_dir` rules.
+- **Deviation from the drafts (recorded as the list asks):** the draft `toryo-local.yaml` says skills "ARE frozen and
+  hashed with each task" — only the skill **names** (role files, the plan) and the lookup **roots** are frozen; the
+  `SKILL.md` text is read for each attempt and hashed into that attempt's `context_sha256` (D3 AC-2).
+- **Open, not fixed (the list says so):** `toryo spike pipeline` (the M0 kit, `src/spike/pipeline.rs`) runs repository
+  verify commands with `Boundary::None` whatever the machine floor says.
 
 ## Progress
 

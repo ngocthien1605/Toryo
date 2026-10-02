@@ -148,6 +148,36 @@ pub fn policy_checks(cfg: &Effective) -> Vec<Check> {
     .collect()
 }
 
+/// M11-R8: the machine's `skills_dir` (org chart mode) — a WARN when the folder does not
+/// exist: a skill only there resolves nowhere, and the turn that needs it escalates
+/// (`skill_unavailable`).
+pub fn skills_dir_checks(cfg: &Effective) -> Vec<Check> {
+    let Some(dir) = cfg
+        .team
+        .as_ref()
+        .and_then(|t| crate::team::machine_skills_dir(&t.skill_roots))
+    else {
+        return Vec::new();
+    };
+    let (level, message) = if dir.is_dir() {
+        (Level::Ok, format!("{} exists", dir.display()))
+    } else {
+        (
+            Level::Warn,
+            format!(
+                "{} does not exist — a skill found only there cannot be delivered (the turn escalates with skill_unavailable)",
+                dir.display()
+            ),
+        )
+    };
+    vec![Check {
+        level,
+        area: "skills_dir".into(),
+        message,
+        source: None,
+    }]
+}
+
 /// Minimum Claude Code versions for flags the plan relies on (§14).
 const CLAUDE_MIN_RESTRICTED: (u64, u64, u64) = (2, 1, 248);
 const CLAUDE_MIN_PERMISSION_PROMPTS: (u64, u64, u64) = (2, 1, 259);
@@ -261,6 +291,7 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
     verify_root_check(&mut r, cfg);
     r.0.extend(origin_checks(cfg));
     r.0.extend(policy_checks(cfg));
+    r.0.extend(skills_dir_checks(cfg));
 
     // Profiles
     let records = results::load();
