@@ -1,0 +1,124 @@
+# =============================================================================
+# toryo-local.yaml (draft) -- test fixture (M11-B1): owner paths replaced by @TMP@
+#   location: MERGE INTO %USERPROFILE%\.toryo\toryo.local.yaml (machine config)
+#
+# WHAT THIS FILE IS
+#   The MACHINE half of Toryo's configuration: everything about THIS computer,
+#   and everything that runs with your full rights. It lives outside every
+#   repository and worktree, so no agent can edit it (R60).
+#   The repository half is .toryo/ (org chart, roles, repo skills).
+#
+#   Analogy: the job cards (repository) say WHAT must be done. The owner of
+#   the workshop (this file) says which craftsmen work here, where the shared
+#   manuals are kept, and how the fit test is done in this house.
+#
+# HOW TO READ THIS FILE (for the implementer)
+#   - deny_unknown_fields and "did you mean ...?" hints, like every Toryo file.
+#   - Never frozen into a repository; profiles, seats, skills and environment
+#     gates ARE frozen and hashed with each task, like today's profiles.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# PROFILES  --  the craftsmen available on this machine (exists today, R60)
+# -----------------------------------------------------------------------------
+# Seats in .toryo/toryo-orgchart.yaml name these. Every field (Foundry,
+# secrets, versions): toryo/templates/toryo.local.yaml.example.
+profiles:
+  claude-max:                      # Claude Max subscription (OAuth login)
+    kind: claude
+    billing: subscription
+    exe: '@TMP@/bin/claude.exe'
+
+  codex-openai:                    # ChatGPT Plus login (was: codex --profile openai)
+    kind: codex
+    billing: subscription
+    exe: '@TMP@/bin/codex.cmd'
+    env:
+      # Log in once for this home:  $env:CODEX_HOME = '<this path>'; codex login
+      # Only auth and sessions are used here; a config.toml here is ignored.
+      CODEX_HOME: '@TMP@/codex-openai'
+    codex:
+      sandbox_mode: workspace-write
+      windows_sandbox: unelevated  # WITHOUT THIS THE WINDOWS SANDBOX IS OFF (R18)
+
+# -----------------------------------------------------------------------------
+# SEATS  --  optional overrides for THIS machine only
+# -----------------------------------------------------------------------------
+# Same fields as `seats` in the org chart. A seat set here replaces the repo's
+# seat on this machine; `toryo config show` marks it "repo, overridden by
+# machine". (Today's key is `roles:`; the new loader reads `seats:`.)
+# Example for the company laptop (Claude through Azure Foundry):
+# seats:
+#   planner:  { profile: claude-foundry, model: opus }
+#   reviewer: { profile: claude-foundry, model: opus }
+
+# -----------------------------------------------------------------------------
+# SKILLS  --  this machine's shared skills folder
+# -----------------------------------------------------------------------------
+# Each skill = <skills_dir>/<name>/SKILL.md. Looked up AFTER the repository's
+# .toryo/skills/<name>/ (repo first, then here). Optional: without it only
+# repo skills are found. Forward slashes work on Windows.
+skills_dir: '@TMP@/machine-skills'
+
+# -----------------------------------------------------------------------------
+# ENVIRONMENT GATES  --  gates that change this machine's D365FO environment
+# -----------------------------------------------------------------------------
+# An `environment` gate runs with your full user rights, so its command lives
+# here, out of every agent's reach. The repository only declares that the
+# gate is required (toryo-orgchart.yaml, gates.dbsync).
+#   - A gate defined here that no repository declares is fine (unused).
+#   - A repository gate `kind: environment` with no entry here follows that
+#     gate's `if_missing` (error | skip).
+#   - `program`: absolute path or a PATH name. Every path in `args` must be
+#     absolute and must NOT be inside the repository, a task worktree or the
+#     verify root (validated): the script must be out of the agents' reach.
+#   - When it runs: only after every `check` gate of the same verify run
+#     passed. Normal user token (no Low integrity), working directory = an EMPTY
+#     folder (M11 review X1). TORYO_VERIFY_CHECKOUT is a fresh export of the
+#     commit (M11 review X6) that no agent code could touch; TORYO_VERIFY_BUILD is
+#     written by the check gates at Low integrity (untrusted when they run tests).
+#     Inside a Job Object (timeout kills the whole tree).
+#     Environment built from scratch (R23) + `env` + resolved `secret_env`.
+#   - Toryo records, per lock name, which task and commit it last deployed.
+#     `toryo status` and the final approval show it, e.g.
+#         d365-env holds BR-001 @ 1a2b3c4 (not approved yet)
+#     so you always know what code your environment is running.
+environment_gates:
+  dbsync:
+    program: powershell            # Windows PowerShell 5.1; use pwsh for 7
+    args: [-NoProfile, -NonInteractive, -File, '@TMP@/gates/dbsync.ps1']
+
+    # Machine-wide lock. Only one environment gate holding this name runs at a
+    # time, across ALL tasks (they share one AxDB). A second task waits, and
+    # `toryo status` shows "waiting for lock d365-env". Required.
+    lock: d365-env
+
+    # Optional plain variables for the script.
+    # env:
+    #   D365_PACKAGES: 'K:\AosService\PackagesLocalDirectory'
+
+    # Optional secrets, read from Windows Credential Manager at run time.
+    # Only if your sync needs credentials. Redacted from every log.
+    # secret_env:
+    #   D365_SYNC_SECRET: credman:toryo/d365-sync
+
+# -----------------------------------------------------------------------------
+# CONTRACT FOR THE SCRIPT (dbsync.ps1)
+# -----------------------------------------------------------------------------
+#   1. The exit code decides: 0 = pass, anything else = fail.
+#      PowerShell exits 0 even when a native .exe failed, so start with
+#          $ErrorActionPreference = 'Stop'
+#      and after every native call (SyncEngine.exe, msbuild.exe, ...):
+#          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+#   2. Deploy what Toryo verified, nothing else: the source from
+#      $env:TORYO_VERIFY_CHECKOUT (commit $env:TORYO_SHA) and/or the compiled
+#      package from $env:TORYO_VERIFY_BUILD -- NEVER from your main repository
+#      folder. (On many dev VMs the repo's Metadata folder is linked into
+#      PackagesLocalDirectory; syncing that would test the wrong code.)
+#   3. Idempotent: Toryo runs it again in the next fix cycle and after a crash.
+#   4. Print the useful error lines; the end of the output is what the
+#      implementer receives to fix the problem.
+#   5. Never write into $env:TORYO_VERIFY_CHECKOUT. Toryo checks afterwards
+#      that the checkout is unchanged (verify_mutated_tree).
+#   6. Never wait for input. With -NonInteractive a prompt fails at once
+#      instead of hanging until the timeout.

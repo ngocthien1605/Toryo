@@ -130,11 +130,16 @@ print one JSON document on stdout and nothing else there. Field names are snake_
 { "tasks": [ {
     "id": "BR-003", "title": "…", "state": "WaitingFinalApproval",   // PipelineState
     "fix_cycle": 1, "max_fix_cycles": 3,
+    // M11, only with the org chart's split limits: "gate_retries", "max_gate_retries",
+    // "review_rounds", "max_review_rounds" (max_fix_cycles is then their sum)
     "spent_tokens": 61234, "reserved_tokens": 0, "budget_tokens": null,   // R41; null = no admission cap
     "active_owner": null,          // "user pid N" while a live process holds the task lock (never a lock probe)
     "compile_only": false,         // R59: an X++ verify proves compile level only; null: frozen config unreadable
     "next_action": "review the branch toryo/BR-003 …"   // what `status` prints after `next:`
-} ] }
+} ],
+  // M11, only once an environment gate has deployed (task show --json: this task's rows):
+  "environments": [ { "lock": "d365-env", "task": "BR-001", "sha": "<sha>", "gate": "dbsync", "machine": "UDE-1",
+                      "started_at": "…", "finished_at": "…", "ok": true, "approved": false, "status": "not approved yet" } ] }
 // task show ID --json: the task object above, plus
 { "worktree": "…", "branch": "toryo/BR-003", "run_store": "…\\runs\\BR-003",
   "attempts": [ { "id": "BR-003/implement/1", "stage": "implement", "attempt": 1, "status": "succeeded",
@@ -156,7 +161,8 @@ recorded them — a cumulative adapter's delta —, or `reserved_tokens` for a t
 `gate_opened` (`gate`, `occurrence`), `budget_warning` (`used`, `cap`), `escalated` (`reason_class` — a typed
 snake_case class such as `max_fix_cycles`, `review_blocked`, `protected_config_changed` —, `reason`),
 `paused` (`reason`), `run_ended` (`state`, `next_action`, `from` = the state when the drive started, `error` when
-it stopped with one). Every drive command ends its lines with one `run_ended`, also when it fails before the
+it stopped with one); M11: `lock_waiting` (`lock`, `holder`) and `environment_deployed` (`lock`, `sha`, `ok`) for
+environment gates, whose `verify_command` also has `kind: "environment"` (absent for every other command). Every drive command ends its lines with one `run_ended`, also when it fails before the
 first stage. `seq` grows across runs; `generation` is the task lock generation of the writing command. Reasons
 are redacted like captures. `task cleanup` removes the file with the run store. The engine's own stderr lines
 (`[state] …`, stage headers, `✔ checkpoint …`, verify commands, `!! budget: …`, and the reason of every
@@ -206,6 +212,176 @@ a command line or a script; it never blocks or fails the run, and toryo waits fo
 Known limit: under PowerShell Constrained Language Mode (AppLocker/WDAC policies) the script cannot load the
 WinRT types — `notify-test` then fails and says so. Elsewhere than Windows: nothing is shown.
 
+## Org chart mode (M11)
+
+A repository can describe its team in `.toryo/` instead of `toryo.yaml`'s `roles:` and `commands:`.
+**Without `.toryo/toryo-orgchart.yaml` nothing changes**: a `toryo.yaml`-only repository behaves as in M10,
+with the same configuration hash.
+
+```
+<repo>/
+  toryo.yaml                          # project, policy, verify, timeouts, context, budgets — no roles/commands
+  CULTURE.md                          # optional team norms (culture: in the org chart)
+  .toryo/
+    toryo-orgchart.yaml               # WHO: seats → Toryo profiles, gates, limits, checks
+    roles/<seat>/toryo-role.yaml      # WHAT: purpose, instructions, skills, writes/never, before_handoff
+    roles/<seat>/instructions.md      # added after Toryo's built-in role text, never instead of it
+    skills/<name>/SKILL.md            # repository skills
+    context/*.md                      # project policy (as before)
+```
+
+Starter set: `templates/d365fo/.toryo/`, `templates/d365fo/CULTURE.md` and `templates/d365fo/toryo.orgchart.yaml.example`
+(the `toryo.yaml` of this mode). Every key of these files is `deny_unknown_fields` with a "did you mean"
+hint (`seats.reviwer: seat 'reviwer' not found. Did you mean 'reviewer'?`); YAML tags are refused in every repository
+file (review C1); all problems of a load are reported at once, each with its file and key path. `.toryo/` is read
+from the repository checkout (`project.root`), never from a task worktree, and everything under it is a protected path.
+
+- **The flow is fixed:** plan → build → review, with the plan gate and the final gate. A `flow:` key is an error.
+- **Seats.** Exactly `planner`, `implementer`, `reviewer`; each names a **Toryo profile** of the machine config
+  (R60) — `codex --profile openai` becomes a profile `codex-openai` with its own `CODEX_HOME`. `model` overrides the
+  profile's model. `fallback` (an ordered list of profiles, implementer only; omitted = none) — a fallback on the
+  planner or reviewer is an error. The machine config's `seats:` (the new spelling of `roles:`) overrides a seat
+  on that machine. A setting in both `toryo.yaml` and the org chart (`roles:`, `commands:`,
+  `pipeline.max_fix_cycles`) is an error.
+- **Limits.** `limits: { max_gate_retries, max_review_rounds }`: a failing gate counts against the first, a rejected
+  review (or a rejected final gate) against the second; a lone `max_fix_cycles` keeps today's single counter, and
+  an org chart without `limits:` has that single counter too (2 fix cycles) — not the split defaults.
+  `status` shows `fix 1 (gate retries 1/3, review rounds 0/3)`.
+- **Checks.** `reviewer-differs-from-builder: off | warn | error` compares the `kind` of every profile whose
+  implementer turn ran (also one that failed or was interrupted after writing — its work stays; M11-R7) with the
+  reviewer's: `warn` (default) notes it at the final gate, `error` escalates
+  (`same_vendor_review`) before the review turn.
+- **Instructions and culture.** In this mode the context of every agent has the embedded role template **always**,
+  then the role's `instructions.md`; the culture file closes the policy sources. A leftover `.toryo/roles/<role>.md`
+  (the M4 override) is an error: move it to `.toryo/roles/<role>/instructions.md`.
+- **Skills.** A role file lists skill names; each is `.toryo/skills/<name>/SKILL.md` of the repository, else
+  `<skills_dir>/<name>/SKILL.md` of the machine config (first match wins; not found is an error naming both). The
+  implementer's list is a **menu**: the planner sees `name — description` (from the SKILL.md front matter) and lists
+  in the plan's `skills` what this task needs; `PLAN.md` shows `Skills for the implementer: …`; a name off the
+  menu, or skills that do not fit `context.budget_kb.implementer`, send the plan back (bounded). Planner and reviewer
+  get every skill of their role file. Skills are pasted into the context file (never trimmed, hashed, listed by
+  `toryo context show` with origin and SHA-256), never into the untrusted user prompt. **Only `SKILL.md` is
+  delivered**; files next to it are readable by the agents only for repository skills (they are in the worktree).
+  The menu lists only the skills that resolve now. The budget check covers **every profile of the implementer
+  chain** (a Claude fallback has TASK.md and PLAN.md inline, never trimmed to make room for skills). Before a turn
+  starts, every skill it needs must resolve: otherwise the task escalates with `skill_unavailable` (naming both
+  lookup paths; no turn, no tokens) — put it back and `toryo resume <id>`. A context with skills that is still over
+  budget escalates with `context_over_budget`. These, and a gate/toolchain/boundary the machine cannot provide, are
+  **machine-caused** (M11-R11, X8): a plain `toryo resume <id>` goes back into the stage once the cause is fixed — no
+  fix cycle, no implementer turn; `--note` is only for giving the implementer another cycle.
+- **The write fence.** The implementer's `writes:` (globs; when set, the only files it may change — `writes: []` or no
+  `writes` means no allowlist: only `never` applies) and `never:`
+  (never, even inside `writes`) — case-insensitive, `/` and `\` alike. A planned file outside the fence sends the
+  plan back; a changed file outside it is restored and sent back to the implementer, with the rule named. The
+  fence only narrows `toryo.yaml`: protected and denied paths stay so; `## Allow protected` in TASK.md opens a fence
+  entry like a protected path. Patterns are normalised at load (`./src/**`, `src/` and `src` all mean `src/**`: the
+  path and everything under it; a last segment without a wildcard covers what is under it too, `**/secrets` is
+  `**/secrets/**`; a wildcard pattern without a `/` matches at any depth, `*.pfx` is `**/*.pfx`); an absolute pattern, `..`, an empty one or syntax the matcher lacks (`{ } [ ] !`;
+  it has `*`, `**`, `?`) is a load error. (`policy.deny_paths` / `protected_paths` keep their M10 behaviour;
+  `toryo doctor` warns about a pattern there that can never match.)
+- **The culture file is protected** (org chart mode) like the verify files: an agent's change is restored, unless
+  TASK.md lists it under `## Allow protected`.
+- **Gates.** The implementer's `before_handoff` lists gates by name, every `check` gate before every `environment`
+  gate, at least one check gate. They run on the checkpoint commit, in that order, and stop at the first failure;
+  the exit code decides. Every gate gets `TORYO_TASK`, `TORYO_SHA`, `TORYO_VERIFY_CHECKOUT`, `TORYO_VERIFY_BUILD`
+  (legacy verify commands too).
+  - `kind: check` — defined in the repository (`program`/`args` or `tool: xpp` + `metadata`/`projects`, `timeout:
+    30s | 20m | 1h`), runs exactly like a verify command: clean checkout, Low integrity, no secrets, its script
+    protected. (M18, for everyone; M11-R10, X7) a gate's **entry script** — the file that decides pass or fail — is
+    protected before it exists, and `task create` refuses a configuration whose base commit lacks it, because the
+    implementer could write it: the program when it is a repository path; `-File x` of PowerShell, else every literal
+    path with a separator and a script extension in a `-Command` line (`& { ./x.ps1 }`), else the first positional
+    `.ps1`; the same in a `cmd /c` line (`call scripts\x.cmd`), where a bare command name (the head of any `&&` / `&`
+    / `|` / `;` segment) with a script extension counts too unless a program of that name is on PATH; in a shell's `-c` line (also `-ec`, `-euxc`); the first argument of
+    `sh`/`bash`/`python`/`node`/`ruby`/`perl` that is not a flag or a flag's value (`-o`, `-W`, `-r`, `-I`,
+    `--env-file`, `--rcfile`, …). A missing entry script is refused only when it has a separator or a script extension
+    (`sh check` is protected, not refused) and the repository does not ignore it (`node dist/cli.js` with `dist/`
+    ignored is build output: admitted, still protected). **Every other argument** — also the value of `KEY=value`,
+    `--flag=value`, `-Flag:value`, `/p:Name=value` — is protected when it names a file of the base commit and never
+    refused; a missing one with a script or program extension gets a `note:` at `task create` and in `doctor`.
+    Remaining limits: a file a gate script itself loads (dot-sourced, imported) is not seen; a script without an
+    extension, in the repository root, run by a program outside this table.
+  - `kind: environment` — the repository only declares it (`timeout`, `if_missing: error | skip`); the command is
+    `environment_gates.<name>` in the machine config (`program`, `args`, `lock`, `env`, `secret_env`), frozen with the
+    task. It runs only after every check gate passed (a check gate that changed a tracked file of the verify checkout
+    → no environment gate starts, `verify_mutated_tree`), with **your normal rights** (no Low integrity), and it
+    **never reads the checkout the check gates used** (M11 review X6): once it holds its lock, Toryo exports the
+    checkpoint commit afresh from the repository's object store into `<verify_root>\<task>\deploy`, a folder no agent
+    code can write — that export is its `TORYO_VERIFY_CHECKOUT` (no `.git`; its tree id is in `VERIFY_RESULT.json`,
+    `source: "export"`). What a check gate left in the checkout is listed (`checkout_extra`, one warning), never
+    deployed; `verify.checkout: tracked` works with environment gates too. It runs in an **empty working directory**
+    that agent code cannot write (`<verify_root>\<task>\envgate`), inside a Job Object, with an
+    environment from scratch + the gate variables + `env` + the resolved
+    `secret_env` (redacted everywhere). The program and every script path must be absolute (or a PATH name) and
+    outside the repository, the worktrees and the verify root; `%VAR%` in them is expanded once, at load (an unset
+    variable is a load error) — the expanded text is what is checked, frozen and run (`config show` prints it), and a
+    PATH name that resolves inside those folders is refused at run time. One gate per `lock` runs at a time across all tasks;
+    a second waits (`status`: `waiting for lock d365-env (held by T-12)`), `toryo stop` ends the wait. A failure
+    goes back to the implementer as data and counts against `max_gate_retries`. A machine without the gate:
+    `if_missing: error` refuses the task, `skip` runs without it and says so at the final gate.
+  - **The script contract** (`templates/toryo.local.yaml.example`): exit code decides (PowerShell: `$ErrorActionPreference
+    = 'Stop'` and `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }` after every native call); deploy only
+    `$env:TORYO_VERIFY_CHECKOUT` / `$env:TORYO_VERIFY_BUILD`, never your main repository folder; idempotent; print
+    the useful error lines; never write into `TORYO_VERIFY_CHECKOUT` (`verify_mutated_tree`); never wait for input; the working
+    directory is an empty folder — never rely on it, call every tool by its absolute path and do not run `git` there
+    (use `TORYO_SHA`). `TORYO_VERIFY_BUILD` is written by the check gates at Low integrity: when a check gate runs
+    agent-written code (tests), treat it as untrusted and build again from `TORYO_VERIFY_CHECKOUT` inside the script.
+- **What is deployed.** Before an environment gate starts, Toryo records per lock which task and commit the
+  environment receives (`environment_deployments`), and updates it at the end. `toryo status` shows one line per
+  lock (`environment    d365-env holds BR-001 @ 1a2b3c4d5e6f (not approved yet)` — `approved` once that task's
+  final gate is approved; `interrupted` after a crash or stop), so do `task show`, both `--json` documents
+  (`environments[]`) and the final gate notes. Cancelling or cleaning up a task never clears it: the environment
+  still runs that code. With an X++ compile and an environment gate that passed, the final gate says `verify:
+  compile + dbsync on <machine>` instead of `compile only`.
+- **The machine floor (review H2, for everyone).** The machine config's `verify: { min_boundary, verify_root }`: a
+  repository `verify.boundary: none` is refused at `task create` (and `task config --reload`) unless the machine says
+  `min_boundary: none`; a machine `verify_root` replaces the repository's. Environment gates are the only sanctioned
+  way to run something with your full rights.
+
+### Migrating an M10 `toryo.yaml` to `.toryo/`
+
+1. Copy `templates/d365fo/.toryo/` (or write `.toryo/toryo-orgchart.yaml` and `.toryo/roles/{planner,implementer,reviewer}/toryo-role.yaml`).
+2. `roles:` → `seats:` of the org chart (same `profile`, `model`, `fallback`). An implementer without `fallback`
+   now has **none** (M10: the planner's profile) — write `fallback: [<planner profile>]` to keep the old behaviour.
+   Delete `roles:` from `toryo.yaml`; the machine's `roles:` may stay or become `seats:`.
+3. `commands.verify[]` → `gates:` of the org chart, `kind: check`, with `timeout: 20m` instead of `timeout_min: 20`;
+   list their names, in order, in the implementer's `before_handoff`. Delete `commands:` from `toryo.yaml`.
+4. `pipeline.max_fix_cycles` → `limits:` (`max_fix_cycles: 3` alone, or `max_gate_retries` / `max_review_rounds`).
+   Delete it from `pipeline:` (the budget keys stay).
+5. `.toryo/roles/<role>.md` → `.toryo/roles/<role>/instructions.md`, named in that role file's `instructions:` — it is
+   now added after Toryo's built-in role text instead of replacing it; drop what duplicates the built-in rules.
+6. `codex --profile <name>` logins → a Toryo profile per login in the machine config, each with its own
+   `env: { CODEX_HOME: … }` (`$env:CODEX_HOME = '<path>'; codex login` once); seats name those profiles.
+7. A repository with `verify.boundary: none` needs `verify: { min_boundary: none }` in the machine config.
+8. Check with `toryo config show`: the mode, every file read, where each seat, gate and setting came from.
+
+## The effective configuration (M11)
+
+`toryo config show [--json]` prints the configuration `task create` would freeze for this repository and
+machine: the mode (`toryo.yaml only`, or `org chart` when `<project.root>/.toryo/toryo-orgchart.yaml` exists),
+every file read with its SHA-256, and where each seat, profile, gate, toolchain, `skills_dir` and verify setting
+came from. Sources: `repo`, `machine`, `repo_overridden_by_machine` (a machine seat override, or the machine's
+`verify.verify_root`), `null` (not set). `--json` (schema 1):
+
+```jsonc
+{ "schema": 1, "mode": "org chart",                 // or "toryo.yaml only"
+  "config_sha256": "…",                             // what `task create` records as tasks.config_sha256
+  "team": "d365fo-dev",                             // null in toryo.yaml-only mode
+  "files": [ { "what": "toryo.yaml", "path": "…", "sha256": "…" } ],   // + machine config, org chart, role <seat>
+  "seats": [ { "seat": "implementer", "profile": "codex-openai", "model": null, "fallback": ["claude-max"], "source": "repo" } ],
+  "profiles": [ { "name": "claude-max", "kind": "claude", "billing": "subscription", "exe": "…", "source": "machine" } ],
+  "gates": [ { "name": "dbsync", "kind": "environment", "timeout": "30m", "lock": "d365-env", "if_missing": "error",
+               "defined_on_this_machine": true, "source": "machine" } ],   // toryo.yaml only: the verify commands, kind "check"
+  "before_handoff": ["build", "dbsync"],             // the implementer's gate order; null without an org chart
+  "toolchains": [ { "name": "xpp", "source": "machine" } ],
+  "skills_dir": { "path": "C:/Temp/AgentShare/skills", "source": "machine" },   // null when unset
+  "verify": { "boundary": { "value": "low_integrity", "source": "repo" },
+              "min_boundary": { "value": null, "source": null },          // null: the default floor low_integrity
+              "verify_root": { "value": "%LOCALAPPDATA%\\toryo-verify", "source": "repo" } },
+  "limits": { "max_gate_retries": 3, "max_review_rounds": 3 },            // null without an org chart
+  "checks": { "reviewer-differs-from-builder": "warn" } }
+```
+
 ## Build and test
 
 ```powershell
@@ -237,6 +413,12 @@ cargo test --release
 | `tests/m10_views.rs` | Windows + Linux | M10-B: `status --json`, `task show --json`, a cleaned-up task; `watch` history, `--json`, a concurrent run followed to the gate, errors, Ctrl+C → exit 0 |
 | `tests/m10_usage.rs` | Windows + Linux | M10-C: `toryo usage` numbers and costs (text and `--json`), `no price`, the model on usage rows and the pre-M10 fallback, bad and missing price tables; scripted turns of a mixed run are exact zero |
 | `tests/m10_notify.rs` | Windows + Linux (`notify-test` Windows only) | M10-D1: toasts at the gates, an escalation and the end, the machine setting and `--notify`/`--no-notify`, `notify-test --dry-run` |
+| `tests/m11_trust.rs` | Windows + Linux | M11-A: the machine floor for `verify.boundary`, the machine `verify_root` and its origin in `doctor` |
+| `tests/m11_orgchart.rs` | Windows + Linux | M11-B/C1: `config show` (text, `--json`), a task frozen and reloaded with the same digest, a fake run to the final gate in org chart mode, layered role instructions in `context show` |
+| `tests/m11_roles.rs` | Windows + Linux | M11-C: the write fence at plan time and after a build turn (`## Allow protected`), `reviewer-differs-from-builder` off/warn/error after a fallback, split limits end to end |
+| `tests/m11_gates.rs` | Windows + Linux | M11-E1/E2: the gate variables, M18 admission, verify output redacted with the task's secrets, stdout/stderr order kept |
+| `tests/m11_env_gates.rs` | Windows + Linux (normal-token vs Low-IL test Windows only) | M11-E3: environment gates after the checks, the deployment record in every view, the shared lock with `stop`, secrets, `if_missing: skip`, a mutated checkout, an unavailable gate, a crash during the gate |
+| `tests/m11_skills.rs` | Windows + Linux | M11-D: the planner's menu, the plan's `skills` (off the menu, over the budget, none), skills per role in `context show`, a changed SKILL.md, the Claude implementer's context file |
 
 CI (`.github/workflows/ci.yml`) runs `cargo test`, `clippy -D warnings` and the core without the kit
 (`--no-default-features`) on `windows-latest` and `ubuntu-latest`, then builds a release `toryo.exe`.
@@ -270,3 +452,13 @@ text as before, except that every escalation and pause now prints its reason onc
 lock; `toryo usage` with estimated cost from the machine's `prices.toml` (plan §12), and every usage row now
 records its model; scripted turns of a mixed fake/real run cost exact zero; an opt-in Windows toast when a task
 needs the owner. Decisions, deviations and open questions: `docs/M10-NOTES.md`.
+
+M11 (`M11_task.md`, branch `m11/orgchart`) is done in code: the trust floor (review C1 — repository files are
+parsed without machine-only keys and YAML tags are refused; H2 — a machine floor for `verify.boundary` and the
+machine's `verify_root`); org chart mode (`.toryo/toryo-orgchart.yaml`, role files, `toryo config show`), layered
+role instructions and culture, the implementer's write fence, `reviewer-differs-from-builder`, split retry limits;
+check gates with gate variables, M18 entry points protected before they exist, verify output redacted with the
+task's secrets (review M2), environment gates with a machine-wide lock and a deployment record; skills (repository
+then machine, the planner's choice, delivered through the context loader). Decisions, deviations and open
+questions: `docs/M11-NOTES.md`. Next after M11: review M13 (cp932 output on Japanese Windows also garbles DB-sync
+output).

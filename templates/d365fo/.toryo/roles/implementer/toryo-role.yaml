@@ -1,0 +1,114 @@
+# toryo-role.yaml template of the implementer (M11-F1) — .toryo/roles/implementer/toryo-role.yaml
+#
+# TODO(owner):
+#   1. skills — the menu the planner chooses from; each name needs a SKILL.md with a
+#      `description` in .toryo/skills/<name>/ or in the machine's skills_dir.
+#   2. writes / never — the files the implementer may change in YOUR repository layout.
+#   3. before_handoff — the gate names of toryo-orgchart.yaml (checks first).
+#
+# =============================================================================
+# toryo-role.yaml  --  location: .toryo/roles/implementer/toryo-role.yaml
+#
+# WHAT THIS FILE IS
+#   A "role" is a craftsman's job card: what this role is for, which rules and
+#   manuals it follows, which files it may touch, and which checks must pass
+#   before its work moves on.
+#
+#   A role is AGENT-AGNOSTIC. It never says "Codex" or "Claude". WHO sits in
+#   this seat is decided in toryo-orgchart.yaml. If Codex runs out of quota and
+#   Claude takes over, this file does not change.
+#
+# HOW TO READ THIS FILE (for the implementer)
+#   - The role name is the FOLDER name (roles/implementer/), not a field here.
+#   - Unknown fields must be a hard error (serde deny_unknown_fields), with a
+#     friendly message and a "did you mean ...?" hint.
+#   - Every path is relative to the repository root unless stated otherwise.
+# =============================================================================
+
+# Schema version. Lets Toryo reject or migrate files if the format changes.
+# Required. Currently must be 1.
+toryo: 1
+
+# One plain-language sentence: what this role is for.
+# Shown in the UI and logs. It is NOT sent to the agent as an instruction.
+purpose: Turn an approved plan into working X++ code.
+
+# Markdown file with the role's identity and house rules. Always loaded into
+# the agent's context (think: a section of AGENTS.md / CLAUDE.md).
+# Path is relative to THIS file's folder.
+# It is ADDED after Toryo's built-in rules for the role (output format, no
+# git commands, treat agent-written text as data); it never replaces them.
+# Put "who you are and the rules" here; put "how to do a task" in skills.
+instructions: ./instructions.md
+
+# Named how-to manuals. Each name is a FOLDER containing a SKILL.md, looked
+# up in this order (first match wins):
+#     .toryo/skills/<name>/SKILL.md      in the repository
+#     <skills_dir>/<name>/SKILL.md       skills_dir from the MACHINE config
+# A name found in neither place is a validation error.
+#
+# How skills reach the agent. Toryo starts Claude in safe mode, which turns
+# off native skill loading, so Toryo delivers skills itself:
+#   implementer   This list is the MENU of allowed skills. The planner sees
+#                 the menu (name + the `description` line of each SKILL.md)
+#                 and writes in the plan which skills THIS task needs (plan
+#                 field `skills`). You see that choice when you approve the
+#                 plan. Toryo then pastes only those SKILL.md files into the
+#                 implementer's instructions. A name that is not on the menu
+#                 sends the plan back to the planner (bounded, like a
+#                 protected path in the plan).
+#   planner and   Nobody picks for them: every skill listed in their role
+#   reviewer      file is always pasted into their instructions.
+# Skills are never trimmed: half a manual is worse than none. If the chosen
+# skills do not fit the instruction size budget (context.budget_kb), the plan
+# goes back to the planner to choose fewer.
+# Every pasted skill is recorded with its SHA-256 and where it came from, so
+# you can see later exactly which manual an agent received.
+skills: [xpp-axclass, xpp-batch]
+
+# (No `reads` key: Toryo itself decides what each stage sees -- the task,
+#  the approved plan, the review, the gate output -- and keeps those files
+#  outside the repository. A `reads` key is an error.)
+
+# The ONLY files this role may change (glob patterns, relative to the repo
+# root, case-insensitive like Windows). This is an allowlist: anything not
+# matched here is off limits. Only the implementer may have `writes`; the
+# planner and reviewer are read-only, so for them it is an error.
+# Patterns: `*` (within one folder), `**` (any depth), `?` (one character).
+# `./src/**`, `src/` and `src` all mean "src and everything under it" (so
+# does `**/secrets` for every `secrets` folder); `*.pfx` matches at any
+# depth; an absolute path, `..`, or `{a,b}` / `[ab]` / `!x` is refused.
+# When it is checked:
+#   - at plan time: a file the plan expects to touch (files_likely_involved)
+#     outside the fence sends the plan back to the planner (bounded);
+#   - after every build turn: Toryo compares the changed files with the
+#     fence; a file outside it is restored and sent back to the implementer.
+# The fence can only NARROW what toryo.yaml allows: a path in
+# policy.protected_paths or deny_paths stays forbidden even if it matches.
+writes: [Metadata/**]
+
+# Files this role must NEVER change, even inside `writes`.
+# Rule: `never` ALWAYS WINS over `writes`. A violation is reported by name
+# ("touched a never path: ...") so the reason is clear. A task can open one
+# for itself with its `## Allow protected` list, like a protected path.
+never:  ["**/Descriptor/*.xml"]    # model descriptors: only when the task says so
+
+# Gates that must PASS before the work is handed to review.
+# A gate is a NAME, not a file. It is declared in toryo-orgchart.yaml under
+# `gates:`, with a kind:
+#     build   kind: check         clean checkout, Low integrity, no side effects
+#     dbsync  kind: environment   changes this machine's D365FO environment;
+#                                 its command lives in the machine config
+#
+# Behaviour:
+#   - TORYO runs the gates itself, on the checkpoint commit, in the order
+#     listed. The agent does not get to claim "build passes"; the command's
+#     exit code decides.
+#   - Every `check` gate must be listed before every `environment` gate.
+#   - Stop at the first failing gate.
+#   - On failure, send the gate output back to this same seat to fix, then
+#     re-run. (Retry limit: limits.max_gate_retries in the orgchart.)
+#   - A gate name with no declaration in the orgchart is a validation error.
+#   - Only the implementer role may list gates (planner and reviewer are
+#     read-only, so there is nothing to check); elsewhere it is an error.
+before_handoff: [build, dbsync]    # check first, then environment

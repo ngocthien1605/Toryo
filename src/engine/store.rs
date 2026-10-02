@@ -135,7 +135,99 @@ CREATE TABLE IF NOT EXISTS events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, stage_attempt_id TEXT,
   kind TEXT NOT NULL, payload TEXT NOT NULL, at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS environment_deployments (
+  lock TEXT PRIMARY KEY, task TEXT NOT NULL, sha TEXT NOT NULL, gate TEXT NOT NULL,
+  machine TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, ok INTEGER
+);
+CREATE TABLE IF NOT EXISTS environment_waits (
+  task TEXT PRIMARY KEY, lock TEXT NOT NULL, since TEXT NOT NULL
+);
 "#;
+
+/// M11-E3: what an environment lock's environment last received — written **before** the gate
+/// starts (a failed or killed sync may already have changed it) and updated at its end. Never
+/// deleted: cancelling a task or `task cleanup` does not change what the environment runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Deployment {
+    pub lock: String,
+    pub task: String,
+    pub sha: String,
+    pub gate: String,
+    pub machine: String,
+    pub started_at: String,
+    /// `None`: the gate is running, or it was interrupted (crash, stop).
+    pub finished_at: Option<String>,
+    /// `None` until it finished; then whether the gate passed.
+    pub ok: Option<bool>,
+}
+
+/// M11-E3: record that `task` starts deploying `sha` through `gate` (one row per lock).
+pub fn deployment_start(
+    tx: &Transaction,
+    lock: &str,
+    task: &str,
+    sha: &str,
+    gate: &str,
+    machine: &str,
+) -> Result<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO environment_deployments(lock, task, sha, gate, machine, started_at, finished_at, ok) VALUES(?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)",
+        params![lock, task, sha, gate, machine, now()],
+    )?;
+    Ok(())
+}
+
+/// M11-E3: the gate of `task` on `lock` ended; `ok: None` for an interrupted (stopped) run.
+pub fn deployment_end(tx: &Transaction, lock: &str, task: &str, ok: Option<bool>) -> Result<()> {
+    tx.execute(
+        "UPDATE environment_deployments SET finished_at = ?3, ok = ?4 WHERE lock = ?1 AND task = ?2",
+        params![lock, task, now(), ok],
+    )?;
+    Ok(())
+}
+
+/// M11-E3: every lock's last deployment, by lock name.
+pub fn deployments(tx: &Transaction) -> Result<Vec<Deployment>> {
+    let mut st = tx.prepare(
+        "SELECT lock, task, sha, gate, machine, started_at, finished_at, ok FROM environment_deployments ORDER BY lock",
+    )?;
+    let rows = st.query_map([], |r| {
+        Ok(Deployment {
+            lock: r.get(0)?,
+            task: r.get(1)?,
+            sha: r.get(2)?,
+            gate: r.get(3)?,
+            machine: r.get(4)?,
+            started_at: r.get(5)?,
+            finished_at: r.get(6)?,
+            ok: r.get(7)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// M11-E3: `task` waits for `lock` (shown by `status`), or no longer waits (`lock: None`).
+pub fn set_env_wait(tx: &Transaction, task: &str, lock: Option<&str>) -> Result<()> {
+    match lock {
+        Some(l) => tx.execute(
+            "INSERT OR REPLACE INTO environment_waits(task, lock, since) VALUES(?1, ?2, ?3)",
+            params![task, l, now()],
+        )?,
+        None => tx.execute("DELETE FROM environment_waits WHERE task = ?1", [task])?,
+    };
+    Ok(())
+}
+
+/// M11-E3: the lock `task` waits for, if any.
+pub fn env_wait(tx: &Transaction, task: &str) -> Result<Option<String>> {
+    Ok(tx
+        .query_row(
+            "SELECT lock FROM environment_waits WHERE task = ?1",
+            [task],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
 
 /// Reservation held for a turn with no telemetry (R41), until M7 derives it per stage.
 pub const DEFAULT_UNKNOWN_RESERVATION: i64 = 200_000;
@@ -573,6 +665,18 @@ fn gate_name(k: GateKind) -> &'static str {
 /// Apply `e` to the task's machine and persist it — state, projections, the event and the
 /// approvals rows (R44a) — in the caller's transaction. On a refused transition nothing is
 /// written.
+/// M11-R11: record the escalation class on the task's machine (the engine, right after it
+/// escalated with that class). No-op unless the task is `Escalated`.
+pub fn set_reason_class(tx: &Transaction, task_id: &str, class: &str) -> Result<()> {
+    let mut m = get_task(tx, task_id)?.machine;
+    m.set_reason_class(class);
+    tx.execute(
+        "UPDATE tasks SET machine = ?2, updated_at = ?3 WHERE id = ?1",
+        params![task_id, serde_json::to_string(&m)?, now()],
+    )?;
+    Ok(())
+}
+
 pub fn transition(tx: &Transaction, task_id: &str, e: PipelineEvent) -> Result<Machine> {
     let t = get_task(tx, task_id)?;
     let before = t.machine.clone();

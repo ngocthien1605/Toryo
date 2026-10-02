@@ -79,7 +79,7 @@ fn toasts_at_the_gates_follow_the_machine_setting_and_the_flags() {
     // the machine setting on, --no-notify wins
     std::fs::write(
         &env.machine,
-        format!("{MACHINE_PROFILES}notify: {{ toast: true }}\n"),
+        format!("{MACHINE_PROFILES}{MACHINE_FLOOR}notify: {{ toast: true }}\n"),
     )
     .unwrap();
     create(&env, "N-2");

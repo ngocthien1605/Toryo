@@ -11,6 +11,7 @@
 
 pub mod agents;
 pub mod config;
+pub mod config_show;
 pub mod doctor;
 pub mod domain;
 pub mod engine;
@@ -21,4 +22,5 @@ pub mod process;
 pub mod runner;
 #[cfg(feature = "m0-kit")]
 pub mod spike;
+pub mod team;
 pub mod usage;

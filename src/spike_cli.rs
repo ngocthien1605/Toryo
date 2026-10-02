@@ -711,10 +711,13 @@ pub fn spike(cli: &Cli, cmd: &SpikeCmd) -> Result<i32> {
         }
         SpikeCmd::JobTest => ok(job::job_test()?),
         SpikeCmd::LowilCanary => {
-            // verify.verify_root from the config when there is one, else the default
+            // the verify_root in force (the machine's, else the repository's, M11-A2) when
+            // there is a config, else the default
             let vr = load_config(cli)
                 .ok()
-                .and_then(|c| toryo::config::expand_vars(&c.repo.verify.verify_root).ok())
+                .and_then(|c| {
+                    toryo::config::expand_vars(toryo::engine::verify::verify_root_setting(&c)).ok()
+                })
                 .map(PathBuf::from);
             ok(lowil::lowil_canary(vr)?)
         }

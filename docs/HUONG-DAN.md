@@ -1,4 +1,4 @@
-# Hướng dẫn sử dụng Toryo (M0 kit · M1 adapter · M2 state machine · M3 engine + recovery · M4–M7 · M8 E2E · M9 D365FO · M10 theo dõi task)
+# Hướng dẫn sử dụng Toryo (M0 kit · M1 adapter · M2 state machine · M3 engine + recovery · M4–M7 · M8 E2E · M9 D365FO · M10 theo dõi task · M11 org chart)
 
 > **Toryo (棟梁 — tōryō)** = "thợ cả": người chỉ huy đội thợ, không tự đục đẽo mà giao việc, kiểm tra từng mối nối
 > và nghiệm thu từng giai đoạn. Tên cũ của tool là `thien` (đổi ngày 2026-09-28, plan v0.7 R55).
@@ -626,6 +626,161 @@ WinRT — `notify-test` sẽ báo lỗi.
 
 ---
 
+### 5.9 M11 — sơ đồ tổ chức (org chart), role, skill và gate môi trường
+
+Hình dung một **xưởng mộc**: *sơ đồ tổ chức* nói ai ngồi ghế nào (thợ cả lập kế hoạch, thợ chính làm, người
+nghiệm thu); *thẻ việc* (role file) của từng ghế nói việc đó là gì, được đụng vào tấm gỗ nào, phải qua bài kiểm
+tra nào trước khi giao. Đổi người ngồi ghế thì thẻ việc **không đổi**. Quy trình cố định: **lập kế hoạch → làm →
+nghiệm thu**, có cổng duyệt kế hoạch và cổng duyệt cuối — không có khoá `flow:`.
+
+**Repo không có `.toryo/toryo-orgchart.yaml` chạy y như M10** (cùng output, cùng hash cấu hình). Có file đó thì
+Toryo vào **chế độ org chart**:
+
+```
+<repo>\
+  toryo.yaml                         # project, policy, verify, timeouts, context, budget — KHÔNG roles/commands
+  CULTURE.md                         # (tuỳ chọn) nề nếp chung của cả đội
+  .toryo\
+    toryo-orgchart.yaml              # AI: ghế → profile Toryo, gate, limits, checks
+    roles\<ghế>\toryo-role.yaml      # LÀM GÌ: purpose, instructions, skills, writes/never, before_handoff
+    roles\<ghế>\instructions.md      # được THÊM sau luật dựng sẵn của Toryo, không thay thế
+    skills\<tên>\SKILL.md            # skill của repo
+```
+
+Bộ mẫu: `templates\d365fo\.toryo\`, `templates\d365fo\CULTURE.md`, `templates\d365fo\toryo.orgchart.yaml.example`
+(dùng làm `toryo.yaml` của chế độ này — `toryo.yaml.example` cũ có `roles:`/`commands:` nên sẽ bị từ chối).
+
+**Những điều cần nhớ:**
+- **Ghế (seat)** đúng 3: `planner`, `implementer`, `reviewer`; mỗi ghế ghi tên một **profile Toryo** của machine
+  config (R60). `codex --profile openai` → profile `codex-openai` có `CODEX_HOME` riêng. Không ghi `fallback` =
+  **không có** fallback (M10 cũ: lấy profile của planner). Fallback chỉ cho implementer. Machine config có thể ghi đè
+  ghế bằng `seats:` (tên mới của `roles:`).
+- **Một chỗ cho một thiết lập**: có org chart thì `toryo.yaml` không được có `roles:`, `commands:`,
+  `pipeline.max_fix_cycles` — báo lỗi nêu cả hai file.
+- **Kiểm tra trước khi chạy**: mọi lỗi được báo **một lần** cùng tên file và đường dẫn khoá, có gợi ý "Did you
+  mean …?" khi gõ nhầm: `seats.reviwer: seat 'reviwer' not found. Did you mean 'reviewer'?`
+- **`toryo config show [--json]`**: chế độ, các file đã đọc (kèm SHA-256), mỗi ghế/profile/gate/`skills_dir`/
+  thiết lập verify đến từ đâu (`repo`, `machine`, `repo, overridden by machine`).
+- **instructions.md và culture**: ngữ cảnh của agent luôn có luật dựng sẵn của Toryo (định dạng output, không dùng
+  Git, dữ liệu không tin cậy), rồi mới đến `instructions.md` của đội — repo chỉ được **thêm**, không bỏ luật. File
+  cũ `.toryo\roles\<role>.md` (M4) → chuyển sang `.toryo\roles\<role>\instructions.md`.
+- **Skill** (cẩm nang làm việc): tìm `.toryo\skills\<tên>\SKILL.md` trong repo trước, rồi `<skills_dir>\<tên>\SKILL.md`
+  của máy. Danh sách skill của implementer là **thực đơn**: planner thấy `tên — description` và ghi vào trường
+  `skills` của kế hoạch những skill task này cần; anh thấy lựa chọn đó khi duyệt kế hoạch (`PLAN.md`: `Skills for
+  the implementer: …`). Tên không có trong thực đơn, hoặc quá ngân sách ngữ cảnh → trả kế hoạch về cho planner
+  (có giới hạn). Planner và reviewer luôn nhận đủ skill trong role file của mình. Skill không bao giờ bị cắt bớt,
+  được băm (hash) và hiện trong `toryo context show` kèm nguồn và SHA-256. **Chỉ giao chính file `SKILL.md`**.
+  Thực đơn chỉ liệt kê skill tìm thấy được lúc này. Kiểm tra ngân sách chạy cho **mọi profile trong chuỗi
+  implementer** (Claude dự phòng nhận TASK.md và PLAN.md inline, không bao giờ bị cắt để nhường chỗ cho skill).
+  Trước mỗi lượt, mọi skill cần dùng phải tìm thấy: không thì task escalate `skill_unavailable` (nêu cả hai đường
+  dẫn đã tìm; chưa chạy lượt nào, không tốn token) — đặt skill lại rồi `toryo resume <id>`. Ngữ cảnh có skill mà vẫn
+  quá ngân sách → escalate `context_over_budget`. Các lỗi này, cùng gate/toolchain/boundary máy không cung cấp được,
+  là **do máy** (M11-R11, X8): `toryo resume <id>` (không `--note`) quay lại stage sau khi sửa nguyên nhân — không
+  tốn vòng sửa, không chạy implementer; `--note` chỉ để cấp thêm một vòng cho implementer.
+- **Hàng rào ghi (write fence)** của implementer: `writes:` = chỉ được sửa các file này (`writes: []` hoặc không ghi = không giới hạn, chỉ áp `never`); `never:` = không bao giờ,
+  kể cả trong `writes`. Kế hoạch đụng file ngoài hàng rào → lập lại kế hoạch; implementer sửa file ngoài hàng rào →
+  khôi phục và trả lại, nêu rõ luật. `## Allow protected` trong TASK.md mở được một mục, như file được bảo vệ.
+  Mẫu được chuẩn hoá lúc nạp: `./src/**`, `src/` và `src` đều là `src/**` (thư mục và mọi thứ bên trong; `**/secrets` là `**/secrets/**`; mẫu có ký tự đại
+  diện mà không có `/` khớp ở mọi cấp: `*.pfx` là `**/*.pfx`); mẫu tuyệt
+  đối, có `..`, rỗng, hoặc dùng cú pháp không hỗ trợ (`{ } [ ] !` — chỉ có `*`, `**`, `?`) → lỗi nạp. (`policy.deny_paths`
+  / `protected_paths` giữ hành vi M10; `toryo doctor` cảnh báo mẫu không bao giờ khớp.)
+- **File `culture` được bảo vệ** (chế độ org chart) như script của gate: agent sửa → khôi phục, trừ khi TASK.md
+  liệt kê nó dưới `## Allow protected`.
+- **Giới hạn**: `limits: { max_gate_retries, max_review_rounds }` — gate trượt tính vào cái đầu, review bị từ chối
+  tính vào cái sau. `toryo status`: `fix 1 (gate retries 1/3, review rounds 0/3)`. Org chart **không có** `limits:`
+  → một bộ đếm chung như cũ (2 vòng sửa), không phải giới hạn tách đôi.
+- **`checks.reviewer-differs-from-builder`**: `off` / `warn` (mặc định: ghi chú ở cổng cuối) / `error` (escalate
+  `same_vendor_review` trước lượt review) — so `kind` của **mọi** profile đã chạy lượt implementer (kể cả lượt hỏng
+  giữa chừng sau khi đã ghi code — phần việc đó vẫn được giữ; M11-R7) với reviewer. Chế độ chỉ có toryo.yaml cũng vậy,
+  nên ghi chú "same vendor" hiện ra trong nhiều trường hợp hơn M10.
+- **Sàn verify của máy (H2, cho mọi repo)**: repo ghi `verify.boundary: none` bị từ chối khi `task create`, trừ khi
+  machine config ghi `verify: { min_boundary: none }`. `verify.verify_root` của máy thay của repo.
+
+**Hai loại gate** (bài kiểm tra Toryo **tự** chạy trên commit checkpoint, theo thứ tự `before_handoff`, dừng ở cái
+trượt đầu tiên; exit code quyết định; mọi gate có `TORYO_TASK`, `TORYO_SHA`, `TORYO_VERIFY_CHECKOUT`,
+`TORYO_VERIFY_BUILD`):
+- `kind: check` — khai báo đầy đủ trong repo, chạy trong checkout sạch với quyền **Low integrity**, không có secret.
+  Script của gate được bảo vệ kể cả khi chưa tồn tại (M18), và `task create` từ chối nếu commit gốc chưa có nó.
+  (M11-R10, X7, áp dụng cho mọi repo) Chỉ **script đầu vào** của gate (file quyết định đạt/không đạt) mới bị từ chối khi
+  commit gốc chưa có, vì implementer có thể tự viết nó: `-File x` của PowerShell, các đường dẫn có `/` hoặc `\` và đuôi
+  script trong dòng `-Command` (`& { ./x.ps1 }`), dòng `cmd /c` (`call scripts\x.cmd`; tên trần có đuôi script cũng tính,
+  trừ khi PATH có chương trình cùng tên), dòng `-c` của shell (cả `-ec`, `-euxc`), và đối số đầu tiên không phải cờ của
+  `sh`/`bash`/`python`/`node`/… (bỏ qua giá trị của `-o`, `-W`, `-r`, `--env-file`, `--rcfile`…). Script đầu vào thiếu
+  chỉ bị từ chối khi có `/`/`\` hoặc đuôi script **và** repo không ignore nó (`node dist/cli.js` với `dist/` bị ignore là
+  output build: cho qua, vẫn được bảo vệ); `sh check` được bảo vệ, không bị từ chối. **Mọi đối số khác** (cả giá trị của
+  `KEY=value`, `--flag=value`, `/p:Name=value`) được bảo vệ nếu có trong commit gốc và không bao giờ bị từ chối; thiếu thì
+  chỉ in một dòng `note:` khi `task create` và trong `doctor`. Giới hạn còn lại: file mà script tự nạp (dot-source,
+  import) không được nhìn thấy; script không có đuôi, ở gốc repo, chạy bằng chương trình ngoài bảng.
+- `kind: environment` — **thay đổi môi trường D365FO** của máy này (deploy, DB sync), chạy bằng **quyền bình thường
+  của anh**, nên lệnh chỉ nằm trong machine config (`environment_gates`), ngoài tầm với của mọi agent. Chỉ chạy
+  sau khi **mọi** check gate cùng lượt đã qua (check gate sửa file đã track trong checkout → không gate môi trường
+  nào chạy, `verify_mutated_tree`), và **không bao giờ đọc bản checkout mà check gate đã dùng** (X6): khi đã giữ lock,
+  Toryo xuất lại commit checkpoint từ kho object của repo vào `<verify_root>\<task>\deploy`, thư mục mà code agent không
+  ghi được — bản xuất đó là `TORYO_VERIFY_CHECKOUT` của gate (không có `.git`; tree id ghi trong `VERIFY_RESULT.json`).
+  File check gate để lại trong checkout chỉ được liệt kê (`checkout_extra`, một dòng cảnh báo), không bao giờ được
+  deploy; `verify.checkout: tracked` dùng được cùng gate môi trường. Gate chạy trong một **thư mục làm việc trống** mà code của
+  agent không ghi được (`envgate`). `%VAR%` trong `program`/`args` được thay **một lần, lúc nạp config** (`task create`;
+  biến chưa đặt → lỗi nạp): chuỗi đã thay là thứ được kiểm tra, đóng băng và chạy (`toryo config show` in ra); tên
+  chương trình tìm qua PATH mà nằm trong repo / worktrees / verify root → bị từ chối lúc chạy. Mỗi `lock` chỉ một gate
+  chạy một lúc trên cả máy (task thứ hai chờ:
+  `waiting for lock d365-env (held by T-12)`; `toryo stop` dừng việc chờ). Trước khi chạy, Toryo ghi lại task và
+  commit mà môi trường sắp nhận; `toryo status` luôn cho biết môi trường đang chạy code nào:
+  `environment    d365-env holds BR-001 @ 1a2b3c4d5e6f (not approved yet)`. Huỷ task hay `task cleanup` **không**
+  xoá dòng này (môi trường vẫn đang chạy code đó).
+
+**Ví dụ D365FO**: build kiểm tra (check) rồi DB sync (environment).
+
+```yaml
+# .toryo\toryo-orgchart.yaml (trích)
+gates:
+  build:  { kind: check, tool: xpp, metadata: Metadata, projects: [Projects/Build/ContosoCore.Build.rnrproj], timeout: 90m }
+  dbsync: { kind: environment, timeout: 30m, if_missing: error }   # laptop không có AxDB: if_missing: skip
+seats:
+  planner:     { profile: claude-max, model: opus }
+  implementer: { profile: codex-openai, fallback: [claude-max] }
+  reviewer:    { profile: claude-max }
+limits: { max_gate_retries: 3, max_review_rounds: 3 }
+```
+
+```yaml
+# .toryo\roles\implementer\toryo-role.yaml (trích)
+toryo: 1
+purpose: Turn an approved plan into working X++ code.
+instructions: ./instructions.md
+skills: [xpp-axclass, xpp-batch]
+writes: [Metadata/**]
+never: ["**/Descriptor/*.xml"]
+before_handoff: [build, dbsync]          # check trước, environment sau
+```
+
+```yaml
+# %USERPROFILE%\.toryo\toryo.local.yaml (trích) — machine config
+skills_dir: C:/Temp/AgentShare/skills
+environment_gates:
+  dbsync:
+    program: powershell
+    args: [-NoProfile, -NonInteractive, -File, 'C:\toryo-gates\dbsync.ps1']   # NGOÀI repo/worktree/verify root
+    lock: d365-env
+```
+
+`dbsync.ps1` phải theo **hợp đồng script** (đầy đủ trong `templates\toryo.local.yaml.example`): (1) exit code quyết
+định — đầu script `$ErrorActionPreference = 'Stop'`, sau mỗi lệnh `.exe` (SyncEngine.exe, msbuild.exe…):
+`if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`; (2) chỉ deploy cái Toryo đã kiểm tra: mã nguồn từ
+`$env:TORYO_VERIFY_CHECKOUT` (commit `$env:TORYO_SHA`) và/hoặc gói đã build từ `$env:TORYO_VERIFY_BUILD`, **không bao
+giờ** từ thư mục repo chính; (3) chạy lại nhiều lần vẫn đúng (idempotent); (4) in rõ dòng lỗi — phần cuối output được
+gửi cho implementer sửa; (5) không ghi vào `$env:TORYO_VERIFY_CHECKOUT`; (6) không chờ nhập liệu; và (M11) gọi mọi công
+cụ bằng **đường dẫn tuyệt đối**; thư mục làm việc là một thư mục trống — đừng dựa vào nó, đừng chạy `git` trong đó, hãy dùng
+`$env:TORYO_SHA`. `TORYO_VERIFY_CHECKOUT` của gate môi trường là bản sao mới của commit mà không code agent nào chạm được;
+`TORYO_VERIFY_BUILD` do check gate ghi ở Low integrity — khi check gate chạy code do agent viết (test), coi thư mục này là
+không tin cậy và build lại từ `TORYO_VERIFY_CHECKOUT` ngay trong script.
+
+Lưu ý trên máy Tokyo (tiếng Nhật): output DB sync có thể bị lỗi mã cp932 (review M13 — việc tiếp theo sau M11).
+
+**Chuyển một `toryo.yaml` M10 sang `.toryo\`** (chi tiết trong README, mục "Migrating"): `roles:` → `seats:`;
+`commands.verify` → các gate `kind: check` + `before_handoff`; `pipeline.max_fix_cycles` → `limits:`;
+`.toryo\roles\<role>.md` → `.toryo\roles\<role>\instructions.md`; mỗi lần `codex --profile` → một profile Toryo có
+`CODEX_HOME` riêng. Xong chạy `toryo config show` để kiểm tra.
+
 ## 6. Thực hành: dự án mẫu **BatchRename** (PowerShell module)
 
 Module đổi tên file hàng loạt. Trạng thái ban đầu chỉ có 1 hàm `ConvertTo-SafeFileName`.
@@ -859,6 +1014,9 @@ CI chạy: `cargo fmt --check`, `clippy -D warnings` (có và không có M0 kit)
 | `protected_config_changed` | Mở file diff được nêu trong lý do; khôi phục rồi `toryo resume ID`, hoặc `--accept-protected-change <path>` |
 | `verify_boundary_unavailable` | `verify_root` không gán được Low label (thiếu WRITE_OWNER) → để mặc định `%LOCALAPPDATA%\toryo-verify`; `toryo doctor` nêu nguyên nhân |
 | `verify_mutated_tree` | Script verify đã sửa file đã track / `.git` của bản checkout → sửa script (hoặc code agent viết), rồi `toryo resume ID --note "…"` |
+| `!! a check gate left files in the verify checkout — they are not deployed` (M11) | Chỉ là cảnh báo: gate môi trường deploy từ bản xuất mới của commit, không từ checkout. Nên cho check gate ghi output vào `TORYO_VERIFY_BUILD`; danh sách nằm ở `checkout_extra` trong `VERIFY_RESULT.json` |
+| `environment_gate_unavailable` (M11) | Máy không chạy được gate môi trường: secret chưa có, chương trình không tìm thấy hoặc nằm trong repo/worktrees/verify root → sửa machine config, rồi `toryo resume ID` (do máy; không tốn vòng sửa); task tạo trước bản này mà có `%VAR%` trong `program`/`args` → `toryo task config ID --reload` |
+| `skill_unavailable` / `context_over_budget` (M11) | Skill cần cho lượt này không tìm thấy (lý do nêu cả hai đường dẫn) → đặt lại rồi `toryo resume ID` (do máy; không tốn vòng sửa); ngữ cảnh có skill vẫn quá ngân sách → tăng `context.budget_kb.<role>` hoặc chọn ít skill hơn |
 | `artifact_tampered` / `artifact_missing` | Có người sửa/xoá file trong `runstore\artifacts\` → khôi phục file, hoặc `toryo task cleanup ID` |
 | `Paused` — `admission cap reached` | `toryo budget set ID --tokens N` rồi `toryo resume ID` |
 | `unverified profiles (R51)` nhắc `claude-implementer-isolation` | `toryo spike claude-implementer-isolation --profile claude-max` (hoặc `doctor --canaries`) |

@@ -39,7 +39,7 @@ fn out(env: &Env, args: &[&str]) -> (i32, String, String) {
 fn foundry_run(env: &Env, id: &str) {
     std::fs::write(
         &env.machine,
-        format!("{MACHINE_PROFILES}  codex-foundry: {{ kind: codex, billing: foundry, exe: codex-not-installed, model: gpt-6-astra }}\n"),
+        format!("{MACHINE_PROFILES}  codex-foundry: {{ kind: codex, billing: foundry, exe: codex-not-installed, model: gpt-6-astra }}\n{MACHINE_FLOOR}"),
     )
     .unwrap();
     let cfg = std::fs::read_to_string(&env.config).unwrap();

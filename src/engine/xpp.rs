@@ -477,6 +477,10 @@ pub fn runs(
 /// The time a command's `timeout_min` gives it (`tool: xpp`: [`DEFAULT_TIMEOUT_MIN`] when unset;
 /// a program: 30 minutes, as before).
 pub fn command_timeout(c: &CommandSpec) -> Duration {
+    // M11: a gate's `timeout` (seconds) wins over minutes
+    if let Some(s) = c.timeout_sec {
+        return Duration::from_secs(s);
+    }
     let default = if c.is_xpp() { DEFAULT_TIMEOUT_MIN } else { 30 };
     Duration::from_secs(60 * c.timeout_min.unwrap_or(default))
 }

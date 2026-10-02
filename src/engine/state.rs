@@ -38,6 +38,23 @@ use thiserror::Error;
 /// Automatic plan rejections (protected paths in `files_likely_involved`) before `Escalated`.
 pub const MAX_PLAN_AUTO_REJECTIONS: u32 = 2;
 
+/// M11-R11 (X8): the escalation classes the **machine** caused — a missing skill, a context
+/// over budget, or a gate/toolchain/boundary the machine cannot provide. Leaving one costs no
+/// fix cycle: a plain `toryo resume <id>` goes back into the stage, which checks its
+/// precondition again (a cause still there escalates again, no turn and no cycle).
+pub const MACHINE_CAUSED: [&str; 5] = [
+    "skill_unavailable",
+    "context_over_budget",
+    "environment_gate_unavailable",
+    "xpp_toolchain_unavailable",
+    "verify_boundary_unavailable",
+];
+
+/// M11-R11: whether `class` is [`MACHINE_CAUSED`].
+pub fn is_machine_caused(class: &str) -> bool {
+    MACHINE_CAUSED.contains(&class)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PipelineState {
     New,
@@ -129,6 +146,10 @@ pub enum PipelineEvent {
     /// The plan lists protected paths: re-plan (bounded), no gate is opened.
     PlanPolicyViolation {
         paths: Vec<String>,
+        /// M11-D2: what is wrong when it is not protected paths — skills off the implementer's
+        /// menu, or over its context budget. Absent (and not serialised) for paths.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// A valid plan exists: opens a plan gate occurrence.
     PlanReady {
@@ -293,9 +314,63 @@ pub struct Machine {
     escalated_from: Option<PipelineState>,
     /// Why the task is `Escalated` / `Failed`, or what the last fix cycle is about.
     reason: Option<String>,
+    /// M11-R11 (X8): the typed class of the current `Escalated` state, when the engine set one
+    /// (`escalate` / `escalate_attempt`). A machine-caused class ([`MACHINE_CAUSED`]) lets a
+    /// plain `toryo resume` go back into the stage without a fix cycle. Set outside the pure
+    /// transition, cleared here whenever the task leaves `Escalated`; absent (and not
+    /// serialised) otherwise, so an M10 / round-1 machine reads back unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason_class: Option<String>,
+    /// M11-C4: the split bounds of an org chart's `limits:` — then a failing gate counts
+    /// against `max_gate_retries` and a rejected review against `max_review_rounds`, and
+    /// `max_fix_cycles` bounds nothing. Absent (and not serialised) for the single bound, so a
+    /// machine stored by M10 reads back and behaves exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    split: Option<SplitLimits>,
+}
+
+/// The split retry bounds and their counters (M11-C4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitLimits {
+    pub max_gate_retries: u32,
+    pub max_review_rounds: u32,
+    /// Entries into `Fixing` after a failing gate (or a path-policy violation).
+    #[serde(default)]
+    pub gate_retries: u32,
+    /// Entries into `Fixing` after a rejected review (or a rejected final gate).
+    #[serde(default)]
+    pub review_rounds: u32,
+}
+
+/// What sent the work back to the implementer (M11-C4: which split counter it uses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bounce {
+    /// A failing gate, or the implementer's own path-policy violation (the build stage).
+    Gate,
+    /// The reviewer's changes requested, or the human's final rejection (the review stage).
+    Review,
 }
 
 impl Machine {
+    /// M11-C4: split bounds — `max_gate_retries` and `max_review_rounds`. `max_fix_cycles()`
+    /// then reports their sum (the most fix cycles the bounds allow), for display only.
+    pub fn with_limits(max_gate_retries: u32, max_review_rounds: u32) -> Self {
+        Self {
+            split: Some(SplitLimits {
+                max_gate_retries,
+                max_review_rounds,
+                gate_retries: 0,
+                review_rounds: 0,
+            }),
+            ..Self::new(max_gate_retries.saturating_add(max_review_rounds))
+        }
+    }
+
+    /// The split bounds and counters, when the task uses them (M11-C4).
+    pub fn split_limits(&self) -> Option<&SplitLimits> {
+        self.split.as_ref()
+    }
+
     pub fn new(max_fix_cycles: u32) -> Self {
         Self {
             state: PipelineState::New,
@@ -311,11 +386,25 @@ impl Machine {
             paused_from: None,
             escalated_from: None,
             reason: None,
+            reason_class: None,
+            split: None,
         }
     }
 
     pub fn state(&self) -> PipelineState {
         self.state
+    }
+
+    /// M11-R11: the typed class of the current `Escalated` state, when the engine set one.
+    pub fn reason_class(&self) -> Option<&str> {
+        self.reason_class.as_deref()
+    }
+
+    /// M11-R11: record the escalation class (engine layer, right after escalating).
+    pub fn set_reason_class(&mut self, class: &str) {
+        if self.state == PipelineState::Escalated {
+            self.reason_class = Some(class.to_string());
+        }
     }
     pub fn fix_cycle(&self) -> u32 {
         self.fix_cycle
@@ -384,10 +473,12 @@ impl Machine {
             (_, E::Fail { error }) => {
                 m.gate = None;
                 m.reason = Some(error.clone());
+                m.reason_class = None;
                 m.state = S::Failed;
             }
             (_, E::Cancel) => {
                 m.gate = None;
+                m.reason_class = None;
                 m.state = S::Cancelled;
             }
             (s, E::Escalate { reason }) if s != S::Escalated => m.escalate(s, reason.clone()),
@@ -410,14 +501,17 @@ impl Machine {
                 m.plan_attempt = 1;
                 m.state = S::Planning;
             }
-            (S::Planning, E::PlanPolicyViolation { paths }) => {
+            (S::Planning, E::PlanPolicyViolation { paths, reason }) => {
                 if m.plan_auto_rejections >= MAX_PLAN_AUTO_REJECTIONS {
-                    m.escalate(
-                        S::Planning,
-                        format!(
+                    let why = match reason {
+                        Some(r) => format!(
+                            "{r} — still, after {MAX_PLAN_AUTO_REJECTIONS} automatic re-plans"
+                        ),
+                        None => format!(
                             "the plan still lists protected paths {paths:?} after {MAX_PLAN_AUTO_REJECTIONS} automatic re-plans"
                         ),
-                    );
+                    };
+                    m.escalate(S::Planning, why);
                 } else {
                     m.plan_auto_rejections += 1;
                     m.plan_attempt += 1;
@@ -449,7 +543,7 @@ impl Machine {
             // ── implement / fix → checkpoint → verify ────────────────────────────────
             (S::Implementing | S::Fixing, E::ImplementationDone) => m.state = S::Checkpointing,
             (S::Implementing | S::Fixing, E::PathPolicyViolation { paths }) => {
-                m.enter_fixing(format!("protected paths changed: {paths:?}"))
+                m.enter_fixing(format!("protected paths changed: {paths:?}"), Bounce::Gate)
             }
             (S::Checkpointing, E::Checkpointed { head }) => {
                 // R40: a no-change turn still produces a checkpoint, so this is the only way on
@@ -464,7 +558,7 @@ impl Machine {
             (S::Verifying, E::VerifyFailed { head }) => {
                 m.require_checkpoint("verify result", head)?;
                 // never to Review (§5.2)
-                m.enter_fixing("verify failed".into());
+                m.enter_fixing("verify failed".into(), Bounce::Gate);
             }
 
             // ── review + final gate ──────────────────────────────────────────────────
@@ -476,7 +570,7 @@ impl Machine {
             }
             (S::Reviewing, E::ChangesRequested { head }) => {
                 m.require_checkpoint("review", head)?;
-                m.enter_fixing("changes requested".into());
+                m.enter_fixing("changes requested".into(), Bounce::Review);
             }
             (S::Reviewing, E::ReviewBlocked { head }) => {
                 m.require_checkpoint("review", head)?;
@@ -496,7 +590,7 @@ impl Machine {
             }
             (S::WaitingFinalApproval, E::FinalRejected { occurrence, reason }) => {
                 m.close_gate(GateKind::Final, *occurrence, None)?;
-                m.enter_fixing(format!("final gate rejected: {reason}"));
+                m.enter_fixing(format!("final gate rejected: {reason}"), Bounce::Review);
             }
 
             // ── leaving Escalated (R5) ───────────────────────────────────────────────
@@ -506,6 +600,7 @@ impl Machine {
                 }
                 m.reason = Some(note.clone());
                 m.escalated_from = None;
+                m.reason_class = None;
                 if m.plan_approved {
                     // the human grants one more cycle: no bound check here
                     m.fix_cycle += 1;
@@ -526,6 +621,7 @@ impl Machine {
                     return Err(invalid);
                 }
                 m.escalated_from = None;
+                m.reason_class = None;
                 m.state = back;
             }
             (S::WaitingFinalApproval | S::Escalated | S::Reviewing, E::Reverify) => {
@@ -535,6 +631,7 @@ impl Machine {
                 m.gate = None;
                 m.verified_head = None;
                 m.escalated_from = None;
+                m.reason_class = None;
                 m.state = S::Verifying;
             }
             (S::Escalated, E::ForceFinal) => {
@@ -544,6 +641,7 @@ impl Machine {
                 m.require_verified()?;
                 let head = m.checkpoint.clone().unwrap_or_default();
                 m.escalated_from = None;
+                m.reason_class = None;
                 m.open_gate(GateKind::Final, head);
                 m.state = S::WaitingFinalApproval;
             }
@@ -559,10 +657,41 @@ impl Machine {
         self.paused_from = None;
         self.escalated_from = Some(from);
         self.reason = Some(reason);
+        // M11-R11: the engine sets the class after this (set_reason_class); start clean so a
+        // non-machine escalation never inherits a stale one
+        self.reason_class = None;
         self.state = PipelineState::Escalated;
     }
 
-    fn enter_fixing(&mut self, cause: String) {
+    fn enter_fixing(&mut self, cause: String, bounce: Bounce) {
+        // M11-C4: the split bound of this kind of bounce, named in the escalation
+        if let Some(l) = &mut self.split {
+            let (used, max, what, key) = match bounce {
+                Bounce::Gate => (
+                    &mut l.gate_retries,
+                    l.max_gate_retries,
+                    "gate retries",
+                    "limits.max_gate_retries",
+                ),
+                Bounce::Review => (
+                    &mut l.review_rounds,
+                    l.max_review_rounds,
+                    "review rounds",
+                    "limits.max_review_rounds",
+                ),
+            };
+            if *used >= max {
+                let reason = format!("{used} {what} used ({key}) — not accepted (last: {cause})");
+                let from = self.state;
+                self.escalate(from, reason);
+            } else {
+                *used += 1;
+                self.fix_cycle += 1;
+                self.reason = Some(cause);
+                self.state = PipelineState::Fixing;
+            }
+            return;
+        }
         if self.fix_cycle >= self.max_fix_cycles {
             let from = self.state;
             self.escalate(

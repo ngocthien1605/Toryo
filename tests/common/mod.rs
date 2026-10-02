@@ -25,6 +25,10 @@ pub struct Env {
 /// The fake profiles of the fixture, in the machine config (R60).
 pub const MACHINE_PROFILES: &str = "profiles:\n  claude-max: { kind: claude, billing: subscription, exe: claude-not-installed }\n  codex-openai: { kind: codex, billing: subscription, exe: codex-not-installed }\n";
 
+/// The verify floor of the fixture machine (review H2, M11-A2): the fixture repository verifies
+/// in trusted-code mode (`verify.boundary: none`), which the machine must allow.
+pub const MACHINE_FLOOR: &str = "verify: { min_boundary: none }\n";
+
 pub fn setup(implementer: &str) -> Env {
     setup_with(implementer, "")
 }
@@ -37,7 +41,7 @@ pub fn setup_with(implementer: &str, extra: &str) -> Env {
     let data = root.join("data");
     let config = root.join("toryo.yaml");
     let machine = root.join("machine.yaml");
-    std::fs::write(&machine, MACHINE_PROFILES).unwrap();
+    std::fs::write(&machine, format!("{MACHINE_PROFILES}{MACHINE_FLOOR}")).unwrap();
     let fwd = |p: &Path| p.display().to_string().replace('\\', "/");
     std::fs::write(
         &config,
@@ -85,6 +89,47 @@ commands:
         &[],
     );
     assert_eq!(code, 0, "{err}");
+    env
+}
+
+/// The org chart of [`setup_orgchart`]: the fixture's verify command as a check gate.
+pub const ORGCHART: &str = "toryo: 1\nteam: calc-team\ngates:\n  divide-present: { kind: check, program: git, args: [grep, -q, Divide-Numbers, --, src], timeout: 5m }\nseats:\n  planner: { profile: claude-max }\n  implementer: { profile: IMPLEMENTER }\n  reviewer: { profile: claude-max }\n";
+
+/// M11: the fixture in org chart mode. The fixture repository gets `.toryo/` (the org chart
+/// [`ORGCHART`] and three role files; the implementer's `before_handoff: [divide-present]`),
+/// then `files` (which may replace any of them), all committed on main; `toryo.yaml` keeps only
+/// `project` and `verify` (+ `extra`) — no `roles:`, `commands:` or `pipeline.max_fix_cycles`.
+pub fn setup_orgchart(implementer: &str, extra: &str, files: &[(&str, &str)]) -> Env {
+    let env = setup(implementer);
+    let fwd = |p: &Path| p.display().to_string().replace('\\', "/");
+    let org = ORGCHART.replace("IMPLEMENTER", implementer);
+    let mut all: Vec<(&str, &str)> = vec![
+        (".toryo/toryo-orgchart.yaml", &org),
+        (
+            ".toryo/roles/planner/toryo-role.yaml",
+            "toryo: 1\npurpose: Plan the change.\n",
+        ),
+        (
+            ".toryo/roles/implementer/toryo-role.yaml",
+            "toryo: 1\npurpose: Change the code.\nbefore_handoff: [divide-present]\n",
+        ),
+        (
+            ".toryo/roles/reviewer/toryo-role.yaml",
+            "toryo: 1\npurpose: Review the checkpoint.\n",
+        ),
+    ];
+    all.extend_from_slice(files);
+    commit_repo(&env, &all, "m11: the org chart");
+    std::fs::write(
+        &env.config,
+        format!(
+            "version: 1\nproject:\n  root: \"{}\"\n  worktrees_root: \"{}\"\nverify: {{ boundary: none, verify_root: \"{}\" }}\n{extra}",
+            fwd(&env.repo),
+            fwd(&env.root.join("wts")),
+            fwd(&env.root.join("verify")),
+        ),
+    )
+    .unwrap();
     env
 }
 

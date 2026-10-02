@@ -58,6 +58,99 @@ pub fn roles(cfg: &Effective) -> Result<(String, Vec<String>, String)> {
     Ok((planner, chain, reviewer))
 }
 
+/// The state machine of a new task: the org chart's split limits (M11-C4: a missing one of
+/// the two is 2, today's default), else the single bound — `--max-fix-cycles`, then
+/// `pipeline.max_fix_cycles` (or a lone `limits.max_fix_cycles`), then 2.
+pub fn new_machine(cfg: &Effective, cli_max: Option<u32>) -> Result<Machine> {
+    match cfg.team.as_ref().map(|t| &t.limits).filter(|l| l.split()) {
+        Some(l) => {
+            if cli_max.is_some() {
+                bail!("--max-fix-cycles sets the single fix-cycle counter, but the org chart splits it (limits.max_gate_retries / limits.max_review_rounds) — change those in .toryo/toryo-orgchart.yaml");
+            }
+            Ok(Machine::with_limits(
+                l.max_gate_retries.unwrap_or(2),
+                l.max_review_rounds.unwrap_or(2),
+            ))
+        }
+        None => Ok(Machine::new(
+            cli_max.or(cfg.repo.pipeline.max_fix_cycles).unwrap_or(2),
+        )),
+    }
+}
+
+/// M18 admission: every repository program and script of a verify command (a check gate,
+/// [`super::checks::verify_entry_points`]) is in the commit `base` — one the task created could
+/// be written by the implementer before verify runs it. At `task create` and at `task config
+/// --reload` (group E review).
+pub fn check_entry_points(cfg: &Effective, g: &GitCmd, repo: &Path, base: &str) -> Result<()> {
+    for n in entry_point_notes(cfg, g, repo, base)? {
+        eprintln!("note: {n}");
+    }
+    Ok(())
+}
+
+/// [`check_entry_points`]: refuses a refusable entry script missing at `base` (M11-R10, X7:
+/// only when the repository does not ignore it — an ignored one is build output a gate creates
+/// in the clean verify checkout, never the implementer's); returns the notes for the other
+/// arguments the base commit lacks (the net: never a refusal). Also used by `doctor`.
+pub fn entry_point_notes(
+    cfg: &Effective,
+    g: &GitCmd,
+    repo: &Path,
+    base: &str,
+) -> Result<Vec<String>> {
+    let cmds = super::checks::verify_commands(cfg, repo).unwrap_or_default();
+    let entry = super::checks::verify_entry_points(&cmds, repo);
+    let net: Vec<(String, String)> = super::checks::script_like_args(&cmds, repo)
+        .into_iter()
+        .filter(|e| !entry.contains(e))
+        .collect();
+    if entry.is_empty() && net.is_empty() {
+        return Ok(Vec::new());
+    }
+    let repol = Loc::Discover(repo.to_path_buf());
+    let listing = g.run(
+        &repol,
+        true,
+        &["ls-tree", "-r", "-t", "-z", "--name-only", base],
+    )?;
+    let tree: std::collections::HashSet<String> = listing
+        .split(|b| *b == 0)
+        .filter(|f| !f.is_empty())
+        .map(|f| String::from_utf8_lossy(f).to_lowercase())
+        .collect();
+    let what = if cfg.team.is_some() {
+        "gate"
+    } else {
+        "verify command"
+    };
+    let ignored = |path: &str| {
+        g.output(
+            &repol,
+            true,
+            &["check-ignore", "--no-index", "-q", "--", path],
+        )
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    };
+    for (name, path) in entry {
+        if !tree.contains(&path.to_lowercase()) && !ignored(&path) {
+            bail!(
+                "verify_script_missing: {what} `{name}` runs `{path}`, which is not in the base commit {} of {} — commit it before creating the task (M18: a verify script the task itself creates could be written by the implementer)",
+                crate::git::short(base),
+                repo.display()
+            );
+        }
+    }
+    Ok(net
+        .into_iter()
+        .filter(|(_, path)| !tree.contains(&path.to_lowercase()))
+        .map(|(name, path)| {
+            format!("{what} `{name}` passes `{path}`, which is not in the base commit — fine for build output; if the {what} runs it as its script, commit it first")
+        })
+        .collect())
+}
+
 /// Git for this task's repository, with the R37 filter plan admitted.
 pub fn task_git(cfg: &Effective, repo: &Path) -> Result<GitCmd> {
     let mut g = default_gitcmd()?;
@@ -108,6 +201,11 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         .map(|l| l.trim_start_matches("# ").trim().to_string())
         .unwrap_or_else(|| id.clone());
     let (planner, implementers, reviewer) = roles(cfg)?;
+    // review H2 (M11-A2): the repository chooses its verify sandbox only above the floor
+    if let Some(reason) = super::verify::below_floor(cfg) {
+        bail!("{reason}");
+    }
+    let machine = new_machine(cfg, a.max_fix_cycles)?;
 
     let g = task_git(cfg, &repo)?;
     // R36/R45 admission: the verify boundary must be available before anything is created
@@ -131,6 +229,7 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         true,
         &["rev-parse", &format!("{base_ref}^{{commit}}")],
     )?;
+    check_entry_points(cfg, &g, &repo, &base)?;
     // R59 admission: its metadata folder and (protected) build projects are in the base commit
     if super::xpp::compile_only(cfg) {
         let listing = g.run(&repol, true, &["ls-tree", "-r", "-z", "--name-only", &base])?;
@@ -218,10 +317,6 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         std::fs::write(&excl, format!("{cur}{sep}/.toryo-tmp/\n"))?;
     }
 
-    let max = a
-        .max_fix_cycles
-        .or(cfg.repo.pipeline.max_fix_cycles)
-        .unwrap_or(2);
     let nt = NewTask {
         id: id.clone(),
         title,
@@ -234,7 +329,7 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         base_commit: base,
         repo,
         task_file: file,
-        machine: Machine::new(max),
+        machine,
         implementers,
         planner,
         reviewer,

@@ -9,6 +9,7 @@
     "validation":             { "type": "array", "items": { "type": "string" } },
     "assumptions":            { "type": "array", "items": { "type": "string" } },
     "open_questions":         { "type": "array", "items": { "type": "string" } },
+    "skills":                 { "type": "array", "items": { "type": "string" } },
     "plan_markdown":          { "type": "string" }
   }
 }

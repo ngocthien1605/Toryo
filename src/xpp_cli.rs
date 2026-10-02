@@ -232,6 +232,7 @@ pub fn run(cli: &Cli, cmd: &XppCmd) -> Result<i32> {
                 },
                 timeout: left,
                 cancel: None,
+                redact: toryo::process::redact::Redactions::empty(),
             },
             None,
         ))?;

@@ -77,3 +77,13 @@ git:
 # Off by default; `toryo notify-test` shows a sample.
 # notify:
 #   toast: true
+
+# M11 — org chart mode (templates/d365fo/.toryo/): the DB-sync environment gate and the shared
+# skills folder of this UDE machine. The full comments and the script contract are in
+# templates/toryo.local.yaml.example.
+# skills_dir: C:/Temp/AgentShare/skills
+# environment_gates:
+#   dbsync:
+#     program: powershell
+#     args: [-NoProfile, -NonInteractive, -File, 'C:\toryo-gates\dbsync.ps1']   # outside every repository
+#     lock: d365-env

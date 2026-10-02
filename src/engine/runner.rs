@@ -36,7 +36,7 @@ use super::checks::{
 use super::context;
 use super::contracts;
 use super::flight::{EngineEvent, Recorder, TurnUsage};
-use super::lock::{StopWatch, TaskLock};
+use super::lock::{EnvLock, StopWatch, TaskLock};
 use super::protect;
 use super::state::{GateKind, Machine, PipelineEvent as Ev, PipelineState as St};
 use super::store::{self, AttemptEnd, AttemptRow, AttemptStatus, NewAttempt, Store, TaskRow};
@@ -52,6 +52,7 @@ use crate::domain::{ErrorClass, OpenSession, Role, StageOutcome, Tri, TurnInput,
 use crate::git::GitCmd;
 use crate::process::Boundary;
 use crate::runner::{CommandResult, CommandRunner, LocalRunner, RunSpec};
+use crate::team::Level;
 use crate::usage::{Accounting, Weights};
 
 #[derive(Debug, Clone, Default)]
@@ -108,6 +109,11 @@ pub fn task_policy(t: &TaskRow, cfg: &Effective) -> Result<(GitCmd, Protected, V
     if let Ok(r) = rel(&t.repo, &t.task_file) {
         exact.push(r); // the task is the contract: agents may not edit it
     }
+    // M11-R4: the culture goes into every seat's instructions — protected like the verify files
+    // (`## Allow protected` can open it)
+    if let Some(c) = cfg.team.as_ref().and_then(|t| t.culture.clone()) {
+        exact.push(c);
+    }
     // the allow list comes from the TASK.md snapshot (hashed at create, R28), not the repo
     let task_md = std::fs::read(t.artifacts().join("TASK.md")).unwrap_or_default();
     if sha256_hex(&task_md) != t.task_sha256 {
@@ -124,6 +130,11 @@ pub fn task_policy(t: &TaskRow, cfg: &Effective) -> Result<(GitCmd, Protected, V
         &parse_allow_protected(&task_md),
         &cfg.repo.policy.deny_paths,
     );
+    // M11-C2: the implementer's write fence (org chart mode)
+    let p = match cfg.team.as_ref().and_then(|t| t.role("implementer")) {
+        Some(r) => p.with_fence(&r.writes, &r.never),
+        None => p,
+    };
     Ok((g, p, cmds))
 }
 
@@ -143,6 +154,8 @@ struct VerifyAt<'a> {
     env: BTreeMap<String, String>,
     boundary: Boundary,
     stop: &'a StopWatch,
+    /// M11-E2 (review M2): the task's secrets, redacted from every verify output.
+    redact: crate::process::redact::Redactions,
 }
 
 impl VerifyAt<'_> {
@@ -156,6 +169,7 @@ impl VerifyAt<'_> {
             boundary: self.boundary,
             timeout,
             cancel: Some(self.stop.flag.clone()),
+            redact: self.redact.clone(),
         }
     }
 }
@@ -224,7 +238,53 @@ impl<'a> Engine<'a> {
 
     /// Escalate with `reason`, printed as `!! reason` before the `[state]` line.
     fn escalate(&self, class: &str, reason: String) -> Result<St> {
-        self.apply_with(Ev::Escalate { reason }, true, Some(class))
+        let st = self.apply_with(Ev::Escalate { reason }, true, Some(class))?;
+        self.record_reason_class(class)?;
+        Ok(st)
+    }
+
+    /// M11-R11: store the escalation class on the machine, so a plain `toryo resume` can tell a
+    /// machine-caused escalation from one a fix cycle should repair.
+    fn record_reason_class(&self, class: &str) -> Result<()> {
+        let (i, c) = (self.id.clone(), class.to_string());
+        self.store
+            .call(move |tx| store::set_reason_class(tx, &i, &c))
+    }
+
+    /// M11-R5: before a turn of `stage` starts (no attempt, no tokens) — every skill it needs
+    /// resolves now (the approved plan's for the implementer, the role file's for planner and
+    /// reviewer), and with its skills the context fits the budget. Otherwise the task
+    /// escalates (`skill_unavailable` / `context_over_budget`) and this returns true; `resume`
+    /// tries again. Without an org chart nothing is checked.
+    fn turn_blocked(&self, t: &TaskRow, stage: &str, profile: &str) -> Result<bool> {
+        if self.cfg.team.is_none() {
+            return Ok(false);
+        }
+        // a task pack that fails its hash check escalates with the attempt (R34)
+        let Ok(req) = context::request(self.store, t, &self.cfg, stage, profile) else {
+            return Ok(false);
+        };
+        let missing = req
+            .team
+            .as_ref()
+            .map(|c| c.missing_skills.clone())
+            .unwrap_or_default();
+        let blocked = if !missing.is_empty() {
+            Some((
+                context::SKILL_UNAVAILABLE,
+                skill_unavailable_reason(t, stage, profile, &missing),
+            ))
+        } else {
+            let c = context::assemble(&req)?;
+            context::over_budget(&c).map(|r| (context::CONTEXT_OVER_BUDGET, r))
+        };
+        match blocked {
+            Some((class, reason)) => {
+                self.escalate(class, reason)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// Apply `e` and report it; `reason_line`: the escalation or pause reason is printed (see
@@ -465,7 +525,7 @@ impl<'a> Engine<'a> {
             prev.as_ref().map(|p| p.status),
             &art.join("TASK.md"),
         );
-        if !self.admitted()? {
+        if !self.admitted()? || self.turn_blocked(t, "plan", &t.planner)? {
             return Ok(Flow::Next);
         }
         let head = Worktree::new(&self.g, &t.worktree).head()?;
@@ -548,6 +608,14 @@ impl<'a> Engine<'a> {
                 return Ok(Flow::Next);
             }
         };
+        // M11-D2 (group D review): `skills` means something only with an org chart — a
+        // legacy plan is stored and shown as in M10
+        let mut plan = plan;
+        if self.cfg.team.is_none() {
+            if let Some(o) = plan.as_object_mut() {
+                o.remove("skills");
+            }
+        }
         let bytes = serde_json::to_vec_pretty(&plan)?;
         let md = super::render::render("plan", &plan)?;
         self.put(t, &a, "plan", "json", &bytes, "plan.json")?;
@@ -558,14 +626,44 @@ impl<'a> Engine<'a> {
             .filter(|f| self.protect.violates(f))
             .collect();
         if !bad.is_empty() {
-            eprintln!("!! the plan lists protected or denied paths {bad:?} — rejected automatically (plan-time policy)");
-            let fb = format!("Your plan lists protected or denied paths {bad:?} (toryo.yaml policy), which may not change. Create the plan again without touching them.");
+            // M11-R8: with a fence violation, the reason (and so the escalation after the
+            // re-plan bound) names the rule, not "protected paths"
+            let fenced = bad.iter().any(|p| self.protect.fence_rule(p).is_some());
+            let reason =
+                fenced.then(|| format!("the plan lists {}", self.protect.violation_words(&bad)));
+            let fb = match plan_fence_feedback(&bad, &self.protect) {
+                // M11-C2: the feedback names the fence rule each path breaks
+                Some(fb) => {
+                    eprintln!("!! the plan lists paths the implementer may not change {bad:?} — rejected automatically (plan-time policy, write fence)");
+                    fb
+                }
+                None => {
+                    eprintln!("!! the plan lists protected or denied paths {bad:?} — rejected automatically (plan-time policy)");
+                    format!("Your plan lists protected or denied paths {bad:?} (toryo.yaml policy), which may not change. Create the plan again without touching them.")
+                }
+            };
             self.end_and(
                 &a,
                 AttemptStatus::Succeeded,
                 &r,
                 AttemptEnd::default(),
-                Some(Ev::PlanPolicyViolation { paths: bad }),
+                Some(Ev::PlanPolicyViolation { paths: bad, reason }),
+                Some(Some(fb)),
+            )?;
+            return Ok(Flow::Next);
+        }
+        // M11-D2: the implementer's skills — on its menu, within its context budget
+        if let Some((reason, fb)) = self.plan_skills_problem(t, &plan)? {
+            eprintln!("!! {reason} — rejected automatically (plan-time skills check)");
+            self.end_and(
+                &a,
+                AttemptStatus::Succeeded,
+                &r,
+                AttemptEnd::default(),
+                Some(Ev::PlanPolicyViolation {
+                    paths: vec![],
+                    reason: Some(reason),
+                }),
                 Some(Some(fb)),
             )?;
             return Ok(Flow::Next);
@@ -580,6 +678,98 @@ impl<'a> Engine<'a> {
             Some(None),
         )?;
         Ok(Flow::Next)
+    }
+
+    /// M11-D2: what is wrong with the plan's `skills` — `(reason, feedback for the planner)`:
+    /// a name that is not on the implementer's menu (the feedback lists the menu, with a "did
+    /// you mean"), or chosen skills that, with the implementer's never-trimmed parts, exceed its
+    /// context budget ("choose fewer"). `None` without an org chart or without skills.
+    fn plan_skills_problem(&self, t: &TaskRow, plan: &Value) -> Result<Option<(String, String)>> {
+        let Some(team) = &self.cfg.team else {
+            return Ok(None);
+        };
+        let chosen = context::plan_skills(plan);
+        if chosen.is_empty() {
+            return Ok(None);
+        }
+        // M11-R5: the menu is what resolves now — a skill that cannot be delivered is off it
+        let machine = crate::team::machine_skills_dir(&team.skill_roots);
+        let available = context::available_skills(team, &t.repo, machine.as_deref());
+        let menu: Vec<&str> = available.iter().map(|k| k.name.as_str()).collect();
+        let off: Vec<String> = chosen
+            .iter()
+            .filter(|s| !menu.contains(&s.as_str()))
+            .map(|s| {
+                let mean = crate::team::did_you_mean(s, &menu)
+                    .map(|m| format!(" (did you mean `{m}`?)"))
+                    .unwrap_or_default();
+                // a name the planner wrote: escaped, it reaches the terminal and the reason
+                format!("`{}`{mean}", s.escape_debug())
+            })
+            .collect();
+        if !off.is_empty() {
+            let reason = format!(
+                "plan_skills: the plan lists skills that are not on the implementer's menu: {}",
+                off.join(", ")
+            );
+            let listed =
+                context::skill_menu(team, &t.repo, machine.as_deref()).unwrap_or_else(|| {
+                    "(no skill of the implementer resolves on this machine now)\n".into()
+                });
+            let fb = format!(
+                "Your plan lists skills that are not on the implementer's menu: {}. {listed}Create the plan again with `skills` naming only skills from this menu (or none).",
+                off.join(", ")
+            );
+            return Ok(Some((reason, fb)));
+        }
+        // the chosen skills are never trimmed: with the implementer's other never-trimmed
+        // parts they must fit its budget — the implementer's context as it would be assembled
+        // (D3: from this plan, the head of `plan`), for every profile of the chain (M11-R5: a
+        // fallback without the run store also has TASK.md and PLAN.md inline, never trimmed)
+        let mut chain: Vec<String> = Vec::new();
+        for p in &t.implementers {
+            if !chain.contains(p) {
+                chain.push(p.clone());
+            }
+        }
+        if chain.is_empty() {
+            chain.push(context::stage_profile(t, "implement")?);
+        }
+        for profile in &chain {
+            let mut req = context::request(self.store, t, &self.cfg, "implement", profile)?;
+            let budget = req.budget;
+            // (R4–R8 review) the test of the attempt (`context::over_budget`: the rendered
+            // context after trimming), on a budget that leaves room for what a fix stage adds
+            // (its pack sentence, the verify result and review as data)
+            req.budget = budget.saturating_sub(PLAN_BUDGET_MARGIN);
+            let c = context::assemble(&req)?;
+            req.budget = budget;
+            let skills: usize = c
+                .sources
+                .iter()
+                .filter(|s| s.label.starts_with("skill "))
+                .map(|s| s.bytes)
+                .sum();
+            let fixed = c.fixed_bytes.saturating_sub(skills);
+            if c.fixed_bytes > req.budget || context::over_budget(&c).is_some() {
+                let inline = if req.no_run_store {
+                    ", with TASK.md and PLAN.md inline"
+                } else {
+                    ""
+                };
+                let reason = format!(
+                    "plan_skills: the chosen skills ({skills} bytes) and the fixed instructions of the implementer `{profile}` ({fixed} bytes{inline}) exceed its context budget ({} KB)",
+                    req.budget / 1024
+                );
+                let fb = format!(
+                    "Choose fewer skills: the skills you chose ({}; {skills} bytes) and the fixed instructions of the implementer `{profile}` ({fixed} bytes{inline}) exceed its context budget of {} KB (context.budget_kb.implementer). Create the plan again with fewer names in `skills`.",
+                    chosen.join(", "),
+                    req.budget / 1024
+                );
+                return Ok(Some((reason, fb)));
+            }
+        }
+        Ok(None)
     }
 
     fn role_model(&self, role: &str) -> Option<String> {
@@ -605,7 +795,7 @@ impl<'a> Engine<'a> {
             return Ok(Flow::Next);
         }
         let Some(run) = self.run_implement_turn(t, &turn, &wt)? else {
-            return Ok(Flow::Next); // the task pack failed its hash check: escalated (R34)
+            return Ok(Flow::Next); // escalated: the task pack failed its hash check (R34), or a skill / the budget (M11-R5)
         };
         let outcome = self.interpret_implement(t, &turn, &run, &wt)?;
         self.retries = outcome.retries_after(self.retries);
@@ -651,14 +841,17 @@ impl<'a> Engine<'a> {
     }
 
     /// Begin the attempt at the current HEAD with an empty TEMP (R46), assemble its context
-    /// (§7), run the turn and record its usage (R41). `None`: the context could not be
-    /// assembled and the task escalated.
+    /// (§7), run the turn and record its usage (R41). `None`: the turn did not run and the task
+    /// escalated (the task pack's hash, a skill that does not resolve, the budget — M11-R5).
     fn run_implement_turn(
         &self,
         t: &TaskRow,
         turn: &ImplementTurn,
         wt: &Worktree,
     ) -> Result<Option<ImplementRun>> {
+        if self.turn_blocked(t, &turn.stage, &turn.profile)? {
+            return Ok(None);
+        }
         let head_before = wt.head()?;
         let tmp = t.worktree.join(".toryo-tmp");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -839,9 +1032,18 @@ impl<'a> Engine<'a> {
                 Ok(Flow::Next)
             }
             ImplementOutcome::PathPolicy { paths } => {
-                eprintln!("!! protected or denied paths changed: {paths:?} — restored, nothing committed; sent back to the implementer");
+                let fb = match change_fence_feedback(&paths, &self.protect) {
+                    // M11-C2: the fix note names the fence rule each path breaks
+                    Some(fb) => {
+                        eprintln!("!! paths the implementer may not change were changed: {paths:?} — restored, nothing committed; sent back to the implementer (write fence)");
+                        fb
+                    }
+                    None => {
+                        eprintln!("!! protected or denied paths changed: {paths:?} — restored, nothing committed; sent back to the implementer");
+                        format!("- POLICY: you changed protected or denied paths {paths:?}. They were restored. Do not modify them; achieve the task another way.")
+                    }
+                };
                 wt.restore(&paths)?;
-                let fb = format!("- POLICY: you changed protected or denied paths {paths:?}. They were restored. Do not modify them; achieve the task another way.");
                 self.end_and(
                     a,
                     AttemptStatus::Failed,
@@ -1223,20 +1425,58 @@ impl<'a> Engine<'a> {
             Some(format!("{} in {}", verify::describe(b), co.dir.display())),
         );
         let stop = self.lock.watch_stop();
-        let Some((results, failure)) = self.run_verify_commands(b, &co, &stop, xpp.as_ref())?
-        else {
-            self.finish_and(
+        let interrupted = |e: &Self| -> Result<Flow> {
+            e.finish_and(
                 &a,
                 AttemptStatus::Interrupted,
                 AttemptEnd::default(),
                 None,
                 None,
             )?;
-            return self.stopped();
+            e.stopped()
         };
-        let pass = failure.is_none();
-        // R29/R47: the checkout must be exactly the checkpoint after the run
-        let mutated = verify::mutated(&self.g, &co, &head)?;
+        let Some((mut results, mut failure)) =
+            self.run_verify_commands(b, &co, &head, &stop, xpp.as_ref())?
+        else {
+            return interrupted(self);
+        };
+        // M11-R9 (X6, replaces X2): the environment gates read a fresh export of the commit,
+        // never the Low checkout. Before the first one, a check gate that changed a tracked file
+        // is still wrong (R29: escalate, no environment gate); what it left besides is not
+        // deployed — one warning and `checkout_extra` in VERIFY_RESULT.json
+        let mut before_deploy: Option<String> = None;
+        let mut extra: Option<Vec<String>> = None;
+        if failure.is_none() && self.deploys() {
+            before_deploy = verify::mutated(&self.g, &co, &head)?;
+            let found = verify::checkout_extra(&self.g, &co)?;
+            if !found.is_empty() {
+                eprintln!(
+                    "!! a check gate left files in the verify checkout — they are not deployed: {:?}",
+                    found.iter().take(10).collect::<Vec<_>>()
+                );
+                extra = Some(found.into_iter().take(10).collect());
+            }
+        }
+        // M11-E3: the environment gates, only after every check gate passed
+        let mut export_mutated: Option<String> = None;
+        if failure.is_none() && before_deploy.is_none() {
+            match self.run_environment_gates(t, &co, &head, &stop, &mut results)? {
+                EnvGates::Done(f) => failure = f,
+                EnvGates::Stopped => return interrupted(self),
+                EnvGates::Unavailable(reason) => {
+                    self.escalate_attempt(&a, ENV_UNAVAILABLE.into(), reason)?;
+                    return Ok(Flow::Next);
+                }
+                EnvGates::Mutated(reason) => export_mutated = Some(reason),
+            }
+        }
+        let pass = failure.is_none() && before_deploy.is_none();
+        // R29/R47: the checkout must be exactly the checkpoint after the run; M11-R9: the
+        // export too, after each environment gate (E3 AC-8)
+        let mutated = match before_deploy.or(export_mutated) {
+            Some(reason) => Some(reason),
+            None => verify::mutated(&self.g, &co, &head)?,
+        };
         let tree = self.g.run_str(
             &Worktree::new(&self.g, &t.worktree).loc,
             true,
@@ -1257,6 +1497,9 @@ impl<'a> Engine<'a> {
         // R59: an X++ build proves compile level only — no DB sync, no unit tests
         if results.iter().any(|r| r["kind"] == "xpp") {
             vr["scope"] = json!("compile");
+        }
+        if let Some(x) = extra {
+            vr["checkout_extra"] = json!(x);
         }
         self.put(
             t,
@@ -1320,14 +1563,20 @@ impl<'a> Engine<'a> {
         &self,
         b: Boundary,
         co: &verify::Checkout,
+        head: &str,
         stop: &StopWatch,
         xpp: Option<&xpp::Toolchain>,
     ) -> Result<Option<(Vec<Value>, Option<String>)>> {
+        let mut env = verify::env(co);
+        // M11-E1: TORYO_TASK, TORYO_SHA, TORYO_VERIFY_CHECKOUT for every command
+        verify::set_gate_vars(&mut env, &self.id, head, co, &co.dir);
+        let t = self.task()?;
         let at = VerifyAt {
             co,
-            env: verify::env(co),
+            env,
             boundary: b,
             stop,
+            redact: super::flight::task_redactions(&self.cfg, &t),
         };
         let mut results = Vec::new();
         for c in &self.cmds {
@@ -1402,6 +1651,17 @@ impl<'a> Engine<'a> {
     /// One verify process through `LocalRunner`, with its ✔/✘ line; `None` when a stop
     /// request ended it (R38). R50: LocalRunner strips ANSI (CSI/OSC) from what it captures.
     fn run_verify_command(&self, run: RunSpec, stop: &StopWatch) -> Result<Option<CommandResult>> {
+        self.run_gate_command(run, stop, None)
+    }
+
+    /// [`Self::run_verify_command`] for a gate of `kind` (`environment`, M11-E3: shown in its
+    /// `verify_command` event; `None` keeps the M10 event).
+    fn run_gate_command(
+        &self,
+        run: RunSpec,
+        stop: &StopWatch,
+        kind: Option<&str>,
+    ) -> Result<Option<CommandResult>> {
         let name = run.name.clone();
         let res = self.hub.block_on(LocalRunner.run(run, None))?;
         if res.cancelled || stop.stopped() {
@@ -1413,8 +1673,238 @@ impl<'a> Engine<'a> {
             timed_out: res.timed_out,
             ok: res.ok(),
             duration_ms: res.duration_ms as u64,
+            kind: kind.map(str::to_string),
         });
         Ok(Some(res))
+    }
+
+    // ── environment gates (M11-E3) ───────────────────────────────────────────────────
+
+    /// M11-R2: this verify run will start an environment gate (the implementer's
+    /// `before_handoff` has one this machine defines).
+    fn deploys(&self) -> bool {
+        self.cfg.team.as_ref().is_some_and(|t| {
+            t.handoff_gates().iter().any(|(_, g)| {
+                g.decl.kind == crate::team::GateType::Environment && g.machine.is_some()
+            })
+        })
+    }
+
+    /// The environment gates of the implementer's `before_handoff`, in order, after every
+    /// check gate of the run passed: each takes its machine-wide lock (waiting while another
+    /// task holds it), records the deployment **before** it starts, runs the frozen machine
+    /// command with the owner's normal token in an empty working directory (`envgate`, M11-R2;
+    /// it deploys from a fresh export of the commit made once the lock is held, M11-R9) (Job Object, timeout,
+    /// environment from scratch + gate variables + `env` + resolved `secret_env`, redacted
+    /// output), records the end and releases the lock. A gate this machine does not define
+    /// (`if_missing: skip`) gets a skipped entry. Stops at the first failure.
+    fn run_environment_gates(
+        &self,
+        t: &TaskRow,
+        co: &verify::Checkout,
+        head: &str,
+        stop: &StopWatch,
+        results: &mut Vec<Value>,
+    ) -> Result<EnvGates> {
+        let Some(team) = &self.cfg.team else {
+            return Ok(EnvGates::Done(None));
+        };
+        let machine = computer_name();
+        let gates: Vec<(&str, &crate::team::Gate)> = team
+            .handoff_gates()
+            .into_iter()
+            .filter(|(_, g)| g.decl.kind == crate::team::GateType::Environment)
+            .collect();
+        for (name, g) in gates {
+            let Some(m) = &g.machine else {
+                eprintln!("  – {name}: skipped — not defined on this machine (if_missing: skip)");
+                results.push(json!({"name": name, "kind": "environment", "skipped": true, "reason": SKIPPED_REASON}));
+                continue;
+            };
+            // M11-R8: one lock and one deployment row whatever the case it is written in
+            let lock_name = super::lock::lock_key(&m.lock);
+            // M11-R12 (item 3): a frozen config has no machine path, so the hint names no file
+            let unavailable = |what: String| {
+                Ok(EnvGates::Unavailable(format!(
+                    "{ENV_UNAVAILABLE}: environment gate `{name}`: {what} — fix the machine config, then `toryo resume {}`",
+                    t.id
+                )))
+            };
+            // M11-R12 (item 2): a task frozen before R3 may still hold `%VAR%` in program/args
+            // (they are expanded at load now, not at run time) — do not run it half-expanded
+            if let Some(var) = gate_residual_var(&m.program, &m.args) {
+                return Ok(EnvGates::Unavailable(format!(
+                    "{ENV_UNAVAILABLE}: environment gate `{name}`: the command still contains `%{var}%` (a task created before M11 expanded gate variables at load) — run `toryo task config {} --reload`, then `toryo resume {}`",
+                    t.id, t.id
+                )));
+            }
+            let mut secrets = BTreeMap::new();
+            for (k, r) in &m.secret_env {
+                match crate::config::resolve_secret(r) {
+                    Ok(v) => {
+                        secrets.insert(k.clone(), v);
+                    }
+                    Err(e) => return unavailable(format!("secret_env.{k}: {e:#}")),
+                }
+            }
+            let program = match env_gate_program(
+                &self.cfg,
+                &m.program,
+                std::env::var_os("PATH").as_deref(),
+            ) {
+                Ok(p) => p,
+                Err(e) => return unavailable(e),
+            };
+            let Some(lock) = self.env_lock(t, &lock_name, stop)? else {
+                return Ok(EnvGates::Stopped);
+            };
+            // M11-R9 (X6): what the gate deploys — a fresh export of the commit from the object
+            // store, made once the lock is held, into a folder Low code cannot write
+            let export = match verify::deploy_source(&self.g, co, head) {
+                Ok(e) => e,
+                Err(e) => {
+                    drop(lock);
+                    return Ok(EnvGates::Unavailable(format!(
+                        "{ENV_UNAVAILABLE}: environment gate `{name}`: the checkpoint {} could not be exported for it (nothing was deployed): {e:#} — `toryo resume {}` exports it again",
+                        short(head),
+                        t.id
+                    )));
+                }
+            };
+            // M11-R2 (X1): a fresh, empty working directory agent code cannot write
+            let cwd = verify::envgate_dir(co)?;
+            // first the record: a failed or killed sync may already have changed the environment
+            let (i, l, h, n, mc) = (
+                t.id.clone(),
+                lock_name.clone(),
+                head.to_string(),
+                name.to_string(),
+                machine.clone(),
+            );
+            self.store
+                .call(move |tx| store::deployment_start(tx, &l, &i, &h, &n, &mc))?;
+            crash_point("verify:environment_gate_started");
+            let mut env = crate::process::env::build_env(std::env::vars(), &m.env, &secrets);
+            // group E review: a bare name the script runs is never looked up in the working
+            // directory (the empty `envgate` folder, M11-R2: it was the checkout) — cmd.exe and
+            // CreateProcess honour this; DLL loading does not (documented in the script contract)
+            env.insert("NoDefaultCurrentDirectoryInExePath".into(), "1".into());
+            verify::set_gate_vars(&mut env, &t.id, head, co, &export.dir);
+            let mut redact = super::flight::task_secrets(&self.cfg, t);
+            redact.extend(secrets.iter().map(|(k, v)| crate::process::redact::Secret {
+                name: k.clone(),
+                value: v.clone(),
+            }));
+            let timeout = Duration::from_secs(
+                crate::team::parse_duration(&g.decl.timeout).unwrap_or(30 * 60),
+            );
+            let run = RunSpec {
+                name: name.to_string(),
+                program,
+                args: m.args.clone(),
+                cwd,
+                env,
+                // the owner's normal token: the check gates' boundary is not changed (D6)
+                boundary: Boundary::None,
+                timeout,
+                cancel: Some(stop.flag.clone()),
+                redact: crate::process::redact::Redactions::new(&redact),
+            };
+            let res = match self.hub.block_on(LocalRunner.run(run, None)) {
+                Ok(r) => r,
+                Err(e) => {
+                    // it did not start: say so in the record, not "interrupted"
+                    let (i, l) = (t.id.clone(), lock_name.clone());
+                    let _ = self
+                        .store
+                        .call(move |tx| store::deployment_end(tx, &l, &i, Some(false)));
+                    return Err(e);
+                }
+            };
+            // M11-R8: a timed-out or cancelled gate was killed part way — the environment may
+            // hold a partial deploy, so the record says interrupted (`ok` empty), not failed. A
+            // stop that arrived after the gate finished keeps the gate's real result.
+            let ok = deployment_ok(&res);
+            let (i, l) = (t.id.clone(), lock_name.clone());
+            self.store
+                .call(move |tx| store::deployment_end(tx, &l, &i, ok))?;
+            drop(lock);
+            if res.cancelled {
+                return Ok(EnvGates::Stopped);
+            }
+            self.rec.emit(EngineEvent::VerifyCommand {
+                name: name.to_string(),
+                exit: res.exit,
+                timed_out: res.timed_out,
+                ok: res.ok(),
+                duration_ms: res.duration_ms as u64,
+                kind: Some("environment".into()),
+            });
+            if stop.stopped() {
+                return Ok(EnvGates::Stopped);
+            }
+            self.rec.emit(EngineEvent::EnvironmentDeployed {
+                lock: lock_name.clone(),
+                sha: head.to_string(),
+                ok: res.ok(),
+            });
+            let argv: Vec<String> = std::iter::once(m.program.clone())
+                .chain(m.args.iter().cloned())
+                .collect();
+            results.push(json!({"name": name, "kind": "environment", "lock": lock_name, "machine": machine, "argv": argv, "exit": res.exit, "timed_out": res.timed_out, "ms": res.duration_ms, "output_tail": res.tail(40), "source": "export", "source_tree": export.tree}));
+            // M11-R9: the gate must not have written into what it deploys from (E3 AC-8)
+            if let Some(reason) = verify::export_changed(&self.g, co, &export)? {
+                return Ok(EnvGates::Mutated(reason));
+            }
+            if !res.ok() {
+                // R61: the output comes from code that ran on the checkpoint — data
+                let f = verify_feedback(&res, "");
+                return Ok(EnvGates::Done(Some(untrusted::wrap("verify", None, &f))));
+            }
+        }
+        Ok(EnvGates::Done(None))
+    }
+
+    /// Take the machine-wide lock `lock` for task `t`, waiting while another task holds it:
+    /// one `lock_waiting` event, `status` shows the wait, a `toryo stop` ends it (`None`).
+    fn env_lock(&self, t: &TaskRow, lock: &str, stop: &StopWatch) -> Result<Option<EnvLock>> {
+        let label = format!("{} ({})", t.id, super::lock::owner_label());
+        let mut waiting = false;
+        loop {
+            if let Some(l) = EnvLock::try_acquire(lock, &label)? {
+                if waiting {
+                    let i = t.id.clone();
+                    self.store
+                        .call(move |tx| store::set_env_wait(tx, &i, None))?;
+                }
+                return Ok(Some(l));
+            }
+            if !waiting {
+                waiting = true;
+                let (i, l) = (t.id.clone(), lock.to_string());
+                let holder = self.store.call(move |tx| {
+                    store::set_env_wait(tx, &i, Some(&l))?;
+                    Ok(store::deployments(tx)?
+                        .into_iter()
+                        .find(|d| d.lock == l && d.finished_at.is_none() && d.task != i)
+                        .map(|d| d.task))
+                })?;
+                self.rec.emit(EngineEvent::LockWaiting {
+                    lock: lock.to_string(),
+                    holder,
+                });
+            }
+            // poll about every 2 s; a stop request ends the wait at once
+            for _ in 0..(env_lock_poll_ms() / 100).max(1) {
+                if stop.stopped() {
+                    let i = t.id.clone();
+                    self.store
+                        .call(move |tx| store::set_env_wait(tx, &i, None))?;
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
     }
 
     // ── Reviewing ────────────────────────────────────────────────────────────────────
@@ -1436,6 +1926,18 @@ impl<'a> Engine<'a> {
             self.apply(Ev::Reverify)?;
             return Ok(Flow::Next);
         }
+        // M11-C3: `reviewer-differs-from-builder: error` — no review turn by the vendor that
+        // built the checkpoint (the profile that actually ran, after any fallback)
+        if reviewer_check(&self.cfg) == Level::Error {
+            let imps = implementer_profiles(self.store, t)?;
+            let same = same_vendor(&self.cfg, &imps, &t.reviewer);
+            if !same.is_empty() {
+                let kind = both_kind(&self.cfg, &t.reviewer);
+                let reason = same_vendor_reason(&t.id, &same, &t.reviewer, &kind);
+                self.escalate(SAME_VENDOR, reason)?;
+                return Ok(Flow::Next);
+            }
+        }
         // R48: a review of the same checkpoint that was interrupted (crash, stop) resumes the
         // Reviewer's session
         let prev = {
@@ -1444,7 +1946,7 @@ impl<'a> Engine<'a> {
                 .call(move |tx| store::last_attempt(tx, &i, "review"))?
         };
         let resume = review_resume(prev.as_ref(), &head, &t.reviewer);
-        if !self.admitted()? {
+        if !self.admitted()? || self.turn_blocked(t, "review", &t.reviewer)? {
             return Ok(Flow::Next);
         }
         let a = self.begin(NewAttempt {
@@ -1916,6 +2418,22 @@ impl<'a> Engine<'a> {
             Err(e) => return Err(e),
         };
         let c = context::assemble(&req)?;
+        // M11-R5: checked before the turn too ([`Self::turn_blocked`]); a skill that went
+        // missing or a skill file that grew in between is caught here
+        let missing = req
+            .team
+            .as_ref()
+            .map(|c| c.missing_skills.clone())
+            .unwrap_or_default();
+        if !missing.is_empty() {
+            let reason = skill_unavailable_reason(t, &a.stage, profile, &missing);
+            self.escalate_attempt(a, context::SKILL_UNAVAILABLE.into(), reason)?;
+            return Ok(None);
+        }
+        if let Some(reason) = context::over_budget(&c) {
+            self.escalate_attempt(a, context::CONTEXT_OVER_BUDGET.into(), reason)?;
+            return Ok(None);
+        }
         for w in &c.warnings {
             eprintln!("!! {w}");
         }
@@ -2178,12 +2696,13 @@ impl<'a> Engine<'a> {
             a,
             AttemptStatus::Failed,
             AttemptEnd {
-                error_class: Some(class),
+                error_class: Some(class.clone()),
                 ..Default::default()
             },
             None,
             Some(Ev::Escalate { reason }),
-        )
+        )?;
+        self.record_reason_class(&class)
     }
 }
 
@@ -2231,6 +2750,57 @@ fn plan_files(plan: &Value) -> Vec<String> {
         .flatten()
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect()
+}
+
+/// M11-C2: the plan-time feedback when a planned path breaks the implementer's write fence —
+/// each such path with its rule, then any protected or denied ones; `None` when no path breaks
+/// the fence (the M10 message is used).
+fn plan_fence_feedback(bad: &[String], protect: &Protected) -> Option<String> {
+    let fenced: Vec<String> = bad
+        .iter()
+        .filter_map(|f| {
+            protect
+                .fence_rule(f)
+                .map(|r| format!("`{f}` — {}", r.plan_reason()))
+        })
+        .collect();
+    if fenced.is_empty() {
+        return None;
+    }
+    let others: Vec<&String> = bad
+        .iter()
+        .filter(|f| protect.fence_rule(f).is_none())
+        .collect();
+    let mut fb = format!(
+        "Your plan lists paths the implementer may not change: {}.",
+        fenced.join("; ")
+    );
+    if !others.is_empty() {
+        fb.push_str(&format!(
+            " It also lists protected or denied paths {others:?} (toryo.yaml policy)."
+        ));
+    }
+    fb.push_str(" Create the plan again without them.");
+    Some(fb)
+}
+
+/// M11-C2: the fix note when a changed path breaks the implementer's write fence — every
+/// restored path with its rule; `None` when none breaks the fence (the M10 note is used).
+fn change_fence_feedback(paths: &[String], protect: &Protected) -> Option<String> {
+    if paths.iter().all(|p| protect.fence_rule(p).is_none()) {
+        return None;
+    }
+    let list: Vec<String> = paths
+        .iter()
+        .map(|p| match protect.fence_rule(p) {
+            Some(r) => format!("`{p}` ({})", r.change_reason()),
+            None => format!("`{p}` (a protected or denied path)"),
+        })
+        .collect();
+    Some(format!(
+        "- POLICY: you changed paths you may not change: {}. They were restored. Do not modify them; achieve the task another way.",
+        list.join("; ")
+    ))
 }
 
 /// An Implementer turn as prepared before admission (R48, R49).
@@ -3297,6 +3867,105 @@ fn verify_program(program: &str, checkout: &Path) -> PathBuf {
         .fold(checkout.to_path_buf(), |dir, c| dir.join(c))
 }
 
+/// What the environment gates of a verify run led to (M11-E3).
+enum EnvGates {
+    /// All ran (or were skipped); `Some(feedback)` when one failed.
+    Done(Option<String>),
+    /// A stop request ended the wait for the lock or the gate.
+    Stopped,
+    /// The machine cannot run a gate (an unresolved secret, a program not found): escalate —
+    /// not something another fix cycle can repair.
+    Unavailable(String),
+    /// M11-R9: an environment gate wrote into the export it deploys from — the reason
+    /// (`verify_mutated_tree`).
+    Mutated(String),
+}
+
+/// The escalation class of an environment gate this machine cannot run (M11-E3).
+pub const ENV_UNAVAILABLE: &str = "environment_gate_unavailable";
+
+/// M11-R12 (item 2): the first `%NAME%` still in an environment gate's program or args — set
+/// only in a config frozen before M11 expanded them at load. Such a gate does not start.
+pub(crate) fn gate_residual_var(program: &str, args: &[String]) -> Option<String> {
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .find_map(crate::config::residual_var)
+}
+
+/// M11-R5 (R4–R8 review): the plan-time skills budget check leaves this much room for what a
+/// fix stage adds to the implementer's context (its pack sentence, the untrusted-data note).
+const PLAN_BUDGET_MARGIN: usize = 512;
+
+/// M11-R8: what the deployment record says about a gate that ran — `None` (interrupted: the
+/// environment may hold a partial deploy) when its process was killed by the timeout or a
+/// stop, else its own result. A stop that arrives after the gate finished does not change it.
+fn deployment_ok(res: &CommandResult) -> Option<bool> {
+    (!res.timed_out && !res.cancelled).then(|| res.ok())
+}
+
+/// M11-R5: the `skill_unavailable` reason — the skills that do not resolve, with both lookup
+/// paths, and the way out.
+fn skill_unavailable_reason(t: &TaskRow, stage: &str, profile: &str, missing: &[String]) -> String {
+    format!(
+        "{}: the {stage} turn ({profile}) was not started — {}; put the skill back, then `toryo resume {}`",
+        context::SKILL_UNAVAILABLE,
+        missing.join("; "),
+        t.id
+    )
+}
+
+/// The `reason` of a skipped environment gate's `VERIFY_RESULT.json` entry (`if_missing: skip`).
+pub const SKIPPED_REASON: &str = "not defined on this machine";
+
+/// This machine's name for the records (`COMPUTERNAME`, else `HOSTNAME`).
+pub fn computer_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "this machine".into())
+}
+
+/// The program of an environment gate (M11-E3): an absolute path as written, a bare name
+/// through `path` (PATH) — resolved here, so it is never looked up in the working directory
+/// (the `envgate` folder). The text was expanded once at load and is not expanded again (M11-R3).
+/// A program that resolves inside the repository, the worktrees or the verify root is refused:
+/// agent code may have planted it there. `Err` is the reason for `environment_gate_unavailable`.
+pub(crate) fn env_gate_program(
+    cfg: &Effective,
+    program: &str,
+    path: Option<&std::ffi::OsStr>,
+) -> std::result::Result<PathBuf, String> {
+    let bare =
+        !(program.contains('/') || program.contains('\\') || Path::new(program).is_absolute());
+    let found = if bare {
+        path.and_then(|path| super::checks::which_in(program, path))
+            .ok_or_else(|| format!("program `{program}` not found on PATH"))?
+    } else {
+        PathBuf::from(program)
+    };
+    // a relative PATH entry would resolve against the working directory
+    let found = std::path::absolute(&found).map_err(|e| format!("program `{program}`: {e}"))?;
+    if !found.is_file() {
+        return Err(format!("program `{program}` not found"));
+    }
+    if let Some((what, root)) = crate::team::reach(cfg, &found.display().to_string()) {
+        return Err(format!(
+            "program `{program}` resolves to {}, inside {what} ({}) where agent code can write — write an absolute path outside it",
+            found.display(),
+            root.display()
+        ));
+    }
+    Ok(found)
+}
+
+/// How often a waiting environment gate tries its lock again: about every 2 s
+/// (`TORYO_TEST_ENV_LOCK_POLL_MS` for tests).
+fn env_lock_poll_ms() -> u64 {
+    std::env::var("TORYO_TEST_ENV_LOCK_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2000)
+}
+
 /// The error class of a prefixed reason: `artifact_tampered: …` → `artifact_tampered`.
 fn reason_class(reason: &str, default: &str) -> String {
     reason.split(':').next().unwrap_or(default).to_string()
@@ -3330,8 +3999,45 @@ pub fn non_blocking(review: &Value) -> Vec<String> {
 pub fn final_gate_notes(store: &Store, t: &TaskRow) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let cfg = frozen_config(t)?;
-    if xpp::compile_only(&cfg) {
-        out.push(xpp::COMPILE_ONLY.to_string());
+    // M11-E3: what the environment gates of the verify result in force did
+    let (mut passed, mut skipped, mut machine) = (Vec::new(), Vec::new(), String::new());
+    if cfg.team.is_some() {
+        if let Some((_, b)) = super::artifacts::read_head(store, t, "verify-result")? {
+            let vr: Value = serde_json::from_slice(&b).unwrap_or_default();
+            for c in vr["commands"].as_array().into_iter().flatten() {
+                if c["kind"] != "environment" {
+                    continue;
+                }
+                let name = c["name"].as_str().unwrap_or_default().to_string();
+                if c["skipped"] == true {
+                    skipped.push(name);
+                } else if c["exit"] == 0 {
+                    machine = c["machine"].as_str().unwrap_or_default().to_string();
+                    passed.push(name);
+                }
+            }
+        }
+    }
+    out.extend(verify_scope_notes(
+        xpp::compile_only(&cfg),
+        &passed,
+        &skipped,
+        &machine,
+    ));
+    // M11-E3: the environments this task's checkpoints were deployed to
+    let i = t.id.clone();
+    let deployed = store.call(move |tx| {
+        Ok(store::deployments(tx)?
+            .into_iter()
+            .filter(|d| d.task == i)
+            .collect::<Vec<_>>())
+    })?;
+    for d in deployed {
+        let status = super::views::deployment_status(&d, Some(t.state), None, false);
+        out.push(format!(
+            "environment: {}",
+            super::views::deployment_line(&d, status)
+        ));
     }
     if let Some((_, b)) = super::artifacts::read_head(store, t, "review")? {
         let v: Value = serde_json::from_slice(&b)?;
@@ -3343,33 +4049,109 @@ pub fn final_gate_notes(store: &Store, t: &TaskRow) -> Result<Vec<String>> {
             ));
         }
     }
+    // M11-C3: `off` drops the note; `warn` (the default, and legacy mode) keeps it
+    if reviewer_check(&cfg) != Level::Off {
+        let imps = implementer_profiles(store, t)?;
+        let same = same_vendor(&cfg, &imps, &t.reviewer);
+        if !same.is_empty() {
+            out.push(format!(
+                "same vendor: {} implemented and {} reviewed ({}) — the review is less independent (R49); read the diff yourself",
+                same.join(", "),
+                t.reviewer,
+                both_kind(&cfg, &t.reviewer)
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// What verify proved, for the final gate (R59, M11-E3): `COMPILE_ONLY` for an X++ compile
+/// without environment gates; `verify: compile + dbsync on <machine>` when environment gates
+/// passed after it; `verify: dbsync on <machine> (environment gate)` without X++; one note per
+/// skipped environment gate.
+fn verify_scope_notes(
+    compile_only: bool,
+    passed: &[String],
+    skipped: &[String],
+    machine: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    match (compile_only, passed.is_empty()) {
+        (true, true) => out.push(xpp::COMPILE_ONLY.to_string()),
+        (true, false) => out.push(format!(
+            "verify: compile + {} on {machine}",
+            passed.join(" + ")
+        )),
+        (false, false) => out.push(format!(
+            "verify: {} on {machine} (environment gate)",
+            passed.join(" + ")
+        )),
+        (false, true) => {}
+    }
+    for s in skipped {
+        out.push(format!(
+            "{s} did not run on this machine (environment gate not defined here, if_missing: skip)"
+        ));
+    }
+    out
+}
+
+/// The profiles of the implement and fix attempts whose turn ran — after a fallback, every one
+/// that wrote into the checkpoint (R49 keeps the partial work of a failed or interrupted turn)
+/// — in order, consecutive repeats once (M11-C3: the final-gate note and the pre-review check
+/// share it). M11-R7 (X4): any end counts (`Succeeded`, `Failed`, `Interrupted`); only an
+/// attempt that ended before its agent started — no context recorded (the context is stored
+/// right before the agent starts) — is left out. A succeeded one always counts.
+pub fn implementer_profiles(store: &Store, t: &TaskRow) -> Result<Vec<String>> {
     let i = t.id.clone();
     let atts = store.call(move |tx| store::attempts(tx, &i))?;
     let mut imps: Vec<String> = atts
         .iter()
         .filter(|a| {
-            a.status == AttemptStatus::Succeeded
-                && a.kind == "agent"
+            a.kind == "agent"
                 && (a.stage == "implement" || a.stage.starts_with("fix-"))
+                && (a.status == AttemptStatus::Succeeded || a.context_sha256.is_some())
         })
         .filter_map(|a| a.profile.clone())
         .collect();
     imps.dedup();
-    let kind = |p: &str| cfg.profile(p).map(|x| x.kind).ok();
-    let same: Vec<&String> = imps
-        .iter()
-        .filter(|p| kind(p).is_some() && kind(p) == kind(&t.reviewer))
-        .collect();
-    if !same.is_empty() {
-        out.push(format!(
-            "same vendor: {} implemented and {} reviewed ({:?} both) — the review is less independent (R49); read the diff yourself",
-            same.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
-            t.reviewer,
-            kind(&t.reviewer).map(|k| format!("{k:?}")).unwrap_or_default()
-        ));
-    }
-    Ok(out)
+    Ok(imps)
 }
+
+/// The implementer profiles of `imps` whose `kind` (claude | codex) is the reviewer's.
+fn same_vendor<'a>(cfg: &Effective, imps: &'a [String], reviewer: &str) -> Vec<&'a str> {
+    let kind = |p: &str| cfg.profile(p).map(|x| x.kind).ok();
+    imps.iter()
+        .map(String::as_str)
+        .filter(|p| kind(p).is_some() && kind(p) == kind(reviewer))
+        .collect()
+}
+
+/// `Claude both` / `Codex both`, for the messages.
+fn both_kind(cfg: &Effective, reviewer: &str) -> String {
+    cfg.profile(reviewer)
+        .map(|p| format!("{:?} both", p.kind))
+        .unwrap_or_default()
+}
+
+/// `checks.reviewer-differs-from-builder` of the org chart (M11-C3); `warn` in legacy mode.
+fn reviewer_check(cfg: &Effective) -> Level {
+    cfg.team
+        .as_ref()
+        .map(|t| t.checks.reviewer_differs_from_builder)
+        .unwrap_or(Level::Warn)
+}
+
+/// The escalation reason of `reviewer-differs-from-builder: error` (M11-C3).
+fn same_vendor_reason(id: &str, same: &[&str], reviewer: &str, kind: &str) -> String {
+    format!(
+        "{SAME_VENDOR}: {} built this checkpoint and {reviewer} would review it ({kind}) — `checks.reviewer-differs-from-builder: error` in the org chart (R49). Review it yourself (`toryo approve {id} --gate final --force` opens the final gate without the AI review), or give the reviewer seat a profile of another kind (machine `seats:`), `toryo task config {id} --reload`, then `toryo resume {id} --note …`",
+        same.join(", ")
+    )
+}
+
+/// The escalation class of a same-vendor review refused before it starts (M11-C3).
+pub const SAME_VENDOR: &str = "same_vendor_review";
 
 fn review_feedback(review: &Value) -> String {
     let mut f = String::new();
@@ -3660,7 +4442,14 @@ pub fn next_action(t: &TaskRow) -> String {
         St::WaitingFinalApproval => format!("review the branch {} (REVIEW.md in the run store), then `toryo approve {id} --gate final` or `toryo reject {id} --gate final --reason \"…\"`", t.branch),
         St::Escalated => {
             let why = t.machine.reason().unwrap_or("");
-            if why.starts_with(protect::REASON) {
+            if t
+                .machine
+                .reason_class()
+                .is_some_and(crate::engine::state::is_machine_caused)
+            {
+                // M11-R11 (X8): the machine caused it — plain resume goes back into the stage
+                format!("{why}\n  → fix the cause, then `toryo resume {id}` (no fix cycle; the stage is checked again)")
+            } else if why.starts_with(protect::REASON) {
                 format!("{why}\n  → restore the file(s) and `toryo resume {id}`, or `toryo resume {id} --accept-protected-change <path>` (recorded in DECISIONS.md)")
             } else if why.starts_with("recovery_policy_violation") {
                 format!("{why}\n  → `toryo resume {id} --discard-partial` (after a snapshot check) or fix the worktree by hand and `toryo resume {id} --keep-partial`")
@@ -3702,15 +4491,14 @@ pub fn write_summary(store: &Store, t: &TaskRow) -> Result<PathBuf> {
     let i = t.id.clone();
     let atts = store.call(move |tx| store::attempts(tx, &i))?;
     let mut s = format!(
-        "# {} — {:?}\n\n{}\n\n- branch: `{}` (base `{}`) in `{}`\n- fix cycles: {} / {}\n- tokens: {} spent{}{}\n- next: {}\n\n## Stage attempts\n\n| attempt | status | profile | error | checkpoint |\n|---|---|---|---|---|\n",
+        "# {} — {:?}\n\n{}\n\n- branch: `{}` (base `{}`) in `{}`\n- fix cycles: {}\n- tokens: {} spent{}{}\n- next: {}\n\n## Stage attempts\n\n| attempt | status | profile | error | checkpoint |\n|---|---|---|---|---|\n",
         t.id,
         t.state,
         t.title,
         t.branch,
         &t.base_commit[..12.min(t.base_commit.len())],
         t.repo.display(),
-        t.fix_cycle,
-        t.machine.max_fix_cycles(),
+        super::views::fix_cycles(t, " / "),
         t.spent_tokens,
         if t.reserved_tokens > 0 { format!(" + ~{} reserved (unknown usage, R41)", t.reserved_tokens) } else { String::new() },
         t.budget_tokens.map(|b| format!(" of {b} (admission cap, may overshoot by one turn)")).unwrap_or_default(),
@@ -3915,6 +4703,75 @@ mod tests {
         for (plan, want) in cases {
             assert_eq!(plan_files(&plan), want, "{plan}");
         }
+    }
+
+    /// M11-E3: the final gate's verify wording — `COMPILE_ONLY` replaced once an environment
+    /// gate passed after an X++ compile, kept when none ran; skipped gates noted.
+    #[test]
+    fn the_verify_scope_at_the_final_gate() {
+        let none: Vec<String> = vec![];
+        assert_eq!(
+            verify_scope_notes(true, &none, &none, "UDE-1"),
+            [xpp::COMPILE_ONLY]
+        );
+        assert_eq!(
+            verify_scope_notes(true, &strings(&["dbsync"]), &none, "UDE-1"),
+            ["verify: compile + dbsync on UDE-1"]
+        );
+        assert_eq!(
+            verify_scope_notes(false, &strings(&["dbsync", "deploy"]), &none, "UDE-1"),
+            ["verify: dbsync + deploy on UDE-1 (environment gate)"]
+        );
+        assert!(verify_scope_notes(false, &none, &none, "x").is_empty());
+        let n = verify_scope_notes(true, &none, &strings(&["dbsync"]), "x");
+        assert_eq!(n[0], xpp::COMPILE_ONLY);
+        assert!(n[1].starts_with("dbsync did not run on this machine"));
+    }
+
+    /// M11-C2: the plan-time feedback and the fix note name the fence rule of each path; with
+    /// no fence (or no fence violation) they are `None`, so the M10 texts are used.
+    #[test]
+    fn fence_feedback_names_the_rule() {
+        let p = Protected::new(vec![], &["Metadata/Locked/**".into()])
+            .with_policy(&[], &["**/ZZZ/**".into()])
+            .with_fence(
+                &strings(&["Metadata/**"]),
+                &strings(&["**/Descriptor/*.xml"]),
+            );
+        let bad = strings(&[
+            "docs/x.md",
+            "Metadata/Pkg/Model/Descriptor/Model.xml",
+            "Metadata/ZZZ/a.xml",
+        ]);
+        let fb = plan_fence_feedback(&bad, &p).unwrap();
+        assert!(
+            fb.contains(
+                "`docs/x.md` — outside the implementer's write fence (`writes: [Metadata/**]`)"
+            ),
+            "{fb}"
+        );
+        assert!(
+            fb.contains("`Metadata/Pkg/Model/Descriptor/Model.xml` — a `never` path (`never: [**/Descriptor/*.xml]`)"),
+            "{fb}"
+        );
+        assert!(
+            fb.contains("It also lists protected or denied paths [\"Metadata/ZZZ/a.xml\"]"),
+            "{fb}"
+        );
+        let note = change_fence_feedback(&bad, &p).unwrap();
+        assert!(
+            note.contains("`Metadata/Pkg/Model/Descriptor/Model.xml` (touched a never path (`never: [**/Descriptor/*.xml]`))")
+                && note.contains("`docs/x.md` (outside your write fence (`writes: [Metadata/**]`))")
+                && note.contains("`Metadata/ZZZ/a.xml` (a protected or denied path)")
+                && note.contains("They were restored."),
+            "{note}"
+        );
+        // no fence rule broken: the M10 messages
+        let denied = strings(&["Metadata/ZZZ/a.xml", "Metadata/Locked/x.md"]);
+        assert_eq!(plan_fence_feedback(&denied, &p), None);
+        assert_eq!(change_fence_feedback(&denied, &p), None);
+        let legacy = Protected::new(vec![], &[]);
+        assert_eq!(plan_fence_feedback(&strings(&["docs/x.md"]), &legacy), None);
     }
 
     // ── implement: prepare ──────────────────────────────────────────────────────────
@@ -4836,6 +5693,44 @@ mod tests {
             let t = task_in(&events);
             assert_eq!(cleaned_up_action(&t), want, "{:?}", t.state);
         }
+    }
+
+    /// M11-R12 (item 2): `gate_residual_var` finds a `%VAR%` left in a frozen gate command.
+    #[test]
+    fn a_gate_command_with_a_leftover_variable_is_detected() {
+        // M11-R12 (item 2): a config frozen before R3 keeps `%VAR%` in program or args
+        assert_eq!(
+            gate_residual_var("%GATES%/sync.exe", &[]),
+            Some("GATES".into())
+        );
+        assert_eq!(
+            gate_residual_var("pwsh", &["-File".into(), "%X%/s.ps1".into()]),
+            Some("X".into())
+        );
+        assert_eq!(
+            gate_residual_var("pwsh", &["-File".into(), "C:/gates/s.ps1".into()]),
+            None
+        );
+    }
+
+    /// M11-R8: `deployment_ok` — a finished gate keeps its result, a killed one is interrupted.
+    #[test]
+    fn the_deployment_record_of_a_gate_that_ran() {
+        let res = |exit: Option<i32>, timed_out: bool, cancelled: bool| CommandResult {
+            name: "dbsync".into(),
+            exit,
+            timed_out,
+            cancelled,
+            duration_ms: 1,
+            output: String::new(),
+        };
+        // finished: its own result — also when a stop came afterwards (the stop flag is not
+        // an input)
+        assert_eq!(deployment_ok(&res(Some(0), false, false)), Some(true));
+        assert_eq!(deployment_ok(&res(Some(2), false, false)), Some(false));
+        // killed part way: interrupted, not failed
+        assert_eq!(deployment_ok(&res(None, true, false)), None);
+        assert_eq!(deployment_ok(&res(None, false, true)), None);
     }
 
     #[test]

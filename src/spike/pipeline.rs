@@ -83,6 +83,7 @@ fn run_command(hub: &AgentHub, spec: &CommandSpec, cwd: &Path) -> Result<Command
             boundary: Boundary::None,
             timeout: Duration::from_secs(60 * spec.timeout_min.unwrap_or(30)),
             cancel: None,
+            redact: crate::process::redact::Redactions::empty(),
         },
         None,
     ))
@@ -350,7 +351,15 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
             if !bad.is_empty() {
                 eprintln!("!! plan wants to touch protected paths {bad:?} — rejected automatically (plan-time policy)");
                 let paths = bad.iter().map(|x| x.to_string()).collect();
-                if step(&mut sm, &mut trail, Ev::PlanPolicyViolation { paths })? == St::Escalated {
+                if step(
+                    &mut sm,
+                    &mut trail,
+                    Ev::PlanPolicyViolation {
+                        paths,
+                        reason: None,
+                    },
+                )? == St::Escalated
+                {
                     return Ok(escalated(&sm));
                 }
                 plan_prompt = format!("Your plan lists protected paths {bad:?}, which may not change. Create the plan again without touching them.");

@@ -9,8 +9,11 @@
 //! 1. `%USERPROFILE%\.toryo\context\global.md` — personal rules.
 //! 2. Repo `AGENTS.md`, then `CLAUDE.md` — **Claude only**: Codex reads `AGENTS.md` natively
 //!    (R20), so the loader omits source 2 for Codex.
-//! 3. Repo `.toryo/context/*.md`, sorted by name — project policy, **never trimmed**.
-//! 4. Role template: repo `.toryo/roles/<role>.md`, else the embedded one — never trimmed.
+//! 3. Repo `.toryo/context/*.md`, sorted by name — project policy, **never trimmed**; in org
+//!    chart mode (M11-C1) then the team's `culture` file.
+//! 4. Role template: repo `.toryo/roles/<role>.md`, else the embedded one — never trimmed. In
+//!    org chart mode the embedded template always, then the role's `instructions.md` under
+//!    `Role instructions (team)`: a repository adds to the built-in rules, never removes them.
 //! 5. Task pack (run store). (R61) Only the **trusted** files — the `TASK.md` snapshot and the
 //!    approved `PLAN.md` — may be inlined (under 8 KB). The **untrusted** ones (diffs, the verify
 //!    result, the review, `DECISIONS.md`) are always listed as paths, whatever their size: an
@@ -48,6 +51,12 @@ pub const INLINE_MAX: usize = 8 * 1024;
 /// R61: the task-pack files a human wrote or approved — the task snapshot and the approved
 /// plan. Every other pack file was produced by an agent or by code an agent wrote.
 pub const TRUSTED_PACK: [&str; 2] = ["TASK.md", "PLAN.md"];
+
+/// M11-R5: a skill the turn needs does not resolve now — the turn is not started.
+pub const SKILL_UNAVAILABLE: &str = "skill_unavailable";
+/// M11-R5: with its skills (never trimmed) and TASK.md / PLAN.md (never trimmed to make room
+/// for them) the context does not fit its budget.
+pub const CONTEXT_OVER_BUDGET: &str = "context_over_budget";
 
 /// Whether a task-pack file (by its label) is trusted (R61). A file added to the pack later is
 /// untrusted unless it is listed in [`TRUSTED_PACK`].
@@ -88,6 +97,25 @@ pub struct Request {
     /// are always inlined, untrusted ones become user-prompt data blocks (R61).
     pub no_run_store: bool,
     pub budget: usize,
+    /// M11-C1: org chart mode — the team's culture and the role's instructions.
+    pub team: Option<TeamContext>,
+}
+
+/// What org chart mode adds to sources 3 and 4 (M11-C1): files of the repository checkout,
+/// each as `(repo-relative path, absolute path)`, never trimmed, hashed.
+#[derive(Debug, Clone, Default)]
+pub struct TeamContext {
+    /// The org chart's `culture`, after `.toryo/context/*.md`.
+    pub culture: Option<(String, PathBuf)>,
+    /// The role file's `instructions`, after the embedded role template.
+    pub instructions: Option<(String, PathBuf)>,
+    /// M11-D2: the planner's menu of the implementer's skills (`name — description` lines).
+    pub menu: Option<String>,
+    /// M11-D3: the skills this attempt receives, resolved now (the implementer: the approved
+    /// plan's choice; planner and reviewer: their role file's list).
+    pub skills: Vec<crate::team::Skill>,
+    /// M11-D3: skills that could not be resolved now (reported as skipped).
+    pub missing_skills: Vec<String>,
 }
 
 /// One source as it went into the context.
@@ -120,6 +148,10 @@ pub struct Assembled {
     /// R61: untrusted pack files for an agent without run-store access, for its user prompt.
     #[serde(skip)]
     pub data: Vec<DataBlock>,
+    /// M11-D2: the bytes of the parts that are never trimmed (policy, culture, the role
+    /// template and instructions, the skill menu and skills) — what no budget trim can reduce.
+    #[serde(skip)]
+    pub fixed_bytes: usize,
 }
 
 /// An untrusted task-pack file handed over in the user prompt (R61).
@@ -259,13 +291,26 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
             &mut skipped,
         );
     }
+    // M11-C1: the team culture closes source 3 (org chart mode)
+    if let Some((rel, path)) = req.team.as_ref().and_then(|t| t.culture.as_ref()) {
+        add(
+            3,
+            &format!("culture ({rel})"),
+            path,
+            format!("Team culture ({rel})"),
+            None,
+            &mut skipped,
+        );
+    }
     let role = req.role.as_str();
     let custom = req
         .repo
         .join(".toryo")
         .join("roles")
         .join(format!("{role}.md"));
-    if custom.is_file() {
+    // org chart mode never replaces the embedded template (M11-C1): it carries the engine's
+    // rules — the output contract, no Git, untrusted data
+    if req.team.is_none() && custom.is_file() {
         add(
             4,
             &format!(".toryo/roles/{role}.md"),
@@ -290,7 +335,68 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
             untrusted: false,
         });
     }
+    // M11-C1: the role's instructions.md is added after the built-in rules, never instead
+    if let Some((rel, path)) = req.team.as_ref().and_then(|t| t.instructions.as_ref()) {
+        match read(path) {
+            Some(body) => parts.push(Part {
+                n: 4,
+                label: rel.clone(),
+                path: path.clone(),
+                heading: "Role instructions (team)".into(),
+                original: body.len(),
+                sha256: sha256_hex(body.as_bytes()),
+                body,
+                rank: None,
+                path_only: false,
+                truncated: false,
+                untrusted: false,
+            }),
+            None => skipped.push(format!("4: {}", disp(path))),
+        }
+    }
+    // M11-D2: the planner chooses the implementer's skills from this menu
+    if let Some(menu) = req.team.as_ref().and_then(|t| t.menu.as_ref()) {
+        parts.push(Part {
+            n: 4,
+            label: "implementer skill menu".into(),
+            path: PathBuf::from("(the implementer's role file)"),
+            heading: "Skills available to the implementer".into(),
+            original: menu.len(),
+            sha256: sha256_hex(menu.as_bytes()),
+            body: menu.clone(),
+            rank: None,
+            path_only: false,
+            truncated: false,
+            untrusted: false,
+        });
+    }
+    // M11-D3: one part per skill — trusted (the repository checkout's protected `.toryo/` or
+    // the machine), never trimmed (half a manual is worse than none), hashed
+    if let Some(team) = &req.team {
+        for k in &team.skills {
+            let origin = k.origin.as_str();
+            parts.push(Part {
+                n: 4,
+                label: format!("skill {} ({origin})", k.name),
+                path: k.path.clone(),
+                heading: format!("Skill: {} ({origin})", k.name),
+                original: k.text.len(),
+                sha256: k.sha256.clone(),
+                body: k.text.clone(),
+                rank: None,
+                path_only: false,
+                truncated: false,
+                untrusted: false,
+            });
+        }
+        for m in &team.missing_skills {
+            skipped.push(format!("4: {m}"));
+        }
+    }
     let pack_start = parts.len();
+    // M11-R5: with skill parts, TASK.md and PLAN.md are never truncated to make room for them
+    // (an agent without the run store has no other copy)
+    let keep_pack = req.team.as_ref().is_some_and(|t| !t.skills.is_empty());
     let mut data = Vec::new();
     let mut data_sources = Vec::new();
     for (i, (label, path)) in req.pack.iter().enumerate() {
@@ -334,12 +440,19 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
             sha256,
             path_only: untrusted || !(small || req.no_run_store),
             body,
-            rank: (!untrusted).then_some(rank),
+            rank: (!untrusted && !(keep_pack && req.no_run_store)).then_some(rank),
             truncated: false,
             untrusted,
         });
     }
     let data_labels: Vec<&str> = data.iter().map(|d| d.label.as_str()).collect();
+    // the never-trimmed parts as `render` writes them (`\n# heading\n\nbody\n`) — with the
+    // inlined TASK.md / PLAN.md when they may not be trimmed (M11-R5)
+    let fixed_bytes = parts
+        .iter()
+        .filter(|p| p.rank.is_none() && !p.path_only)
+        .map(|p| p.heading.len() + p.body.trim_end().len() + 6)
+        .sum();
     let mut warnings = Vec::new();
     let mut text = render(req, &parts, pack_start, &data_labels);
     if text.len() > req.budget {
@@ -412,6 +525,7 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
         sha256: sha256_hex(text.as_bytes()),
         text,
         data,
+        fixed_bytes,
     })
 }
 
@@ -523,6 +637,64 @@ pub fn request(
         .get(role.as_str())
         .copied()
         .unwrap_or(DEFAULT_BUDGET_KB);
+    // M11-D3: the implementer gets the approved plan's skills (those on its menu); planner
+    // and reviewer every skill of their role file
+    let mut off_menu: Vec<String> = Vec::new();
+    let wanted: Vec<String> = match (cfg.team.as_ref(), role) {
+        (None, _) => Vec::new(),
+        (Some(team), Role::Implementer) => {
+            let menu = team
+                .role("implementer")
+                .map(|r| r.skills.clone())
+                .unwrap_or_default();
+            let plan: serde_json::Value = super::artifacts::read_head(store, t, "plan")?
+                .and_then(|(_, b)| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+            let (on, off): (Vec<String>, Vec<String>) = plan_skills(&plan)
+                .into_iter()
+                .partition(|s| menu.iter().any(|m| m == s));
+            // e.g. a `task config --reload` changed the menu after the plan was approved
+            off_menu = off
+                .iter()
+                .map(|s| {
+                    format!(
+                        "skill {:?} of the approved plan is no longer on the implementer's menu",
+                        s
+                    )
+                })
+                .collect();
+            on
+        }
+        (Some(team), r) => team
+            .role(r.as_str())
+            .map(|x| x.skills.clone())
+            .unwrap_or_default(),
+    };
+    // M11-C1: org chart mode — from the repository checkout, like sources 2–4
+    let team = cfg.team.as_ref().map(|team| {
+        let at = |rel: &String| (rel.clone(), t.repo.join(rel));
+        let machine_dir = crate::team::machine_skills_dir(&team.skill_roots);
+        let (mut skills, mut missing_skills) = (Vec::new(), off_menu.clone());
+        for name in &wanted {
+            match crate::team::resolve_skill(name, &t.repo, machine_dir.as_deref()) {
+                Ok(k) => skills.push(k),
+                Err(why) => missing_skills.push(why),
+            }
+        }
+        TeamContext {
+            skills,
+            missing_skills,
+            culture: team.culture.as_ref().map(at),
+            instructions: team
+                .role(role.as_str())
+                .and_then(|r| r.instructions.as_ref())
+                .map(at),
+            // M11-D2: only the planner sees the menu
+            menu: (role == Role::Planner)
+                .then(|| skill_menu(team, &t.repo, machine_dir.as_deref()))
+                .flatten(),
+        }
+    });
     Ok(Request {
         role,
         kind,
@@ -531,6 +703,74 @@ pub fn request(
         pack: task_pack(store, t, stage)?,
         no_run_store: role == Role::Implementer && kind == ProfileKind::Claude,
         budget: (kb as usize) * 1024,
+        team,
+    })
+}
+
+/// M11-D2: the plan's `skills` — its string entries **as written** (no trimming: a name is a
+/// menu entry or it is not), once each, in order. The plan check and the delivery (D3) both use
+/// it, so what the check accepts is exactly what the implementer gets (group D review).
+pub fn plan_skills(plan: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in plan["skills"].as_array().into_iter().flatten() {
+        if let Some(s) = s.as_str() {
+            if !out.iter().any(|x| x == s) {
+                out.push(s.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// M11-D2: the planner's menu of the implementer's skills — one `name — description` line
+/// each, read now (repository first, then the machine); only the skills that resolve now
+/// (M11-R5: one that does not could not be delivered). `None` when there is none.
+pub fn skill_menu(team: &crate::team::Team, repo: &Path, machine: Option<&Path>) -> Option<String> {
+    let skills = available_skills(team, repo, machine);
+    if skills.is_empty() {
+        return None;
+    }
+    let mut s = String::from("Skills available to the implementer — list the ones this task needs in `skills` (names from this list only; leave it out when none applies). The implementer receives exactly the skills you list:\n");
+    for k in skills {
+        let d = k.description.unwrap_or_else(|| "(no description)".into());
+        s.push_str(&format!("- {} — {d}\n", k.name));
+    }
+    Some(s)
+}
+
+/// M11-R5: the implementer's skills that resolve now, in the role file's order.
+pub fn available_skills(
+    team: &crate::team::Team,
+    repo: &Path,
+    machine: Option<&Path>,
+) -> Vec<crate::team::Skill> {
+    team.role("implementer")
+        .map(|r| r.skills.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|name| crate::team::resolve_skill(name, repo, machine).ok())
+        .collect()
+}
+
+/// M11-R5: a context with skill parts that is still over its budget after trimming — the
+/// `context_over_budget` reason with the numbers, or None. (Without skills the M10 rule
+/// stays: a warning.)
+pub fn over_budget(c: &Assembled) -> Option<String> {
+    let skills: usize = c
+        .sources
+        .iter()
+        .filter(|s| s.label.starts_with("skill "))
+        .map(|s| s.bytes)
+        .sum();
+    (skills > 0 && c.text.len() > c.budget).then(|| {
+        format!(
+            "{CONTEXT_OVER_BUDGET}: the {} context is {} bytes, over its budget of {} KB ({} bytes); its skills ({skills} bytes), TASK.md and PLAN.md are never trimmed — raise `context.budget_kb.{}` or choose fewer skills",
+            c.role,
+            c.text.len(),
+            c.budget / 1024,
+            c.budget,
+            c.role
+        )
     })
 }
 
@@ -563,15 +803,29 @@ pub fn describe(a: &Assembled) -> String {
     );
     for x in &a.sources {
         s.push_str(&format!(
-            "  [{}] {:<28} {:>7} B  {:<22} {}\n",
+            "  [{}] {:<28} {:>7} B  {:<22} {}",
             x.n, x.label, x.bytes, x.mode, x.path
         ));
+        // M11-D3: which manual an agent received
+        if x.label.starts_with("skill ") {
+            s.push_str(&format!("  sha256 {}", short(&x.sha256)));
+        }
+        s.push('\n');
     }
     for k in &a.skipped {
         s.push_str(&format!("  (skipped, not found) {k}\n"));
     }
     for w in &a.warnings {
         s.push_str(&format!("  !! {w}\n"));
+    }
+    // (R4–R8 review) the preview says when the real turn would not start (M11-R5)
+    if a.skipped.iter().any(|k| k.starts_with("4: skill ")) {
+        s.push_str(&format!(
+            "  !! the turn would not start: {SKILL_UNAVAILABLE} (a skill above is not found)\n"
+        ));
+    }
+    if let Some(r) = over_budget(a) {
+        s.push_str(&format!("  !! the turn would not start: {r}\n"));
     }
     s
 }
@@ -589,7 +843,172 @@ mod tests {
             pack: vec![],
             no_run_store: false,
             budget: 40 * 1024,
+            team: None,
         }
+    }
+
+    /// Org chart mode (M11-C1): a culture file and the role's instructions in the repository.
+    fn team_req(repo: &Path, kind: ProfileKind, role: Role) -> Request {
+        let r = role.as_str();
+        std::fs::write(repo.join("CULTURE.md"), "CULTURE-NORMS\n").unwrap();
+        let dir = repo.join(".toryo").join("roles").join(r);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("instructions.md"), format!("TEAM-{r}-RULES\n")).unwrap();
+        Request {
+            team: Some(TeamContext {
+                culture: Some(("CULTURE.md".into(), repo.join("CULTURE.md"))),
+                instructions: Some((
+                    format!(".toryo/roles/{r}/instructions.md"),
+                    dir.join("instructions.md"),
+                )),
+                menu: None,
+                skills: vec![],
+                missing_skills: vec![],
+            }),
+            ..req(repo, kind, role)
+        }
+    }
+
+    /// M11-R5: with skill parts, the inlined TASK.md and PLAN.md of an implementer without the
+    /// run store are never truncated to make room — still over budget is `context_over_budget`
+    /// with the numbers. Without skills the M10 trim (and only a warning) stays.
+    #[test]
+    fn with_skills_the_inlined_task_pack_is_never_trimmed() {
+        let d = setup();
+        std::fs::write(d.path().join("TASK.md"), "T".repeat(3000)).unwrap();
+        std::fs::write(d.path().join("PLAN.md"), "P".repeat(3000)).unwrap();
+        let text = format!("# Batch\n{}\n", "s".repeat(2000));
+        let skill = crate::team::Skill {
+            name: "xpp-batch".into(),
+            origin: crate::team::SkillOrigin::Repo,
+            path: d.path().join(".toryo/skills/xpp-batch/SKILL.md"),
+            sha256: sha256_hex(text.as_bytes()),
+            bytes: text.len(),
+            description: None,
+            text,
+        };
+        let mut r = team_req(d.path(), ProfileKind::Claude, Role::Implementer);
+        r.no_run_store = true;
+        r.budget = 6 * 1024;
+        r.pack = vec![
+            ("TASK.md".into(), d.path().join("TASK.md")),
+            ("PLAN.md".into(), d.path().join("PLAN.md")),
+        ];
+        // without skills: the pack may be trimmed, with a warning only
+        let c = assemble(&r).unwrap();
+        assert!(
+            c.sources.iter().any(|s| s.mode == "trimmed" && s.n == 5),
+            "{:?}",
+            c.sources
+        );
+        assert_eq!(over_budget(&c), None);
+        // with a skill: TASK.md and PLAN.md stay whole; over budget is an escalation reason
+        r.team.as_mut().unwrap().skills = vec![skill];
+        let c = assemble(&r).unwrap();
+        for f in ["TASK.md", "PLAN.md"] {
+            let s = c.sources.iter().find(|s| s.label == f).unwrap();
+            assert_eq!((s.mode.as_str(), s.included_bytes), ("inline", 3000), "{f}");
+        }
+        assert!(c.fixed_bytes > 8000, "{}", c.fixed_bytes);
+        let why = over_budget(&c).expect("over budget");
+        assert!(
+            why.starts_with("context_over_budget: the implementer context is ")
+                && why.contains("over its budget of 6 KB (6144 bytes)")
+                && why.contains("its skills (2009 bytes)")
+                && why.contains("raise `context.budget_kb.implementer` or choose fewer skills"),
+            "{why}"
+        );
+    }
+
+    /// M11-C1 AC-1: in org chart mode the embedded role template comes first — also when an
+    /// instructions file exists, and a legacy `.toryo/roles/<role>.md` is not read — then the
+    /// role's instructions, then the task pack; the culture closes source 3.
+    #[test]
+    fn org_chart_mode_layers_the_role_instructions_after_the_embedded_rules() {
+        for role in [Role::Planner, Role::Implementer, Role::Reviewer] {
+            let d = setup();
+            let r = role.as_str();
+            std::fs::create_dir_all(d.path().join(".toryo/roles")).unwrap();
+            std::fs::write(
+                d.path().join(format!(".toryo/roles/{r}.md")),
+                "LEGACY-OVERRIDE\n",
+            )
+            .unwrap();
+            std::fs::write(d.path().join("TASK.md"), "TASK-BODY\n").unwrap();
+            let mut q = team_req(d.path(), ProfileKind::Claude, role);
+            q.pack = vec![("TASK.md".into(), d.path().join("TASK.md"))];
+            let c = assemble(&q).unwrap();
+            let t = &c.text;
+            let pos = |x: &str| t.find(x).unwrap_or_else(|| panic!("{r}: {x} missing"));
+            let embedded = contracts::role(&format!("{r}.md")).replace("\r\n", "\n");
+            let first = embedded.lines().find(|l| !l.trim().is_empty()).unwrap();
+            assert!(pos("NAMING") < pos("# Team culture (CULTURE.md)"));
+            assert!(pos("CULTURE-NORMS") < pos(&format!("# Role: {r}")));
+            assert!(pos(&format!("# Role: {r}")) < pos(first.trim()));
+            assert!(pos(first.trim()) < pos("# Role instructions (team)"));
+            assert!(pos(&format!("TEAM-{r}-RULES")) < pos("TASK-BODY"));
+            assert!(
+                !t.contains("LEGACY-OVERRIDE"),
+                "{r}: the M4 file is not read"
+            );
+            let labels: Vec<(u8, &str)> = c
+                .sources
+                .iter()
+                .map(|s| (s.n, s.label.as_str()))
+                .filter(|(n, _)| *n >= 3)
+                .collect();
+            assert_eq!(
+                labels,
+                [
+                    (3, ".toryo/context/10-models.md"),
+                    (3, ".toryo/context/20-naming.md"),
+                    (3, "culture (CULTURE.md)"),
+                    (4, &format!("embedded {r}.md") as &str),
+                    (4, &format!(".toryo/roles/{r}/instructions.md") as &str),
+                    (5, "TASK.md"),
+                ],
+                "{r}"
+            );
+            // never trimmed, also under a tight budget
+            q.budget = 1024;
+            let c = assemble(&q).unwrap();
+            assert!(
+                c.text.contains("CULTURE-NORMS") && c.text.contains(&format!("TEAM-{r}-RULES"))
+            );
+        }
+    }
+
+    /// M11-C1 AC-2: the context hash changes when `instructions.md` or the culture changes
+    /// between two attempts.
+    #[test]
+    fn instructions_and_culture_are_hashed() {
+        let d = setup();
+        let q = team_req(d.path(), ProfileKind::Codex, Role::Implementer);
+        let a = assemble(&q).unwrap().sha256;
+        assert_eq!(assemble(&q).unwrap().sha256, a, "deterministic");
+        std::fs::write(
+            d.path().join(".toryo/roles/implementer/instructions.md"),
+            "TEAM-implementer-RULES v2\n",
+        )
+        .unwrap();
+        let b = assemble(&q).unwrap().sha256;
+        assert_ne!(a, b);
+        std::fs::write(d.path().join("CULTURE.md"), "CULTURE-NORMS v2\n").unwrap();
+        let c = assemble(&q).unwrap();
+        assert_ne!(c.sha256, b);
+        let src = c
+            .sources
+            .iter()
+            .find(|s| s.label == "culture (CULTURE.md)")
+            .unwrap();
+        assert_eq!(src.sha256, sha256_hex(b"CULTURE-NORMS v2\n"));
+        // a file named by the role file that is gone at attempt time is skipped and reported
+        std::fs::remove_file(d.path().join("CULTURE.md")).unwrap();
+        let c = assemble(&q).unwrap();
+        assert!(c
+            .skipped
+            .iter()
+            .any(|s| s.starts_with("3: ") && s.contains("CULTURE.md")));
     }
 
     fn setup() -> tempfile::TempDir {

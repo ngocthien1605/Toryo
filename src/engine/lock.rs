@@ -203,6 +203,108 @@ impl Drop for StopWatch {
     }
 }
 
+/// M11-E3: the file of an environment gate's machine-wide lock,
+/// `<data_dir>/locks/env/<lock>.lock` — a folder of its own, so no task id (`locks/<task>.lock`)
+/// can name the same file (group E review). Lower case: Windows file names ignore case.
+pub fn env_lock_path(lock: &str) -> PathBuf {
+    data_dir()
+        .join("locks")
+        .join("env")
+        .join(format!("{}.lock", lock.to_ascii_lowercase()))
+}
+
+/// An environment-gate lock name is part of a file name: letters, digits, `-`, `_`, `.`
+/// (not only dots).
+pub fn valid_lock_name(lock: &str) -> bool {
+    lock_name_problem(lock).is_none()
+}
+
+/// Why `lock` cannot be an environment-gate lock name, or None. M11-R8: a Windows device name
+/// (`con`, `nul`, `com1`, … — also before a dot) is not a file; names are case-insensitive
+/// (`D365-Env` is `d365-env`: one lock file and one deployment row).
+pub fn lock_name_problem(lock: &str) -> Option<&'static str> {
+    let chars = !lock.is_empty()
+        && lock.chars().any(|c| c != '.')
+        && lock
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !chars {
+        return Some("use letters, digits, `-`, `_` and `.` only (e.g. d365-env)");
+    }
+    let stem = lock
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let numbered = |p: &str| {
+        stem.strip_prefix(p)
+            .is_some_and(|n| n.len() == 1 && ('1'..='9').contains(&n.chars().next().unwrap()))
+    };
+    if ["con", "prn", "aux", "nul"].contains(&stem.as_str()) || numbered("com") || numbered("lpt") {
+        return Some("is a Windows device name (con, prn, aux, nul, com1–com9, lpt1–lpt9) — choose another (e.g. d365-env)");
+    }
+    None
+}
+
+/// The stored form of a lock name (M11-R8): lower case, so `D365-Env` and `d365-env` are one
+/// lock and one deployment row.
+pub fn lock_key(lock: &str) -> String {
+    lock.to_ascii_lowercase()
+}
+
+/// M11-E3: an environment gate's machine-wide lock — one gate per lock name runs at a time,
+/// across all tasks (they share one environment). An exclusive OS file lock like
+/// [`TaskLock`]: the OS releases it when the holder exits or crashes; the holder's label is
+/// written inside (for a human; Windows does not let other processes read a locked file, so
+/// `status` names the holder from `environment_deployments`). Held only while the gate runs.
+pub struct EnvLock {
+    file: File,
+    pub name: String,
+}
+
+impl EnvLock {
+    /// Take the lock if it is free (non-blocking); `None` while another process holds it.
+    pub fn try_acquire(lock: &str, holder: &str) -> Result<Option<EnvLock>> {
+        if !valid_lock_name(lock) {
+            anyhow::bail!(
+                "environment gate lock `{lock}`: use letters, digits, `-`, `_` and `.` only"
+            );
+        }
+        let p = env_lock_path(lock);
+        std::fs::create_dir_all(p.parent().expect("parent"))?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&p)
+            .with_context(|| format!("opening {}", p.display()))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("locking {}", p.display()))
+            }
+        }
+        use std::io::{Seek, Write};
+        let _ = file.set_len(0);
+        let _ = file.seek(std::io::SeekFrom::Start(0));
+        let _ = writeln!(file, "{holder}");
+        Ok(Some(EnvLock {
+            file,
+            name: lock.to_string(),
+        }))
+    }
+}
+
+impl Drop for EnvLock {
+    fn drop(&mut self) {
+        // explicitly, not only by closing the handle (review L9: Windows may release a
+        // closed handle's lock asynchronously)
+        let _ = self.file.unlock();
+    }
+}
+
 /// Is the task lock free right now? A probe: taken and released at once, never a mutation.
 pub fn probe_free(task: &str) -> Result<bool> {
     let f = open_lock_file(task)?;
@@ -270,4 +372,48 @@ pub fn stop(store: &Store, task: &str, wait: Duration) -> Result<StopOutcome> {
         }
     }
     Ok(StopOutcome::Pending)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M11-R8: Windows device names are refused (also before a dot, any case); names are one
+    /// lock whatever their case.
+    #[test]
+    fn lock_names_refuse_device_names_and_ignore_case() {
+        for bad in [
+            "con",
+            "NUL",
+            "Aux",
+            "prn.x",
+            "com1",
+            "COM9",
+            "lpt3",
+            "lpt1.lock",
+        ] {
+            let why = lock_name_problem(bad).unwrap_or_else(|| panic!("{bad}"));
+            assert!(why.contains("Windows device name"), "{bad}: {why}");
+        }
+        for ok in [
+            "d365-env", "console", "com10", "com0", "lpt", "nul-env", "x.con",
+        ] {
+            assert_eq!(lock_name_problem(ok), None, "{ok}");
+        }
+        assert_eq!(lock_key("D365-Env"), "d365-env");
+        assert_eq!(env_lock_path("D365-Env"), env_lock_path("d365-env"));
+    }
+
+    /// Group E review: an environment lock never shares a file with a task lock (task ids
+    /// allow `-`, so `env-<lock>` could be one), and its name is folded to lower case.
+    #[test]
+    fn environment_locks_have_their_own_folder() {
+        assert_ne!(env_lock_path("d365-env"), lock_path("env-d365-env"));
+        assert_ne!(
+            env_lock_path("d365-env").parent(),
+            lock_path("env-d365-env").parent()
+        );
+        assert_eq!(env_lock_path("D365-Env"), env_lock_path("d365-env"));
+        assert!(env_lock_path("d365-env").ends_with("env/d365-env.lock"));
+    }
 }

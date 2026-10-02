@@ -104,7 +104,93 @@ pub fn origin_checks(cfg: &Effective) -> Vec<Check> {
             source,
         });
     }
+    // M11-A2: the verify boundary, the machine's floor and the verify root in force
+    for (key, source) in &cfg.origins.verify {
+        let value = match key.as_str() {
+            "boundary" => cfg.repo.verify.boundary.clone(),
+            "min_boundary" => cfg.machine_verify.min_boundary.clone().unwrap_or_default(),
+            _ => crate::engine::verify::verify_root(cfg)
+                .display()
+                .to_string(),
+        };
+        out.push(Check {
+            level: Level::Info,
+            area: format!("verify {key}"),
+            message: format!("{value} — source: {}", place(*source)),
+            source: Some(*source),
+        });
+    }
     out
+}
+
+/// M11-R4: a WARN for each `policy.deny_paths` / `protected_paths` glob that can never match a
+/// repository path (`./x/**`, `x/`, `/x/**`, `{a,b}` …). They keep their behaviour — and the
+/// config its hash; the org chart's `writes` / `never` are normalised or refused at load.
+pub fn policy_checks(cfg: &Effective) -> Vec<Check> {
+    let p = &cfg.repo.policy;
+    let root = expand_vars(&cfg.repo.project.root).map(PathBuf::from).ok();
+    // (R4–R8 review) a pattern without a wildcard that names a folder of the repository
+    // matches the folder entry only, none of the files in it
+    let folder = |g: &str| {
+        let t = g.trim().replace('\\', "/");
+        let t = t.trim_end_matches('/');
+        (!t.is_empty()
+            && !t.contains(['*', '?'])
+            && t != crate::engine::checks::VERIFY_SCRIPTS
+            && root.as_ref().is_some_and(|r| r.join(t).is_dir()))
+        .then(|| {
+            format!("names the folder `{t}`: as written it matches the folder entry only, none of the files in it — write `{t}/**`")
+        })
+    };
+    [
+        ("deny_paths", &p.deny_paths),
+        ("protected_paths", &p.protected_paths),
+    ]
+    .into_iter()
+    .flat_map(|(key, list)| list.iter().map(move |g| (key, g)))
+    .filter_map(|(key, g)| {
+        let why = crate::engine::checks::dead_pattern(g).or_else(|| folder(g));
+        why.map(|why| Check {
+            level: Level::Warn,
+            area: "policy".into(),
+            message: format!(
+                "{}: policy.{key}: `{g}` {why} (this pattern protects nothing)",
+                cfg.repo_path.display()
+            ),
+            source: None,
+        })
+    })
+    .collect()
+}
+
+/// M11-R8: the machine's `skills_dir` (org chart mode) — a WARN when the folder does not
+/// exist: a skill only there resolves nowhere, and the turn that needs it escalates
+/// (`skill_unavailable`).
+pub fn skills_dir_checks(cfg: &Effective) -> Vec<Check> {
+    let Some(dir) = cfg
+        .team
+        .as_ref()
+        .and_then(|t| crate::team::machine_skills_dir(&t.skill_roots))
+    else {
+        return Vec::new();
+    };
+    let (level, message) = if dir.is_dir() {
+        (Level::Ok, format!("{} exists", dir.display()))
+    } else {
+        (
+            Level::Warn,
+            format!(
+                "{} does not exist — a skill found only there cannot be delivered (the turn escalates with skill_unavailable)",
+                dir.display()
+            ),
+        )
+    };
+    vec![Check {
+        level,
+        area: "skills_dir".into(),
+        message,
+        source: None,
+    }]
 }
 
 /// Minimum Claude Code versions for flags the plan relies on (§14).
@@ -219,6 +305,8 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
     }
     verify_root_check(&mut r, cfg);
     r.0.extend(origin_checks(cfg));
+    r.0.extend(policy_checks(cfg));
+    r.0.extend(skills_dir_checks(cfg));
 
     // Profiles
     let records = results::load();
@@ -263,7 +351,11 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
             ),
             Err(e) => r.add(Level::Fail, &area, format!("{e}")),
         }
-        let ver = run_version(&exe, build_env(std::env::vars(), &p.env, &BTreeMap::new()));
+        let ver = run_version(
+            &exe,
+            build_env(std::env::vars(), &p.env, &BTreeMap::new()),
+            &results::profile_redactions(p),
+        );
         let current = ver.as_ref().ok().and_then(|v| results::parse_version(v));
         match ver {
             Ok(v) => {
@@ -448,7 +540,8 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
 /// where this account may set a Low label (WRITE_OWNER). Probe it with a scratch dir.
 fn verify_root_check(r: &mut Report, cfg: &Effective) {
     let area = "verify root";
-    let root = match expand_vars(&cfg.repo.verify.verify_root) {
+    // M11-A2: the machine's `verify.verify_root` replaces the repository's
+    let root = match expand_vars(crate::engine::verify::verify_root_setting(cfg)) {
         Ok(v) => PathBuf::from(v),
         Err(e) => return r.add(Level::Fail, area, format!("{e:#}")),
     };
@@ -460,10 +553,17 @@ fn verify_root_check(r: &mut Report, cfg: &Effective) {
         );
     }
     if cfg.repo.verify.boundary == "none" {
+        // M11-A2: say when `task create` will refuse it
+        let floor = match crate::engine::verify::below_floor(cfg) {
+            Some(_) => " — below this machine's floor `low_integrity`: `task create` refuses it (the machine config may allow it with `verify: { min_boundary: none }`)",
+            None => "",
+        };
         return r.add(
             Level::Warn,
             area,
-            "verify.boundary: none — trusted-code mode, verification is NOT isolated (R36)",
+            format!(
+                "verify.boundary: none — trusted-code mode, verification is NOT isolated (R36){floor}"
+            ),
         );
     }
     match crate::engine::verify::probe(cfg) {
@@ -567,6 +667,16 @@ fn repo_checks(r: &mut Report, cfg: &Effective, root: &Path, gc: Option<GitCmd>)
         r.add(Level::Fail, area, format!("{e:#}"));
     }
     if let Some(g) = gc {
+        // M11-R10: M18 at HEAD — a missing entry script (the refusal `task create` would give)
+        // and the notes for other arguments the commit lacks
+        match crate::engine::task::entry_point_notes(cfg, &g, root, "HEAD") {
+            Ok(notes) => {
+                for n in notes {
+                    r.add(Level::Info, "M18", format!("note: {n}"));
+                }
+            }
+            Err(e) => r.add(Level::Warn, "M18", format!("{e:#}")),
+        }
         match g.plan_filters(
             root,
             &cfg.trusted_filters,
@@ -900,6 +1010,113 @@ fn finish(r: Report, json: bool) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M11-A2 (group A review): the verify-root check probes the root in force — the machine's
+    /// — not the repository's, which may not even expand on this machine.
+    #[test]
+    fn the_verify_root_check_uses_the_machine_root() {
+        let d = tempfile::tempdir().unwrap();
+        let (p, m) = (d.path().join("toryo.yaml"), d.path().join("machine.yaml"));
+        std::fs::write(
+            &p,
+            "version: 1\nproject: { root: r, worktrees_root: w }\nverify: { verify_root: '%TORYO_TEST_NEVER_SET%\\vr' }\n",
+        )
+        .unwrap();
+        let mvr = d.path().join("machine-vr");
+        std::fs::write(
+            &m,
+            format!(
+                "verify: {{ verify_root: '{}' }}\n",
+                mvr.display().to_string().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        let cfg = Effective::load(&p, Some(&m)).unwrap();
+        let mut r = Report::default();
+        verify_root_check(&mut r, &cfg);
+        let c = &r.0[0];
+        assert!(
+            !c.message.contains("TORYO_TEST_NEVER_SET"),
+            "{:?}: {}",
+            c.level,
+            c.message
+        );
+        // a boundary below the floor says that `task create` refuses it
+        std::fs::write(
+            &p,
+            "version: 1\nproject: { root: r, worktrees_root: w }\nverify: { boundary: none }\n",
+        )
+        .unwrap();
+        std::fs::write(&m, "").unwrap();
+        let cfg = Effective::load(&p, Some(&m)).unwrap();
+        let mut r = Report::default();
+        verify_root_check(&mut r, &cfg);
+        if cfg!(windows) {
+            assert!(
+                r.0[0].message.contains("`task create` refuses it"),
+                "{}",
+                r.0[0].message
+            );
+        }
+    }
+
+    /// M11-R4 AC-3: a legacy `deny_paths` / `protected_paths` glob that can never match is a
+    /// WARN; the pattern is kept as written, so the configuration's hash does not change.
+    #[test]
+    fn a_legacy_pattern_that_never_matches_is_a_warning() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("toryo.yaml");
+        let base = "version: 1\nproject: { root: r, worktrees_root: w }\n";
+        std::fs::write(
+            &p,
+            format!("{base}policy: {{ deny_paths: ['./x/**', '**/ZZZ/**'], protected_paths: ['@verify-scripts', 'cfg/'] }}\n"),
+        )
+        .unwrap();
+        let cfg = Effective::load(&p, None).unwrap();
+        let w: Vec<String> = policy_checks(&cfg)
+            .into_iter()
+            .inspect(|c| assert_eq!(c.level, Level::Warn))
+            .map(|c| c.message)
+            .collect();
+        assert_eq!(w.len(), 2, "{w:#?}");
+        assert!(
+            w[0].contains("policy.deny_paths: `./x/**` never matches")
+                && w[0].contains("write `x/**`"),
+            "{w:#?}"
+        );
+        assert!(w[1].contains("policy.protected_paths: `cfg/`"), "{w:#?}");
+        // kept as written: what is hashed is what was hashed before M11-R4
+        assert_eq!(cfg.repo.policy.deny_paths, ["./x/**", "**/ZZZ/**"]);
+        assert!(cfg
+            .canonical_json()
+            .contains(r#""deny_paths":["./x/**","**/ZZZ/**"]"#));
+        // a clean policy: no warning
+        std::fs::write(&p, format!("{base}policy: {{ deny_paths: ['x/**'] }}\n")).unwrap();
+        assert!(policy_checks(&Effective::load(&p, None).unwrap()).is_empty());
+        // R4–R8 review: `secrets` naming a folder of the repository matches none of its files
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(repo.join("secrets")).unwrap();
+        let root = repo.display().to_string().replace('\\', "/");
+        std::fs::write(
+            &p,
+            format!("version: 1\nproject: {{ root: '{root}', worktrees_root: w }}\npolicy: {{ deny_paths: [secrets, notes.md] }}\n"),
+        )
+        .unwrap();
+        let w = policy_checks(&Effective::load(&p, None).unwrap());
+        assert_eq!(
+            w.len(),
+            1,
+            "{:?}",
+            w.iter().map(|c| &c.message).collect::<Vec<_>>()
+        );
+        assert!(
+            w[0].message
+                .contains("policy.deny_paths: `secrets` names the folder `secrets`")
+                && w[0].message.contains("write `secrets/**`"),
+            "{}",
+            w[0].message
+        );
+    }
 
     /// R60 (M9-A2, B1): each profile, toolchain and role says where it came from, in text and in `--json`;
     /// the config hash does not depend on it.

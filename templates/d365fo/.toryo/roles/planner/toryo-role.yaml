@@ -1,0 +1,8 @@
+# toryo-role.yaml template of the planner (M11-F1) — .toryo/roles/planner/toryo-role.yaml
+# TODO(owner): purpose in your words; skills the planner always gets (every one listed is pasted
+# into its instructions — none here by default). No writes / never / before_handoff: the planner
+# is read-only.
+toryo: 1
+purpose: Turn TASK.md into a plan a human can approve.
+instructions: ./instructions.md
+skills: []

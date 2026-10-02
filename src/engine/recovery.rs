@@ -371,12 +371,12 @@ impl<'a> Recovery<'a> {
             .collect();
         let unfinished = wt.unfinished_operation()?;
         if !prot.is_empty() || unfinished.is_some() {
+            // M11-R8: a fence violation names its rule
+            let paths = self.protect.violation_words(&prot);
             let what = match (&unfinished, prot.is_empty()) {
                 (Some(op), true) => format!("an unfinished Git operation ({op})"),
-                (Some(op), false) => {
-                    format!("an unfinished Git operation ({op}) and protected paths {prot:?}")
-                }
-                (None, _) => format!("protected paths {prot:?}"),
+                (Some(op), false) => format!("an unfinished Git operation ({op}) and {paths}"),
+                (None, _) => paths,
             };
             let reason = format!(
                 "{POLICY_VIOLATION}: the interrupted attempt {} left {what}; snapshot {}",

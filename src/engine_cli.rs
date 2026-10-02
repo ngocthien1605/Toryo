@@ -496,9 +496,24 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
             max_fix_cycles,
         } => {
             let cfg = load_config(cli)?;
+            let root = PathBuf::from(toryo::config::expand_vars(&cfg.repo.project.root)?);
             let repo = match repo {
+                // M11-R8: the org chart was validated from project.root, but instructions,
+                // culture and skills are read from the task's repository — they must be one
+                Some(r)
+                    if cfg.team.is_some()
+                        && (std::fs::canonicalize(r).ok() != std::fs::canonicalize(&root).ok()
+                            || !r.is_dir()) =>
+                {
+                    bail!(
+                        "task create --repo {}: in org chart mode the task's repository must be project.root ({}) — the org chart, the role files and the skills are read from it; change project.root in {} or leave --repo out",
+                        r.display(),
+                        root.display(),
+                        cfg.repo_path.display()
+                    );
+                }
                 Some(r) => r.clone(),
-                None => PathBuf::from(toryo::config::expand_vars(&cfg.repo.project.root)?),
+                None => root,
             };
             let st = store()?;
             let t = task::create(
@@ -605,6 +620,10 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     let (old_path, old_text) = task::frozen_config_text(&t)?;
     let old = toryo::config::Effective::from_frozen(&old_text, &old_path)?;
     let new = load_config(cli)?;
+    // review H2 (M11-A2): a reload cannot go below the machine floor either
+    if let Some(reason) = toryo::engine::verify::below_floor(&new) {
+        bail!("{reason}");
+    }
     let new_text = new.canonical_json();
     let new_sha = sha256_hex(new_text.as_bytes());
     if new_sha == t.config_sha256 {
@@ -629,6 +648,8 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     std::fs::write(&a, pretty(&old_text)?)?;
     std::fs::write(&b, pretty(&new_text)?)?;
     let g = task::task_git(&new, &t.repo)?; // R37 admission under the new machine config
+                                            // M18 (group E review): a reloaded gate script must be in the base commit too
+    task::check_entry_points(&new, &g, &t.repo, &t.base_commit)?;
     let out = g.output(
         &toryo::git::Loc::Discover(dir.clone()),
         true,
@@ -662,6 +683,9 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     let verify_changed = serde_json::to_value(&old.repo.commands.verify)?
         != serde_json::to_value(&new.repo.commands.verify)?
         || serde_json::to_value(&old.repo.verify)? != serde_json::to_value(&new.repo.verify)?
+        || old.machine_verify != new.machine_verify // M11-A2
+        // M11 (group E review): the gates, their machine commands, the role files
+        || serde_json::to_value(&old.team)? != serde_json::to_value(&new.team)?
         || toryo::engine::xpp::build_toolchain(&old) != toryo::engine::xpp::build_toolchain(&new); // R59
     let reverify = verify_changed && artifacts::head(&st, &t, "verify-result")?.is_some();
     let invalidated = serde_json::to_vec_pretty(
@@ -1020,6 +1044,24 @@ fn resume_before_drive(st: &Store, t: &TaskRow, r: &ResumeArgs, protected: bool)
                 t.machine.reason().unwrap_or("")
             ),
         )?;
+    } else if t.state == PipelineState::Escalated
+        && t.machine
+            .reason_class()
+            .is_some_and(toryo::engine::state::is_machine_caused)
+        && t.machine.escalated_from().is_some_and(|s| s.is_running())
+    {
+        // M11-R11 (X8): the machine caused this (a missing skill, a context over budget, a gate
+        // the machine cannot run) — a plain `toryo resume` goes back into the stage, which
+        // checks its precondition again. No fix cycle, no implementer turn for nothing.
+        let class = t.machine.reason_class().unwrap_or_default().to_string();
+        let i = t.id.clone();
+        st.call(move |tx| store::transition(tx, &i, PipelineEvent::ResumeStage).map(|_| ()))?;
+        toryo::engine::decisions::append(
+            st,
+            t,
+            &format!("resumed after {class} (M11-R11)"),
+            t.machine.reason().unwrap_or(""),
+        )?;
     } else if t.state == PipelineState::Paused {
         // R49: after an implementer quota pause the chain starts again from the primary
         let quota = t
@@ -1123,18 +1165,59 @@ fn print_json(v: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// M11-E3: what each environment lock's environment holds — every lock, or only the locks
+/// `task` deployed to — with its status in words and whether that task's final gate is
+/// approved.
+fn environments(
+    st: &Store,
+    task: Option<&str>,
+) -> Result<Vec<(store::Deployment, &'static str, bool)>> {
+    let rows = st.read(store::deployments)?;
+    let mut out = Vec::new();
+    for d in rows
+        .into_iter()
+        .filter(|d| task.is_none_or(|i| d.task == i))
+    {
+        let i = d.task.clone();
+        let holder = st.read(move |tx| {
+            Ok(store::get_task(tx, &i)
+                .ok()
+                .map(|t| (t.state, t.machine.checkpoint().map(str::to_string))))
+        })?;
+        let state = holder.as_ref().map(|h| h.0);
+        // M11-R8: the head the holder's final gate approved — only a completed task has one
+        let approved = holder
+            .as_ref()
+            .filter(|h| h.0 == PipelineState::Completed)
+            .and_then(|h| h.1.clone());
+        let active = driven_owner(st, &d.task).ok().flatten().is_some();
+        let status = views::deployment_status(&d, state, approved.as_deref(), active);
+        out.push((d, status, status == "approved"));
+    }
+    Ok(out)
+}
+
 pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
     let st = store()?;
     let tasks = match id {
         Some(i) => vec![read_task(&st, i)?],
         None => st.read(store::list_tasks)?,
     };
+    let envs = environments(&st, id)?;
     if json {
         let list = tasks
             .iter()
             .map(|t| Ok(views::task_json(t, &facts(&st, t)?)))
             .collect::<Result<Vec<_>>>()?;
-        print_json(&serde_json::json!({ "tasks": list }))?;
+        let mut doc = serde_json::json!({ "tasks": list });
+        // M11-E3: only when an environment gate has deployed (the M10 document otherwise)
+        if !envs.is_empty() {
+            doc["environments"] = envs
+                .iter()
+                .map(|(d, s, a)| views::deployment_json(d, s, *a))
+                .collect();
+        }
+        print_json(&doc)?;
         return Ok(0);
     }
     if tasks.is_empty() {
@@ -1148,11 +1231,10 @@ pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
             .map(|o| format!(" · ACTIVE ({o})"))
             .unwrap_or_default();
         println!(
-            "{:<14} {:<22} fix {}/{} · tokens {}{}{}{}",
+            "{:<14} {:<22} fix {} · tokens {}{}{}{}",
             t.id,
             format!("{:?}", t.state),
-            t.fix_cycle,
-            t.machine.max_fix_cycles(),
+            views::fix_cycles(&t, "/"),
             t.spent_tokens,
             if t.reserved_tokens > 0 {
                 format!(" (+~{} reserved)", t.reserved_tokens)
@@ -1168,7 +1250,25 @@ pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
         if f.compile_only == Some(true) {
             println!("               {}", toryo::engine::xpp::COMPILE_ONLY);
         }
+        // M11-E3: an environment gate waiting for its machine-wide lock (only while its run is
+        // alive: a crash while waiting leaves the row behind — group E review)
+        if t.state == PipelineState::Verifying && f.active_owner.is_some() {
+            let i = t.id.clone();
+            if let Some(lock) = st.read(move |tx| store::env_wait(tx, &i))? {
+                let holder = st
+                    .read(store::deployments)?
+                    .into_iter()
+                    .find(|d| d.lock == lock && d.finished_at.is_none() && d.task != t.id)
+                    .map(|d| format!(" (held by {})", d.task))
+                    .unwrap_or_default();
+                println!("               waiting for lock {lock}{holder}");
+            }
+        }
         println!("               next: {}", f.next_action);
+    }
+    // M11-E3: one line per environment lock — what code that environment runs
+    for (d, s, _) in &envs {
+        println!("environment    {}", views::deployment_line(d, s));
     }
     Ok(0)
 }
@@ -1216,7 +1316,16 @@ fn show(id: &str, json: bool) -> Result<i32> {
     if json {
         let task = views::task_json(&t, &facts(&st, &t)?);
         let events = toryo::engine::flight::events_path(&t);
-        print_json(&views::show_json(task, &t, &atts, &usage, &ap, &events))?;
+        let mut doc = views::show_json(task, &t, &atts, &usage, &ap, &events);
+        // M11-E3: the environments this task deployed to (only then)
+        let envs = environments(&st, Some(id))?;
+        if !envs.is_empty() {
+            doc["environments"] = envs
+                .iter()
+                .map(|(d, s, a)| views::deployment_json(d, s, *a))
+                .collect();
+        }
+        print_json(&doc)?;
         return Ok(0);
     }
     status(Some(id), false)?;
