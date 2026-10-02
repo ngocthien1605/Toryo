@@ -241,6 +241,47 @@ impl<'a> Engine<'a> {
         self.apply_with(Ev::Escalate { reason }, true, Some(class))
     }
 
+    /// M11-R5: before a turn of `stage` starts (no attempt, no tokens) — every skill it needs
+    /// resolves now (the approved plan's for the implementer, the role file's for planner and
+    /// reviewer), and with its skills the context fits the budget. Otherwise the task
+    /// escalates (`skill_unavailable` / `context_over_budget`) and this returns true; `resume`
+    /// tries again. Without an org chart nothing is checked.
+    fn turn_blocked(&self, t: &TaskRow, stage: &str, profile: &str) -> Result<bool> {
+        if self.cfg.team.is_none() {
+            return Ok(false);
+        }
+        // a task pack that fails its hash check escalates with the attempt (R34)
+        let Ok(req) = context::request(self.store, t, &self.cfg, stage, profile) else {
+            return Ok(false);
+        };
+        let missing = req
+            .team
+            .as_ref()
+            .map(|c| c.missing_skills.clone())
+            .unwrap_or_default();
+        let blocked = if !missing.is_empty() {
+            Some((
+                context::SKILL_UNAVAILABLE,
+                format!(
+                    "{}: the {stage} turn ({profile}) was not started — {}; put the skill back, then `toryo resume {} --note …`",
+                    context::SKILL_UNAVAILABLE,
+                    missing.join("; "),
+                    t.id
+                ),
+            ))
+        } else {
+            let c = context::assemble(&req)?;
+            context::over_budget(&c).map(|r| (context::CONTEXT_OVER_BUDGET, r))
+        };
+        match blocked {
+            Some((class, reason)) => {
+                self.escalate(class, reason)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Apply `e` and report it; `reason_line`: the escalation or pause reason is printed (see
     /// [`Self::end_with`] for the rule and its one exception, the budget pause).
     fn apply_with(&self, e: Ev, reason_line: bool, class: Option<&str>) -> Result<St> {
@@ -479,7 +520,7 @@ impl<'a> Engine<'a> {
             prev.as_ref().map(|p| p.status),
             &art.join("TASK.md"),
         );
-        if !self.admitted()? {
+        if !self.admitted()? || self.turn_blocked(t, "plan", &t.planner)? {
             return Ok(Flow::Next);
         }
         let head = Worktree::new(&self.g, &t.worktree).head()?;
@@ -644,11 +685,10 @@ impl<'a> Engine<'a> {
         if chosen.is_empty() {
             return Ok(None);
         }
-        let menu: Vec<&str> = team
-            .role("implementer")
-            .map(|r| r.skills.iter().map(String::as_str).collect())
-            .unwrap_or_default();
+        // M11-R5: the menu is what resolves now — a skill that cannot be delivered is off it
         let machine = crate::team::machine_skills_dir(&team.skill_roots);
+        let available = context::available_skills(team, &t.repo, machine.as_deref());
+        let menu: Vec<&str> = available.iter().map(|k| k.name.as_str()).collect();
         let off: Vec<String> = chosen
             .iter()
             .filter(|s| !menu.contains(&s.as_str()))
@@ -665,8 +705,10 @@ impl<'a> Engine<'a> {
                 "plan_skills: the plan lists skills that are not on the implementer's menu: {}",
                 off.join(", ")
             );
-            let listed = context::skill_menu(team, &t.repo, machine.as_deref())
-                .unwrap_or_else(|| "(the implementer has no skills)\n".into());
+            let listed =
+                context::skill_menu(team, &t.repo, machine.as_deref()).unwrap_or_else(|| {
+                    "(no skill of the implementer resolves on this machine now)\n".into()
+                });
             let fb = format!(
                 "Your plan lists skills that are not on the implementer's menu: {}. {listed}Create the plan again with `skills` naming only skills from this menu (or none).",
                 off.join(", ")
@@ -675,28 +717,44 @@ impl<'a> Engine<'a> {
         }
         // the chosen skills are never trimmed: with the implementer's other never-trimmed
         // parts they must fit its budget — the implementer's context as it would be assembled
-        // (D3: from this plan, the head of `plan`)
-        let profile = context::stage_profile(t, "implement")?;
-        let req = context::request(self.store, t, &self.cfg, "implement", &profile)?;
-        let c = context::assemble(&req)?;
-        let skills: usize = c
-            .sources
-            .iter()
-            .filter(|s| s.label.starts_with("skill "))
-            .map(|s| s.bytes)
-            .sum();
-        let fixed = c.fixed_bytes.saturating_sub(skills);
-        if c.fixed_bytes > req.budget {
-            let reason = format!(
-                "plan_skills: the chosen skills ({skills} bytes) and the implementer's fixed instructions ({fixed} bytes) exceed its context budget ({} KB)",
-                req.budget / 1024
-            );
-            let fb = format!(
-                "Choose fewer skills: the skills you chose ({}; {skills} bytes) and the implementer's fixed instructions ({fixed} bytes) exceed its context budget of {} KB (context.budget_kb.implementer). Create the plan again with fewer names in `skills`.",
-                chosen.join(", "),
-                req.budget / 1024
-            );
-            return Ok(Some((reason, fb)));
+        // (D3: from this plan, the head of `plan`), for every profile of the chain (M11-R5: a
+        // fallback without the run store also has TASK.md and PLAN.md inline, never trimmed)
+        let mut chain: Vec<String> = Vec::new();
+        for p in &t.implementers {
+            if !chain.contains(p) {
+                chain.push(p.clone());
+            }
+        }
+        if chain.is_empty() {
+            chain.push(context::stage_profile(t, "implement")?);
+        }
+        for profile in &chain {
+            let req = context::request(self.store, t, &self.cfg, "implement", profile)?;
+            let c = context::assemble(&req)?;
+            let skills: usize = c
+                .sources
+                .iter()
+                .filter(|s| s.label.starts_with("skill "))
+                .map(|s| s.bytes)
+                .sum();
+            let fixed = c.fixed_bytes.saturating_sub(skills);
+            if c.fixed_bytes > req.budget {
+                let inline = if req.no_run_store {
+                    ", with TASK.md and PLAN.md inline"
+                } else {
+                    ""
+                };
+                let reason = format!(
+                    "plan_skills: the chosen skills ({skills} bytes) and the fixed instructions of the implementer `{profile}` ({fixed} bytes{inline}) exceed its context budget ({} KB)",
+                    req.budget / 1024
+                );
+                let fb = format!(
+                    "Choose fewer skills: the skills you chose ({}; {skills} bytes) and the fixed instructions of the implementer `{profile}` ({fixed} bytes{inline}) exceed its context budget of {} KB (context.budget_kb.implementer). Create the plan again with fewer names in `skills`.",
+                    chosen.join(", "),
+                    req.budget / 1024
+                );
+                return Ok(Some((reason, fb)));
+            }
         }
         Ok(None)
     }
@@ -724,7 +782,7 @@ impl<'a> Engine<'a> {
             return Ok(Flow::Next);
         }
         let Some(run) = self.run_implement_turn(t, &turn, &wt)? else {
-            return Ok(Flow::Next); // the task pack failed its hash check: escalated (R34)
+            return Ok(Flow::Next); // escalated: the task pack failed its hash check (R34), or a skill / the budget (M11-R5)
         };
         let outcome = self.interpret_implement(t, &turn, &run, &wt)?;
         self.retries = outcome.retries_after(self.retries);
@@ -770,14 +828,17 @@ impl<'a> Engine<'a> {
     }
 
     /// Begin the attempt at the current HEAD with an empty TEMP (R46), assemble its context
-    /// (§7), run the turn and record its usage (R41). `None`: the context could not be
-    /// assembled and the task escalated.
+    /// (§7), run the turn and record its usage (R41). `None`: the turn did not run and the task
+    /// escalated (the task pack's hash, a skill that does not resolve, the budget — M11-R5).
     fn run_implement_turn(
         &self,
         t: &TaskRow,
         turn: &ImplementTurn,
         wt: &Worktree,
     ) -> Result<Option<ImplementRun>> {
+        if self.turn_blocked(t, &turn.stage, &turn.profile)? {
+            return Ok(None);
+        }
         let head_before = wt.head()?;
         let tmp = t.worktree.join(".toryo-tmp");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1823,7 +1884,7 @@ impl<'a> Engine<'a> {
                 .call(move |tx| store::last_attempt(tx, &i, "review"))?
         };
         let resume = review_resume(prev.as_ref(), &head, &t.reviewer);
-        if !self.admitted()? {
+        if !self.admitted()? || self.turn_blocked(t, "review", &t.reviewer)? {
             return Ok(Flow::Next);
         }
         let a = self.begin(NewAttempt {
@@ -2295,6 +2356,12 @@ impl<'a> Engine<'a> {
             Err(e) => return Err(e),
         };
         let c = context::assemble(&req)?;
+        // M11-R5: checked before the turn too ([`Self::turn_blocked`]); a skill file that grew
+        // in between is caught here
+        if let Some(reason) = context::over_budget(&c) {
+            self.escalate_attempt(a, context::CONTEXT_OVER_BUDGET.into(), reason)?;
+            return Ok(None);
+        }
         for w in &c.warnings {
             eprintln!("!! {w}");
         }

@@ -670,6 +670,11 @@ Bộ mẫu: `templates\d365fo\.toryo\`, `templates\d365fo\CULTURE.md`, `template
   the implementer: …`). Tên không có trong thực đơn, hoặc quá ngân sách ngữ cảnh → trả kế hoạch về cho planner
   (có giới hạn). Planner và reviewer luôn nhận đủ skill trong role file của mình. Skill không bao giờ bị cắt bớt,
   được băm (hash) và hiện trong `toryo context show` kèm nguồn và SHA-256. **Chỉ giao chính file `SKILL.md`**.
+  Thực đơn chỉ liệt kê skill tìm thấy được lúc này. Kiểm tra ngân sách chạy cho **mọi profile trong chuỗi
+  implementer** (Claude dự phòng nhận TASK.md và PLAN.md inline, không bao giờ bị cắt để nhường chỗ cho skill).
+  Trước mỗi lượt, mọi skill cần dùng phải tìm thấy: không thì task escalate `skill_unavailable` (nêu cả hai đường
+  dẫn đã tìm; chưa chạy lượt nào, không tốn token) — đặt skill lại rồi `toryo resume <id> --note …`. Ngữ cảnh có
+  skill mà vẫn quá ngân sách → escalate `context_over_budget`.
 - **Hàng rào ghi (write fence)** của implementer: `writes:` = chỉ được sửa các file này; `never:` = không bao giờ,
   kể cả trong `writes`. Kế hoạch đụng file ngoài hàng rào → lập lại kế hoạch; implementer sửa file ngoài hàng rào →
   khôi phục và trả lại, nêu rõ luật. `## Allow protected` trong TASK.md mở được một mục, như file được bảo vệ.

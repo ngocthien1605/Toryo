@@ -112,7 +112,7 @@ Task list: `M11-review-fixes.md` (review of 2026-10-02, built and run on Linux b
 - [x] R2 — environment gates see exactly the checkpoint; neutral working directory
 - [x] R3 — environment gate `program`/`args`: validate what runs
 - [x] R4 — fence patterns that match nothing; the culture file is protected
-- [ ] R5 — a skill that cannot be delivered stops the turn; the budget check covers the whole chain
+- [x] R5 — a skill that cannot be delivered stops the turn; the budget check covers the whole chain
 - [ ] R6 — M18 script detection: no false refusals, no missed scripts
 - [ ] R7 — the same-vendor check counts every turn that ran
 - [ ] R8 — cheap Low fixes and test gaps
@@ -226,6 +226,37 @@ Task list: `M11-review-fixes.md` (review of 2026-10-02, built and run on Linux b
   with `## Allow protected` committed). No existing test changed.
 - Docs: README, HUONG-DAN §5.9, the d365fo template's implementer role file (pattern rules) and org chart
   (`culture` is protected).
+
+### R5 — a skill that cannot be delivered stops the turn; the budget check covers the whole chain
+
+- **Before a turn** (`Engine::turn_blocked`, called after admission and before `begin` in `plan`, `review` and
+  `run_implement_turn` — so implement and every fix stage): the stage's `context::request` is built; any
+  `missing_skills` (a skill that does not resolve now, or an approved-plan skill no longer on the menu) → escalate
+  `skill_unavailable: the <stage> turn (<profile>) was not started — skill 'x' not found: neither <repo path> nor
+  <machine path>; put the skill back, then `toryo resume <id> --note …``. No attempt row, no tokens. `resume`
+  re-enters the stage, which checks again. A pack hash error is left to the attempt (R34 escalation as before).
+  Without an org chart nothing is checked.
+- **The menu** (`context::skill_menu`, and the plan check's menu via the new `context::available_skills`) lists only
+  skills that resolve now; a plan naming one that does not is sent back as "not on the implementer's menu".
+- **Plan-time budget:** `plan_skills_problem` assembles the implement context for every distinct profile of
+  `t.implementers` (or the stage profile when the chain is empty). Over budget → the same "choose fewer skills"
+  re-plan, now naming the profile (`the fixed instructions of the implementer `claude-max` (… bytes, with TASK.md
+  and PLAN.md inline)`).
+- **Attempt time:** in `context::assemble`, when skill parts are present and the agent has no run store, TASK.md and
+  PLAN.md get no trim rank (they are counted in `fixed_bytes`). With skills, a context still over budget after
+  trimming → `context::over_budget` → escalate `context_over_budget: the implementer context is N bytes, over its
+  budget of K KB (B bytes); its skills (S bytes), TASK.md and PLAN.md are never trimmed — raise
+  `context.budget_kb.implementer` or choose fewer skills` — before the turn (`turn_blocked`, no attempt) and, as a
+  guard, in `context_and_data` (attempt `Failed` with that class). Without skills the M10 rule stays (trim, warning).
+  With the run store (Codex) TASK.md / PLAN.md may still become `path (budget)` — listed, not truncated.
+- M11 test changed (mandated by "the planner's menu lists only skills that resolve"):
+  `tests/m11_skills.rs::machine_skills_are_delivered_and_missing_ones_skipped` asserted the menu line
+  `- xpp-batch — (not found on this machine)`; it now asserts that `xpp-batch` is absent and `xpp-axclass` listed.
+  The `context show` assertions of that test (skipped, not found) are unchanged — the preview still reports it.
+- Tests: `tests/m11_skills.rs::a_skill_that_is_gone_stops_the_turn_until_it_is_back` (AC-1: both paths, no
+  implementer attempt, resume with the skill in the context), `::the_budget_check_covers_every_implementer_of_the_
+  chain` (AC-2: `[codex-openai, claude-max]`, the feedback names `claude-max` only),
+  `context::tests::with_skills_the_inlined_task_pack_is_never_trimmed` (attempt time).
 
 ## Progress
 

@@ -52,6 +52,12 @@ pub const INLINE_MAX: usize = 8 * 1024;
 /// plan. Every other pack file was produced by an agent or by code an agent wrote.
 pub const TRUSTED_PACK: [&str; 2] = ["TASK.md", "PLAN.md"];
 
+/// M11-R5: a skill the turn needs does not resolve now — the turn is not started.
+pub const SKILL_UNAVAILABLE: &str = "skill_unavailable";
+/// M11-R5: with its skills (never trimmed) and TASK.md / PLAN.md (never trimmed to make room
+/// for them) the context does not fit its budget.
+pub const CONTEXT_OVER_BUDGET: &str = "context_over_budget";
+
 /// Whether a task-pack file (by its label) is trusted (R61). A file added to the pack later is
 /// untrusted unless it is listed in [`TRUSTED_PACK`].
 pub fn is_trusted(label: &str) -> bool {
@@ -388,6 +394,9 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
         }
     }
     let pack_start = parts.len();
+    // M11-R5: with skill parts, TASK.md and PLAN.md are never truncated to make room for them
+    // (an agent without the run store has no other copy)
+    let keep_pack = req.team.as_ref().is_some_and(|t| !t.skills.is_empty());
     let mut data = Vec::new();
     let mut data_sources = Vec::new();
     for (i, (label, path)) in req.pack.iter().enumerate() {
@@ -431,16 +440,17 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
             sha256,
             path_only: untrusted || !(small || req.no_run_store),
             body,
-            rank: (!untrusted).then_some(rank),
+            rank: (!untrusted && !(keep_pack && req.no_run_store)).then_some(rank),
             truncated: false,
             untrusted,
         });
     }
     let data_labels: Vec<&str> = data.iter().map(|d| d.label.as_str()).collect();
-    // the never-trimmed parts as `render` writes them (`\n# heading\n\nbody\n`)
-    let fixed_bytes = parts[..pack_start]
+    // the never-trimmed parts as `render` writes them (`\n# heading\n\nbody\n`) — with the
+    // inlined TASK.md / PLAN.md when they may not be trimmed (M11-R5)
+    let fixed_bytes = parts
         .iter()
-        .filter(|p| p.rank.is_none())
+        .filter(|p| p.rank.is_none() && !p.path_only)
         .map(|p| p.heading.len() + p.body.trim_end().len() + 6)
         .sum();
     let mut warnings = Vec::new();
@@ -713,22 +723,55 @@ pub fn plan_skills(plan: &serde_json::Value) -> Vec<String> {
 }
 
 /// M11-D2: the planner's menu of the implementer's skills — one `name — description` line
-/// each, read now (repository first, then the machine); `None` when the implementer lists no
-/// skill.
+/// each, read now (repository first, then the machine); only the skills that resolve now
+/// (M11-R5: one that does not could not be delivered). `None` when there is none.
 pub fn skill_menu(team: &crate::team::Team, repo: &Path, machine: Option<&Path>) -> Option<String> {
-    let skills = &team.role("implementer")?.skills;
+    let skills = available_skills(team, repo, machine);
     if skills.is_empty() {
         return None;
     }
     let mut s = String::from("Skills available to the implementer — list the ones this task needs in `skills` (names from this list only; leave it out when none applies). The implementer receives exactly the skills you list:\n");
-    for name in skills {
-        let d = match crate::team::resolve_skill(name, repo, machine) {
-            Ok(k) => k.description.unwrap_or_else(|| "(no description)".into()),
-            Err(_) => "(not found on this machine)".into(),
-        };
-        s.push_str(&format!("- {name} — {d}\n"));
+    for k in skills {
+        let d = k.description.unwrap_or_else(|| "(no description)".into());
+        s.push_str(&format!("- {} — {d}\n", k.name));
     }
     Some(s)
+}
+
+/// M11-R5: the implementer's skills that resolve now, in the role file's order.
+pub fn available_skills(
+    team: &crate::team::Team,
+    repo: &Path,
+    machine: Option<&Path>,
+) -> Vec<crate::team::Skill> {
+    team.role("implementer")
+        .map(|r| r.skills.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|name| crate::team::resolve_skill(name, repo, machine).ok())
+        .collect()
+}
+
+/// M11-R5: a context with skill parts that is still over its budget after trimming — the
+/// `context_over_budget` reason with the numbers, or None. (Without skills the M10 rule
+/// stays: a warning.)
+pub fn over_budget(c: &Assembled) -> Option<String> {
+    let skills: usize = c
+        .sources
+        .iter()
+        .filter(|s| s.label.starts_with("skill "))
+        .map(|s| s.bytes)
+        .sum();
+    (skills > 0 && c.text.len() > c.budget).then(|| {
+        format!(
+            "{CONTEXT_OVER_BUDGET}: the {} context is {} bytes, over its budget of {} KB ({} bytes); its skills ({skills} bytes), TASK.md and PLAN.md are never trimmed — raise `context.budget_kb.{}` or choose fewer skills",
+            c.role,
+            c.text.len(),
+            c.budget / 1024,
+            c.budget,
+            c.role
+        )
+    })
 }
 
 /// The profile that runs the next attempt of `stage`.
@@ -815,6 +858,57 @@ mod tests {
             }),
             ..req(repo, kind, role)
         }
+    }
+
+    /// M11-R5: with skill parts, the inlined TASK.md and PLAN.md of an implementer without the
+    /// run store are never truncated to make room — still over budget is `context_over_budget`
+    /// with the numbers. Without skills the M10 trim (and only a warning) stays.
+    #[test]
+    fn with_skills_the_inlined_task_pack_is_never_trimmed() {
+        let d = setup();
+        std::fs::write(d.path().join("TASK.md"), "T".repeat(3000)).unwrap();
+        std::fs::write(d.path().join("PLAN.md"), "P".repeat(3000)).unwrap();
+        let text = format!("# Batch\n{}\n", "s".repeat(2000));
+        let skill = crate::team::Skill {
+            name: "xpp-batch".into(),
+            origin: crate::team::SkillOrigin::Repo,
+            path: d.path().join(".toryo/skills/xpp-batch/SKILL.md"),
+            sha256: sha256_hex(text.as_bytes()),
+            bytes: text.len(),
+            description: None,
+            text,
+        };
+        let mut r = team_req(d.path(), ProfileKind::Claude, Role::Implementer);
+        r.no_run_store = true;
+        r.budget = 6 * 1024;
+        r.pack = vec![
+            ("TASK.md".into(), d.path().join("TASK.md")),
+            ("PLAN.md".into(), d.path().join("PLAN.md")),
+        ];
+        // without skills: the pack may be trimmed, with a warning only
+        let c = assemble(&r).unwrap();
+        assert!(
+            c.sources.iter().any(|s| s.mode == "trimmed" && s.n == 5),
+            "{:?}",
+            c.sources
+        );
+        assert_eq!(over_budget(&c), None);
+        // with a skill: TASK.md and PLAN.md stay whole; over budget is an escalation reason
+        r.team.as_mut().unwrap().skills = vec![skill];
+        let c = assemble(&r).unwrap();
+        for f in ["TASK.md", "PLAN.md"] {
+            let s = c.sources.iter().find(|s| s.label == f).unwrap();
+            assert_eq!((s.mode.as_str(), s.included_bytes), ("inline", 3000), "{f}");
+        }
+        assert!(c.fixed_bytes > 8000, "{}", c.fixed_bytes);
+        let why = over_budget(&c).expect("over budget");
+        assert!(
+            why.starts_with("context_over_budget: the implementer context is ")
+                && why.contains("over its budget of 6 KB (6144 bytes)")
+                && why.contains("its skills (2009 bytes)")
+                && why.contains("raise `context.budget_kb.implementer` or choose fewer skills"),
+            "{why}"
+        );
     }
 
     /// M11-C1 AC-1: in org chart mode the embedded role template comes first — also when an

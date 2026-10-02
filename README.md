@@ -260,6 +260,11 @@ from the repository checkout (`project.root`), never from a task worktree, and e
   get every skill of their role file. Skills are pasted into the context file (never trimmed, hashed, listed by
   `toryo context show` with origin and SHA-256), never into the untrusted user prompt. **Only `SKILL.md` is
   delivered**; files next to it are readable by the agents only for repository skills (they are in the worktree).
+  The menu lists only the skills that resolve now. The budget check covers **every profile of the implementer
+  chain** (a Claude fallback has TASK.md and PLAN.md inline, never trimmed to make room for skills). Before a turn
+  starts, every skill it needs must resolve: otherwise the task escalates with `skill_unavailable` (naming both
+  lookup paths; no turn, no tokens) — put it back and `toryo resume <id> --note …`. A context with skills that is
+  still over budget escalates with `context_over_budget`.
 - **The write fence.** The implementer's `writes:` (globs; when set, the only files it may change) and `never:`
   (never, even inside `writes`) — case-insensitive, `/` and `\` alike. A planned file outside the fence sends the
   plan back; a changed file outside it is restored and sent back to the implementer, with the rule named. The

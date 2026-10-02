@@ -356,9 +356,147 @@ fn machine_skills_are_delivered_and_missing_ones_skipped() {
         "{err}"
     );
     assert!(!text.contains("MACHINE-BATCH-BODY"));
+    // M11-R5: the menu lists only the skills that resolve now (it said "(not found on this
+    // machine)" before)
     let (_, plan_text) = context_show(&env, "SK-11", "plan");
     assert!(
-        plan_text.contains("- xpp-batch — (not found on this machine)"),
+        !plan_text.contains("- xpp-batch")
+            && plan_text.contains("- xpp-axclass — Create or change an X++ class."),
         "{plan_text}"
+    );
+}
+
+/// M11-R5 AC-1: an approved skill whose folder is gone before the implement turn → the task
+/// escalates with `skill_unavailable` (both lookup paths named) and no implementer attempt
+/// starts; once the folder is back, `resume --note` runs the turn with the skill.
+#[test]
+fn a_skill_that_is_gone_stops_the_turn_until_it_is_back() {
+    let env = skills_env("", &[]);
+    let shared = env.root.join("machine-skills");
+    std::fs::create_dir_all(&shared).unwrap();
+    let m = std::fs::read_to_string(&env.machine).unwrap();
+    let shared_fwd = shared.display().to_string().replace('\\', "/");
+    std::fs::write(&env.machine, format!("{m}skills_dir: '{shared_fwd}'\n")).unwrap();
+    approved_plan(&env, "SK-R5", json!(["xpp-batch"]));
+    let dir = env.repo.join(".toryo").join("skills").join("xpp-batch");
+    let aside = env.root.join("xpp-batch-aside");
+    std::fs::rename(&dir, &aside).unwrap();
+    let turns = |name: &str| {
+        script(
+            &env,
+            name,
+            json!({
+                "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+                "reviewer": [turn(vec![approved()])],
+            }),
+        )
+    };
+    let s = turns("r5a.json");
+    let (_, err) = toryo(&env, &["run", "SK-R5", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "SK-R5");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    let reason = t.machine.reason().unwrap_or_default().to_string();
+    assert!(
+        reason.starts_with("skill_unavailable: the implement turn (codex-openai) was not started")
+            && reason.contains("skill 'xpp-batch' not found: neither")
+            && reason.contains(&dir.join("SKILL.md").display().to_string())
+            && reason.contains(" nor ")
+            && reason.contains("machine-skills"),
+        "{reason}"
+    );
+    assert!(
+        attempts(&env, "SK-R5").iter().all(|a| a.stage == "plan"),
+        "no implementer attempt"
+    );
+    assert!(calls_of(&env, "SK-R5", "implementer").is_empty());
+    std::fs::rename(&aside, &dir).unwrap();
+    let s = turns("r5b.json");
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "SK-R5",
+            "--note",
+            "the skill is back",
+            "--yes",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "SK-R5").state, St::Completed, "{err}");
+    let imp = calls_of(&env, "SK-R5", "implementer");
+    assert!(
+        imp[0]["context"]
+            .as_str()
+            .unwrap()
+            .contains("BATCH-SKILL-BODY"),
+        "the turn has the skill"
+    );
+}
+
+/// M11-R5 AC-2: the plan-time budget check runs for every profile of the implementer chain —
+/// skills that fit the Codex implementer (TASK.md and PLAN.md in the run store) but not the
+/// Claude fallback (both inline, never trimmed) send the plan back naming the Claude profile.
+#[test]
+fn the_budget_check_covers_every_implementer_of_the_chain() {
+    let big = format!(
+        "---\ndescription: A long manual.\n---\n{}",
+        "x".repeat(5 * 1024)
+    );
+    let org = ORGCHART.replace("IMPLEMENTER", "codex-openai").replace(
+        "implementer: { profile: codex-openai }",
+        "implementer: { profile: codex-openai, fallback: [claude-max] }",
+    );
+    let env = skills_env(
+        "context: { budget_kb: { implementer: 8 } }\n",
+        &[
+            (".toryo/toryo-orgchart.yaml", &org),
+            (".toryo/skills/xpp-batch/SKILL.md", &big),
+        ],
+    );
+    let task_md = std::fs::read_to_string(env.repo.join("TASK.md")).unwrap();
+    let long = env.root.join("TASK-long.md");
+    std::fs::write(
+        &long,
+        format!(
+            "{task_md}\n## Background\n\n{}\n",
+            "Some background. ".repeat(220)
+        ),
+    )
+    .unwrap();
+    let (code, err) = toryo(
+        &env,
+        &[
+            "task",
+            "create",
+            "--file",
+            long.to_str().unwrap(),
+            "--id",
+            "SK-R5B",
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "SK-R5B");
+    assert_eq!(t.implementers, ["codex-openai", "claude-max"]);
+    let s = script(
+        &env,
+        "r5c.json",
+        json!({"planner": [turn(vec![plan_with(json!(["xpp-batch"]))]), turn(vec![plan_with(json!([]))])]}),
+    );
+    let (code, err) = toryo(&env, &["run", "SK-R5B", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "SK-R5B").state, St::WaitingPlanApproval, "{err}");
+    let p = calls_of(&env, "SK-R5B", "planner");
+    assert_eq!(p.len(), 2, "re-planned once");
+    let fb = p[1]["prompt"].as_str().unwrap();
+    assert!(
+        fb.contains("Choose fewer skills")
+            && fb.contains("the implementer `claude-max`")
+            && fb.contains("with TASK.md and PLAN.md inline")
+            && !fb.contains("`codex-openai`"),
+        "{fb}"
     );
 }
