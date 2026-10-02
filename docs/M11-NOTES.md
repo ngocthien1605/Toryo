@@ -571,7 +571,7 @@ the push and the pull request.
 - [x] R11 — `resume` after a machine-caused escalation costs no fix cycle
 - [x] R12 — cheap Low fixes
 - [x] Finish — notes, README, HUONG-DAN, templates
-- [ ] Push and pull request
+- [~] Push and pull request — BLOCKED: `git push` denied by the environment permission layer (not a credentials problem); the branch is ready
 
 #### Decisions X6–X8 (binding)
 
