@@ -75,8 +75,9 @@ skills: [xpp-axclass, xpp-batch]
 # matched here is off limits. Only the implementer may have `writes`; the
 # planner and reviewer are read-only, so for them it is an error.
 # Patterns: `*` (within one folder), `**` (any depth), `?` (one character).
-# `./src/**`, `src/` and `src` all mean "src and everything under it"; an
-# absolute path, `..`, or `{a,b}` / `[ab]` / `!x` is refused when loading.
+# `./src/**`, `src/` and `src` all mean "src and everything under it" (so
+# does `**/secrets` for every `secrets` folder); `*.pfx` matches at any
+# depth; an absolute path, `..`, or `{a,b}` / `[ab]` / `!x` is refused.
 # When it is checked:
 #   - at plan time: a file the plan expects to touch (files_likely_involved)
 #     outside the fence sends the plan back to the planner (bounded);

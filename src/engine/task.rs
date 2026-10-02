@@ -94,7 +94,11 @@ pub fn check_entry_points(cfg: &Effective, g: &GitCmd, repo: &Path, base: &str) 
         return Ok(());
     }
     let repol = Loc::Discover(repo.to_path_buf());
-    let listing = g.run(&repol, true, &["ls-tree", "-r", "-z", "--name-only", base])?;
+    let listing = g.run(
+        &repol,
+        true,
+        &["ls-tree", "-r", "-t", "-z", "--name-only", base],
+    )?;
     let tree: std::collections::HashSet<String> = listing
         .split(|b| *b == 0)
         .filter(|f| !f.is_empty())

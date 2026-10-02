@@ -273,7 +273,8 @@ from the repository checkout (`project.root`), never from a task worktree, and e
   plan back; a changed file outside it is restored and sent back to the implementer, with the rule named. The
   fence only narrows `toryo.yaml`: protected and denied paths stay so; `## Allow protected` in TASK.md opens a fence
   entry like a protected path. Patterns are normalised at load (`./src/**`, `src/` and `src` all mean `src/**`: the
-  path and everything under it); an absolute pattern, `..`, an empty one or syntax the matcher lacks (`{ } [ ] !`;
+  path and everything under it; a last segment without a wildcard covers what is under it too, `**/secrets` is
+  `**/secrets/**`; a wildcard pattern without a `/` matches at any depth, `*.pfx` is `**/*.pfx`); an absolute pattern, `..`, an empty one or syntax the matcher lacks (`{ } [ ] !`;
   it has `*`, `**`, `?`) is a load error. (`policy.deny_paths` / `protected_paths` keep their M10 behaviour;
   `toryo doctor` warns about a pattern there that can never match.)
 - **The culture file is protected** (org chart mode) like the verify files: an agent's change is restored, unless
@@ -288,8 +289,9 @@ from the repository checkout (`project.root`), never from a task worktree, and e
     `-Command` or the first positional `.ps1`; the script of `sh`/`bash`/`python`/`node`/…, skipping the values of
     `-o`, `-W`, `-r`, `-I`, …; the first token after `cmd /c`) is protected before it exists, and `task create` refuses
     a configuration whose base commit lacks it. A candidate without a path separator or a script extension is never
-    refused; any argument naming a repository `.ps1 .psm1 .cmd .bat .sh .py .js .ts .rb .pl .exe` file missing at the
-    base commit is (M11-R6). Not caught: a script without an extension, in the repository root, run by a program
+    refused; an argument (or the first token of a `-c` / `-Command` / `/c` command line) that is a literal repository
+    path with a separator and a `.ps1 .psm1 .cmd .bat .sh .py .js .ts .rb .pl .exe` extension, missing at the base
+    commit, is (M11-R6; a glob, a variable, a whole command line or the value of `-o` / `--out…` / `-OutFile` is not). Not caught: a script without an extension, in the repository root, run by a program
     outside this table.
   - `kind: environment` — the repository only declares it (`timeout`, `if_missing: error | skip`); the command is
     `environment_gates.<name>` in the machine config (`program`, `args`, `lock`, `env`, `secret_env`), frozen with the

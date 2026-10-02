@@ -678,7 +678,8 @@ Bộ mẫu: `templates\d365fo\.toryo\`, `templates\d365fo\CULTURE.md`, `template
 - **Hàng rào ghi (write fence)** của implementer: `writes:` = chỉ được sửa các file này (`writes: []` hoặc không ghi = không giới hạn, chỉ áp `never`); `never:` = không bao giờ,
   kể cả trong `writes`. Kế hoạch đụng file ngoài hàng rào → lập lại kế hoạch; implementer sửa file ngoài hàng rào →
   khôi phục và trả lại, nêu rõ luật. `## Allow protected` trong TASK.md mở được một mục, như file được bảo vệ.
-  Mẫu được chuẩn hoá lúc nạp: `./src/**`, `src/` và `src` đều là `src/**` (thư mục và mọi thứ bên trong); mẫu tuyệt
+  Mẫu được chuẩn hoá lúc nạp: `./src/**`, `src/` và `src` đều là `src/**` (thư mục và mọi thứ bên trong; `**/secrets` là `**/secrets/**`; mẫu có ký tự đại
+  diện mà không có `/` khớp ở mọi cấp: `*.pfx` là `**/*.pfx`); mẫu tuyệt
   đối, có `..`, rỗng, hoặc dùng cú pháp không hỗ trợ (`{ } [ ] !` — chỉ có `*`, `**`, `?`) → lỗi nạp. (`policy.deny_paths`
   / `protected_paths` giữ hành vi M10; `toryo doctor` cảnh báo mẫu không bao giờ khớp.)
 - **File `culture` được bảo vệ** (chế độ org chart) như script của gate: agent sửa → khôi phục, trừ khi TASK.md
@@ -700,7 +701,8 @@ trượt đầu tiên; exit code quyết định; mọi gate có `TORYO_TASK`, `
   Script của gate được bảo vệ kể cả khi chưa tồn tại (M18), và `task create` từ chối nếu commit gốc chưa có nó.
   (M11-R6, áp dụng cho mọi repo) Toryo nhận ra script cả khi viết `pwsh scripts\x.ps1` (không `-File`), `pwsh -Command
   ./x.ps1`, `cmd /c "x.cmd arg"`, và bỏ qua giá trị của cờ (`bash -o pipefail x.sh`, `python -W error x.py`). Đối số
-  nào chỉ tới file `.ps1 .psm1 .cmd .bat .sh .py .js .ts .rb .pl .exe` trong repo mà commit gốc chưa có → bị từ chối.
+  nào là đường dẫn cụ thể (có `/` hoặc `\`) tới file `.ps1 .psm1 .cmd .bat .sh .py .js .ts .rb .pl .exe` trong repo mà
+  commit gốc chưa có → bị từ chối (glob, biến, cả một dòng lệnh, hay giá trị của `-o` / `--out…` thì không).
   Giới hạn còn lại: script không có đuôi, nằm ở gốc repo, chạy bằng chương trình ngoài bảng.
 - `kind: environment` — **thay đổi môi trường D365FO** của máy này (deploy, DB sync), chạy bằng **quyền bình thường
   của anh**, nên lệnh chỉ nằm trong machine config (`environment_gates`), ngoài tầm với của mọi agent. Chỉ chạy

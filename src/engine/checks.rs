@@ -276,8 +276,9 @@ fn glob_ci(g: &str) -> regex::Regex {
 
 /// M11-R4: a `writes` / `never` pattern in the form the matcher compares paths in, or why it
 /// is refused. `\` is `/`; a leading `./` and empty or `.` segments go; a trailing `/` — or a
-/// pattern without `*` and `?` — matches that path and everything under it (`x/**`). Refused:
-/// empty, absolute, `..`, and syntax the matcher does not have.
+/// last segment without `*` and `?` — matches that path and everything under it (`x/**`); a
+/// wildcard pattern without a `/` matches at any depth (`*.pfx` is `**/*.pfx`). Refused: empty,
+/// absolute, `..`, and syntax the matcher does not have.
 pub fn fence_pattern(p: &str) -> std::result::Result<String, String> {
     let t = p.trim().replace('\\', "/");
     if t.is_empty() {
@@ -302,7 +303,14 @@ pub fn fence_pattern(p: &str) -> std::result::Result<String, String> {
         return Err("names no path".into());
     }
     let mut out = parts.join("/");
-    if (t.ends_with('/') || !out.contains(['*', '?'])) && !out.ends_with("/**") && out != "**" {
+    // (R4–R8 review) gitignore-like: a wildcard pattern without a `/` matches at any depth
+    // (`*.pfx` is `**/*.pfx`), and a last segment without a wildcard names a folder as well
+    // as a file (`**/secrets` is `**/secrets/**`)
+    if parts.len() == 1 && out.contains(['*', '?']) && out != "**" {
+        out = format!("**/{out}");
+    }
+    let last = out.rsplit('/').next().unwrap_or_default();
+    if (t.ends_with('/') || !last.contains(['*', '?'])) && last != "**" {
         out.push_str("/**");
     }
     Ok(out)
@@ -325,7 +333,7 @@ pub fn dead_pattern(p: &str) -> Option<String> {
             .filter(|c| !c.is_empty() && *c != ".")
             .collect::<Vec<_>>()
             .join("/");
-        let fix = if t.ends_with('/') {
+        let fix = if t.ends_with('/') && !fix.ends_with("**") {
             format!("{fix}/**")
         } else {
             fix
@@ -374,9 +382,11 @@ pub fn parse_allow_protected(task: &str) -> Vec<String> {
         }
         if in_section {
             if let Some(item) = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")) {
-                let p = item.trim().trim_matches('`').trim();
+                let p = item.trim().trim_matches('`').trim().replace('\\', "/");
+                // (R4–R8 review) `./CULTURE.md` names CULTURE.md
+                let p = p.trim_start_matches("./");
                 if !p.is_empty() {
-                    out.push(p.replace('\\', "/"));
+                    out.push(p.to_string());
                 }
             }
         }
@@ -438,11 +448,19 @@ impl Protected {
         if writes.is_empty() && never.is_empty() {
             return self;
         }
+        // (R4–R8 review) normalised here too: a task frozen before M11-R4 holds the patterns
+        // as written; for the others this changes nothing
+        let norm = |v: &[String]| -> Vec<String> {
+            v.iter()
+                .map(|g| fence_pattern(g).unwrap_or_else(|_| g.clone()))
+                .collect()
+        };
+        let (writes, never) = (norm(writes), norm(never));
         self.fence = Some(Fence {
             writes: writes.iter().map(|g| glob_ci(g)).collect(),
             never: never.iter().map(|g| glob_ci(g)).collect(),
-            writes_src: writes.to_vec(),
-            never_src: never.to_vec(),
+            writes_src: writes,
+            never_src: never,
         });
         self
     }
@@ -650,6 +668,11 @@ pub fn verify_files(cmds: &[CommandSpec], repo: &Path) -> Vec<String> {
                 add(a.replace('\\', "/"));
             }
         }
+        // M11-R6 (R4–R8 review): a script the net finds inside a command line
+        // (`bash -c "./ci/x.sh --fast"`) is protected too — admission refuses it missing
+        for (_, r) in script_like_args(std::slice::from_ref(c), repo) {
+            add(r);
+        }
     }
     out
 }
@@ -703,6 +726,15 @@ pub const SCRIPT_EXTENSIONS: [&str; 11] = [
     ".ps1", ".psm1", ".cmd", ".bat", ".sh", ".py", ".js", ".ts", ".rb", ".pl", ".exe",
 ];
 
+/// The shells of [`INTERPRETERS`] (short-flag clusters, `-c` command strings).
+const SH_FAMILY: [&str; 5] = ["sh", "bash", "zsh", "dash", "ksh"];
+
+/// One literal path: no whitespace, no glob and no variable (`* ? [ ] $ % ~`).
+fn plain_path(p: &str) -> bool {
+    !p.chars()
+        .any(|c| c.is_whitespace() || "*?[]$%~".contains(c))
+}
+
 fn has_script_ext(p: &str) -> bool {
     let lower = p.to_ascii_lowercase();
     SCRIPT_EXTENSIONS.iter().any(|x| lower.ends_with(x))
@@ -730,7 +762,13 @@ fn first_token(s: &str) -> Option<String> {
 /// existing file is protected as any argument). `None` for any other program: `-f` of
 /// `dotnet`, `docker` or `grep` is not a script.
 pub fn script_of(program: &str, args: &[String]) -> Option<String> {
-    let sure = |s: String| (s.contains(['/', '\\']) || has_script_ext(&s)).then_some(s);
+    // a folder or a glob (`node --test test/`, `"t/**/*.js"`) is not one script (R4–R8 review)
+    let sure = |s: String| {
+        ((s.contains(['/', '\\']) || has_script_ext(&s))
+            && plain_path(&s)
+            && !s.ends_with(['/', '\\']))
+        .then_some(s)
+    };
     let base = program_base(program);
     if base == "pwsh" || base == "powershell" {
         if let Some(i) = args.iter().position(|a| is_file_flag(a)) {
@@ -756,6 +794,7 @@ pub fn script_of(program: &str, args: &[String]) -> Option<String> {
         return sure(first_token(args.get(i + 1)?)?);
     }
     let (_, inline, valued) = INTERPRETERS.iter().find(|(n, _, _)| *n == base)?;
+    let shell = SH_FAMILY.contains(&base.as_str());
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if inline.iter().any(|f| a == f) {
@@ -763,6 +802,16 @@ pub fn script_of(program: &str, args: &[String]) -> Option<String> {
         }
         if valued.iter().any(|f| a == f) {
             it.next(); // the flag's value
+            continue;
+        }
+        // a shell's short-flag cluster: `-ec` runs inline code, `-euo pipefail` takes a value
+        if shell && a.len() > 2 && a.starts_with('-') && !a.starts_with("--") {
+            if a.contains('c') {
+                return None;
+            }
+            if a.ends_with(['o', 'O']) {
+                it.next();
+            }
             continue;
         }
         if !a.starts_with('-') {
@@ -786,20 +835,42 @@ pub fn script_arg<'a>(program: &str, args: &'a [String]) -> Option<&'a String> {
 pub fn script_like_args(cmds: &[CommandSpec], repo: &Path) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for c in cmds {
-        let CommandKind::Program { args, .. } = c.kind() else {
+        let CommandKind::Program { program, args } = c.kind() else {
             continue;
         };
+        let base = program_base(program);
+        // the flags whose value is a command line: only its first token is looked at
+        let command_flag = |a: &str| match base.as_str() {
+            "pwsh" | "powershell" => ["-command", "-c", "/command", "/c"]
+                .iter()
+                .any(|f| a.eq_ignore_ascii_case(f)),
+            "cmd" => a.eq_ignore_ascii_case("/c") || a.eq_ignore_ascii_case("/k"),
+            b => SH_FAMILY.contains(&b) && a == "-c",
+        };
+        // an output the command writes is not a script it runs
+        let output_flag = |a: &str| {
+            let l = a.to_ascii_lowercase();
+            l == "-o" || l == "-outfile" || l.starts_with("--out")
+        };
+        let mut prev: Option<&String> = None;
         for a in args {
-            let tokens = [Some(a.clone()), first_token(a)];
-            for t in tokens.into_iter().flatten() {
-                if t.starts_with(['-', '/']) || !has_script_ext(&t) {
-                    continue;
-                }
-                if let Some(r) = repo_relative(repo, &t) {
-                    let e = (c.name.clone(), r);
-                    if !out.contains(&e) {
-                        out.push(e);
-                    }
+            let candidate = match prev {
+                Some(p) if output_flag(p) => None,
+                Some(p) if command_flag(p) => first_token(a),
+                _ => Some(a.clone()),
+            };
+            prev = Some(a);
+            // (R4–R8 review) a literal path with a separator and a script extension only —
+            // never a glob, a variable, a command line or a bare PATH name
+            let Some(t) = candidate.filter(|t| {
+                !t.starts_with('-') && plain_path(t) && t.contains(['/', '\\']) && has_script_ext(t)
+            }) else {
+                continue;
+            };
+            if let Some(r) = repo_relative(repo, &t) {
+                let e = (c.name.clone(), r);
+                if !out.contains(&e) {
+                    out.push(e);
                 }
             }
         }
@@ -1093,6 +1164,11 @@ mod tests {
             ("**/*.pfx", "**/*.pfx"),
             ("**", "**"),
             ("CULTURE.md", "CULTURE.md/**"),
+            // R4–R8 review: gitignore-like forms
+            ("*.pfx", "**/*.pfx"),
+            ("**/secrets", "**/secrets/**"),
+            ("*/secrets", "*/secrets/**"),
+            ("src/*/", "src/*/**"),
         ];
         for (written, want) in ok {
             let n = fence_pattern(written).unwrap();
@@ -1110,6 +1186,18 @@ mod tests {
             Protected::new(vec![], &[]).with_fence(&[], &[fence_pattern("CULTURE.md").unwrap()]);
         assert!(f.violates("culture.md"));
         assert!(!f.violates("CULTURE.md.bak"));
+        // R4–R8 review: `**/secrets` and `*.pfx` fence what is below and deeper
+        let deep = |p: &str| fence_pattern(p).unwrap();
+        let f = Protected::new(vec![], &[]).with_fence(&[], &[deep("**/secrets"), deep("*.pfx")]);
+        assert!(f.violates("a/secrets/key.txt") && f.violates("secrets/x"));
+        assert!(f.violates("deep/dir/cert.pfx") && !f.violates("deep/dir/cert.pem"));
+        // a task frozen before R4 holds `./secrets/`: normalised by the fence itself
+        let old = Protected::new(vec![], &[]).with_fence(&[], &["./secrets/".into()]);
+        assert!(old.violates("secrets/key.pfx"));
+        // `## Allow protected` with `./`
+        let allow =
+            parse_allow_protected("## Allow protected\n- ./CULTURE.md\n- `.\\docs\\x.md`\n");
+        assert_eq!(allow, ["CULTURE.md", "docs/x.md"]);
         for (written, why) in [
             ("/secrets/**", "is absolute"),
             (r"C:\secrets\**", "is absolute"),
@@ -1137,6 +1225,7 @@ mod tests {
             ("./x/**", "write `x/**`"),
             ("x/", "write `x/**`"),
             ("a//b", "write `a/b`"),
+            ("x/**/", "write `x/**`"),
             ("/x/**", "is absolute"),
             ("**/*.{pfx,key}", "uses `{`"),
             ("../x", "may not contain `..`"),
@@ -1412,6 +1501,11 @@ mod tests {
             ("bash", &["-o", "pipefail"], None),
             ("sh", &["--posix", "later"], None),
             ("dotnet", &["test", "-f", "net8.0"], None),
+            // R4–R8 review: shell flag clusters, a folder or a glob in the script position
+            ("bash", &["-euo", "pipefail", "ci/run"], Some("ci/run")),
+            ("sh", &["-ec", "exit 0"], None),
+            ("node", &["--test", "test/"], None),
+            ("node", &["--test", "test/**/*.test.js"], None),
         ];
         for (program, args, want) in cases {
             assert_eq!(
@@ -1436,18 +1530,37 @@ mod tests {
                 &["run", "tools/gen.exe", "--out", "build/report.xml"],
                 None,
             ),
+            // (the table finds this one; the net wants a path separator)
             CommandSpec::program("c", "cmd", &["/c", "x.cmd arg"], None),
             CommandSpec::program("abs", "pwsh", &["-File", &outside], None),
+            CommandSpec::program("sh", "bash", &["-c", "./ci/x.sh --fast"], None),
+            // R4–R8 review: none of these is a script the base commit must hold
+            CommandSpec::program("lint", "npx", &["eslint", "src/**/*.js"], None),
+            CommandSpec::program("tsc", "tsc", &["--outFile", "build/x.js"], None),
+            CommandSpec::program("out", "gen", &["-o", "build/x.ps1"], None),
+            CommandSpec::program("cd", "bash", &["-c", "cd src && ./test.sh"], None),
+            CommandSpec::program(
+                "pester",
+                "pwsh",
+                &["-Command", "Invoke-Pester tests/x.Tests.ps1"],
+                None,
+            ),
+            CommandSpec::program("var", "bash", &["-c", "$HOME/bin/check.sh"], None),
+            CommandSpec::program("bare", "where", &["git.exe"], None),
+            CommandSpec::program("call", "cmd", &["/c", "call x.cmd"], None),
         ];
         let net = script_like_args(&cmds, d.path());
         assert_eq!(
             net,
             [
                 ("t".to_string(), "tools/gen.exe".to_string()),
-                ("c".to_string(), "x.cmd".to_string()),
+                ("sh".to_string(), "ci/x.sh".to_string()),
             ],
             "{net:?}"
         );
+        // what the net finds is protected, like the table's scripts
+        let files = verify_files(&cmds, d.path());
+        assert!(files.contains(&"ci/x.sh".to_string()), "{files:?}");
     }
 
     /// R59 (as EC-07): `@verify-scripts` covers the projects of a `tool: xpp` command — also

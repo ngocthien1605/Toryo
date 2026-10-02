@@ -409,6 +409,11 @@ fn a_skill_that_is_gone_stops_the_turn_until_it_is_back() {
         "no implementer attempt"
     );
     assert!(calls_of(&env, "SK-R5", "implementer").is_empty());
+    let (err, _) = context_show(&env, "SK-R5", "implement");
+    assert!(
+        err.contains("!! the turn would not start: skill_unavailable"),
+        "{err}"
+    );
     std::fs::rename(&aside, &dir).unwrap();
     let s = turns("r5b.json");
     let (code, err) = toryo(
@@ -581,5 +586,148 @@ fn fix_and_fallback_turns_get_the_approved_skills() {
     assert!(
         ctx.contains("# Skill: xpp-batch (repo)") && ctx.contains("BATCH-SKILL-BODY"),
         "{ctx}"
+    );
+}
+
+/// R4–R8 review (M11-R5): the planner's and the reviewer's own skills are checked before their
+/// turn too — gone after `task create` → `skill_unavailable`, no attempt of that stage.
+#[test]
+fn a_missing_planner_or_reviewer_skill_stops_their_turn() {
+    // the planner
+    let env = skills_env(
+        "",
+        &[(
+            ".toryo/roles/planner/toryo-role.yaml",
+            "toryo: 1\npurpose: Plan the change.\nskills: [review-checklist]\n",
+        )],
+    );
+    create(&env, "SK-RV1");
+    std::fs::remove_dir_all(env.repo.join(".toryo/skills/review-checklist")).unwrap();
+    let s = script(&env, "rv1.json", json!({"planner": [turn(vec![plan()])]}));
+    let (_, err) = toryo(&env, &["run", "SK-RV1", "--fake-agents", &s], &[]);
+    let t = task(&env, "SK-RV1");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    let why = t.machine.reason().unwrap_or_default().to_string();
+    assert!(
+        why.starts_with("skill_unavailable: the plan turn (claude-max) was not started — skill 'review-checklist' not found"),
+        "{why}"
+    );
+    assert!(attempts(&env, "SK-RV1").is_empty(), "no plan attempt");
+
+    // the reviewer
+    let env = skills_env("", &[]);
+    approved_plan(&env, "SK-RV2", json!([]));
+    std::fs::remove_dir_all(env.repo.join(".toryo/skills/review-checklist")).unwrap();
+    let s = script(
+        &env,
+        "rv2.json",
+        json!({
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "SK-RV2", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "SK-RV2");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    let why = t.machine.reason().unwrap_or_default().to_string();
+    assert!(
+        why.starts_with("skill_unavailable: the review turn (claude-max) was not started"),
+        "{why}"
+    );
+    assert!(attempts(&env, "SK-RV2").iter().all(|a| a.stage != "review"));
+    assert!(calls_of(&env, "SK-RV2", "reviewer").is_empty());
+}
+
+/// R4–R8 review (M11-R5): an approved skill that grew past the budget after the plan check →
+/// `context_over_budget` before the implement turn (no attempt), with the numbers; `context
+/// show` says the turn would not start.
+#[test]
+fn a_skill_that_grew_past_the_budget_stops_the_turn() {
+    let env = skills_env("context: { budget_kb: { implementer: 8 } }\n", &[]);
+    approved_plan(&env, "SK-OB", json!(["xpp-batch"]));
+    let big = format!("---\ndescription: d\n---\n{}", "x".repeat(10 * 1024));
+    std::fs::write(env.repo.join(".toryo/skills/xpp-batch/SKILL.md"), big).unwrap();
+    let (err, _) = context_show(&env, "SK-OB", "implement");
+    assert!(
+        err.contains("!! the turn would not start: context_over_budget"),
+        "{err}"
+    );
+    let s = script(
+        &env,
+        "ob.json",
+        json!({"implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])]}),
+    );
+    let (_, err) = toryo(&env, &["run", "SK-OB", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "SK-OB");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    let why = t.machine.reason().unwrap_or_default().to_string();
+    assert!(
+        why.starts_with("context_over_budget: the implementer context is ")
+            && why.contains("over its budget of 8 KB (8192 bytes)")
+            && why.contains("raise `context.budget_kb.implementer` or choose fewer skills"),
+        "{why}"
+    );
+    assert!(attempts(&env, "SK-OB").iter().all(|a| a.stage == "plan"));
+}
+
+/// R4–R8 review (M11-R5): the plan-time budget check uses the attempt's test (the rendered
+/// context: header, pack sentence, headings), with room for a fix stage — not only the sum of
+/// the never-trimmed parts. A Claude implementer with nothing trimmable: skills whose fixed
+/// parts fit 8 KB but whose rendered context is within 100 bytes of it send the plan back.
+#[test]
+fn the_plan_budget_check_uses_the_rendered_context() {
+    let org = ORGCHART.replace("IMPLEMENTER", "claude-max");
+    let env = skills_env(
+        "context: { budget_kb: { implementer: 8 } }\n",
+        &[(".toryo/toryo-orgchart.yaml", &org)],
+    );
+    // nothing trimmable: no AGENTS.md / CLAUDE.md, no global.md
+    for f in ["AGENTS.md", "CLAUDE.md"] {
+        if env.repo.join(f).exists() {
+            git(&env.repo, &["rm", "-q", f]);
+        }
+    }
+    git(
+        &env.repo,
+        &["commit", "-q", "-m", "no project instructions"],
+    );
+    let _ = std::fs::remove_file(env.root.join("global.md"));
+    // measure: the rendered implementer context with the small skill
+    approved_plan(&env, "SK-M1", json!(["xpp-batch"]));
+    let (err, _) = context_show(&env, "SK-M1", "implement");
+    let n0: usize = err
+        .split("context for the implementer (claude): ")
+        .nth(1)
+        .and_then(|r| r.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{err}"));
+    assert!(!err.contains("trimmed") && n0 < 8192, "{err}");
+    // a skill that brings the rendered context to 100 bytes under the budget
+    let grow = 8192 - 100 - n0;
+    let big = BATCH.replace(
+        "BATCH-SKILL-BODY",
+        &"x".repeat("BATCH-SKILL-BODY".len() + grow),
+    );
+    std::fs::write(env.repo.join(".toryo/skills/xpp-batch/SKILL.md"), &big).unwrap();
+    git(&env.repo, &["commit", "-q", "-am", "a bigger skill"]);
+    create(&env, "SK-M2");
+    let s = script(
+        &env,
+        "m2.json",
+        json!({"planner": [turn(vec![plan_with(json!(["xpp-batch"]))]), turn(vec![plan_with(json!([]))])]}),
+    );
+    let (code, err) = toryo(&env, &["run", "SK-M2", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "SK-M2").state, St::WaitingPlanApproval, "{err}");
+    let p = calls_of(&env, "SK-M2", "planner");
+    assert_eq!(p.len(), 2, "re-planned: {err}");
+    assert!(
+        p[1]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("Choose fewer skills")
+            && p[1]["prompt"].as_str().unwrap().contains("`claude-max`"),
+        "{}",
+        p[1]["prompt"]
     );
 }

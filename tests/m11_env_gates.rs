@@ -1077,9 +1077,9 @@ fn files_git_cannot_see_stop_the_deploy() {
     assert!(deployments(&env).is_empty());
 }
 
-/// M11-R8: an environment gate that runs past its timeout is killed with its whole process
-/// tree, and the deployment record says interrupted (the environment may hold a partial
-/// deploy) — not "the deploy failed".
+/// M11-R8: an environment gate that runs past its timeout (6 s: room for two pwsh start-ups)
+/// is killed with its whole process tree, and the deployment record says interrupted (the
+/// environment may hold a partial deploy) — not "the deploy failed".
 #[test]
 fn a_timed_out_environment_gate_is_recorded_as_interrupted() {
     let env = env_gate_setup(
@@ -1094,7 +1094,7 @@ fn a_timed_out_environment_gate_is_recorded_as_interrupted() {
         &env,
         &[(
             org_path,
-            &org.replace("timeout: 2m, if_missing", "timeout: 3s, if_missing"),
+            &org.replace("timeout: 2m, if_missing", "timeout: 6s, if_missing"),
         )],
         "a short gate timeout",
     );

@@ -392,4 +392,16 @@ fn script_detection_admits_flag_values_and_refuses_a_positional_script() {
         err.contains("verify command `wrapped` passes `scripts/gen.ps1` (a script or program file), which is not in the base commit"),
         "{err}"
     );
+    // R4–R8 review: a glob, an output and a command line are no scripts — admitted
+    let env = setup("codex-openai");
+    with_command(
+        &env,
+        r#"    - { name: lint, program: git, args: ["ls-files", "src/**/*.psm1", "--output", "build/x.js", "-c", "cd src && ./t.sh"] }"#,
+    );
+    let (code, err) = toryo(
+        &env,
+        &["task", "create", "--file", "TASK.md", "--id", "R6-4"],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
 }

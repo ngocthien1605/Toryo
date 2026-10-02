@@ -128,6 +128,20 @@ pub fn origin_checks(cfg: &Effective) -> Vec<Check> {
 /// config its hash; the org chart's `writes` / `never` are normalised or refused at load.
 pub fn policy_checks(cfg: &Effective) -> Vec<Check> {
     let p = &cfg.repo.policy;
+    let root = expand_vars(&cfg.repo.project.root).map(PathBuf::from).ok();
+    // (R4–R8 review) a pattern without a wildcard that names a folder of the repository
+    // matches the folder entry only, none of the files in it
+    let folder = |g: &str| {
+        let t = g.trim().replace('\\', "/");
+        let t = t.trim_end_matches('/');
+        (!t.is_empty()
+            && !t.contains(['*', '?'])
+            && t != crate::engine::checks::VERIFY_SCRIPTS
+            && root.as_ref().is_some_and(|r| r.join(t).is_dir()))
+        .then(|| {
+            format!("names the folder `{t}`: as written it matches the folder entry only, none of the files in it — write `{t}/**`")
+        })
+    };
     [
         ("deny_paths", &p.deny_paths),
         ("protected_paths", &p.protected_paths),
@@ -135,7 +149,8 @@ pub fn policy_checks(cfg: &Effective) -> Vec<Check> {
     .into_iter()
     .flat_map(|(key, list)| list.iter().map(move |g| (key, g)))
     .filter_map(|(key, g)| {
-        crate::engine::checks::dead_pattern(g).map(|why| Check {
+        let why = crate::engine::checks::dead_pattern(g).or_else(|| folder(g));
+        why.map(|why| Check {
             level: Level::Warn,
             area: "policy".into(),
             message: format!(
@@ -1068,6 +1083,29 @@ mod tests {
         // a clean policy: no warning
         std::fs::write(&p, format!("{base}policy: {{ deny_paths: ['x/**'] }}\n")).unwrap();
         assert!(policy_checks(&Effective::load(&p, None).unwrap()).is_empty());
+        // R4–R8 review: `secrets` naming a folder of the repository matches none of its files
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(repo.join("secrets")).unwrap();
+        let root = repo.display().to_string().replace('\\', "/");
+        std::fs::write(
+            &p,
+            format!("version: 1\nproject: {{ root: '{root}', worktrees_root: w }}\npolicy: {{ deny_paths: [secrets, notes.md] }}\n"),
+        )
+        .unwrap();
+        let w = policy_checks(&Effective::load(&p, None).unwrap());
+        assert_eq!(
+            w.len(),
+            1,
+            "{:?}",
+            w.iter().map(|c| &c.message).collect::<Vec<_>>()
+        );
+        assert!(
+            w[0].message
+                .contains("policy.deny_paths: `secrets` names the folder `secrets`")
+                && w[0].message.contains("write `secrets/**`"),
+            "{}",
+            w[0].message
+        );
     }
 
     /// R60 (M9-A2, B1): each profile, toolchain and role says where it came from, in text and in `--json`;

@@ -305,7 +305,7 @@ AC of R1–R3 was confirmed met (R2 AC-4 is a property test: `base` was never Lo
 - **The net:** `checks::script_like_args` — every argument (or its first token) that is a repository path with
   extension `.ps1 .psm1 .cmd .bat .sh .py .js .ts .rb .pl .exe`. `task::check_entry_points` refuses one missing at
   the base commit: `verify_script_missing: <gate|verify command> `<name>` passes `<path>` (a script or program file),
-  which is not in the base commit …`. Arguments starting with `-` or `/` are not looked at, nor absolute paths.
+  which is not in the base commit …`. (Narrowed by the R4–R8 review, see there.)
 - **Remaining limit (recorded):** a script without an extension, in the repository root, run by a program outside the
   table (e.g. `make` with a root `Makefile`, `dotnet tool run x later`) is neither protected before it exists nor
   refused when missing. Also not parsed: `pwsh -EncodedCommand`, `--flag=path` forms.
@@ -380,6 +380,49 @@ AC of R1–R3 was confirmed met (R2 AC-4 is a property test: `base` was never Lo
   `SKILL.md` text is read for each attempt and hashed into that attempt's `context_sha256` (D3 AC-2).
 - **Open, not fixed (the list says so):** `toryo spike pipeline` (the M0 kit, `src/spike/pipeline.rs`) runs repository
   verify commands with `Boundary::None` whatever the machine floor says.
+
+### Review of R4–R8 (independent subagent) — follow-up commit
+
+A second subagent reviewed `2dc01ab..e7e755c` (the R2/R3 follow-up and R4–R8; read-only, from a `git archive`
+export, all affected suites passing there). It confirmed Linux compilation by reading, the named test changes, and
+M10 behaviour/hash without an org chart. Fixed:
+
+- **Must fix — R6's net refused legitimate configurations, also without an org chart:** it took any argument ending
+  in a script extension, so `bash -c "cd src && ./test.sh"`, `pwsh -Command "Invoke-Pester tests/x.Tests.ps1"`,
+  `npx eslint src/**/*.js`, `tsc --outFile build/x.js`, `$HOME/bin/x.sh` were refused at `task create`. Now
+  `script_like_args` looks at a whole argument, or — after `-c` of a shell, `-Command`/`-c` of PowerShell, `/c` of
+  cmd — at the first token of the command line; skips the value of `-o`, `--out…`, `-OutFile`; and keeps a
+  candidate only when it is a **literal path** (no whitespace, `* ? [ ] $ % ~`) **with a separator** and a script
+  extension. What it finds is now also **protected** (`verify_files`), e.g. `bash -c "./ci/x.sh --fast"`. Admission
+  lists folders too (`ls-tree -r -t`). `script_of`: a shell's short-flag cluster ending in `o`/`O` takes a value
+  (`bash -euo pipefail ci/run` → `ci/run`), one containing `c` runs inline code; a folder or a glob in the script
+  position (`node --test test/`) is no script. Tests: the R6 table and net cases extended, an admitted lint/output/
+  command-line configuration in `script_detection_admits_flag_values_and_refuses_a_positional_script`.
+- **R4, still failing open:** a last segment without a wildcard now always covers what is under it (`**/secrets` →
+  `**/secrets/**`), and a wildcard pattern without `/` matches at any depth (`*.pfx` → `**/*.pfx`, gitignore-like).
+  `with_fence` normalises too (a task frozen before R4); `## Allow protected` drops a leading `./`; `doctor` warns
+  about a legacy wildcard-free pattern that names a folder of the repository (`deny_paths: [secrets]`), and about
+  `x/**/` with the right suggestion. Tests: `fence_patterns_are_normalised_or_refused` (more forms, deeper matches,
+  pre-R4 patterns, `./` in the allow list), `legacy_patterns_that_never_match_are_named`,
+  `a_legacy_pattern_that_never_matches_is_a_warning` (the folder case; assertions added only).
+- **R5, plan time weaker than attempt time:** the plan-time check now also applies `context::over_budget` (the
+  rendered context after trimming) on the budget minus `PLAN_BUDGET_MARGIN` (512 bytes: room for a fix stage's pack
+  sentence and data note). Test `the_plan_budget_check_uses_the_rendered_context` (a Claude implementer with nothing
+  trimmable, the rendered context 100 bytes under 8 KB: re-planned; fails with the old check — verified).
+- **R5, a skill gone between the check and the attempt:** `context_and_data` escalates `skill_unavailable` too (one
+  reason helper for both places). `context show` prints "the turn would not start: skill_unavailable / context_over_
+  budget …" when the real turn would not start.
+- **Test gaps:** `a_missing_planner_or_reviewer_skill_stops_their_turn`, `a_skill_that_grew_past_the_budget_stops_
+  the_turn` (no attempt, the numbers, the `context show` line), `runner::tests::the_deployment_record_of_a_gate_
+  that_ran` (the new `deployment_ok`: a finished gate keeps its result whatever the stop flag says — the end-to-end
+  race of a stop arriving just after the gate is not reproducible reliably, so the decision is a pure function and
+  tested as one). The timeout test now allows 6 s (two `pwsh` start-ups).
+- **Recorded under Open, not fixed:** (a) `pwsh -WorkingDirectory scripts x.ps1` is checked as `x.ps1` at the root;
+  (b) a `skills_dir` that *contains* an agent root (e.g. the parent of the worktrees) is not refused; (c) R7 counts an
+  attempt whose context was stored but whose agent process could not start (no "process started" marker; the list
+  allows counting them); (d) `EnvGates::Dirty` after the lock wait uses the pre-deploy wording ("a check gate must
+  write …") although, with two environment gates, the first gate's script may be the writer; (e) a secret split
+  across two live chunks of `LocalRunner` (no engine caller; predates M11).
 
 ## Progress
 

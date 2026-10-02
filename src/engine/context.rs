@@ -818,6 +818,15 @@ pub fn describe(a: &Assembled) -> String {
     for w in &a.warnings {
         s.push_str(&format!("  !! {w}\n"));
     }
+    // (R4–R8 review) the preview says when the real turn would not start (M11-R5)
+    if a.skipped.iter().any(|k| k.starts_with("4: skill ")) {
+        s.push_str(&format!(
+            "  !! the turn would not start: {SKILL_UNAVAILABLE} (a skill above is not found)\n"
+        ));
+    }
+    if let Some(r) = over_budget(a) {
+        s.push_str(&format!("  !! the turn would not start: {r}\n"));
+    }
     s
 }
 

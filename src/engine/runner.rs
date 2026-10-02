@@ -262,12 +262,7 @@ impl<'a> Engine<'a> {
         let blocked = if !missing.is_empty() {
             Some((
                 context::SKILL_UNAVAILABLE,
-                format!(
-                    "{}: the {stage} turn ({profile}) was not started — {}; put the skill back, then `toryo resume {} --note …`",
-                    context::SKILL_UNAVAILABLE,
-                    missing.join("; "),
-                    t.id
-                ),
+                skill_unavailable_reason(t, stage, profile, &missing),
             ))
         } else {
             let c = context::assemble(&req)?;
@@ -731,8 +726,14 @@ impl<'a> Engine<'a> {
             chain.push(context::stage_profile(t, "implement")?);
         }
         for profile in &chain {
-            let req = context::request(self.store, t, &self.cfg, "implement", profile)?;
+            let mut req = context::request(self.store, t, &self.cfg, "implement", profile)?;
+            let budget = req.budget;
+            // (R4–R8 review) the test of the attempt (`context::over_budget`: the rendered
+            // context after trimming), on a budget that leaves room for what a fix stage adds
+            // (its pack sentence, the verify result and review as data)
+            req.budget = budget.saturating_sub(PLAN_BUDGET_MARGIN);
             let c = context::assemble(&req)?;
+            req.budget = budget;
             let skills: usize = c
                 .sources
                 .iter()
@@ -740,7 +741,7 @@ impl<'a> Engine<'a> {
                 .map(|s| s.bytes)
                 .sum();
             let fixed = c.fixed_bytes.saturating_sub(skills);
-            if c.fixed_bytes > req.budget {
+            if c.fixed_bytes > req.budget || context::over_budget(&c).is_some() {
                 let inline = if req.no_run_store {
                     ", with TASK.md and PLAN.md inline"
                 } else {
@@ -1789,7 +1790,7 @@ impl<'a> Engine<'a> {
             // M11-R8: a timed-out or cancelled gate was killed part way — the environment may
             // hold a partial deploy, so the record says interrupted (`ok` empty), not failed. A
             // stop that arrived after the gate finished keeps the gate's real result.
-            let ok = (!res.timed_out && !res.cancelled).then(|| res.ok());
+            let ok = deployment_ok(&res);
             let (i, l) = (t.id.clone(), lock_name.clone());
             self.store
                 .call(move |tx| store::deployment_end(tx, &l, &i, ok))?;
@@ -2379,8 +2380,18 @@ impl<'a> Engine<'a> {
             Err(e) => return Err(e),
         };
         let c = context::assemble(&req)?;
-        // M11-R5: checked before the turn too ([`Self::turn_blocked`]); a skill file that grew
-        // in between is caught here
+        // M11-R5: checked before the turn too ([`Self::turn_blocked`]); a skill that went
+        // missing or a skill file that grew in between is caught here
+        let missing = req
+            .team
+            .as_ref()
+            .map(|c| c.missing_skills.clone())
+            .unwrap_or_default();
+        if !missing.is_empty() {
+            let reason = skill_unavailable_reason(t, &a.stage, profile, &missing);
+            self.escalate_attempt(a, context::SKILL_UNAVAILABLE.into(), reason)?;
+            return Ok(None);
+        }
         if let Some(reason) = context::over_budget(&c) {
             self.escalate_attempt(a, context::CONTEXT_OVER_BUDGET.into(), reason)?;
             return Ok(None);
@@ -3833,6 +3844,28 @@ enum EnvGates {
 
 /// The escalation class of an environment gate this machine cannot run (M11-E3).
 pub const ENV_UNAVAILABLE: &str = "environment_gate_unavailable";
+
+/// M11-R5 (R4–R8 review): the plan-time skills budget check leaves this much room for what a
+/// fix stage adds to the implementer's context (its pack sentence, the untrusted-data note).
+const PLAN_BUDGET_MARGIN: usize = 512;
+
+/// M11-R8: what the deployment record says about a gate that ran — `None` (interrupted: the
+/// environment may hold a partial deploy) when its process was killed by the timeout or a
+/// stop, else its own result. A stop that arrives after the gate finished does not change it.
+fn deployment_ok(res: &CommandResult) -> Option<bool> {
+    (!res.timed_out && !res.cancelled).then(|| res.ok())
+}
+
+/// M11-R5: the `skill_unavailable` reason — the skills that do not resolve, with both lookup
+/// paths, and the way out.
+fn skill_unavailable_reason(t: &TaskRow, stage: &str, profile: &str, missing: &[String]) -> String {
+    format!(
+        "{}: the {stage} turn ({profile}) was not started — {}; put the skill back, then `toryo resume {} --note …`",
+        context::SKILL_UNAVAILABLE,
+        missing.join("; "),
+        t.id
+    )
+}
 
 /// The `reason` of a skipped environment gate's `VERIFY_RESULT.json` entry (`if_missing: skip`).
 pub const SKIPPED_REASON: &str = "not defined on this machine";
@@ -5606,6 +5639,26 @@ mod tests {
             let t = task_in(&events);
             assert_eq!(cleaned_up_action(&t), want, "{:?}", t.state);
         }
+    }
+
+    /// M11-R8: `deployment_ok` — a finished gate keeps its result, a killed one is interrupted.
+    #[test]
+    fn the_deployment_record_of_a_gate_that_ran() {
+        let res = |exit: Option<i32>, timed_out: bool, cancelled: bool| CommandResult {
+            name: "dbsync".into(),
+            exit,
+            timed_out,
+            cancelled,
+            duration_ms: 1,
+            output: String::new(),
+        };
+        // finished: its own result — also when a stop came afterwards (the stop flag is not
+        // an input)
+        assert_eq!(deployment_ok(&res(Some(0), false, false)), Some(true));
+        assert_eq!(deployment_ok(&res(Some(2), false, false)), Some(false));
+        // killed part way: interrupted, not failed
+        assert_eq!(deployment_ok(&res(None, true, false)), None);
+        assert_eq!(deployment_ok(&res(None, false, true)), None);
     }
 
     #[test]
