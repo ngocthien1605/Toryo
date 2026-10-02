@@ -919,13 +919,23 @@ impl Recorder {
     fn dispatch(&self, e: EngineEvent, quiet: bool) {
         let env = Envelope {
             v: VERSION,
-            // never wraps: at the (implausible) end of the range the number stays there
-            seq: self
-                .next
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                    Some(n.saturating_add(1))
-                })
-                .unwrap_or(u64::MAX),
+            // never wraps: at the (implausible) end of the range the number stays there. A plain
+            // compare-exchange loop: `fetch_update` is deprecated from Rust 1.99 and its
+            // replacement `try_update` is newer than our rust-version (M11-ci)
+            seq: {
+                let mut n = self.next.load(Ordering::SeqCst);
+                loop {
+                    match self.next.compare_exchange_weak(
+                        n,
+                        n.saturating_add(1),
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(prev) => break prev,
+                        Err(now) => n = now,
+                    }
+                }
+            },
             ts: super::store::now(),
             task: self.task.clone(),
             generation: self.generation,
