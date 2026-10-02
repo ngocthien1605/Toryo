@@ -857,7 +857,8 @@ fn probe_then_dbsync(ps1: &str, sh: &str) -> (Env, PathBuf) {
     let marker = env.root.join("gates").join("deployed");
     let m = fwd(&marker);
     // M11-R9: the gate also writes what it sees as TORYO_VERIFY_CHECKOUT to `gates/seen.txt` —
-    // `co=<path>`, then its files (relative, `/`), hidden ones included
+    // `co=<path>`, then its files (relative, `/`), hidden ones included; listed with `-Name`, not
+    // cut from FullName, so a short (8.3) spelling of the path cannot shift them (M11-ci)
     let seen = fwd(&env.root.join("gates").join("seen.txt"));
     define_gates(
         &env,
@@ -865,7 +866,7 @@ fn probe_then_dbsync(ps1: &str, sh: &str) -> (Env, PathBuf) {
             &env,
             "dbsync",
             "d365-env",
-            &format!("Set-Content -Path '{m}' -Value x\n\"cwd=$((Get-Location).Path)\"\n\"repo-file=$(Test-Path src/Calculator.psm1)\"\n$c = $env:TORYO_VERIFY_CHECKOUT\nSet-Content -Path '{seen}' -Value \"co=$c\"\nGet-ChildItem -LiteralPath $c -Recurse -Force | Where-Object {{ -not $_.PSIsContainer -or $_.Name -eq '.git' }} | ForEach-Object {{ $_.FullName.Substring($c.Length + 1).Replace('\\', '/') }} | Add-Content -Path '{seen}'\nexit 0\n"),
+            &format!("Set-Content -Path '{m}' -Value x\n\"cwd=$((Get-Location).Path)\"\n\"repo-file=$(Test-Path src/Calculator.psm1)\"\n$c = $env:TORYO_VERIFY_CHECKOUT\nSet-Content -Path '{seen}' -Value \"co=$c\"\nGet-ChildItem -LiteralPath $c -Recurse -Force -Name | Where-Object {{ (Test-Path -LiteralPath (Join-Path $c $_) -PathType Leaf) -or (Split-Path $_ -Leaf) -eq '.git' }} | ForEach-Object {{ $_.Replace('\\', '/') }} | Add-Content -Path '{seen}'\nexit 0\n"),
             &format!("echo x > '{m}'\necho \"cwd=$(pwd)\"\nif [ -e src/Calculator.psm1 ]; then echo repo-file=True; else echo repo-file=False; fi\nc=\"$TORYO_VERIFY_CHECKOUT\"\necho \"co=$c\" > '{seen}'\n(cd \"$c\" && find . \\( -type f -o -name .git \\) | sed 's|^\\./||') >> '{seen}'\nexit 0\n"),
             "",
         ),
