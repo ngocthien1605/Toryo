@@ -510,7 +510,7 @@ the push and the pull request.
 - [x] R9 — environment gates deploy from a fresh export of the commit
 - [x] R10 — M18 script detection, second pass
 - [x] R11 — `resume` after a machine-caused escalation costs no fix cycle
-- [ ] R12 — cheap Low fixes
+- [x] R12 — cheap Low fixes
 - [ ] Finish — notes, README, HUONG-DAN, templates
 - [ ] Push and pull request
 
@@ -660,6 +660,31 @@ An independent review of `29226ec` found two must-fix bypasses of X6, fixed here
   `state_tests.rs::a_machine_caused_class_is_recorded_and_cleared_on_resume` and the `reason_class() == None`
   assertion added to `an_m10_machine_reads_back_and_behaves_the_same` (AC-3: a fix-cycle-bound escalation is not
   machine-caused; AC-4: the M10 JSON round-trips and the transition tables stay exhaustive).
+
+#### R12 — cheap Low fixes
+
+- **A `%NAME%` left after expansion** (`team::expand_env_gate`): a variable whose value itself contains `%Y%` left
+  `%Y%` in the expanded text, and `env_gate_problems` then re-expanded that text — so the argument looked "unset" and
+  its absolute-path and reach checks were skipped. Now `expand_env_gate` expands once and a residual `%NAME%`
+  (`config::residual_var`) is a load problem naming the key; `env_gate_problems` skips an argument that still holds
+  `%...%` without re-expanding. Test `team::tests::a_variable_value_that_contains_a_percent_token_is_a_load_problem`.
+- **A task frozen before R3 with `%VAR%` in a gate's program/args** no longer starts the gate, fails, writes a
+  deployment row and spends a fix cycle: at run time `runner::gate_residual_var` finds the leftover `%NAME%` →
+  `environment_gate_unavailable` "run `toryo task config <id> --reload`". (Loading such a config today is impossible —
+  it is a load error — so this is a guard for configs frozen by an older binary.) Test
+  `runner::tests::a_gate_command_with_a_leftover_variable_is_detected`.
+- **The `environment_gate_unavailable` hint** no longer names a machine-config file: a frozen config has
+  `machine_path = None`, so `machine_config_hint` always named the default file. The hint now reads "fix the machine
+  config, then `toryo resume <id>`" (no path).
+- **`doctor` "protects nothing"** no longer fires for a legacy `deny_paths` / `protected_paths` pattern with `{ } [ ]
+  ! % ~ $`: the legacy matcher (`glob_to_regex`) escapes those, so they match literally. `dead_pattern` now warns
+  only for the forms that truly never match a repository-relative path — empty, absolute, or a `..` segment — plus the
+  `./` / `//` / trailing-`/` tidy case. Test `legacy_patterns_that_never_match_are_named` extended.
+- **Fence patterns `%VAR%/…`, `~/…`, `$X/…`** are refused at load (`fence_pattern`): a fence is not
+  variable-expanded, so they would match nothing. Test `fence_patterns_are_normalised_or_refused` extended.
+- **Open (recorded, not fixed):** `ExitInfo.tree_gone` (`src/process/mod.rs`) is still ignored by `LocalRunner`
+  (review M7); an empty folder or an alternate data stream in the Low checkout is seen by no check — harmless after
+  R9, since an environment gate reads the export, not the checkout.
 
 ## Progress
 

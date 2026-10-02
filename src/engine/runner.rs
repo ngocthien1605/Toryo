@@ -1723,13 +1723,21 @@ impl<'a> Engine<'a> {
             };
             // M11-R8: one lock and one deployment row whatever the case it is written in
             let lock_name = super::lock::lock_key(&m.lock);
+            // M11-R12 (item 3): a frozen config has no machine path, so the hint names no file
             let unavailable = |what: String| {
                 Ok(EnvGates::Unavailable(format!(
-                    "{ENV_UNAVAILABLE}: environment gate `{name}`: {what} — fix the machine config ({}), then `toryo resume {}`",
-                    crate::config::machine_config_hint(self.cfg.machine_path.as_deref()),
+                    "{ENV_UNAVAILABLE}: environment gate `{name}`: {what} — fix the machine config, then `toryo resume {}`",
                     t.id
                 )))
             };
+            // M11-R12 (item 2): a task frozen before R3 may still hold `%VAR%` in program/args
+            // (they are expanded at load now, not at run time) — do not run it half-expanded
+            if let Some(var) = gate_residual_var(&m.program, &m.args) {
+                return Ok(EnvGates::Unavailable(format!(
+                    "{ENV_UNAVAILABLE}: environment gate `{name}`: the command still contains `%{var}%` (a task created before M11 expanded gate variables at load) — run `toryo task config {} --reload`, then `toryo resume {}`",
+                    t.id, t.id
+                )));
+            }
             let mut secrets = BTreeMap::new();
             for (k, r) in &m.secret_env {
                 match crate::config::resolve_secret(r) {
@@ -3876,6 +3884,14 @@ enum EnvGates {
 /// The escalation class of an environment gate this machine cannot run (M11-E3).
 pub const ENV_UNAVAILABLE: &str = "environment_gate_unavailable";
 
+/// M11-R12 (item 2): the first `%NAME%` still in an environment gate's program or args — set
+/// only in a config frozen before M11 expanded them at load. Such a gate does not start.
+pub(crate) fn gate_residual_var(program: &str, args: &[String]) -> Option<String> {
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .find_map(crate::config::residual_var)
+}
+
 /// M11-R5 (R4–R8 review): the plan-time skills budget check leaves this much room for what a
 /// fix stage adds to the implementer's context (its pack sentence, the untrusted-data note).
 const PLAN_BUDGET_MARGIN: usize = 512;
@@ -5677,6 +5693,24 @@ mod tests {
             let t = task_in(&events);
             assert_eq!(cleaned_up_action(&t), want, "{:?}", t.state);
         }
+    }
+
+    /// M11-R12 (item 2): `gate_residual_var` finds a `%VAR%` left in a frozen gate command.
+    #[test]
+    fn a_gate_command_with_a_leftover_variable_is_detected() {
+        // M11-R12 (item 2): a config frozen before R3 keeps `%VAR%` in program or args
+        assert_eq!(
+            gate_residual_var("%GATES%/sync.exe", &[]),
+            Some("GATES".into())
+        );
+        assert_eq!(
+            gate_residual_var("pwsh", &["-File".into(), "%X%/s.ps1".into()]),
+            Some("X".into())
+        );
+        assert_eq!(
+            gate_residual_var("pwsh", &["-File".into(), "C:/gates/s.ps1".into()]),
+            None
+        );
     }
 
     /// M11-R8: `deployment_ok` — a finished gate keeps its result, a killed one is interrupted.

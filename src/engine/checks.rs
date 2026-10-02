@@ -292,6 +292,13 @@ pub fn fence_pattern(p: &str) -> std::result::Result<String, String> {
             "uses `{c}`, which the matcher does not support — only `*` (within one folder), `**` (any depth) and `?` (one character)"
         ));
     }
+    // M11-R12: a variable or home shortcut is not expanded for a fence, so it would match
+    // nothing — refuse it rather than accept a pattern that silently protects no file
+    if let Some(c) = t.chars().find(|c| "%~$".contains(*c)) {
+        return Err(format!(
+            "uses `{c}` — a fence pattern is not variable-expanded; write the repository-relative path"
+        ));
+    }
     let parts: Vec<&str> = t
         .split('/')
         .filter(|c| !c.is_empty() && *c != ".")
@@ -323,8 +330,21 @@ pub fn dead_pattern(p: &str) -> Option<String> {
     if t == VERIFY_SCRIPTS {
         return None;
     }
-    if let Err(why) = fence_pattern(&t) {
-        return Some(format!("{why}, so it never matches"));
+    // M11-R12: the legacy matcher (`glob_to_regex`) escapes `{ } [ ] ! % ~ $`, so a pattern
+    // with them matches those characters literally — do not call it dead. Only a pattern that
+    // can never match a repository-relative path is dead: empty, absolute, or with a `..`
+    // segment (a normalised repo path has none).
+    if t.is_empty() {
+        return Some("is empty, so it never matches".into());
+    }
+    if t.starts_with('/') || t.chars().nth(1) == Some(':') {
+        return Some("is absolute — a repository path is relative, so it never matches".into());
+    }
+    if t.split('/').any(|c| c == "..") {
+        return Some(
+            "has a `..` segment — a normalised repository path has none, so it never matches"
+                .into(),
+        );
     }
     let tidy = t.split('/').all(|c| !c.is_empty() && c != ".");
     (!tidy).then(|| {
@@ -1339,6 +1359,10 @@ mod tests {
             ),
             ("secrets/[ab].pfx", "uses `[`"),
             ("!secrets/**", "uses `!`"),
+            // M11-R12: a variable or home shortcut is refused (never expanded for a fence)
+            ("%APPDATA%/x", "uses `%`"),
+            ("~/secrets/**", "uses `~`"),
+            ("$HOME/x", "uses `$`"),
             ("src/../secrets/**", "may not contain `..`"),
             ("", "is empty"),
             ("  ", "is empty"),
@@ -1358,13 +1382,22 @@ mod tests {
             ("a//b", "write `a/b`"),
             ("x/**/", "write `x/**`"),
             ("/x/**", "is absolute"),
-            ("**/*.{pfx,key}", "uses `{`"),
-            ("../x", "may not contain `..`"),
+            ("../x", "has a `..` segment"),
         ] {
             let w = dead_pattern(p).unwrap_or_else(|| panic!("{p}"));
             assert!(w.contains(want), "{p}: {w}");
         }
-        for p in ["**/ZZZ/**", "secrets", "docs/*.md", VERIFY_SCRIPTS] {
+        // M11-R12: the legacy matcher escapes `{ } [ ] ! % ~ $`, so these match literally and
+        // are not dead (unlike a fence, which refuses them)
+        for p in [
+            "**/ZZZ/**",
+            "secrets",
+            "docs/*.md",
+            "**/*.{pfx,key}",
+            "secrets/[ab].pfx",
+            "!x",
+            VERIFY_SCRIPTS,
+        ] {
             assert_eq!(dead_pattern(p), None, "{p}");
         }
     }

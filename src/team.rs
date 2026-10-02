@@ -834,8 +834,18 @@ pub fn reach(cfg: &Effective, p: &str) -> Option<(&'static str, PathBuf)> {
 /// load; the expanded text is what the reach check sees, what is frozen and hashed, and what
 /// runs. An unset variable is a problem naming the key (the text is then kept as written).
 fn expand_env_gate(name: &str, g: &EnvGate, machine: &str, problems: &mut Vec<String>) -> EnvGate {
+    // M11-R12: expand once; a `%NAME%` that survives (because a variable's value contained it)
+    // is a load problem — it is never expanded again
     let mut one = |key: String, s: &str| match crate::config::expand_vars(s) {
-        Ok(v) => v,
+        Ok(v) => match crate::config::residual_var(&v) {
+            Some(var) => {
+                problems.push(format!(
+                    "{machine}: environment_gates.{name}.{key}: a variable's value contains `%{var}%`, which is left as is — expand it yourself or remove it"
+                ));
+                v
+            }
+            None => v,
+        },
         Err(e) => {
             problems.push(format!(
                 "{machine}: environment_gates.{name}.{key}: {e:#} — set it, or write the path out"
@@ -876,9 +886,10 @@ fn env_gate_problems(
         // M11-E3: the name is part of the lock's file name
         out.push(format!("{key}.lock: `{}` — {why}", g.lock));
     }
-    // M11-R3 (X3): `program` and `args` were expanded at load — this is the text that runs
-    // (a value with a variable that is not set was reported at load, once)
-    let unset = |s: &str| crate::config::expand_vars(s).is_err();
+    // M11-R3 (X3): `program` and `args` were expanded at load — this is the text that runs.
+    // M11-R12: a value that still holds `%...%` (an unset variable kept raw, or a variable's
+    // value that contained it) was reported once at load; skip it here without re-expanding.
+    let unset = |s: &str| crate::config::residual_var(s).is_some();
     let reach = |p: &str| reach(cfg, p);
     let program = g.program.clone();
     if (program.contains('/') || program.contains('\\')) && !unset(&program) {
@@ -2031,6 +2042,27 @@ mod tests {
             .unwrap();
         assert_eq!(g.args[3], format!("{tmp}/gates/dbsync.ps1"));
         assert_eq!(g.program, "powershell");
+    }
+
+    /// M11-R12 (item 1): a `%NAME%` that survives expansion because a variable's value contains
+    /// it is a load problem (expanded once, never again), and the argument's reach check is not
+    /// skipped by a second expansion.
+    #[test]
+    fn a_variable_value_that_contains_a_percent_token_is_a_load_problem() {
+        let (d, y, m) = draft_repo(&[]);
+        let tmp = d.path().display().to_string().replace('\\', "/");
+        // the value of TORYO_R12_WRAP itself contains `%EVIL%`
+        std::env::set_var("TORYO_R12_WRAP", "%EVIL%");
+        let text = std::fs::read_to_string(&m).unwrap().replace(
+            &format!("'{tmp}/gates/dbsync.ps1'"),
+            "'%TORYO_R12_WRAP%/x.ps1'",
+        );
+        std::fs::write(&m, text).unwrap();
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains("environment_gates.dbsync.args[3]: a variable's value contains `%EVIL%`"),
+            "{e}"
+        );
     }
 
     /// M11-R8: the machine's `skills_dir` is trusted text — after `%VAR%` it must be absolute
