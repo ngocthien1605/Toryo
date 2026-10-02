@@ -114,7 +114,7 @@ Task list: `M11-review-fixes.md` (review of 2026-10-02, built and run on Linux b
 - [x] R4 — fence patterns that match nothing; the culture file is protected
 - [x] R5 — a skill that cannot be delivered stops the turn; the budget check covers the whole chain
 - [x] R6 — M18 script detection: no false refusals, no missed scripts
-- [ ] R7 — the same-vendor check counts every turn that ran
+- [x] R7 — the same-vendor check counts every turn that ran
 - [ ] R8 — cheap Low fixes and test gaps
 
 ### Decisions of the list (X1–X5) and the answers to "Open"
@@ -318,6 +318,21 @@ AC of R1–R3 was confirmed met (R2 AC-4 is a property test: `base` was never Lo
   (AC-2 in a toryo.yaml-only repository, plus the net). AC-3: `m18_script_arguments_per_program`,
   `m18_entry_points_are_protected_before_they_exist`, `a_gate_script_missing_from_the_base_commit_is_refused_at_
   admission` and the EC-07 tests pass unchanged.
+
+### R7 — the same-vendor check counts every turn that ran
+
+- `runner::implementer_profiles` (shared by the final-gate note and `error`) counts every `implement` / `fix-N` agent
+  attempt whose turn started, whatever its end — `Succeeded`, `Failed`, `Interrupted` (R49 keeps the partial work).
+  "Started" is read from the row: `context_sha256` is stored right before the agent starts, so an attempt without it
+  ended before (a pack hash error, R5's over-budget guard) and is left out; the `pid` column is never filled, so it
+  cannot tell. A `Succeeded` attempt always counts (rows from before context hashing).
+- **Deviation (applies to everyone):** legacy mode, where the note is always `warn`, now shows `same vendor: …` in
+  more cases — whenever a turn of the reviewer's vendor wrote into the checkpoint, also one that then failed.
+- X5: the note keeps `(Claude both)`; the C3 section's "byte-identical" sentence is corrected.
+- Tests: `tests/m11_roles.rs::the_same_vendor_check_counts_a_turn_that_failed_after_writing` (AC-1: Codex quota →
+  Claude writes and hits its quota → pause → `resume` → Codex succeeds → Claude reviews; `warn` names `claude-max`,
+  `error` escalates `same_vendor_review` with no review attempt), `::the_legacy_same_vendor_note_is_exact` (the exact
+  line in a toryo.yaml-only repository). AC-2: the C3 tests pass unchanged.
 
 ## Progress
 
@@ -607,7 +622,9 @@ Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
   attempts (the profile that actually ran, after any fallback), factored out of
   `final_gate_notes`; `same_vendor` compares their profile `kind` with the reviewer's.
 - `warn` (the default, and the only behaviour in legacy mode): today's "same vendor" note at the
-  final gate, byte-identical. `off`: no note. `error`: before a **review** turn starts (after the
+  final gate — **not** byte-identical, corrected in M11-R7: `main` printed `("Claude" both)`, M11 prints `(Claude
+  both)` (X5 keeps it; `the_legacy_same_vendor_note_is_exact` pins the line), and since R7 a failed or interrupted
+  implementer turn counts too. `off`: no note. `error`: before a **review** turn starts (after the
   EC-10 re-verify check, before admission and before the attempt begins), the task escalates with
   the typed class `same_vendor_review` and a message naming both profiles and the ways out
   (`approve --gate final --force` to review it yourself, or a reviewer of another kind via machine

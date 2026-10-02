@@ -686,7 +686,9 @@ Bộ mẫu: `templates\d365fo\.toryo\`, `templates\d365fo\CULTURE.md`, `template
 - **Giới hạn**: `limits: { max_gate_retries, max_review_rounds }` — gate trượt tính vào cái đầu, review bị từ chối
   tính vào cái sau. `toryo status`: `fix 1 (gate retries 1/3, review rounds 0/3)`.
 - **`checks.reviewer-differs-from-builder`**: `off` / `warn` (mặc định: ghi chú ở cổng cuối) / `error` (escalate
-  `same_vendor_review` trước lượt review) — so `kind` của profile **thực sự** đã làm (sau fallback) với reviewer.
+  `same_vendor_review` trước lượt review) — so `kind` của **mọi** profile đã chạy lượt implementer (kể cả lượt hỏng
+  giữa chừng sau khi đã ghi code — phần việc đó vẫn được giữ; M11-R7) với reviewer. Chế độ chỉ có toryo.yaml cũng vậy,
+  nên ghi chú "same vendor" hiện ra trong nhiều trường hợp hơn M10.
 - **Sàn verify của máy (H2, cho mọi repo)**: repo ghi `verify.boundary: none` bị từ chối khi `task create`, trừ khi
   machine config ghi `verify: { min_boundary: none }`. `verify.verify_root` của máy thay của repo.
 

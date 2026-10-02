@@ -246,8 +246,9 @@ from the repository checkout (`project.root`), never from a task worktree, and e
 - **Limits.** `limits: { max_gate_retries, max_review_rounds }`: a failing gate counts against the first, a rejected
   review (or a rejected final gate) against the second; a lone `max_fix_cycles` keeps today's single counter.
   `status` shows `fix 1 (gate retries 1/3, review rounds 0/3)`.
-- **Checks.** `reviewer-differs-from-builder: off | warn | error` compares the `kind` of the profile that actually
-  built (after a fallback) with the reviewer's: `warn` (default) notes it at the final gate, `error` escalates
+- **Checks.** `reviewer-differs-from-builder: off | warn | error` compares the `kind` of every profile whose
+  implementer turn ran (also one that failed or was interrupted after writing — its work stays; M11-R7) with the
+  reviewer's: `warn` (default) notes it at the final gate, `error` escalates
   (`same_vendor_review`) before the review turn.
 - **Instructions and culture.** In this mode the context of every agent has the embedded role template **always**,
   then the role's `instructions.md`; the culture file closes the policy sources. A leftover `.toryo/roles/<role>.md`

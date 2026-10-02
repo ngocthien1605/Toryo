@@ -3998,18 +3998,21 @@ fn verify_scope_notes(
     out
 }
 
-/// The profiles of the implement and fix attempts that succeeded — after a fallback, the one
-/// that actually built (R49) — in order, consecutive repeats once (M11-C3: the final-gate note
-/// and the pre-review check share it).
+/// The profiles of the implement and fix attempts whose turn ran — after a fallback, every one
+/// that wrote into the checkpoint (R49 keeps the partial work of a failed or interrupted turn)
+/// — in order, consecutive repeats once (M11-C3: the final-gate note and the pre-review check
+/// share it). M11-R7 (X4): any end counts (`Succeeded`, `Failed`, `Interrupted`); only an
+/// attempt that ended before its agent started — no context recorded (the context is stored
+/// right before the agent starts) — is left out. A succeeded one always counts.
 pub fn implementer_profiles(store: &Store, t: &TaskRow) -> Result<Vec<String>> {
     let i = t.id.clone();
     let atts = store.call(move |tx| store::attempts(tx, &i))?;
     let mut imps: Vec<String> = atts
         .iter()
         .filter(|a| {
-            a.status == AttemptStatus::Succeeded
-                && a.kind == "agent"
+            a.kind == "agent"
                 && (a.stage == "implement" || a.stage.starts_with("fix-"))
+                && (a.status == AttemptStatus::Succeeded || a.context_sha256.is_some())
         })
         .filter_map(|a| a.profile.clone())
         .collect();

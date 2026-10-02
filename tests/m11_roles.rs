@@ -6,6 +6,7 @@ mod common;
 use common::*;
 
 use serde_json::{json, Value};
+use toryo::engine::store::AttemptStatus;
 use toryo::engine::PipelineState as St;
 
 const IMPL: &str = ".toryo/roles/implementer/toryo-role.yaml";
@@ -402,4 +403,119 @@ fn the_culture_file_is_protected_unless_the_task_allows_it() {
     assert_eq!(t.fix_cycle, 0, "{err}");
     let files = git(&wt(&env, "CU-2"), &["diff", "--name-only", "main..HEAD"]);
     assert!(files.contains("CULTURE.md"), "{files}");
+}
+
+/// M11-R7 AC-1 (X4): the same-vendor check counts every implementer turn that ran. Codex hits
+/// its quota → Claude (the fallback) writes the code, then hits its quota too (its changes
+/// stay) → the task pauses → `resume` starts the chain again at Codex, which succeeds on top
+/// of Claude's code → Claude reviews. `warn` → the final-gate note names `claude-max`;
+/// `error` → `Escalated` with `same_vendor_review` before any review turn.
+#[test]
+fn the_same_vendor_check_counts_a_turn_that_failed_after_writing() {
+    let to_pause = |env: &Env, id: &str| {
+        let s = script(
+            env,
+            &format!("{id}-a.json"),
+            json!({
+                "planner": [turn(vec![plan()])],
+                "implementer": [turn(vec![fail("QuotaExceeded", "You've hit your usage limit")])],
+                "implementer@claude-max": [turn(vec![write("src/Calculator.psm1", DIVIDE), fail("QuotaExceeded", "Claude usage limit reached")])],
+            }),
+        );
+        create(env, id);
+        let (code, err) = toryo(env, &["run", id, "--fake-agents", &s], &[]);
+        assert_eq!(code, 0, "{err}");
+        let (_, err) = toryo(
+            env,
+            &[
+                "approve",
+                id,
+                "--gate",
+                "plan",
+                "--continue",
+                "--fake-agents",
+                &s,
+            ],
+            &[],
+        );
+        assert_eq!(task(env, id).state, St::Paused, "{err}");
+        let s = script(
+            env,
+            &format!("{id}-b.json"),
+            json!({
+                "implementer": [turn(vec![implementation()])],
+                "reviewer": [turn(vec![approved()])],
+            }),
+        );
+        let (_, err) = toryo(env, &["resume", id, "--fake-agents", &s], &[]);
+        err
+    };
+    let env = vendor_env("warn", true);
+    let err = to_pause(&env, "R7-1");
+    assert_eq!(task(&env, "R7-1").state, St::WaitingFinalApproval, "{err}");
+    let ran: Vec<(String, AttemptStatus)> = attempts(&env, "R7-1")
+        .into_iter()
+        .filter(|a| a.stage == "implement")
+        .map(|a| (a.profile.unwrap_or_default(), a.status))
+        .collect();
+    assert!(
+        ran.contains(&("claude-max".into(), AttemptStatus::Failed))
+            && ran.contains(&("codex-openai".into(), AttemptStatus::Succeeded)),
+        "{ran:?}"
+    );
+    assert!(
+        err.contains("final gate — same vendor: claude-max implemented and claude-max reviewed (Claude both)"),
+        "{err}"
+    );
+
+    let env = vendor_env("error", true);
+    let err = to_pause(&env, "R7-2");
+    assert_eq!(task(&env, "R7-2").state, St::Escalated, "{err}");
+    assert!(
+        err.contains("same_vendor_review: claude-max built this checkpoint and claude-max would review it (Claude both)"),
+        "{err}"
+    );
+    assert!(attempts(&env, "R7-2").iter().all(|a| a.stage != "review"));
+}
+
+/// M11-R7 (X5): the same-vendor note in a toryo.yaml-only repository, as an exact line —
+/// `(Claude both)`, not `("Claude" both)`.
+#[test]
+fn the_legacy_same_vendor_note_is_exact() {
+    let env = setup("codex-openai");
+    let s = script(
+        &env,
+        "r7l.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![fail("QuotaExceeded", "limit")])],
+            "implementer@claude-max": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    create(&env, "R7-L");
+    toryo(&env, &["run", "R7-L", "--fake-agents", &s], &[]);
+    let (code, err) = toryo(
+        &env,
+        &[
+            "approve",
+            "R7-L",
+            "--gate",
+            "plan",
+            "--continue",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "R7-L").state, St::WaitingFinalApproval, "{err}");
+    let line = err
+        .lines()
+        .find(|l| l.contains("same vendor:"))
+        .unwrap_or_else(|| panic!("{err}"));
+    assert!(
+        line.ends_with("same vendor: claude-max implemented and claude-max reviewed (Claude both) — the review is less independent (R49); read the diff yourself"),
+        "{line:?}"
+    );
 }
