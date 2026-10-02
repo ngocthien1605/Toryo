@@ -158,10 +158,18 @@ fn record_path(t: &TaskRow) -> PathBuf {
 }
 
 fn empty_dir(d: &Path) -> Result<()> {
+    // never through a link: a junction put in place of `d` (or inside it) is removed as a
+    // link, its target is left alone (M11-R2 review)
+    if std::fs::symlink_metadata(d).is_ok_and(|m| m.file_type().is_symlink()) {
+        remove_link(d).with_context(|| format!("removing the link {}", d.display()))?;
+    }
     std::fs::create_dir_all(d)?;
     for e in std::fs::read_dir(d)?.flatten() {
         let p = e.path();
-        let r = if e.file_type().map(|f| f.is_dir()).unwrap_or(false) {
+        let ft = e.file_type().ok();
+        let r = if ft.is_some_and(|f| f.is_symlink()) {
+            remove_link(&p)
+        } else if ft.is_some_and(|f| f.is_dir()) {
             std::fs::remove_dir_all(&p)
         } else {
             std::fs::remove_file(&p)
@@ -169,6 +177,11 @@ fn empty_dir(d: &Path) -> Result<()> {
         r.with_context(|| format!("emptying {}", d.display()))?;
     }
     Ok(())
+}
+
+/// Remove a symbolic link or junction itself (a directory link on Windows needs `remove_dir`).
+fn remove_link(p: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(p).or_else(|_| std::fs::remove_dir(p))
 }
 
 /// Create the checkout once (or again, if it is gone), then reset it to `sha` for this run.
@@ -389,6 +402,93 @@ pub fn untracked(g: &GitCmd, co: &Checkout) -> Result<Option<String>> {
     )))
 }
 
+/// M11-R2 review: what `git status` cannot see in the checkout — a gitlink (a nested repository:
+/// Git never looks inside it, and `git clean` leaves it), an entry named `.git` below the root
+/// (Git skips it), a link or junction that is not tracked, any file that is not tracked. The
+/// checkout is walked without following links and compared with `git ls-files`.
+pub fn hidden(g: &GitCmd, co: &Checkout) -> Result<Option<String>> {
+    let key = |p: &str| {
+        if cfg!(windows) {
+            p.to_lowercase()
+        } else {
+            p.to_string()
+        }
+    };
+    let out = g.run(&co.loc(), true, &["ls-files", "-s", "-z"])?;
+    let mut tracked = std::collections::HashSet::new();
+    let mut found = Vec::new();
+    for e in out.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        let e = String::from_utf8_lossy(e);
+        let Some((meta, path)) = e.split_once('\t') else {
+            continue;
+        };
+        if meta.starts_with("160000 ") {
+            found.push(format!("{path} (a gitlink — Git does not see inside it)"));
+        }
+        tracked.insert(key(path));
+    }
+    fn walk(
+        dir: &Path,
+        rel: &str,
+        tracked: &std::collections::HashSet<String>,
+        key: &dyn Fn(&str) -> String,
+        found: &mut Vec<String>,
+    ) -> Result<()> {
+        for e in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+            let e = e?;
+            let name = e.file_name().to_string_lossy().to_string();
+            // the pointer to the recorded admin dir (R47; `mutated` checks its bytes)
+            if rel.is_empty() && name.eq_ignore_ascii_case(".git") {
+                continue;
+            }
+            let r = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            let ft = e.file_type()?;
+            if name.eq_ignore_ascii_case(".git") {
+                found.push(format!("{r} (a `.git` entry — Git skips it)"));
+            } else if ft.is_symlink() {
+                if !tracked.contains(&key(&r)) {
+                    found.push(format!("{r} (a link or junction)"));
+                }
+            } else if ft.is_dir() {
+                walk(&e.path(), &r, tracked, key, found)?;
+            } else if !tracked.contains(&key(&r)) {
+                found.push(r);
+            }
+        }
+        Ok(())
+    }
+    walk(&co.dir, "", &tracked, &key, &mut found)?;
+    if found.is_empty() {
+        return Ok(None);
+    }
+    let shown: Vec<&String> = found.iter().take(10).collect();
+    let more = if found.len() > 10 {
+        format!(" and {} more", found.len() - 10)
+    } else {
+        String::new()
+    };
+    Ok(Some(format!(
+        "{DIRTY}: the verify checkout holds what the checkpoint does not, or what Git cannot see: {shown:?}{more} — environment gates deploy from the checkout, so it must be exactly the checkpoint; a check gate must write its output under TORYO_VERIFY_BUILD, and a checkpoint may not hold a nested repository"
+    )))
+}
+
+/// M11-R2: may an environment gate deploy from this checkout — `(class, reason)` when not:
+/// a changed tracked file or pointer ([`mutated`]), an untracked or ignored file
+/// ([`untracked`]), or what Git cannot see ([`hidden`]).
+pub fn deployable(g: &GitCmd, co: &Checkout, head: &str) -> Result<Option<(&'static str, String)>> {
+    if let Some(r) = mutated(g, co, head)? {
+        return Ok(Some((MUTATED, r)));
+    }
+    if let Some(r) = untracked(g, co)? {
+        return Ok(Some((DIRTY, r)));
+    }
+    Ok(hidden(g, co)?.map(|r| (DIRTY, r)))
+}
+
 /// M11-R2 (X1): the working directory of an environment gate — `<base>/envgate`, created and
 /// emptied before each gate. It is not among the Low-labelled folders, so code a check gate ran
 /// at Low integrity cannot plant a file there; a relative argument, a bare tool name or a DLL
@@ -438,4 +538,50 @@ pub fn cleanup(g: &GitCmd, t: &TaskRow, cfg: Option<&Effective>) -> Result<()> {
         &["worktree", "prune"],
     );
     Ok(())
+}
+
+// Windows only: junctions (`mklink /J`) need no privilege there
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// M11-R2 review: emptying a folder never goes through a link — a junction put in place of
+    /// the folder, or inside it, is removed as a link and its target keeps its files.
+    #[test]
+    fn emptying_a_folder_never_follows_a_junction() {
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("precious");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), "x").unwrap();
+        let junction = |link: &Path| {
+            let ok = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(link)
+                .arg(&target)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "mklink /J {}", link.display());
+        };
+        // in place of the folder
+        let envgate = d.path().join("envgate");
+        junction(&envgate);
+        empty_dir(&envgate).unwrap();
+        assert!(
+            target.join("keep.txt").exists(),
+            "the target keeps its files"
+        );
+        let m = std::fs::symlink_metadata(&envgate).unwrap();
+        assert!(
+            m.is_dir() && !m.file_type().is_symlink(),
+            "a real folder now"
+        );
+        // inside it
+        junction(&envgate.join("inner"));
+        std::fs::write(envgate.join("stray.txt"), "x").unwrap();
+        empty_dir(&envgate).unwrap();
+        assert_eq!(std::fs::read_dir(&envgate).unwrap().count(), 0);
+        assert!(target.join("keep.txt").exists());
+    }
 }

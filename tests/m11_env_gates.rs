@@ -1040,3 +1040,39 @@ fn an_environment_gate_variable_is_expanded_once_at_create() {
     assert_eq!(task(&env, "R3-1").state, St::Completed, "{err}");
     assert!(gates.join("deployed").exists(), "the script ran: {err}");
 }
+
+/// M11-R2 review: what `git status` cannot see stops the deploy too — a gitlink in the
+/// checkpoint (Git never looks inside it) that a check gate fills, and an entry named `.git`
+/// below the root (Git skips it).
+#[test]
+fn files_git_cannot_see_stop_the_deploy() {
+    let (env, marker) = probe_then_dbsync(
+        "$c = $env:TORYO_VERIFY_CHECKOUT\nNew-Item -ItemType Directory -Force (Join-Path $c 'deploy') | Out-Null\nSet-Content -Path (Join-Path $c 'deploy/evil.xml') -Value x\nNew-Item -ItemType Directory -Force (Join-Path $c 'src/.git') | Out-Null\nSet-Content -Path (Join-Path $c 'src/.git/payload') -Value x\nexit 0\n",
+        "c=\"$TORYO_VERIFY_CHECKOUT\"\nmkdir -p \"$c/deploy\" \"$c/src/.git\"\necho x > \"$c/deploy/evil.xml\"\necho x > \"$c/src/.git/payload\"\nexit 0\n",
+    );
+    // the checkpoint holds a gitlink `deploy` (a nested repository, no .gitmodules)
+    let head = git(&env.repo, &["rev-parse", "HEAD"]);
+    git(
+        &env.repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{},deploy", head.trim()),
+        ],
+    );
+    git(&env.repo, &["commit", "-q", "-m", "a gitlink"]);
+    let err = one_turn(&env, "R2-G");
+    let t = task(&env, "R2-G");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    let reason = t.machine.reason().unwrap_or_default().to_string();
+    assert!(
+        reason.starts_with("verify_checkout_dirty:")
+            && reason.contains("deploy (a gitlink")
+            && reason.contains("deploy/evil.xml")
+            && reason.contains("src/.git (a `.git` entry"),
+        "{reason}"
+    );
+    assert!(!marker.exists(), "the environment gate never started");
+    assert!(deployments(&env).is_empty());
+}

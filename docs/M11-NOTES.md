@@ -200,6 +200,38 @@ Task list: `M11-review-fixes.md` (review of 2026-10-02, built and run on Linux b
   `the_draft_set_loads_freezes_and_reloads` gained the `runs:` line (added assertions only).
 - Docs: the template's `environment_gates` paragraph, README, HUONG-DAN §5.9.
 
+### Review of R1–R3 (independent subagent) — follow-up commit
+
+A subagent reviewed `4bfa291..2dc01ab` (read-only, from a `git archive` export; it ran `m11_env_gates` 15/15). Every
+AC of R1–R3 was confirmed met (R2 AC-4 is a property test: `base` was never Low-writable). Fixed:
+
+- **Must fix — what `git status` cannot see:** a gitlink (mode 160000, no `.gitmodules`; `git add -A` turns a nested
+  repository the implementer creates into one) gives an empty folder in the checkout that a Low check gate can fill;
+  Git never looks inside it, `git clean -ffdx` leaves it, and an entry named `.git` below the root is skipped too. So
+  both pre-deploy checks passed while the deploy would read agent files. New `verify::hidden`: `git ls-files -s -z`
+  (a 160000 entry is reported) and a walk of the checkout **without following links** — any `.git` entry below the
+  root, any untracked link or junction, any untracked file → `verify_checkout_dirty`. `verify::deployable` combines
+  `mutated`, `untracked` and `hidden`. Test: `tests/m11_env_gates.rs::files_git_cannot_see_stop_the_deploy` (a
+  committed gitlink filled by the probe gate, plus `src/.git/payload`; no marker, no deployment row).
+- **Should fix — `envgate` as a junction:** `empty_dir` (used for `envgate` and the Low folders) now removes a link
+  or junction put in place of the folder, or inside it, as a link — never emptying its target; a junction entry no
+  longer makes it fail. Test (Windows only, `mklink /J`): `verify::tests::emptying_a_folder_never_follows_a_junction`.
+- **Nice to have, done:** the checkout is checked again once each environment gate holds its lock (the wait may be
+  long; new `EnvGates::Dirty`, handled like the pre-deploy check); stale "runs in the verify checkout" comments
+  (runner, config.rs); the `environment_gate_unavailable` hint names the machine config in use
+  (`--machine-config`), not the default; an unset variable is reported once (no second "must be an absolute path"
+  problem); `draft_repo` normalises CRLF in the machine fixture too (a Windows clone with `autocrlf`); the script
+  contract says TORYO_VERIFY_BUILD is Low-written and not covered by the check, and that what the script interprets
+  from either folder runs agent logic with full rights; HUONG-DAN's troubleshooting table has rows for
+  `verify_checkout_dirty`, `environment_gate_unavailable`, `skill_unavailable` / `context_over_budget`.
+- **Not fixed — recorded under Open:** (a) `envgate` relies on `<verify_root>/<task>` not being Low-writable; a
+  `verify_root` the owner puts under a Low-labelled tree (e.g. `AppData\LocalLow`) is not refused. (b) `verify.boundary:
+  none` (machine `min_boundary: none`) with an environment gate makes the check gates run with full rights — no B3
+  warning (Linux tests need `none`). (c) A task frozen before R3 with `%VAR%` in `program` now escalates with
+  `environment_gate_unavailable … not found` — `toryo task config <id> --reload` (troubleshooting row added).
+  (d) `named_path` reads `a.ps1;b.ps1` or space-joined paths as one path (owner mistakes only). (e) `which_in` ignores
+  PATHEXT and tries the bare name first (predates M11). (f) The xpp `obj\` question of R2 stays open.
+
 ### R4 — fence patterns that match nothing; the culture file is protected
 
 - **Normalised at load:** `checks::fence_pattern` — `\` → `/`; a leading `./` and empty or `.` segments go (`a//b`

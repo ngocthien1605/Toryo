@@ -120,6 +120,12 @@ git:
 #   $env:TORYO_VERIFY_CHECKOUT / $env:TORYO_VERIFY_BUILD, call every tool by its absolute path,
 #   and do not run `git` against the checkout (its files come from the implementer) — use
 #   $env:TORYO_SHA.
+#   (M11) Both folders hold what the implementer wrote: TORYO_VERIFY_BUILD is written by the
+#   check gates at Low integrity and is NOT covered by the "exactly the checkpoint" check.
+#   Anything your script interprets from them (a .ps1 it dot-sources, a project or
+#   Directory.Build.* file msbuild reads, an .exe it starts) runs agent-written logic with your
+#   full rights — deploy their files, do not execute them. A checkpoint with a nested repository
+#   (gitlink) is refused before any environment gate (verify_checkout_dirty).
 
 # M11 (review H2) — this machine's floor for the repositories' verify sandbox, and its verify
 # root. A repository `verify.boundary: none` is refused unless `min_boundary: none` here (only

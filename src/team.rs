@@ -880,9 +880,11 @@ fn env_gate_problems(
         ));
     }
     // M11-R3 (X3): `program` and `args` were expanded at load — this is the text that runs
+    // (a value with a variable that is not set was reported at load, once)
+    let unset = |s: &str| crate::config::expand_vars(s).is_err();
     let reach = |p: &str| reach(cfg, p);
     let program = g.program.clone();
-    if program.contains('/') || program.contains('\\') {
+    if (program.contains('/') || program.contains('\\')) && !unset(&program) {
         let dots = program.replace('\\', "/").split('/').any(|c| c == "..");
         if dots || !Path::new(&program).is_absolute() {
             out.push(format!(
@@ -897,7 +899,7 @@ fn env_gate_problems(
             ));
         }
     }
-    for a in &g.args {
+    for a in g.args.iter().filter(|a| !unset(a)) {
         let Some(named) = named_path(a) else {
             continue;
         };
@@ -1504,8 +1506,10 @@ mod tests {
         )
         .unwrap();
         let m = d.path().join("toryo.local.yaml");
+        // CRLF too (a Windows clone with autocrlf): the tests edit it by exact text
         let machine = std::fs::read_to_string(src.join("toryo.local.yaml"))
             .unwrap()
+            .replace(CRLF, "\n")
             .replace("@TMP@", &tmp);
         std::fs::write(&m, machine).unwrap();
         (d, y, m)
@@ -2000,6 +2004,11 @@ mod tests {
             e.contains("environment_gates.dbsync.program: environment variable %TORYO_R3_UNSET_P% is not set")
                 && e.contains("environment_gates.dbsync.args[3]: environment variable %TORYO_R3_UNSET_A% is not set")
                 && e.contains(&m.display().to_string()),
+            "{e}"
+        );
+        // reported once: not also as a relative program or argument (R1–R3 review)
+        assert!(
+            !e.contains("must be an absolute path") && e.matches("TORYO_R3_UNSET_A").count() == 2,
             "{e}"
         );
         // AC-3: a variable that points into the repository

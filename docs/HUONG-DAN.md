@@ -993,6 +993,9 @@ CI chạy: `cargo fmt --check`, `clippy -D warnings` (có và không có M0 kit)
 | `protected_config_changed` | Mở file diff được nêu trong lý do; khôi phục rồi `toryo resume ID`, hoặc `--accept-protected-change <path>` |
 | `verify_boundary_unavailable` | `verify_root` không gán được Low label (thiếu WRITE_OWNER) → để mặc định `%LOCALAPPDATA%\toryo-verify`; `toryo doctor` nêu nguyên nhân |
 | `verify_mutated_tree` | Script verify đã sửa file đã track / `.git` của bản checkout → sửa script (hoặc code agent viết), rồi `toryo resume ID --note "…"` |
+| `verify_checkout_dirty` (M11) | Trước gate môi trường, bản checkout có file checkpoint không có (check gate ghi vào checkout, thư mục `.git` lồng, nested repository/gitlink, link/junction) → cho check gate ghi output vào `TORYO_VERIFY_BUILD`; bỏ nested repo khỏi commit; rồi `toryo resume ID --note "…"` |
+| `environment_gate_unavailable` (M11) | Máy không chạy được gate môi trường: secret chưa có, chương trình không tìm thấy hoặc nằm trong repo/worktrees/verify root → sửa machine config; task tạo trước bản này mà có `%VAR%` trong `program` → `toryo task config ID --reload` |
+| `skill_unavailable` / `context_over_budget` (M11) | Skill cần cho lượt này không tìm thấy (lý do nêu cả hai đường dẫn) → đặt lại rồi `toryo resume ID --note "…"`; ngữ cảnh có skill vẫn quá ngân sách → tăng `context.budget_kb.<role>` hoặc chọn ít skill hơn |
 | `artifact_tampered` / `artifact_missing` | Có người sửa/xoá file trong `runstore\artifacts\` → khôi phục file, hoặc `toryo task cleanup ID` |
 | `Paused` — `admission cap reached` | `toryo budget set ID --tokens N` rồi `toryo resume ID` |
 | `unverified profiles (R51)` nhắc `claude-implementer-isolation` | `toryo spike claude-implementer-isolation --profile claude-max` (hoặc `doctor --canaries`) |

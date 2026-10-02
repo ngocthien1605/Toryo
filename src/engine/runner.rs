@@ -1431,13 +1431,10 @@ impl<'a> Engine<'a> {
         // so before the first one starts it must be exactly the checkpoint — a check gate (code
         // the implementer wrote) may have changed or added files. Found → no environment gate
         // runs and the task escalates (not a fix cycle: the gate setup is wrong, not the code).
+        // (checked again once each gate holds its lock — the wait may be long)
         let mut before_deploy: Option<(&str, String)> = None;
         if failure.is_none() && self.deploys() {
-            if let Some(reason) = verify::mutated(&self.g, &co, &head)? {
-                before_deploy = Some((verify::MUTATED, reason));
-            } else if let Some(reason) = verify::untracked(&self.g, &co)? {
-                before_deploy = Some((verify::DIRTY, reason));
-            }
+            before_deploy = verify::deployable(&self.g, &co, &head)?;
         }
         // M11-E3: the environment gates, only after every check gate passed
         if failure.is_none() && before_deploy.is_none() {
@@ -1448,6 +1445,7 @@ impl<'a> Engine<'a> {
                     self.escalate_attempt(&a, ENV_UNAVAILABLE.into(), reason)?;
                     return Ok(Flow::Next);
                 }
+                EnvGates::Dirty(class, reason) => before_deploy = Some((class, reason)),
             }
         }
         let pass = failure.is_none() && before_deploy.is_none();
@@ -1673,7 +1671,8 @@ impl<'a> Engine<'a> {
     /// The environment gates of the implementer's `before_handoff`, in order, after every
     /// check gate of the run passed: each takes its machine-wide lock (waiting while another
     /// task holds it), records the deployment **before** it starts, runs the frozen machine
-    /// command with the owner's normal token in the verify checkout (Job Object, timeout,
+    /// command with the owner's normal token in an empty working directory (`envgate`, M11-R2;
+    /// the checkout is re-checked once the lock is held) (Job Object, timeout,
     /// environment from scratch + gate variables + `env` + resolved `secret_env`, redacted
     /// output), records the end and releases the lock. A gate this machine does not define
     /// (`if_missing: skip`) gets a skipped entry. Stops at the first failure.
@@ -1703,7 +1702,7 @@ impl<'a> Engine<'a> {
             let unavailable = |what: String| {
                 Ok(EnvGates::Unavailable(format!(
                     "{ENV_UNAVAILABLE}: environment gate `{name}`: {what} — fix the machine config ({}), then `toryo resume {} --note …`",
-                    crate::config::machine_config_hint(None),
+                    crate::config::machine_config_hint(self.cfg.machine_path.as_deref()),
                     t.id
                 )))
             };
@@ -1727,6 +1726,12 @@ impl<'a> Engine<'a> {
             let Some(lock) = self.env_lock(t, &m.lock, stop)? else {
                 return Ok(EnvGates::Stopped);
             };
+            // M11-R2 review: the wait for the lock may have been long — the checkout must still be
+            // exactly the checkpoint when the gate starts
+            if let Some((class, reason)) = verify::deployable(&self.g, co, head)? {
+                drop(lock);
+                return Ok(EnvGates::Dirty(class, reason));
+            }
             // M11-R2 (X1): a fresh, empty working directory agent code cannot write
             let cwd = verify::envgate_dir(co)?;
             // first the record: a failed or killed sync may already have changed the environment
@@ -1742,7 +1747,7 @@ impl<'a> Engine<'a> {
             crash_point("verify:environment_gate_started");
             let mut env = crate::process::env::build_env(std::env::vars(), &m.env, &secrets);
             // group E review: a bare name the script runs is never looked up in the working
-            // directory (the verify checkout, which holds the checkpoint's files) — cmd.exe and
+            // directory (the empty `envgate` folder, M11-R2: it was the checkout) — cmd.exe and
             // CreateProcess honour this; DLL loading does not (documented in the script contract)
             env.insert("NoDefaultCurrentDirectoryInExePath".into(), "1".into());
             verify::set_gate_vars(&mut env, &t.id, head, co);
@@ -3803,6 +3808,9 @@ enum EnvGates {
     /// The machine cannot run a gate (an unresolved secret, a program not found): escalate —
     /// not something another fix cycle can repair.
     Unavailable(String),
+    /// M11-R2 review: once the gate held its lock the checkout was no longer exactly the
+    /// checkpoint — `(class, reason)`; nothing was deployed by this gate.
+    Dirty(&'static str, String),
 }
 
 /// The escalation class of an environment gate this machine cannot run (M11-E3).
@@ -3819,8 +3827,8 @@ pub fn computer_name() -> String {
 }
 
 /// The program of an environment gate (M11-E3): an absolute path as written, a bare name
-/// through `path` (PATH) — resolved here, so it is never looked up in the verify checkout (the
-/// working directory). The text was expanded once at load and is not expanded again (M11-R3).
+/// through `path` (PATH) — resolved here, so it is never looked up in the working directory
+/// (the `envgate` folder). The text was expanded once at load and is not expanded again (M11-R3).
 /// A program that resolves inside the repository, the worktrees or the verify root is refused:
 /// agent code may have planted it there. `Err` is the reason for `environment_gate_unavailable`.
 pub(crate) fn env_gate_program(

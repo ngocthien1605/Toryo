@@ -486,7 +486,8 @@ pub struct MachineConfig {
 }
 
 /// `environment_gates.<name>` in the machine config (M11-E3): the command an org chart's
-/// `kind: environment` gate runs, with the owner's normal token, in the verify checkout.
+/// `kind: environment` gate runs, with the owner's normal token, in an empty working directory
+/// (M11-R2), after the checkout was found to be exactly the checkpoint.
 /// Frozen and hashed with each task that uses it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
