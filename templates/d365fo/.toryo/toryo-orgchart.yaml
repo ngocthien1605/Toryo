@@ -121,9 +121,12 @@ culture: ./CULTURE.md              # optional team-wide norms
 # Variables Toryo sets for every gate:
 #   TORYO_TASK             task id
 #   TORYO_SHA              the checkpoint commit being verified
-#   TORYO_VERIFY_CHECKOUT  the clean checkout of TORYO_SHA (read only)
-#   TORYO_VERIFY_BUILD     build output folder: check gates write here,
-#                          environment gates read the compiled package here
+#   TORYO_VERIFY_CHECKOUT  for an environment gate: a fresh export of the
+#                          commit TORYO_SHA that no agent code could touch
+#                          (M11 review X6); for a check gate: the Low checkout
+#   TORYO_VERIFY_BUILD     build output folder, written by the check gates at
+#                          Low integrity. An environment gate must treat it as
+#                          untrusted and build again from TORYO_VERIFY_CHECKOUT
 gates:
   build:
     kind: check

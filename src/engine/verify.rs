@@ -390,23 +390,32 @@ pub fn checkout_extra(g: &GitCmd, co: &Checkout) -> Result<Vec<String>> {
     let mut found = Vec::new();
     for e in out.split(|b| *b == 0).filter(|e| !e.is_empty()) {
         let e = String::from_utf8_lossy(e);
-        let Some((meta, path)) = e.split_once('\t') else {
+        let Some((_, path)) = e.split_once('\t') else {
             continue;
         };
-        if meta.starts_with("160000 ") {
-            found.push(format!("{path} (a gitlink)"));
-        }
+        // a gitlink of the checkpoint itself is not something a check gate left (R9 review)
         tracked.insert(key(path));
     }
+    // (R9 review) best effort and capped: a check gate must never make verify *error* — an
+    // unreadable entry is skipped, and the walk stops after `CAP` finds
+    const CAP: usize = 1000;
     fn walk(
         dir: &Path,
         rel: &str,
         tracked: &std::collections::HashSet<String>,
         key: &dyn Fn(&str) -> String,
         found: &mut Vec<String>,
-    ) -> Result<()> {
-        for e in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-            let e = e?;
+    ) {
+        if found.len() >= CAP {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            if found.len() >= CAP {
+                return;
+            }
             let name = e.file_name().to_string_lossy().to_string();
             // the pointer to the recorded admin dir (R47; `mutated` checks its bytes)
             if rel.is_empty() && name.eq_ignore_ascii_case(".git") {
@@ -417,7 +426,7 @@ pub fn checkout_extra(g: &GitCmd, co: &Checkout) -> Result<Vec<String>> {
             } else {
                 format!("{rel}/{name}")
             };
-            let ft = e.file_type()?;
+            let Ok(ft) = e.file_type() else { continue };
             if name.eq_ignore_ascii_case(".git") {
                 found.push(format!("{r} (a `.git` entry)"));
             } else if ft.is_symlink() {
@@ -425,14 +434,13 @@ pub fn checkout_extra(g: &GitCmd, co: &Checkout) -> Result<Vec<String>> {
                     found.push(format!("{r} (a link or junction)"));
                 }
             } else if ft.is_dir() {
-                walk(&e.path(), &r, tracked, key, found)?;
+                walk(&e.path(), &r, tracked, key, found);
             } else if !tracked.contains(&key(&r)) {
                 found.push(r);
             }
         }
-        Ok(())
     }
-    walk(&co.dir, "", &tracked, &key, &mut found)?;
+    walk(&co.dir, "", &tracked, &key, &mut found);
     Ok(found)
 }
 
@@ -459,16 +467,27 @@ pub fn deploy_source(g: &GitCmd, co: &Checkout, head: &str) -> Result<Export> {
     let dir = co.base.join("deploy");
     let index = co.base.join("deploy.index");
     empty_dir(&dir)?;
-    if std::fs::symlink_metadata(&index).is_ok() {
-        // a link is removed as a link (its target is left alone)
-        remove_link(&index).with_context(|| format!("removing {}", index.display()))?;
+    // the scratch index and a lock a killed git left behind (owner-only files)
+    for f in [index.clone(), co.base.join("deploy.index.lock")] {
+        if std::fs::symlink_metadata(&f).is_ok() {
+            // a link is removed as a link (its target is left alone)
+            remove_link(&f).with_context(|| format!("removing {}", f.display()))?;
+        }
     }
     let loc = Loc::Explicit {
         git_dir: co.admin.clone(),
         work_tree: dir.clone(),
     };
-    let scratch = [("GIT_INDEX_FILE", index.as_path())];
+    // (R9 review) the commit's bytes only: no replacement objects, and a link in the commit
+    // is written as a plain file holding its target text, never as a link
+    let scratch = [
+        ("GIT_INDEX_FILE", index.as_path()),
+        ("GIT_NO_REPLACE_OBJECTS", Path::new("1")),
+    ];
     let git = |args: &[&str]| -> Result<String> {
+        let mut full = vec!["-c", "core.symlinks=false"];
+        full.extend_from_slice(args);
+        let args = &full[..];
         let o = g.output_env(&loc, false, args, &scratch)?;
         if !o.status.success() {
             bail!(
@@ -490,7 +509,37 @@ pub fn deploy_source(g: &GitCmd, co: &Checkout, head: &str) -> Result<Export> {
             short(head)
         );
     }
-    Ok(Export { dir, index, tree })
+    let e = Export { dir, index, tree };
+    // (R9 review) the files on disk must be the commit's before any gate reads them, and the
+    // export holds no link
+    if let Some(why) = export_changed(g, co, &e)? {
+        bail!("the export of {} is not the commit: {why}", short(head));
+    }
+    if let Some(l) = first_link(&e.dir)? {
+        bail!(
+            "the export of {} holds a link ({}) — links are exported as files",
+            short(head),
+            l.display()
+        );
+    }
+    Ok(e)
+}
+
+/// The first symbolic link or junction under `dir` (not followed), if any.
+fn first_link(dir: &Path) -> Result<Option<PathBuf>> {
+    for e in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let e = e?;
+        let ft = e.file_type()?;
+        if ft.is_symlink() {
+            return Ok(Some(e.path()));
+        }
+        if ft.is_dir() {
+            if let Some(l) = first_link(&e.path())? {
+                return Ok(Some(l));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// M11-R9 (E3 AC-8 against the export): after an environment gate, `Some(reason)` when the
@@ -502,13 +551,23 @@ pub fn export_changed(g: &GitCmd, co: &Checkout, e: &Export) -> Result<Option<St
         git_dir: co.admin.clone(),
         work_tree: e.dir.clone(),
     };
-    let scratch = [("GIT_INDEX_FILE", e.index.as_path())];
+    // the settings of the export (`deploy_source`)
+    let scratch = [
+        ("GIT_INDEX_FILE", e.index.as_path()),
+        ("GIT_NO_REPLACE_OBJECTS", Path::new("1")),
+    ];
+    let c = ["-c", "core.symlinks=false"];
     // a timestamp-only touch is no change: refresh the stat data, then compare by content
-    let _ = g.output_env(&loc, false, &["update-index", "-q", "--refresh"], &scratch)?;
+    let _ = g.output_env(
+        &loc,
+        false,
+        &[c[0], c[1], "update-index", "-q", "--refresh"],
+        &scratch,
+    )?;
     let mut files = Vec::new();
     for args in [
-        &["diff-files", "--name-only", "-z"][..],
-        &["ls-files", "--others", "-z"][..],
+        &[c[0], c[1], "diff-files", "--name-only", "-z"][..],
+        &[c[0], c[1], "ls-files", "--others", "-z"][..],
     ] {
         let o = g.output_env(&loc, true, args, &scratch)?;
         if !o.status.success() {
@@ -634,35 +693,64 @@ mod tests {
     /// A repository with one commit and a verify-style checkout of it (as `prepare` makes it:
     /// a detached worktree, its admin dir and pointer recorded), under `d`.
     fn repo_and_checkout(d: &Path) -> (GitCmd, Checkout, String) {
+        repo_and_checkout_with(d, false)
+    }
+
+    /// git in `dir` (the test repository), checked.
+    fn tgit(dir: &Path, args: &[&str]) -> String {
+        let o = std::process::Command::new(crate::git::git_exe())
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "core.autocrlf=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    /// [`repo_and_checkout`]; `with_link`: the commit also holds a link entry `lnk` (mode
+    /// 120000) whose target text is `../outside`.
+    fn repo_and_checkout_with(d: &Path, with_link: bool) -> (GitCmd, Checkout, String) {
         let repo = d.join("repo");
         std::fs::create_dir_all(repo.join("src")).unwrap();
-        let sh = |dir: &Path, args: &[&str]| {
-            let o = std::process::Command::new(crate::git::git_exe())
-                .arg("-C")
-                .arg(dir)
-                .args([
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@t",
-                    "-c",
-                    "core.autocrlf=false",
-                ])
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                o.status.success(),
-                "{args:?}: {}",
-                String::from_utf8_lossy(&o.stderr)
-            );
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        };
+        let sh = tgit;
         sh(&repo, &["init", "-q", "-b", "main"]);
         sh(&repo, &["config", "core.autocrlf", "false"]);
         std::fs::write(repo.join("app.txt"), "committed\n").unwrap();
         std::fs::write(repo.join("src").join("lib.txt"), "library\n").unwrap();
         sh(&repo, &["add", "-A"]);
+        if with_link {
+            std::fs::write(d.join("target.txt"), "../outside").unwrap();
+            let blob = sh(
+                &repo,
+                &[
+                    "hash-object",
+                    "-w",
+                    &d.join("target.txt").display().to_string(),
+                ],
+            );
+            sh(
+                &repo,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("120000,{blob},lnk"),
+                ],
+            );
+        }
         sh(&repo, &["commit", "-q", "-m", "one"]);
         let head = sh(&repo, &["rev-parse", "HEAD"]);
         let base = d.join("vr").join("T-1");
@@ -740,6 +828,43 @@ mod tests {
         // the next export starts from scratch
         let e = deploy_source(&g, &co, &head).unwrap();
         assert!(!e.dir.join("new.txt").exists());
+        assert_eq!(export_changed(&g, &co, &e).unwrap(), None);
+    }
+
+    /// R9 review: the export holds only the commit's bytes — a link entry of the commit is a
+    /// plain file holding its target text (never a link, whatever `core.symlinks` says), a
+    /// replacement object of the repository is not used, and a stale `deploy.index.lock` left by
+    /// a killed git does not block the next export.
+    #[test]
+    fn the_export_is_plain_files_of_the_commit() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, co, head) = repo_and_checkout_with(d.path(), true);
+        let repo = d.path().join("repo");
+        tgit(&repo, &["config", "core.symlinks", "true"]);
+        // a replacement for app.txt's blob in the repository
+        let blob = tgit(&repo, &["rev-parse", &format!("{head}:app.txt")]);
+        std::fs::write(d.path().join("other.txt"), "replaced\n").unwrap();
+        let other = tgit(
+            &repo,
+            &[
+                "hash-object",
+                "-w",
+                &d.path().join("other.txt").display().to_string(),
+            ],
+        );
+        tgit(&repo, &["replace", &blob, &other]);
+        std::fs::write(co.base.join("deploy.index.lock"), "").unwrap();
+        let e = deploy_source(&g, &co, &head).unwrap();
+        let lnk = e.dir.join("lnk");
+        let m = std::fs::symlink_metadata(&lnk).unwrap();
+        assert!(m.is_file() && !m.file_type().is_symlink(), "a plain file");
+        assert_eq!(std::fs::read_to_string(&lnk).unwrap(), "../outside");
+        assert_eq!(
+            std::fs::read_to_string(e.dir.join("app.txt")).unwrap(),
+            "committed\n",
+            "the commit's blob, not its replacement"
+        );
+        assert_eq!(first_link(&e.dir).unwrap(), None);
         assert_eq!(export_changed(&g, &co, &e).unwrap(), None);
     }
 }

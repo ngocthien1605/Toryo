@@ -1746,10 +1746,11 @@ impl<'a> Engine<'a> {
                 Ok(e) => e,
                 Err(e) => {
                     drop(lock);
-                    return unavailable(format!(
-                        "the checkpoint {} could not be exported for it: {e:#}",
-                        short(head)
-                    ));
+                    return Ok(EnvGates::Unavailable(format!(
+                        "{ENV_UNAVAILABLE}: environment gate `{name}`: the checkpoint {} could not be exported for it (nothing was deployed): {e:#} — `toryo resume {} --note …` exports it again",
+                        short(head),
+                        t.id
+                    )));
                 }
             };
             // M11-R2 (X1): a fresh, empty working directory agent code cannot write

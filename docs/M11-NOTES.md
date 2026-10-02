@@ -562,16 +562,40 @@ the push and the pull request.
   `an_environment_gate_that_writes_into_the_checkout_mutates_the_tree` (AC-5), `a_check_gate_that_edits_a_tracked_
   file_stops_the_deploy` (AC-6, unchanged), `a_tracked_checkout_with_an_environment_gate_loads` and
   `two_tasks_share_one_environment_lock` (AC-7).
-- **AC-3 on this machine:** Git for Windows **does** see the same-length forgery with restored timestamps (the
-  task escalates `verify_mutated_tree` before any deploy) — so on Windows the test takes the "no deploy" branch; the
-  other branch (Git fooled, as the reviewer showed on Linux with `core.trustctime=false`) is covered by AC-1: the
-  export is made from the object store and never holds the checkout's bytes.
+- **AC-3 (corrected after the R9 review):** whether Git for Windows catches a same-length forgery with restored
+  timestamps depends on index raciness (the reviewer showed Git **can** be fooled); the test asserts the invariant in
+  both outcomes (escalate with no deploy, or deploy the committed bytes). The deterministic proof that the export
+  never carries the checkout's bytes — whatever Git's stat check decides — is the unit test
+  `the_export_holds_the_commit_not_the_checkout` (a forged same-length tracked file in `co.dir`; the export holds the
+  commit) and the e2e `a_check_gate_that_adds_a_file_is_not_deployed`.
 - Docs: the machine template (the paragraph and the script contract: the two variables), the fixture's comment,
   README, HUONG-DAN §5.9 and its troubleshooting row.
 - **Open (not fixed, the list says so):** the Low verify checkouts of different tasks share one integrity label, so
   one task's check gates can write another task's checkout and build folder (a separate user or AppContainer per
   task would be needed). The export closes this for what an environment gate deploys from
   `TORYO_VERIFY_CHECKOUT`, not for `TORYO_VERIFY_BUILD`.
+
+##### Review of R9 (independent subagent) — folded into the R9 commit's follow-up
+
+An independent review of `29226ec` found two must-fix bypasses of X6, fixed here:
+- **A link in the commit.** With `core.symlinks=true` (Git's default on Linux, system-wide on this machine), a
+  120000 entry became a real link inside `deploy`, so an environment gate following `lib -> ../build/payload` (or an
+  absolute path) read what Low code wrote, or any file on disk. Fixed: the export runs with `-c core.symlinks=false`,
+  so a link entry is written as a plain file holding its target text (the commit's bytes); after the export,
+  `deploy_source` refuses any reparse point found under `deploy` (`first_link`). `export_changed` uses the same
+  setting.
+- **A replacement object.** `write-tree == <head>^{tree}` always held (the scratch index came from `read-tree`), so
+  it proved nothing; an implementer agent that ran `git replace <blob> <evil>` in the shared common dir changed the
+  exported bytes. Fixed: the export (and `export_changed`) run with `GIT_NO_REPLACE_OBJECTS=1`, and `deploy_source`
+  now runs `export_changed` **before** the gate starts (the files on disk must be the commit's), failing as
+  `environment_gate_unavailable` rather than catching it only after the deploy.
+- Also: a stale `deploy.index.lock` (a killed git) is removed before the export; the export-failure message is its
+  own (`… could not be exported … resume … exports it again`), not "fix the machine config"; `checkout_extra` is best
+  effort and capped at 1000 (a Low check gate cannot make verify *error* with an unreadable or huge tree) and no
+  longer lists a checkpoint's own gitlink; `gate_tail` in the test is `#[cfg(windows)]` (else ubuntu clippy fails on
+  dead code); the AC-3 note is corrected (Git for Windows can be fooled; the deterministic proof is AC-1 / AC-2).
+- Test: `verify::tests::the_export_is_plain_files_of_the_commit` (a link entry → a plain file; a repository `git
+  replace` is not used; a stale index lock does not block the export).
 
 #### R10 — M18 script detection, second pass (applies to everyone)
 

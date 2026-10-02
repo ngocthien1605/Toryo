@@ -1127,9 +1127,10 @@ fn files_git_cannot_see_are_not_deployed() {
         .iter()
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
+    // (R9 review: a checkpoint gitlink itself is not something a check gate left; what the gate
+    // wrote inside it, and the `.git` entry, are)
     assert!(
-        extra.iter().any(|x| x == "deploy (a gitlink)")
-            && extra.iter().any(|x| x == "deploy/evil.xml")
+        extra.iter().any(|x| x == "deploy/evil.xml")
             && extra.iter().any(|x| x == "src/.git (a `.git` entry)"),
         "{extra:?}"
     );
@@ -1261,6 +1262,7 @@ fn a_lock_name_is_stored_in_lower_case() {
 }
 
 /// The `output_tail` of the gate `name` in the latest VERIFY_RESULT.json of `id`.
+#[cfg(windows)]
 fn gate_tail(env: &Env, id: &str, name: &str) -> String {
     verify_result(env, id)["commands"]
         .as_array()
@@ -1274,7 +1276,10 @@ fn gate_tail(env: &Env, id: &str, name: &str) -> String {
 /// M11-R9 AC-3 (Windows): the forgery R9 is about — a check gate overwrites a tracked file with
 /// content of the same length and puts its timestamps back. Whatever `mutated` says, what the
 /// environment gate reads has the committed bytes: either the task escalates before any deploy,
-/// or the deployed file's SHA-256 is the original's, never the forged one's.
+/// or the deployed file's SHA-256 is the original's, never the forged one's. (Whether Git for
+/// Windows catches this forgery depends on index raciness; the export never carries the
+/// checkout's bytes regardless — the deterministic proof is `the_export_holds_the_commit_not_the
+/// _checkout` and `a_check_gate_that_adds_a_file_is_not_deployed`.)
 #[cfg(windows)]
 #[test]
 fn a_same_length_forgery_in_the_checkout_is_never_deployed() {
@@ -1304,7 +1309,6 @@ fn a_same_length_forgery_in_the_checkout_is_never_deployed() {
     let (orig, forged) = (line("orig="), line("forged="));
     assert_ne!(orig, forged, "the probe forged the file");
     let t = task(&env, "R9-F");
-    eprintln!("R9-F: {:?}", t.state);
     if t.state == St::Escalated {
         // Git saw it: no environment gate started
         assert!(err.contains("verify_mutated_tree"), "{err}");
