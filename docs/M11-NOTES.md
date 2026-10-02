@@ -745,6 +745,24 @@ An independent review of `29226ec` found two must-fix bypasses of X6, fixed here
   (review M7); an empty folder or an alternate data stream in the Low checkout is seen by no check — harmless after
   R9, since an environment gate reads the export, not the checkout.
 
+#### Review of R10–R12 (independent subagent) — folded into the review-fix commit
+
+The second review of this round found **no must-fix** (the R9 export hardening was confirmed sound). Fixed:
+- **R10 `cmd` chained bare name:** `command_line_entries` applied the `cmd` bare-name rule only to the first command
+  token, so `cmd /c "setup.exe && run.cmd"` left `run.cmd` (a bare `.cmd` `cmd` runs from the CWD) neither refused
+  nor protected. Now it checks the head of **every** `&&` / `&` / `|` / `;` / parenthesised segment. Test case added
+  to `entry_scripts_refusals_and_protection`; README M18 wording widened.
+- **R12 test gaps:** `an_environment_gate_that_cannot_run_escalates` now asserts the `environment_gate_unavailable`
+  hint names no machine-config file (item 3). Item 2's runtime guard stays unit-tested (`gate_residual_var`): a
+  config with `%VAR%` is a load error today, so the end-to-end path is not forgeable without an older binary.
+- **R11 nice-to-haves:** `reason_class` is now cleared on `Fail` / `Cancel` too (the field's doc comment holds for
+  every exit from `Escalated`); a negative-path assertion was added — a plain resume while the skill is still gone
+  re-escalates with no implementer turn and no fix cycle.
+- **Recorded, not changed:** the class is written in a second transaction right after the escalation
+  (`record_reason_class`); a crash in that narrow window would leave `reason_class = None` and a later plain resume a
+  no-op (the owner would use `--note`). Folding it into the escalation transition would need the class threaded
+  through the pure state machine; left as is.
+
 ## Progress
 
 Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.

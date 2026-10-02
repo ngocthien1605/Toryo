@@ -761,6 +761,30 @@ fn plain_resume_after_a_missing_skill_costs_no_fix_cycle() {
     assert_eq!(t.state, St::Escalated, "{err}");
     assert_eq!(t.machine.reason_class(), Some("skill_unavailable"));
     assert_eq!(t.fix_cycle, 0);
+    // R10–R12 review: a plain resume while the skill is STILL gone re-checks the precondition
+    // and re-escalates — no implementer turn, no fix cycle
+    let (_, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "SK-RS",
+            "--yes",
+            "--fake-agents",
+            &turns("still.json"),
+        ],
+        &[],
+    );
+    let t = task(&env, "SK-RS");
+    assert_eq!(t.state, St::Escalated, "still gone: {err}");
+    assert_eq!(t.fix_cycle, 0);
+    assert_eq!(t.machine.reason_class(), Some("skill_unavailable"));
+    assert!(
+        calls(&env, "SK-RS").iter().all(|c| !c["key"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("implementer")),
+        "no implementer turn"
+    );
     // the skill is back; a PLAIN resume (no --note)
     std::fs::rename(&aside, &dir).unwrap();
     let (code, err) = toryo(

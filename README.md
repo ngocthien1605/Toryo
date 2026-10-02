@@ -291,8 +291,8 @@ from the repository checkout (`project.root`), never from a task worktree, and e
     protected before it exists, and `task create` refuses a configuration whose base commit lacks it, because the
     implementer could write it: the program when it is a repository path; `-File x` of PowerShell, else every literal
     path with a separator and a script extension in a `-Command` line (`& { ./x.ps1 }`), else the first positional
-    `.ps1`; the same in a `cmd /c` line (`call scripts\x.cmd`), where a bare first name with a script extension counts
-    too unless a program of that name is on PATH; in a shell's `-c` line (also `-ec`, `-euxc`); the first argument of
+    `.ps1`; the same in a `cmd /c` line (`call scripts\x.cmd`), where a bare command name (the head of any `&&` / `&`
+    / `|` / `;` segment) with a script extension counts too unless a program of that name is on PATH; in a shell's `-c` line (also `-ec`, `-euxc`); the first argument of
     `sh`/`bash`/`python`/`node`/`ruby`/`perl` that is not a flag or a flag's value (`-o`, `-W`, `-r`, `-I`,
     `--env-file`, `--rcfile`, …). A missing entry script is refused only when it has a separator or a script extension
     (`sh check` is protected, not refused) and the repository does not ignore it (`node dist/cli.js` with `dist/`

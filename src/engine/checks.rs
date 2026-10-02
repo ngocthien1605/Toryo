@@ -798,29 +798,42 @@ fn command_tokens(s: &str) -> Vec<String> {
 /// The entry scripts of a command line (X7): every token that is a literal path with a
 /// separator and a script extension (`& { ./x.ps1 }`, `call scripts\x.cmd`, `./ci/x.sh
 /// --fast`). PowerShell never runs a bare name from the working directory, `cmd` does: for
-/// `cmd` the first command (after an optional `call`) without a separator is an entry too when
-/// it has a script extension and no program of that name is on PATH.
+/// `cmd` the head command of **each** segment of a `&&`/`&`/`|`/`;`/parenthesised chain (after
+/// an optional `call`), without a separator, is an entry too when it has a script extension and
+/// no program of that name is on PATH (R10 review: not only the first segment).
 fn command_line_entries(s: &str, cmd: bool, on_path: &dyn Fn(&str) -> bool) -> Vec<Entry> {
-    let toks = command_tokens(s);
     let mut out: Vec<Entry> = Vec::new();
     if cmd {
-        if let Some(f) = toks.iter().find(|t| !t.eq_ignore_ascii_case("call")) {
-            if !f.contains(['/', '\\']) && is_literal(f) && has_script_ext(f) && !on_path(f) {
-                out.push(Entry {
-                    path: f.clone(),
-                    refusable: true,
-                });
+        for seg in s.split(|c| "&|;()".contains(c)) {
+            let mut words = seg.split_whitespace().map(|w| w.trim_matches(['\'', '"']));
+            let mut head = words.next();
+            if head.is_some_and(|h| h.eq_ignore_ascii_case("call")) {
+                head = words.next();
+            }
+            if let Some(f) = head.filter(|f| {
+                !f.is_empty()
+                    && !f.contains(['/', '\\'])
+                    && is_literal(f)
+                    && has_script_ext(f)
+                    && !on_path(f)
+            }) {
+                if !out.iter().any(|e| e.path == f) {
+                    out.push(Entry {
+                        path: f.to_string(),
+                        refusable: true,
+                    });
+                }
             }
         }
     }
-    for t in &toks {
-        if is_literal(t)
+    for t in command_tokens(s) {
+        if is_literal(&t)
             && t.contains(['/', '\\'])
-            && has_script_ext(t)
-            && !out.iter().any(|e| &e.path == t)
+            && has_script_ext(&t)
+            && !out.iter().any(|e| e.path == t)
         {
             out.push(Entry {
-                path: t.clone(),
+                path: t,
                 refusable: true,
             });
         }
@@ -1801,6 +1814,13 @@ mod tests {
                 &["build/app.exe"],
             ),
             ("cmd", &["/c", "x.cmd arg"], &[("x.cmd", true)], &[]),
+            // R10 review: a bare entry in a later `&&` segment, not only the first
+            (
+                "cmd",
+                &["/c", "setup.exe && run.cmd"],
+                &[("setup.exe", true), ("run.cmd", true)],
+                &[],
+            ),
             (
                 "cmd",
                 &["/c", r"call scripts\x.cmd"],

@@ -762,6 +762,12 @@ fn an_environment_gate_that_cannot_run_escalates() {
             err.contains("environment_gate_unavailable: environment gate `dbsync`"),
             "{id}: {err}"
         );
+        // M11-R12 (item 3): the hint names no machine-config file (a frozen config has no path)
+        assert!(
+            !err.contains("toryo.local.yaml")
+                && err.contains("fix the machine config, then `toryo resume"),
+            "{id}: {err}"
+        );
         let ev = events(&env, id);
         assert!(
             ev.iter()

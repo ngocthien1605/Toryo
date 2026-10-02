@@ -473,10 +473,12 @@ impl Machine {
             (_, E::Fail { error }) => {
                 m.gate = None;
                 m.reason = Some(error.clone());
+                m.reason_class = None;
                 m.state = S::Failed;
             }
             (_, E::Cancel) => {
                 m.gate = None;
+                m.reason_class = None;
                 m.state = S::Cancelled;
             }
             (s, E::Escalate { reason }) if s != S::Escalated => m.escalate(s, reason.clone()),
