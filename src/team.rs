@@ -777,11 +777,24 @@ fn named_path(a: &str) -> Option<&str> {
 
 /// The lexical form the reach check compares (group B review): `/` separators, no `\\?\`
 /// prefix, `.` dropped, `..` resolved, trailing dots and spaces of a segment dropped (Windows
-/// ignores them), lower case. An existing path is canonicalised first (junctions, 8.3 names).
+/// ignores them), lower case. The longest existing ancestor is canonicalised first (junctions,
+/// 8.3 names) and the rest appended: a path that does not exist yet is compared in the same
+/// spelling as an existing root (M11-ci: `C:\Users\RUNNER~1\…` against `C:\Users\runneradmin\…`).
 fn lexical(p: &str) -> String {
-    let canon = std::fs::canonicalize(p)
+    let path = Path::new(p);
+    let canon = path
+        .ancestors()
+        .find_map(|a| {
+            let c = std::fs::canonicalize(a).ok()?;
+            let rest = path.strip_prefix(a).ok()?;
+            Some(if rest.as_os_str().is_empty() {
+                c
+            } else {
+                c.join(rest)
+            })
+        })
         .map(|c| c.display().to_string())
-        .unwrap_or_else(|_| p.to_string());
+        .unwrap_or_else(|| p.to_string());
     let s = canon.replace('\\', "/");
     let s = s
         .strip_prefix("//?/")
@@ -1990,6 +2003,58 @@ mod tests {
         }
         assert!(!e.contains("`/c`"), "a switch is not a path: {e}");
         assert!(!e.contains("gates/ok.ps1"), "{e}");
+    }
+
+    /// M11-ci: a path that does not exist yet is inside a root reached through another
+    /// spelling of the same folder — a junction or symlink, or (Windows) an 8.3 short name as
+    /// in a runner's `C:\Users\RUNNER~1\AppData\Local\Temp`. Only the root existed, so only the
+    /// root was canonicalised, and the check failed open.
+    #[test]
+    fn a_path_spelled_another_way_is_still_inside() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("a-long-folder-name");
+        std::fs::create_dir_all(real.join("repo")).unwrap();
+        let alias = d.path().join("alias");
+        #[cfg(windows)]
+        {
+            let ok = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(&alias)
+                .arg(&real)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "mklink /J {}", alias.display());
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let s = |p: PathBuf| p.display().to_string();
+        let repo = real.join("repo");
+        let via_alias = alias.join("repo");
+        for (p, root) in [
+            (s(via_alias.join("tools/ps.exe")), repo.clone()),
+            (s(repo.join("tools/ps.exe")), via_alias.clone()),
+            (s(via_alias.join("missing/deeper/x.ps1")), repo.clone()),
+        ] {
+            assert!(inside(&p, &root), "{p} in {}", root.display());
+        }
+        assert!(!inside(&s(alias.join("other/x.ps1")), &repo));
+        #[cfg(windows)]
+        {
+            // the 8.3 name of the long folder, where the volume keeps them
+            use std::os::windows::process::CommandExt;
+            let out = std::process::Command::new("cmd")
+                .raw_arg(format!(
+                    "/c for %I in (\"{}\") do @echo %~sI",
+                    real.display()
+                ))
+                .output()
+                .unwrap();
+            let short = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let p = format!("{short}\\repo\\tools\\ps.exe");
+            assert!(inside(&p, &repo), "{p} in {}", repo.display());
+        }
     }
 
     /// M11-R3 AC-2/AC-3 (X3): `%VAR%` in an environment gate's program and args is expanded
