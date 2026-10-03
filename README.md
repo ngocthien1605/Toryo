@@ -356,10 +356,15 @@ from the repository checkout (`project.root`), never from a task worktree, and e
     **never reads the checkout the check gates used** (M11 review X6): once it holds its lock, Toryo exports the
     checkpoint commit afresh from the repository's object store into `<verify_root>\<task>\deploy`, a folder no agent
     code can write — that export is its `TORYO_VERIFY_CHECKOUT` (no `.git`; its tree id is in `VERIFY_RESULT.json`,
-    `source: "export"`). (M11-R13) Before the gate starts — and again after it — **every exported file is hashed**
-    against the commit's tree (no size-and-timestamp shortcut): a file whose content is not the commit's stops the
-    gate (`environment_gate_unavailable` before it, `verify_mutated_tree` after it — a gate script never writes
-    there). With the `low_integrity` boundary Toryo also proves, before each verify run, that the task's folder
+    `source: "export"`). (M11-R13, R20) The check is **byte-exact**: right after the export Toryo walks the folder
+    (no link followed) and records every entry — path, kind, size, SHA-256. Before the gate starts, the folder must
+    hold exactly the entries of the commit's tree, and every file the bytes Git writes for its blob (`git cat-file
+    --filters`: `.gitattributes`, `core.autocrlf`, filter drivers) — compared as bytes, never through Git's own view
+    after its line-ending conversion, so a repository with `*.xml text eol=crlf` over CRLF blobs is fine; a
+    difference stops the gate (`environment_gate_unavailable`, naming the first files). After the gate, a new walk
+    must match the record: a changed, added or removed file or folder (an empty one, a `.git` entry too) is
+    `verify_mutated_tree` — a gate script never writes there (this guards your own script: a contract, not a
+    boundary). With the `low_integrity` boundary Toryo also proves, before each verify run, that the task's folder
     under `verify_root` is **not writable at Low integrity** (a Low process tries to create a folder there and must
     fail): a `verify_root` inside a Low-writable tree such as `AppData\LocalLow` would hand the export and the
     gate's working folder to the code under test — `verify_boundary_unavailable`, and `toryo doctor` / `task

@@ -1262,7 +1262,7 @@ environment's permission layer, so nothing is pushed yet.
 
 - [x] R18 — a gate entry that is a folder is admitted again
 - [x] R19 — protect what exists at base wherever the reader cannot go; `popd`; `-WorkingDirectory`
-- [ ] R20 — the export check is byte-exact
+- [x] R20 — the export check is byte-exact
 - [ ] R21 — Low fixes
 - [ ] Review of R18–R20 (independent subagent)
 - [ ] Finish — notes, README, HUONG-DAN
@@ -1346,6 +1346,51 @@ environment's permission layer, so nothing is pushed yet.
   end to end `m11_gates::a_script_behind_a_wrapper_is_protected_from_the_implementer` (fails on the old code).
 - README: the M18 paragraph (here-document, `-WorkingDirectory`, X13 in one sentence). Why round 3 lost the
   protection: `21e83c9` removed the token scan of arguments that hold a command line (it was not in its commit body).
+
+#### R20 — the export check is byte-exact (X15)
+
+- **Why round 3 blocked gates.** `export_changed` loaded the tree into a fresh index and asked `diff-files`, which
+  compares each file *after Git's clean conversion* with its blob. A blob that still holds CRLF under an explicit
+  `text` / `eol=crlf` attribute is converted to LF by the clean filter (the "has CR in the index, do not convert"
+  rule exists only for `text=auto`), so every such file was "modified" on a pristine export: every environment gate
+  blocked, "a gate script must never write there". Reproduced here as a unit test with git 2.55 (it fails on the
+  round-3 code with exactly that error). Also missed after a gate: an empty folder, a file in a gitlink folder, a
+  `.git` entry.
+- **Manifest (Do 1).** `verify::manifest(dir)` walks the folder without following a link and records every entry:
+  file (size, SHA-256 of the bytes, hashed in 64 KiB pieces), folder (empty ones too), link (its target text); a
+  `.git` entry is an entry like any other. `deploy_source` takes it right after the export and keeps it in
+  `Export.manifest` (memory; nothing is written to a Low folder).
+- **Before the gate (Do 2).** `bytes_are_the_commits`: the manifest has exactly the entries of the commit's tree
+  (`ls-tree -r -z --full-tree`: files and the parent folders of every entry; a submodule is an empty folder that may
+  be missing; nothing else — no extra file, folder, link or `.git`), and for every blob the SHA-256 of **the bytes Git
+  must write** — `git cat-file --batch --filters`, fed `<blob> <path>`, same hardened git prefix, scratch index,
+  `GIT_NO_REPLACE_OBJECTS` and `core.symlinks=false` as the export; a link entry (mode 120000, exported as a plain
+  file holding its target) is compared with its stored bytes — equals the manifest's. A mismatch → `deploy_source`
+  fails, the gate does not start (`environment_gate_unavailable`), the message names the first files and does not
+  blame a gate script. The answers are streamed and hashed as they are read (a blob is never held).
+- **Deviation (needed, measured): framing by the size on disk.** With `--filters` the header of each answer names
+  the size of the *stored* blob, not of the converted bytes that follow (an LF blob under `core.autocrlf=true`
+  prints 10 and then 11 bytes), so the answers cannot be framed by it. They are framed by the size the manifest
+  recorded for the file; when Git's bytes have another length the frame does not close (no line break, no header of
+  the next object) and that file is reported (`lost`) — a wrong length is a mismatch; the files after it are not
+  compared (said in the message). The alternative, one `git` process per file, costs minutes on a Windows
+  checkout with `core.autocrlf=true`.
+- **After the gate (Do 3, 4).** `export_changed(&Export) -> Option<String>` walks again and compares with the
+  manifest — changed, added, removed files **and folders** (empty ones, `.git`) → `verify_mutated_tree`, listing
+  `changed:` / `added:` / `removed:` names. No Git, no index (`deploy.check.index` is gone), no timestamps; an
+  unreadable export after the gate is reported as a change. Its signature lost `g` and `co` (callers in
+  `runner.rs` and the unit tests updated: `export_changed(&g, &co, &e).unwrap()` → `export_changed(&e)`; the
+  assertions are the same).
+- **Tests.** `verify::tests::crlf_blobs_under_eol_crlf_export_clean` (AC-1; fails on the round-3 code),
+  `::every_change_to_a_finished_export_is_reported` (AC-2: a same-length change, an added file, a removed file, an
+  empty folder, one inside a folder, a `.git` file), `::the_bytes_are_the_commits_before_the_gate` (same-length,
+  shorter, longer, extra, `.git`, empty folder, missing), end to end
+  `m11_env_gates::an_environment_gate_runs_when_the_blobs_keep_crlf_under_eol_crlf` (the whole chain over such a
+  repository; whether the checkpoint keeps the CRLF blob or Git renormalises it at the first `add` depends on
+  racy-git timing in a repository this small, so the unit test is the one that pins the failure). AC-3: the R13
+  tests (`a_same_length_change_with_restored_timestamps_is_seen`, `the_content_check_follows_the_line_ending_settings`,
+  the forgery test, the `tracked` run) pass unchanged.
+- README / HUONG-DAN §5.9: the byte-exact check.
 
 ## Progress
 

@@ -755,9 +755,14 @@ trượt đầu tiên; exit code quyết định; mọi gate có `TORYO_TASK`, `
   nào chạy, `verify_mutated_tree`), và **không bao giờ đọc bản checkout mà check gate đã dùng** (X6): khi đã giữ lock,
   Toryo xuất lại commit checkpoint từ kho object của repo vào `<verify_root>\<task>\deploy`, thư mục mà code agent không
   ghi được — bản xuất đó là `TORYO_VERIFY_CHECKOUT` của gate (không có `.git`; tree id ghi trong `VERIFY_RESULT.json`).
-  (M11-R13) Trước khi gate chạy — và một lần nữa sau khi chạy — **mọi file đã xuất được băm lại** và so với tree của
-  commit (không tin kích thước hay thời gian sửa): file có nội dung khác commit → gate không chạy
-  (`environment_gate_unavailable`), hoặc `verify_mutated_tree` nếu chính script gate ghi vào đó. Với boundary
+  (M11-R13, R20) Việc kiểm tra là **từng byte**: ngay sau khi xuất, Toryo duyệt thư mục (không đi theo link) và ghi lại
+  mọi mục — đường dẫn, loại, kích thước, SHA-256. Trước khi gate chạy, thư mục phải có đúng các mục của tree commit,
+  và mỗi file đúng các byte mà Git sẽ ghi cho blob của nó (`git cat-file --filters`: `.gitattributes`,
+  `core.autocrlf`, filter driver) — so từng byte, không qua cách Git nhìn sau khi đổi kết thúc dòng, nên repo có
+  `*.xml text eol=crlf` với blob CRLF vẫn ổn; khác → gate không chạy (`environment_gate_unavailable`, nêu tên các file
+  đầu tiên). Sau khi gate chạy, một lần duyệt mới phải khớp bản ghi: file hoặc thư mục bị đổi, thêm, xoá (kể cả thư
+  mục rỗng, mục `.git`) → `verify_mutated_tree` — script gate không bao giờ được ghi vào đó (việc này canh script của
+  chính bạn: một cam kết, không phải ranh giới). Với boundary
   `low_integrity`, trước mỗi lần verify Toryo còn kiểm tra thư mục của task dưới `verify_root` **không ghi được ở mức
   Low integrity** (cho một tiến trình Low thử tạo thư mục ở đó — phải thất bại): `verify_root` nằm trong cây thư mục
   Low ghi được (như `AppData\LocalLow`) sẽ trao bản xuất và thư mục làm việc của gate cho code đang được kiểm tra →

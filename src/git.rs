@@ -168,6 +168,28 @@ impl GitCmd {
             .with_context(|| format!("running git {}", args.join(" ")))
     }
 
+    /// Start `git` with pipes on stdin, stdout and stderr, for a caller that drives a
+    /// long-running command itself (`cat-file --batch`, M11-R20); extra environment as in
+    /// [`GitCmd::output_env`].
+    pub fn spawn_piped(
+        &self,
+        loc: &Loc,
+        read_only: bool,
+        args: &[&str],
+        env: &[(&str, &Path)],
+    ) -> Result<std::process::Child> {
+        let mut cmd = self.command(loc, read_only);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        cmd.args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.spawn()
+            .with_context(|| format!("running git {}", args.join(" ")))
+    }
+
     /// Run, require exit 0, return stdout bytes.
     pub fn run(&self, loc: &Loc, read_only: bool, args: &[&str]) -> Result<Vec<u8>> {
         let out = self.output(loc, read_only, args)?;

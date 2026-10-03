@@ -589,12 +589,14 @@ pub fn checkout_extra(g: &GitCmd, co: &Checkout) -> Result<Vec<String>> {
 
 /// M11-R9: a fresh export of a checkpoint commit — what the environment gates read as
 /// `TORYO_VERIFY_CHECKOUT`. `dir` has no `.git` entry; `index` is the scratch index it was
-/// checked out from; `tree` the tree id it holds.
+/// checked out from; `tree` the tree id it holds; `manifest` every entry of `dir` as it was
+/// when the export was proven (M11-R20) — what the after-gate check compares with.
 #[derive(Debug, Clone)]
 pub struct Export {
     pub dir: PathBuf,
     pub index: PathBuf,
     pub tree: String,
+    pub manifest: Manifest,
 }
 
 /// M11-R9 (X6): export commit `head` into `<base>/deploy` from the repository's **object
@@ -606,9 +608,10 @@ pub struct Export {
 /// repository's own config, so the bytes are those of a clean checkout. Neither `deploy` nor
 /// the index is Low-labelled, and the task's folder is proven not writable at Low integrity
 /// (`prepare`, M11-R13). The export is accepted only when `write-tree` of the index equals
-/// `<head>^{tree}` and every file on disk **hashes** to its entry ([`export_changed`]): what is
-/// proven is "each file's content has the object id the commit names", by reading the file —
-/// not by trusting the object store's bytes or Git's stat data.
+/// `<head>^{tree}`, a manifest of the folder (every entry, files with the SHA-256 of their bytes)
+/// has exactly the commit's entries, and each file's bytes are the bytes Git must write for the
+/// commit's blob (`git cat-file --filters`, M11-R20, X15) — compared as bytes, not through Git's
+/// view after its clean conversion; no stat data, no timestamp.
 pub fn deploy_source(g: &GitCmd, co: &Checkout, head: &str) -> Result<Export> {
     let dir = co.base.join("deploy");
     let index = co.base.join("deploy.index");
@@ -655,17 +658,26 @@ pub fn deploy_source(g: &GitCmd, co: &Checkout, head: &str) -> Result<Export> {
             short(head)
         );
     }
-    let e = Export { dir, index, tree };
-    // (R9 review, R13) before any gate reads them, every file on disk must hash to the
-    // commit's entry, and the export holds no link
-    if let Some(why) = export_changed(g, co, &e)? {
-        bail!("the export of {} is not the commit: {why}", short(head));
-    }
-    if let Some(l) = first_link(&e.dir)? {
+    if let Some(l) = first_link(&dir)? {
         bail!(
             "the export of {} holds a link ({}) — links are exported as files",
             short(head),
             l.display()
+        );
+    }
+    // (R9 review, R13, R20) before any gate reads them: the folder holds the commit's entries
+    // and no others, and each file holds the bytes Git must write for it
+    let manifest = manifest(&dir).context("reading the export")?;
+    let e = Export {
+        dir,
+        index,
+        tree,
+        manifest,
+    };
+    if let Some(why) = bytes_are_the_commits(g, co, &e, &e.manifest)? {
+        bail!(
+            "the export of {} does not hold the bytes Git writes for the commit: {why}",
+            short(head)
         );
     }
     Ok(e)
@@ -688,81 +700,360 @@ fn first_link(dir: &Path) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// M11-R9 / R13 (E3 AC-8 against the export): `Some(reason)` when the export does not hold
-/// exactly the commit — a file whose **content** differs, a file missing or a file added. It
-/// runs before the gate (in [`deploy_source`]) and after it. No stat shortcut: every file is
-/// hashed against a throw-away index read from the export's tree, which holds no size or
-/// timestamp, so Git has to read each file (the index of the export itself is never refreshed
-/// either). A touched timestamp is no change. After the gate this guards the owner's own script
-/// — the gate runs with the owner's rights, so it is a contract, not a boundary.
-pub fn export_changed(g: &GitCmd, co: &Checkout, e: &Export) -> Result<Option<String>> {
+/// M11-R20 (X15): one entry of an export as found on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Item {
+    /// A file: its size and the SHA-256 of its bytes.
+    File { size: u64, sha256: String },
+    /// A folder, an empty one too.
+    Dir,
+    /// A symbolic link or junction — never followed: the text of its target.
+    Link(String),
+}
+
+/// Every entry under an export folder: its path (relative, `/`) and what it is.
+pub type Manifest = BTreeMap<String, Item>;
+
+/// SHA-256 of a file's bytes, read in pieces; with its size.
+fn hash_file(p: &Path) -> Result<(u64, String)> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let ctx = || format!("reading {}", p.display());
+    let mut f = std::fs::File::open(p).with_context(ctx)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut size = 0u64;
+    loop {
+        let n = f.read(&mut buf).with_context(ctx)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+        size += n as u64;
+    }
+    Ok((size, hex::encode(h.finalize())))
+}
+
+/// M11-R20 (X15): walk `dir` — no link is followed — and record **every** entry: files with the
+/// SHA-256 of their bytes, folders (empty ones too), links, and a `.git` entry like any other.
+/// No timestamp, no Git index, no line-ending conversion is involved: bytes.
+pub fn manifest(dir: &Path) -> Result<Manifest> {
+    fn walk(dir: &Path, rel: &str, out: &mut Manifest) -> Result<()> {
+        for e in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+            let e = e?;
+            let name = e.file_name().to_string_lossy().to_string();
+            let r = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            let ft = e
+                .file_type()
+                .with_context(|| format!("reading {}", e.path().display()))?;
+            if ft.is_symlink() {
+                let target = std::fs::read_link(e.path())
+                    .map(|t| t.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                out.insert(r, Item::Link(target));
+            } else if ft.is_dir() {
+                out.insert(r.clone(), Item::Dir);
+                walk(&e.path(), &r, out)?;
+            } else {
+                let (size, sha256) = hash_file(&e.path())?;
+                out.insert(r, Item::File { size, sha256 });
+            }
+        }
+        Ok(())
+    }
+    let mut out = Manifest::new();
+    walk(dir, "", &mut out)?;
+    Ok(out)
+}
+
+/// The first few names of `v`, and how many more there are.
+fn some(v: &[String]) -> String {
+    const SHOWN: usize = 8;
+    let mut s = v.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+    if v.len() > SHOWN {
+        s.push_str(&format!(", … (+{} more)", v.len() - SHOWN));
+    }
+    s
+}
+
+/// What [`batch_hashes`] read: the SHA-256 of each answer it could frame, and the first item
+/// whose answer could not be framed — its bytes are not the file's — after which nothing is known.
+struct Hashed {
+    sums: Vec<String>,
+    lost: Option<usize>,
+}
+
+/// The SHA-256 of what `git cat-file --batch` prints for each of `items` — `(object, path, size
+/// of the file on disk)`; with `filters` the bytes Git writes to a work tree for that path
+/// (`--filters`: attributes, `core.autocrlf`, filter drivers), else the stored bytes. Streamed:
+/// a blob is hashed as it is read, never held.
+///
+/// With `--filters` the header names the size of the *stored* blob, not of what follows, so the
+/// answers are framed by the size of the file on disk: when the bytes Git writes have another
+/// length the frame does not close (no line break, no header of the next object) and that file
+/// is the one reported as `lost` — a wrong length is a mismatch.
+fn batch_hashes(
+    g: &GitCmd,
+    loc: &Loc,
+    scratch: &[(&str, &Path)],
+    filters: bool,
+    items: &[(&str, &str, u64)],
+) -> Result<Hashed> {
+    use sha2::{Digest, Sha256};
+    use std::io::{BufRead, Read, Write};
+    let mut args = vec!["-c", "core.symlinks=false", "cat-file", "--batch"];
+    if filters {
+        args.push("--filters");
+    }
+    let mut child = g.spawn_piped(loc, true, &args, scratch)?;
+    let (Some(mut stdin), Some(mut stderr), Some(stdout)) =
+        (child.stdin.take(), child.stderr.take(), child.stdout.take())
+    else {
+        bail!("git cat-file has no pipes");
+    };
+    // the requests go out from a thread: git answers while it is still being asked
+    let lines: Vec<String> = items
+        .iter()
+        .map(|(o, p, _)| {
+            if filters {
+                format!("{o} {p}\n")
+            } else {
+                format!("{o}\n")
+            }
+        })
+        .collect();
+    let writer = std::thread::spawn(move || {
+        for l in lines {
+            if stdin.write_all(l.as_bytes()).is_err() {
+                break;
+            }
+        }
+    });
+    let errors = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s);
+        s
+    });
+    let mut out = std::io::BufReader::new(stdout);
+    let mut read = Hashed {
+        sums: Vec::with_capacity(items.len()),
+        lost: None,
+    };
+    let mut buf = vec![0u8; 64 * 1024];
+    'items: for (n, (oid, _, size)) in items.iter().enumerate() {
+        // the header of this answer: `<object> blob <size>`
+        let mut line = String::new();
+        let got = out.read_line(&mut line).unwrap_or(0);
+        let mut parts = line.trim_end().split(' ');
+        let framed = got > 0
+            && matches!(
+                (parts.next(), parts.next(), parts.next(), parts.next()),
+                (Some(o), Some("blob"), Some(s), None)
+                    if o == *oid && !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+            );
+        if !framed {
+            // the answer before it was longer or shorter than the file: it is the one lost
+            read.lost = Some(n.saturating_sub(1));
+            read.sums.truncate(n.saturating_sub(1));
+            break;
+        }
+        let mut h = Sha256::new();
+        let mut left = *size;
+        while left > 0 {
+            let want = buf.len().min(left as usize);
+            match out.read(&mut buf[..want]) {
+                Ok(k) if k > 0 => {
+                    h.update(&buf[..k]);
+                    left -= k as u64;
+                }
+                _ => {
+                    read.lost = Some(n);
+                    break 'items;
+                }
+            }
+        }
+        let mut nl = [0u8; 1];
+        if out.read_exact(&mut nl).is_err() || nl[0] != b'\n' {
+            read.lost = Some(n);
+            break;
+        }
+        read.sums.push(hex::encode(h.finalize()));
+    }
+    drop(out); // git stops writing if it has not finished
+    let _ = writer.join();
+    let stderr = errors.join().unwrap_or_default();
+    let status = child.wait()?;
+    if read.lost.is_none() && !status.success() {
+        bail!("git cat-file failed ({status}): {}", stderr.trim());
+    }
+    Ok(read)
+}
+
+/// M11-R20 (X15), **before the gate**: "the bytes are the commit's". The export folder holds
+/// exactly the entries of the commit's tree — no other file, folder, link or `.git` entry — and
+/// every file hashes to the bytes **Git must write** for its blob: `git cat-file --filters`, the
+/// settings of the export (attributes, `core.autocrlf`, filter drivers), compared as bytes. Git's
+/// own view after its clean conversion is no part of it: a repository whose `.gitattributes` says
+/// `text eol=crlf` over blobs that still hold CRLF is clean. `None` when it holds; else the first
+/// files that do not.
+fn bytes_are_the_commits(
+    g: &GitCmd,
+    co: &Checkout,
+    e: &Export,
+    found: &Manifest,
+) -> Result<Option<String>> {
     let loc = Loc::Explicit {
         git_dir: co.admin.clone(),
         work_tree: e.dir.clone(),
     };
-    let check = co.base.join("deploy.check.index");
-    let clear = || -> Result<()> {
-        for f in [check.clone(), co.base.join("deploy.check.index.lock")] {
-            if std::fs::symlink_metadata(&f).is_ok() {
-                remove_link(&f).with_context(|| format!("removing {}", f.display()))?;
-            }
-        }
-        Ok(())
-    };
-    clear()?;
     // the settings of the export (`deploy_source`)
     let scratch = [
-        ("GIT_INDEX_FILE", check.as_path()),
+        ("GIT_INDEX_FILE", e.index.as_path()),
         ("GIT_NO_REPLACE_OBJECTS", Path::new("1")),
     ];
-    let c = ["-c", "core.symlinks=false"];
-    let git = |read_only: bool, args: &[&str]| -> Result<Vec<u8>> {
-        let mut full = c.to_vec();
-        full.extend_from_slice(args);
-        let o = g.output_env(&loc, read_only, &full, &scratch)?;
-        if !o.status.success() {
-            bail!(
-                "git {} failed ({}): {}",
-                args.join(" "),
-                o.status,
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-        }
-        Ok(o.stdout)
-    };
-    let mut files = Vec::new();
-    let found = (|| -> Result<()> {
-        git(false, &["read-tree", &e.tree])?;
-        // every entry is without stat data, so this hashes every file; an entry whose content
-        // matches gets its stat data, one that does not stays "changed" (the exit status says
-        // only that there is one)
-        let _ = g.output_env(
-            &loc,
-            false,
-            &[c[0], c[1], "update-index", "-q", "--refresh"],
-            &scratch,
-        )?;
-        for args in [
-            &["diff-files", "--name-only", "-z"][..],
-            &["ls-files", "--others", "-z"][..],
-        ] {
-            files.extend(
-                git(true, args)?
-                    .split(|b| *b == 0)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| String::from_utf8_lossy(s).to_string()),
-            );
-        }
-        Ok(())
-    })();
-    let _ = clear();
-    found?;
-    if files.is_empty() {
-        return Ok(None);
+    let o = g.output_env(
+        &loc,
+        true,
+        &[
+            "-c",
+            "core.symlinks=false",
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            &e.tree,
+        ],
+        &scratch,
+    )?;
+    if !o.status.success() {
+        bail!(
+            "git ls-tree failed ({}): {}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr).trim()
+        );
     }
-    Ok(Some(format!(
-        "{MUTATED}: the export of the checkpoint an environment gate deploys from (TORYO_VERIFY_CHECKOUT) does not hold the commit's files: {files:?} — a gate script must never write there"
-    )))
+    // what the commit holds: files (object id, link?) and folders — the parents of every entry
+    // and a submodule's (checked out as an empty folder, which may be missing)
+    let mut files: BTreeMap<String, (String, bool)> = BTreeMap::new();
+    let mut dirs: std::collections::BTreeSet<String> = Default::default();
+    for ent in o.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+        let ent = String::from_utf8_lossy(ent).to_string();
+        let Some((meta, path)) = ent.split_once('\t') else {
+            bail!("git ls-tree printed `{ent}`");
+        };
+        let m: Vec<&str> = meta.split(' ').collect();
+        let [mode, kind, oid] = m[..] else {
+            bail!("git ls-tree printed `{ent}`");
+        };
+        if kind == "commit" {
+            dirs.insert(path.to_string());
+        } else {
+            files.insert(path.to_string(), (oid.to_string(), mode == "120000"));
+        }
+        let mut p = path;
+        while let Some((parent, _)) = p.rsplit_once('/') {
+            dirs.insert(parent.to_string());
+            p = parent;
+        }
+    }
+    let mut problems: Vec<String> = Vec::new();
+    for (p, item) in found {
+        let ok = match item {
+            Item::File { .. } => files.contains_key(p),
+            Item::Dir => dirs.contains(p),
+            Item::Link(_) => false,
+        };
+        if !ok {
+            problems.push(format!("{p} (the commit has no such entry)"));
+        }
+    }
+    type Asked<'a> = Vec<(&'a str, &'a str, u64)>;
+    let (mut plain, mut stored): (Asked, Asked) = (Vec::new(), Vec::new());
+    for (p, (oid, link)) in &files {
+        let Some(Item::File { size, .. }) = found.get(p) else {
+            problems.push(format!("{p} (missing)"));
+            continue;
+        };
+        if p.contains(['\n', '\r']) {
+            problems.push(format!(
+                "{p:?} (a name with a line break cannot be checked)"
+            ));
+        } else if *link {
+            // a link is exported as a file holding its target text: the stored bytes
+            stored.push((oid, p, *size));
+        } else {
+            plain.push((oid, p, *size));
+        }
+    }
+    for (filters, items) in [(true, plain), (false, stored)] {
+        if items.is_empty() {
+            continue;
+        }
+        let read = batch_hashes(g, &loc, &scratch, filters, &items)?;
+        for ((_, p, _), sha) in items.iter().zip(&read.sums) {
+            if !matches!(found.get(*p), Some(Item::File { sha256, .. }) if sha256 == sha) {
+                problems.push(format!(
+                    "{p} (not the bytes Git writes for the commit's blob)"
+                ));
+            }
+        }
+        if let Some(n) = read.lost {
+            let (_, p, _) = items[n];
+            problems.push(format!(
+                "{p} (not the bytes Git writes for the commit's blob — its length differs; the files after it were not compared)"
+            ));
+        }
+    }
+    problems.sort();
+    Ok((!problems.is_empty()).then(|| some(&problems)))
+}
+
+/// M11-R20 (X15), **after the gate**: `Some(reason)` when the export is not what it was before
+/// the gate ran — a file whose bytes changed, a file or folder added (an empty one, a `.git`
+/// entry too) or removed. The manifest taken when the export was proven is compared with a new
+/// walk: bytes, no timestamp, no Git. It guards the owner's own script — the gate runs with the
+/// owner's rights, so it is a contract, not a boundary.
+pub fn export_changed(e: &Export) -> Option<String> {
+    let now = match manifest(&e.dir) {
+        Ok(m) => m,
+        Err(err) => {
+            return Some(format!(
+                "{MUTATED}: the export of the checkpoint an environment gate deploys from (TORYO_VERIFY_CHECKOUT) cannot be read after the gate ran: {err:#} — a gate script must never write there"
+            ))
+        }
+    };
+    let (mut changed, mut added, mut removed) = (Vec::new(), Vec::new(), Vec::new());
+    for (p, item) in &now {
+        match e.manifest.get(p) {
+            None => added.push(p.clone()),
+            Some(before) if before != item => changed.push(p.clone()),
+            Some(_) => {}
+        }
+    }
+    for p in e.manifest.keys().filter(|p| !now.contains_key(*p)) {
+        removed.push(p.clone());
+    }
+    if changed.is_empty() && added.is_empty() && removed.is_empty() {
+        return None;
+    }
+    let mut what = Vec::new();
+    for (label, v) in [
+        ("changed", &changed),
+        ("added", &added),
+        ("removed", &removed),
+    ] {
+        if !v.is_empty() {
+            what.push(format!("{label}: {}", some(v)));
+        }
+    }
+    Some(format!(
+        "{MUTATED}: the export of the checkpoint an environment gate deploys from (TORYO_VERIFY_CHECKOUT) is not what it was before the gate ran — {} — a gate script must never write there",
+        what.join("; ")
+    ))
 }
 
 /// M11-R2 (X1): the working directory of an environment gate — `<base>/envgate`, created and
@@ -983,14 +1274,14 @@ mod tests {
             .run_str(&co.loc(), true, &["rev-parse", &format!("{head}^{{tree}}")])
             .unwrap();
         assert_eq!(e.tree, want);
-        assert_eq!(export_changed(&g, &co, &e).unwrap(), None);
+        assert_eq!(export_changed(&e), None);
         // the checkout itself still says what it holds: the forged file is not hidden from
         // `checkout_extra`'s view of added files
         assert_eq!(checkout_extra(&g, &co).unwrap(), ["added.txt"]);
         // a gate that writes into the export: a changed and an added file are seen
         std::fs::write(e.dir.join("app.txt"), "synced\n").unwrap();
         std::fs::write(e.dir.join("new.txt"), "x").unwrap();
-        let why = export_changed(&g, &co, &e).unwrap().expect("changed");
+        let why = export_changed(&e).expect("changed");
         assert!(
             why.starts_with("verify_mutated_tree:")
                 && why.contains("app.txt")
@@ -1000,7 +1291,7 @@ mod tests {
         // the next export starts from scratch
         let e = deploy_source(&g, &co, &head).unwrap();
         assert!(!e.dir.join("new.txt").exists());
-        assert_eq!(export_changed(&g, &co, &e).unwrap(), None);
+        assert_eq!(export_changed(&e), None);
     }
 
     /// R9 review: the export holds only the commit's bytes — a link entry of the commit is a
@@ -1037,7 +1328,7 @@ mod tests {
             "the commit's blob, not its replacement"
         );
         assert_eq!(first_link(&e.dir).unwrap(), None);
-        assert_eq!(export_changed(&g, &co, &e).unwrap(), None);
+        assert_eq!(export_changed(&e), None);
     }
 
     /// M11-R13 AC-1: the export check compares **content**. A file replaced inside a finished
@@ -1072,11 +1363,144 @@ mod tests {
             .unwrap()
             .set_modified(later)
             .unwrap();
-        let why = export_changed(&g, &co, &e).unwrap().expect("seen");
+        let why = export_changed(&e).expect("seen");
         assert!(why.contains("app.txt"), "{why}");
         // and a file whose bytes are the commit's again is clean, whatever its times say
         std::fs::write(&f, "committed\n").unwrap();
-        assert_eq!(export_changed(&g, &co, &e).unwrap(), None);
+        assert_eq!(export_changed(&e), None);
+    }
+
+    /// M11-R20 AC-1 (X15): `.gitattributes` says `text eol=crlf` and the blob still holds CRLF
+    /// (committed with `core.autocrlf=false`, never renormalised). The bytes on disk are the
+    /// blob's; the export is accepted and the after-gate check finds nothing.
+    #[test]
+    fn crlf_blobs_under_eol_crlf_export_clean() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, co, _) = repo_and_checkout(d.path());
+        let repo = d.path().join("repo");
+        std::fs::write(repo.join(".gitattributes"), "*.xml text eol=crlf\n").unwrap();
+        std::fs::write(d.path().join("model.xml"), "<a>\r\n<b/>\r\n</a>\r\n").unwrap();
+        let blob = tgit(
+            &repo,
+            &[
+                "hash-object",
+                "-w",
+                "--no-filters",
+                &d.path().join("model.xml").display().to_string(),
+            ],
+        );
+        tgit(
+            &repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{blob},model.xml"),
+            ],
+        );
+        tgit(&repo, &["add", ".gitattributes"]);
+        tgit(&repo, &["commit", "-q", "-m", "xml"]);
+        let head = tgit(&repo, &["rev-parse", "HEAD"]);
+        let e = deploy_source(&g, &co, &head).unwrap();
+        assert_eq!(
+            std::fs::read(e.dir.join("model.xml")).unwrap(),
+            b"<a>\r\n<b/>\r\n</a>\r\n"
+        );
+        assert_eq!(export_changed(&e), None);
+        // and a blob with LF only is written with CRLF there, and is just as clean
+        std::fs::write(repo.join("lf.xml"), "<a>\n</a>\n").unwrap();
+        tgit(&repo, &["add", "lf.xml"]);
+        tgit(&repo, &["commit", "-q", "-m", "lf"]);
+        let head = tgit(&repo, &["rev-parse", "HEAD"]);
+        let e = deploy_source(&g, &co, &head).unwrap();
+        assert_eq!(
+            std::fs::read(e.dir.join("lf.xml")).unwrap(),
+            b"<a>\r\n</a>\r\n"
+        );
+        assert_eq!(export_changed(&e), None);
+    }
+
+    /// M11-R20 AC-2 (X15): inside a finished export each of these is reported, on every
+    /// platform — a file whose bytes changed (same length, timestamps put back: the other test),
+    /// an added file, a removed file, an empty folder, a `.git` file — and the export is clean
+    /// again once it is put back.
+    #[test]
+    fn every_change_to_a_finished_export_is_reported() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, co, head) = repo_and_checkout(d.path());
+        let e = deploy_source(&g, &co, &head).unwrap();
+        assert_eq!(export_changed(&e), None);
+        let said = |want: &str, name: &str| {
+            let why = export_changed(&e).expect(name);
+            assert!(
+                why.starts_with("verify_mutated_tree:") && why.contains(want),
+                "{name}: {why}"
+            );
+        };
+        let lib = e.dir.join("src").join("lib.txt");
+        std::fs::write(&lib, "LIBRARY\n").unwrap(); // same length
+        said("changed: src/lib.txt", "same-length change");
+        std::fs::write(&lib, "library\n").unwrap();
+        assert_eq!(export_changed(&e), None);
+        std::fs::write(e.dir.join("new.txt"), "x").unwrap();
+        said("added: new.txt", "added file");
+        std::fs::remove_file(e.dir.join("new.txt")).unwrap();
+        std::fs::remove_file(e.dir.join("app.txt")).unwrap();
+        said("removed: app.txt", "removed file");
+        std::fs::write(e.dir.join("app.txt"), "committed\n").unwrap();
+        assert_eq!(export_changed(&e), None);
+        std::fs::create_dir(e.dir.join("empty")).unwrap();
+        said("added: empty", "empty folder");
+        std::fs::remove_dir(e.dir.join("empty")).unwrap();
+        std::fs::create_dir_all(e.dir.join("src").join("deeper")).unwrap();
+        said("added: src/deeper", "empty folder inside a folder");
+        std::fs::remove_dir(e.dir.join("src").join("deeper")).unwrap();
+        std::fs::write(e.dir.join(".git"), "gitdir: elsewhere\n").unwrap();
+        said("added: .git", ".git file");
+        std::fs::remove_file(e.dir.join(".git")).unwrap();
+        assert_eq!(export_changed(&e), None);
+    }
+
+    /// M11-R20 Do 2: before the gate, the folder holds exactly the commit's entries and each
+    /// file holds the bytes Git writes for its blob — a file of the same length with other
+    /// bytes, one of another length (the answers can no longer be framed by it), an extra and a
+    /// missing file, a `.git` entry and a link are all named.
+    #[test]
+    fn the_bytes_are_the_commits_before_the_gate() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, co, head) = repo_and_checkout(d.path());
+        let e = deploy_source(&g, &co, &head).unwrap();
+        let check = |e: &Export| {
+            let found = manifest(&e.dir).unwrap();
+            bytes_are_the_commits(&g, &co, e, &found).unwrap()
+        };
+        assert_eq!(check(&e), None);
+        let app = e.dir.join("app.txt");
+        std::fs::write(&app, "COMMITTED\n").unwrap();
+        let why = check(&e).expect("same length");
+        assert!(why.contains("app.txt") && !why.contains("lib.txt"), "{why}");
+        std::fs::write(&app, "short\n").unwrap();
+        let why = check(&e).expect("shorter");
+        assert!(why.contains("app.txt"), "{why}");
+        std::fs::write(&app, "committed and longer than the blob\n").unwrap();
+        let why = check(&e).expect("longer");
+        assert!(why.contains("app.txt"), "{why}");
+        std::fs::write(&app, "committed\n").unwrap();
+        assert_eq!(check(&e), None);
+        std::fs::write(e.dir.join("extra.txt"), "x").unwrap();
+        std::fs::write(e.dir.join(".git"), "gitdir: x\n").unwrap();
+        std::fs::create_dir(e.dir.join("empty")).unwrap();
+        let why = check(&e).expect("extra");
+        assert!(
+            why.contains("extra.txt") && why.contains(".git") && why.contains("empty"),
+            "{why}"
+        );
+        std::fs::remove_file(e.dir.join("extra.txt")).unwrap();
+        std::fs::remove_file(e.dir.join(".git")).unwrap();
+        std::fs::remove_dir(e.dir.join("empty")).unwrap();
+        std::fs::remove_file(e.dir.join("src").join("lib.txt")).unwrap();
+        let why = check(&e).expect("missing");
+        assert!(why.contains("src/lib.txt (missing)"), "{why}");
     }
 
     /// M11-R13: hashing every file is not fooled by line-ending conversion — with
@@ -1100,7 +1524,7 @@ mod tests {
             b"a\r\nb\r\n",
             "converted on the way out, like a clean checkout"
         );
-        assert_eq!(export_changed(&g, &co, &e).unwrap(), None);
+        assert_eq!(export_changed(&e), None);
         for (name, text) in [
             ("crlf.txt", "a\r\nX\r\n"),
             ("lf.txt", "a\r\nX\r\n"),
@@ -1108,10 +1532,10 @@ mod tests {
         ] {
             let before = std::fs::read(e.dir.join(name)).unwrap();
             std::fs::write(e.dir.join(name), text).unwrap();
-            let why = export_changed(&g, &co, &e).unwrap().expect(name);
+            let why = export_changed(&e).expect(name);
             assert!(why.contains(name), "{why}");
             std::fs::write(e.dir.join(name), before).unwrap();
-            assert_eq!(export_changed(&g, &co, &e).unwrap(), None, "{name}");
+            assert_eq!(export_changed(&e), None, "{name}");
         }
     }
 }

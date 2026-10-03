@@ -1434,6 +1434,75 @@ fn a_low_writable_verify_root_is_refused() {
     assert!(err.contains("verify_boundary_unavailable"), "{err}");
 }
 
+/// M11-R20 AC-1 (X15): `.gitattributes` says `text eol=crlf` and the blobs still hold CRLF (never
+/// renormalised): the export is accepted, the environment gate runs and the after-gate check is
+/// clean. (Round 3 compared Git's view after its clean conversion and blocked every gate.)
+#[test]
+fn an_environment_gate_runs_when_the_blobs_keep_crlf_under_eol_crlf() {
+    let (env, marker) = probe_then_dbsync("exit 0\n", "exit 0\n");
+    // `.gitattributes` says `text eol=crlf`; the blob was committed with CRLF through plumbing
+    // (`core.autocrlf=false`), as a Visual Studio XML file may be in a repository never
+    // renormalised
+    let source = env.root.join("crlf-source.xml");
+    std::fs::write(&source, "<a>\r\n<b/>\r\n</a>\r\n").unwrap();
+    std::fs::write(env.repo.join(".gitattributes"), "*.xml text eol=crlf\n").unwrap();
+    let blob = git(
+        &env.repo,
+        &[
+            "hash-object",
+            "-w",
+            "--no-filters",
+            &source.display().to_string(),
+        ],
+    );
+    let blob = blob.trim();
+    git(
+        &env.repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{blob},data/model.xml"),
+        ],
+    );
+    git(&env.repo, &["add", ".gitattributes"]);
+    git(
+        &env.repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "xml with CRLF blobs",
+        ],
+    );
+    create(&env, "R20-C");
+    let s = script(
+        &env,
+        "r20c.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R20-C", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R20-C");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert!(marker.exists(), "the environment gate ran");
+    // (whether the checkpoint keeps the CRLF blob or Git renormalises it at the first `add`
+    // depends on racy-git timing in a repository this small; the unit test
+    // `verify::tests::crlf_blobs_under_eol_crlf_export_clean` pins the case that blocked every
+    // gate — this one runs the whole chain over such a repository)
+    let (_, files) = seen_by_the_gate(&env);
+    assert!(files.iter().any(|f| f == "data/model.xml"), "{files:?}");
+    let d = deployments(&env);
+    assert_eq!((d.len(), d[0].ok), (1, Some(true)));
+}
+
 /// M11-R13 AC-3 (R9 AC-7, run): with `verify.checkout: tracked` an environment gate runs and
 /// passes — from the export of the commit, on a second verify run too (the checkout and its
 /// build folder are kept between runs in this mode).

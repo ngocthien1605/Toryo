@@ -1946,7 +1946,7 @@ impl<'a> Engine<'a> {
                 .collect();
             results.push(json!({"name": name, "kind": "environment", "lock": lock_name, "machine": machine, "argv": argv, "exit": res.exit, "timed_out": res.timed_out, "ms": res.duration_ms, "output_tail": res.tail(40), "source": "export", "source_tree": export.tree}));
             // M11-R9: the gate must not have written into what it deploys from (E3 AC-8)
-            if let Some(reason) = verify::export_changed(&self.g, co, &export)? {
+            if let Some(reason) = verify::export_changed(&export) {
                 return Ok(EnvGates::Mutated(reason));
             }
             if !res.ok() {
