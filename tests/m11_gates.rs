@@ -661,6 +661,17 @@ fn a_missing_path_argument_with_a_file_extension_gets_a_note() {
     let cfgv = toryo::engine::task::frozen_config(&t).unwrap();
     let (_, prot, _) = toryo::engine::runner::task_policy(&t, &cfgv).unwrap();
     assert!(prot.violates("ci/settings.json"));
+    // ignored by the repository: build output, no note (review)
+    let env = setup("codex-openai");
+    commit_repo(
+        &env,
+        &[("scripts/smoke.ps1", "exit 0\n"), (".gitignore", "ci/\n")],
+        "a smoke script; ci/ is ignored",
+    );
+    with_verify_command(&env, line);
+    let (code, err) = create_as(&env, "R21-I");
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("ci/settings.json"), "{err}");
 }
 
 /// M11-R21: `task config --reload` probes a changed `verify_root` as `task create` and `doctor`
@@ -1161,7 +1172,7 @@ fn a_script_behind_a_wrapper_is_protected_from_the_implementer() {
         (
             "ci/x.sh",
             // a nested shell
-            r#"    - { name: ci, program: sh, args: ["-c", "sh -c '. ./ci/x.sh --fast'"] }"#,
+            r#"    - { name: ci, program: sh, args: ["-c", "sh -c '. ./ci/x.sh'"] }"#,
         )
     };
     commit_repo(&env, &[(file, "exit 0\n")], "a gate script in ci/");

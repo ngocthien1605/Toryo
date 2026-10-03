@@ -998,14 +998,23 @@ fn plain_path(p: &str) -> bool {
         .any(|c| c.is_whitespace() || "*?[]$%~".contains(c))
 }
 
-/// The last segment ends in `.ext` — one to eight letters or digits after a name (not a hidden
-/// file such as `.env`): `ci/settings.json`, `data/model.xml`.
+/// Data and configuration files a verify command is given (R21, `-Config ci/settings.json`).
+const DATA_EXTENSIONS: [&str; 16] = [
+    "json", "yaml", "yml", "xml", "toml", "ini", "cfg", "conf", "csv", "txt", "props", "targets",
+    "config", "sln", "csproj", "md",
+];
+
+/// The last segment is a name with one of the [`DATA_EXTENSIONS`]: `ci/settings.json`,
+/// `data/model.xml`. Not a tag, a range or a host (`myorg/app:1.2.3`, `origin/main..HEAD`,
+/// `release/1.2`): the name starts with a letter or `_` and holds no `:` or `..`.
 fn has_file_ext(p: &str) -> bool {
+    if p.contains(':') || p.contains("..") {
+        return false;
+    }
     let name = p.rsplit(['/', '\\']).next().unwrap_or(p);
     name.rsplit_once('.').is_some_and(|(stem, ext)| {
-        !stem.is_empty()
-            && (1..=8).contains(&ext.len())
-            && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        stem.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && DATA_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
     })
 }
 
@@ -1240,6 +1249,10 @@ pub fn entry_scripts(program: &str, args: &[String]) -> Vec<Entry> {
                     }]
                 })
                 .unwrap_or_default();
+        }
+        // (R19 review) a `-Command` whose folder cannot be followed has no script argument
+        if args.iter().any(|a| is_command_flag(a)) {
+            return Vec::new();
         }
         return args
             .iter()
@@ -2392,6 +2405,29 @@ mod tests {
         assert_eq!(got(&["/c", "setup.exe && run.cmd"]), two);
     }
 
+    /// M11-R18 AC-2 (X14): the set of the base commit that protects arguments holds files, so a
+    /// folder entry (`node --test tests/unit`) is protected as that exact name only and nothing
+    /// inside the folder is protected because of it; a folder named by another argument is not
+    /// protected at all.
+    #[test]
+    fn a_folder_is_protected_as_its_own_name_only() {
+        let d = tempfile::tempdir().unwrap();
+        let base: std::collections::HashSet<String> = ["tests/unit/a.test.js", "src/app.ts"]
+            .map(String::from)
+            .into();
+        let run = |program: &str, args: &[&str]| {
+            let cmd = [CommandSpec::program("g", program, args, None)];
+            verify_files_at_base(&cmd, d.path(), &base)
+        };
+        assert_eq!(run("node", &["--test", "tests/unit"]), ["tests/unit"]);
+        assert_eq!(
+            run("node", &["--test", "tests/unit/"]),
+            Vec::<String>::new()
+        );
+        assert_eq!(run("eslint", &["src"]), Vec::<String>::new());
+        assert_eq!(run("eslint", &["src/app.ts"]), ["src/app.ts"]);
+    }
+
     /// M11-R19 AC-1 (X13, applies to everyone): "refusing needs certainty, protecting does not".
     /// For each command line, over a base commit holding `base`: the protected names (exactly)
     /// and what is refused when missing (exactly) — X13 adds protected names, never a refusal.
@@ -2977,6 +3013,31 @@ mod tests {
                 one("scripts/x.ps1", true),
                 &["ci/settings.json"],
                 Some(&["scripts/x.ps1"]),
+            ),
+            // (review) no path, no note: a tag, a range, a version; a `-Command` whose folder
+            // cannot be followed has no script argument to refuse
+            (
+                "docker",
+                &["build", "-t", "myorg/app:1.2.3", "."],
+                none(),
+                &[],
+                Some(&[]),
+            ),
+            ("git", &["checkout", "release/1.2"], none(), &[], Some(&[])),
+            (
+                "git",
+                &["diff", "origin/main..HEAD"],
+                none(),
+                &[],
+                Some(&[]),
+            ),
+            ("tool", &["--ver", "1.2/3.4"], none(), &[], Some(&[])),
+            (
+                "pwsh",
+                &["-WorkingDirectory", "../x", "-Command", "./x.ps1"],
+                none(),
+                &["x.ps1"], // (a note, never a refusal)
+                Some(&["x.ps1"]),
             ),
             // a module specifier is no repository path
             (

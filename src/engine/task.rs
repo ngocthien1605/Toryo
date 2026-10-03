@@ -234,9 +234,14 @@ fn admission(cfg: &Effective, g: &GitCmd, repo: &Path, base: &str) -> Result<Adm
             ));
         }
     }
+    // (R21 review) a data or configuration file (`ci/settings.json`) that the repository ignores
+    // is build output: no note. A script-like path keeps its note, ignored or not (M11-R10).
     found.notes = net
         .into_iter()
-        .filter(|(_, path)| !tree.contains(&path.to_lowercase()))
+        .filter(|(_, path)| {
+            !tree.contains(&path.to_lowercase())
+                && (super::checks::has_script_ext(path) || !ignored(path))
+        })
         .map(|(name, path)| {
             format!("{what} `{name}` passes `{path}`, which is not in the base commit — fine for build output; if the {what} runs it as its script, commit it first")
         })

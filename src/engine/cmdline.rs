@@ -32,6 +32,12 @@
 //!
 //! A word that holds a variable, a glob or an escape is not literal: it is never an entry and
 //! never an argument. When in doubt the reader refuses nothing.
+//!
+//! **Refusing needs certainty; protecting does not (M11-R19, X13).** Where this reader cannot
+//! follow a string — a wrapper program, a nested command line, a here-document, a `cd` it cannot
+//! follow — [`everywhere`] is the net under it: every word of every argument, from the root and
+//! from every folder a change of folder names. It only ever adds names to protect, never an entry,
+//! never a refusal, never a note.
 
 use super::checks::{arg_values, has_script_ext, Entry};
 
@@ -749,24 +755,29 @@ const NESTING: usize = 6;
 /// `-C`, `-WorkingDirectory`), whether or not the reader followed it. The caller keeps those that
 /// are files of the base commit.
 pub fn everywhere<'a>(args: impl IntoIterator<Item = &'a str>) -> Vec<String> {
-    let mut words: Vec<String> = Vec::new();
-    let mut folders: Vec<String> = vec![String::new()];
+    let mut seen = Seen {
+        words: Vec::new(),
+        folders: vec![String::new()],
+        word_set: Default::default(),
+        folder_set: Default::default(),
+    };
     let args: Vec<&str> = args.into_iter().collect();
     for a in &args {
-        scan(a, 0, &mut words, &mut folders);
+        scan(a, 0, &mut seen);
     }
     // the arguments side by side as a shell would read them (`cmd /c cd sub && x`, `-C sub`):
     // a change of folder and the folder it names are separate arguments
-    scan(&args.join(" "), 0, &mut words, &mut folders);
+    scan(&args.join(" "), 0, &mut seen);
     let mut out: Vec<String> = Vec::new();
-    for w in &words {
+    let mut have: std::collections::HashSet<String> = Default::default();
+    for w in &seen.words {
         for v in arg_values(w) {
             if v.starts_with('-') || !relative(&v) {
                 continue;
             }
-            for f in &folders {
+            for f in &seen.folders {
                 if let Some(p) = join(f, &v, true).filter(|p| !p.is_empty()) {
-                    if !out.contains(&p) {
+                    if have.insert(p.clone()) {
                         out.push(p);
                     }
                 }
@@ -774,6 +785,34 @@ pub fn everywhere<'a>(args: impl IntoIterator<Item = &'a str>) -> Vec<String> {
         }
     }
     out
+}
+
+/// What [`everywhere`] has collected. A hostile configuration cannot make it slow: the words
+/// and the folders are capped (a word or folder beyond the cap protects nothing extra) and
+/// looked up in sets.
+struct Seen {
+    words: Vec<String>,
+    folders: Vec<String>,
+    word_set: std::collections::HashSet<String>,
+    folder_set: std::collections::HashSet<String>,
+}
+
+/// At most this many distinct words, and folders besides the root, are kept.
+const MAX_WORDS: usize = 4096;
+const MAX_FOLDERS: usize = 32;
+
+impl Seen {
+    fn word(&mut self, w: &str) {
+        if self.words.len() < MAX_WORDS && self.word_set.insert(w.to_string()) {
+            self.words.push(w.to_string());
+        }
+    }
+
+    fn folder(&mut self, f: String) {
+        if self.folders.len() <= MAX_FOLDERS && self.folder_set.insert(f.clone()) {
+            self.folders.push(f);
+        }
+    }
 }
 
 /// A word with its quoting escapes taken off (`\"` → `"`), to be tokenised again.
@@ -791,7 +830,7 @@ fn unescape(s: &str) -> String {
     out
 }
 
-fn scan(s: &str, depth: usize, words: &mut Vec<String>, folders: &mut Vec<String>) {
+fn scan(s: &str, depth: usize, seen: &mut Seen) {
     // a string with a here-document is a `sh` script: PowerShell and `cmd` would read its body
     // as commands, so only `sh` reads it
     let sh = tokens(s, Shell::Sh);
@@ -817,9 +856,7 @@ fn scan(s: &str, depth: usize, words: &mut Vec<String>, folders: &mut Vec<String
             }
             if folder_next && w.literal && relative(&w.text) && !w.text.starts_with('-') {
                 if let Some(f) = join("", &w.text, true).filter(|f| !f.is_empty()) {
-                    if !folders.contains(&f) {
-                        folders.push(f);
-                    }
+                    seen.folder(f);
                 }
             }
             folder_next = w.literal
@@ -827,15 +864,15 @@ fn scan(s: &str, depth: usize, words: &mut Vec<String>, folders: &mut Vec<String
                     || one_of(&w.text, PUSHD)
                     || w.text == "-C"
                     || one_of(&w.text, &["-workingdirectory", "-wd"]));
-            if w.literal && !w.text.is_empty() && !words.contains(&w.text) {
-                words.push(w.text.clone());
+            if w.literal && !w.text.is_empty() {
+                seen.word(&w.text);
             }
             // a word that is a command line itself: quoted, or holding a space
             if depth < NESTING
                 && w.text
                     .contains(|c: char| c.is_whitespace() || c == '"' || c == '\'')
             {
-                scan(&unescape(&w.text), depth + 1, words, folders);
+                scan(&unescape(&w.text), depth + 1, seen);
             }
         }
     }
@@ -1365,6 +1402,30 @@ mod tests {
         ] {
             let _ = everywhere([s]);
         }
+    }
+
+    /// M11-R19 review: a hostile configuration cannot make the net slow — thousands of words,
+    /// folders and quotes in 100 KB are read in a moment, and the caps hold.
+    #[test]
+    fn a_huge_command_line_is_read_in_a_moment() {
+        let start = std::time::Instant::now();
+        let many_words: String = (0..15_000).map(|i| format!("w{i}/a.sh ")).collect();
+        let v = everywhere(["-c", many_words.as_str()]);
+        assert!(v.len() <= MAX_WORDS * (MAX_FOLDERS + 1));
+        let folders: String = (0..8_000)
+            .map(|i| format!("cd d{i}; ./x{i}.sh\n"))
+            .collect();
+        let v = everywhere(["-c", folders.as_str()]);
+        assert!(!v.is_empty());
+        let quoted: String = (0..8_000).map(|i| format!("'q{i} z' ")).collect();
+        let _ = everywhere([quoted.as_str()]);
+        let open: String = "'\"".repeat(30_000);
+        let _ = everywhere([open.as_str()]);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

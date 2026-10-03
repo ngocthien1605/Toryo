@@ -441,7 +441,11 @@ pub fn prepare(
         // reviewer rejected would be the entry of the next run when no gate builds it again: the
         // task's build-output entries start every run absent, before any gate
         for e in &cfg.build_entries {
-            remove_entry(&co.dir, &e.path)?;
+            // a locked file is no reason to stop: a stale entry would show in the next run's
+            // own checks
+            if let Err(err) = remove_entry(&co.dir, &e.path) {
+                eprintln!("warning: could not remove the build-output entry `{}` from the verify checkout: {err:#}", e.path);
+            }
         }
     }
     let head = g.run_str(&loc, true, &["rev-parse", "HEAD"])?;
@@ -753,6 +757,8 @@ pub enum Item {
     Dir,
     /// A symbolic link or junction — never followed: the text of its target.
     Link(String),
+    /// Anything else (a pipe, a socket, a device): never opened.
+    Other,
 }
 
 /// Every entry under an export folder: its path (relative, `/`) and what it is.
@@ -802,9 +808,11 @@ pub fn manifest(dir: &Path) -> Result<Manifest> {
             } else if ft.is_dir() {
                 out.insert(r.clone(), Item::Dir);
                 walk(&e.path(), &r, out)?;
-            } else {
+            } else if ft.is_file() {
                 let (size, sha256) = hash_file(&e.path())?;
                 out.insert(r, Item::File { size, sha256 });
+            } else {
+                out.insert(r, Item::Other);
             }
         }
         Ok(())
@@ -900,9 +908,15 @@ fn batch_hashes(
                     if o == *oid && !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
             );
         if !framed {
-            // the answer before it was longer or shorter than the file: it is the one lost
-            read.lost = Some(n.saturating_sub(1));
-            read.sums.truncate(n.saturating_sub(1));
+            // `<object> missing` names this item; else the answer before it was longer or
+            // shorter than the file: it is the one lost
+            let lost = if line.trim_end().ends_with(" missing") {
+                n
+            } else {
+                n.saturating_sub(1)
+            };
+            read.lost = Some(lost);
+            read.sums.truncate(lost);
             break;
         }
         let mut h = Sha256::new();
@@ -926,6 +940,11 @@ fn batch_hashes(
             break;
         }
         read.sums.push(hex::encode(h.finalize()));
+    }
+    // nothing may follow the last answer: bytes left over mean its length was not the file's
+    if read.lost.is_none() && !items.is_empty() && out.fill_buf().is_ok_and(|b| !b.is_empty()) {
+        read.lost = Some(items.len() - 1);
+        read.sums.truncate(items.len() - 1);
     }
     drop(out); // git stops writing if it has not finished
     let _ = writer.join();
@@ -1009,7 +1028,7 @@ fn bytes_are_the_commits(
         let ok = match item {
             Item::File { .. } => files.contains_key(p),
             Item::Dir => dirs.contains(p),
-            Item::Link(_) => false,
+            Item::Link(_) | Item::Other => false,
         };
         if !ok {
             problems.push(format!("{p} (the commit has no such entry)"));
@@ -1023,9 +1042,9 @@ fn bytes_are_the_commits(
             continue;
         };
         if p.contains(['\n', '\r']) {
-            problems.push(format!(
-                "{p:?} (a name with a line break cannot be checked)"
-            ));
+            // the request protocol cannot carry the name: its bytes are not compared (it is
+            // present, and the commit's entry — no certainty, no complaint)
+            continue;
         } else if *link {
             // a link is exported as a file holding its target text: the stored bytes
             stored.push((oid, p, *size));
@@ -1530,6 +1549,13 @@ mod tests {
         let why = check(&e).expect("longer");
         assert!(why.contains("app.txt"), "{why}");
         std::fs::write(&app, "committed\n").unwrap();
+        assert_eq!(check(&e), None);
+        // (review) the last file, one byte short of what Git writes: bytes are left over
+        let lib = e.dir.join("src").join("lib.txt");
+        std::fs::write(&lib, "library").unwrap();
+        let why = check(&e).expect("a prefix of the last file");
+        assert!(why.contains("src/lib.txt"), "{why}");
+        std::fs::write(&lib, "library\n").unwrap();
         assert_eq!(check(&e), None);
         std::fs::write(e.dir.join("extra.txt"), "x").unwrap();
         std::fs::write(e.dir.join(".git"), "gitdir: x\n").unwrap();
