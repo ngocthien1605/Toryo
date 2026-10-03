@@ -34,6 +34,27 @@ use crate::process::Boundary;
 pub const UNAVAILABLE: &str = "verify_boundary_unavailable";
 pub const MUTATED: &str = "verify_mutated_tree";
 
+/// M11-R16 (X8): why the verify stage cannot start — the boundary is unavailable or the checkout
+/// is not the checkpoint. The escalation **class** travels with the error, typed; the engine
+/// never reads it out of the reason text. `reason` begins with the class, as before.
+#[derive(Debug)]
+pub struct Stop {
+    pub class: &'static str,
+    pub reason: String,
+}
+
+impl std::fmt::Display for Stop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for Stop {}
+
+fn stop(class: &'static str, reason: String) -> anyhow::Error {
+    anyhow::Error::new(Stop { class, reason })
+}
+
 /// `verify.verify_root`, expanded (default `%LOCALAPPDATA%\toryo-verify`; `<data>/verify`
 /// where `LOCALAPPDATA` does not exist). The machine's `verify.verify_root` replaces the
 /// repository's (review H2, M11-A2).
@@ -75,7 +96,10 @@ pub fn boundary(cfg: &Effective) -> Result<Boundary> {
     match cfg.repo.verify.boundary.as_str() {
         "none" => Ok(Boundary::None),
         "low_integrity" => Ok(Boundary::LowIntegrity),
-        other => bail!("{UNAVAILABLE}: verify.boundary `{other}` is not available in v0.1 (low_integrity | none)"),
+        other => Err(stop(
+            UNAVAILABLE,
+            format!("{UNAVAILABLE}: verify.boundary `{other}` is not available in v0.1 (low_integrity | none)"),
+        )),
     }
 }
 
@@ -104,16 +128,22 @@ pub fn probe(cfg: &Effective) -> Result<()> {
         Boundary::None => Ok(()),
         Boundary::LowIntegrity => {
             if !cfg!(windows) {
-                bail!("{UNAVAILABLE}: the Low integrity boundary exists only on Windows — set `verify.boundary: none` for trusted-code mode (verification not isolated)");
+                return Err(stop(
+                    UNAVAILABLE,
+                    format!("{UNAVAILABLE}: the Low integrity boundary exists only on Windows — set `verify.boundary: none` for trusted-code mode (verification not isolated)"),
+                ));
             }
             let root = verify_root(cfg);
             let scratch = root.join(format!(".label-probe-{}", std::process::id()));
             let r = label(std::slice::from_ref(&scratch));
             let _ = std::fs::remove_dir_all(&scratch);
             r.map_err(|e| {
-                anyhow::anyhow!(
-                    "{UNAVAILABLE}: verify_root {} — {e:#} (R45)",
-                    root.display()
+                stop(
+                    UNAVAILABLE,
+                    format!(
+                        "{UNAVAILABLE}: verify_root {} — {e:#} (R45)",
+                        root.display()
+                    ),
                 )
             })?;
             not_low_writable(&root, &root)
@@ -130,17 +160,23 @@ pub fn probe(cfg: &Effective) -> Result<()> {
 /// process tries to create a folder in `dir` and must fail. Not Windows: nothing to check.
 fn not_low_writable(dir: &Path, root: &Path) -> Result<()> {
     let writable = low_can_write(dir).map_err(|e| {
-        anyhow::anyhow!(
-            "{UNAVAILABLE}: could not start a Low-integrity process to check {}: {e:#}",
-            dir.display()
+        stop(
+            UNAVAILABLE,
+            format!(
+                "{UNAVAILABLE}: could not start a Low-integrity process to check {}: {e:#}",
+                dir.display()
+            ),
         )
     })?;
     if writable {
-        bail!(
-            "{UNAVAILABLE}: verify_root {} — a Low-integrity process can create files in {}, so the code under test could write what an environment gate deploys (the export of the checkpoint) and the folder the gate runs in. Set `verify.verify_root` to a folder outside Low-writable trees (not under AppData\\LocalLow; the default %LOCALAPPDATA%\\toryo-verify is fine) (M11-R13)",
-            root.display(),
-            dir.display()
-        );
+        return Err(stop(
+            UNAVAILABLE,
+            format!(
+                "{UNAVAILABLE}: verify_root {} — a Low-integrity process can create files in {}, so the code under test could write what an environment gate deploys (the export of the checkpoint) and the folder the gate runs in. Set `verify.verify_root` to a folder outside Low-writable trees (not under AppData\\LocalLow; the default %LOCALAPPDATA%\\toryo-verify is fine) (M11-R13)",
+                root.display(),
+                dir.display()
+            ),
+        ));
     }
     Ok(())
 }
@@ -262,7 +298,7 @@ pub fn prepare(
     let base = verify_root(cfg).join(&t.id);
     if low {
         std::fs::create_dir_all(&base)?;
-        low_base(&base, cfg, t)?;
+        not_low_writable(&base, &verify_root(cfg))?;
     }
     let co = match rec
         .filter(|c| c.dir.exists() && c.admin.exists() && c.low == low && c.base == base)
@@ -305,7 +341,7 @@ pub fn prepare(
             }
             if low {
                 label(&[c.dir.clone(), c.build(), c.cache(), c.tmp(), c.home()])
-                    .map_err(|e| anyhow::anyhow!("{UNAVAILABLE}: {e:#} (R45)"))?;
+                    .map_err(|e| stop(UNAVAILABLE, format!("{UNAVAILABLE}: {e:#} (R45)")))?;
             }
             std::fs::write(record_path(t), serde_json::to_vec_pretty(&c)?)?;
             c
@@ -336,24 +372,16 @@ pub fn prepare(
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
     )?;
     if head.trim() != sha || !status.is_empty() {
-        bail!(
-            "{MUTATED}: the verify checkout is not a clean checkout of {} before the run (HEAD {})",
-            short(sha),
-            head.trim()
-        );
+        return Err(stop(
+            MUTATED,
+            format!(
+                "{MUTATED}: the verify checkout is not a clean checkout of {} before the run (HEAD {})",
+                short(sha),
+                head.trim()
+            ),
+        ));
     }
     Ok(co)
-}
-
-/// M11-R13: [`not_low_writable`] for a task's folder, with what the owner does next.
-fn low_base(base: &Path, cfg: &Effective, t: &TaskRow) -> Result<()> {
-    not_low_writable(base, &verify_root(cfg)).map_err(|e| {
-        anyhow::anyhow!(
-            "{e:#} — then `toryo task config {} --reload` and `toryo resume {}`",
-            t.id,
-            t.id
-        )
-    })
 }
 
 /// The environment of a verify command: caches and temp in the Low directories.

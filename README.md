@@ -268,7 +268,12 @@ from the repository checkout (`project.root`), never from a task worktree, and e
   lookup paths; no turn, no tokens) — put it back and `toryo resume <id>`. A context with skills that is still over
   budget escalates with `context_over_budget`. These, and a gate/toolchain/boundary the machine cannot provide, are
   **machine-caused** (M11-R11, X8): a plain `toryo resume <id>` goes back into the stage once the cause is fixed — no
-  fix cycle, no implementer turn; `--note` is only for giving the implementer another cycle.
+  fix cycle, no implementer turn; `--note` is only for giving the implementer another cycle. **Which fix needs which
+  step (M11-R16):** fixed on the machine itself — a value added to Credential Manager, a program installed, a skill
+  folder put back — `toryo resume <id>`. Fixed in a config file — `environment_gates.<name>` in the machine config,
+  `context.budget_kb` in `toryo.yaml`, a profile, `verify.verify_root` — `toryo task config <id> --reload`, then
+  `toryo resume <id>`: a task runs on the configuration frozen at `task create`, so a corrected file alone changes
+  nothing (the reason and `status` say so).
 - **The write fence.** The implementer's `writes:` (globs; when set, the only files it may change — `writes: []` or no
   `writes` means no allowlist: only `never` applies) and `never:`
   (never, even inside `writes`) — case-insensitive, `/` and `\` alike. A planned file outside the fence sends the
@@ -336,7 +341,10 @@ from the repository checkout (`project.root`), never from a task worktree, and e
     variable is a load error) — the expanded text is what is checked, frozen and run (`config show` prints it), and a
     PATH name that resolves inside those folders is refused at run time. One gate per `lock` runs at a time across all tasks;
     a second waits (`status`: `waiting for lock d365-env (held by T-12)`), `toryo stop` ends the wait. A failure
-    goes back to the implementer as data and counts against `max_gate_retries`. A machine without the gate:
+    goes back to the implementer as data and counts against `max_gate_retries`. What a gate needs from the machine —
+    every `secret_env` value, its program, a valid lock name — is checked **before the check gates run** (M11-R16,
+    X12) and again when the gate starts: a gate that cannot start stops the task with `environment_gate_unavailable`
+    at once, not after a build of tens of minutes. A machine without the gate:
     `if_missing: error` refuses the task, `skip` runs without it and says so at the final gate.
   - **The script contract** (`templates/toryo.local.yaml.example`): exit code decides (PowerShell: `$ErrorActionPreference
     = 'Stop'` and `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }` after every native call); deploy only

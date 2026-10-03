@@ -971,6 +971,16 @@ fn resume_protected(st: &Store, t: &TaskRow, accept: &[String]) -> Result<bool> 
     Ok(true)
 }
 
+/// M11-R11 (X8): the task is `Escalated` with a machine-caused class, from a running state — a
+/// plain `toryo resume` goes back into the stage (`ResumeStage`).
+fn machine_caused_stop(t: &TaskRow) -> bool {
+    t.state == PipelineState::Escalated
+        && t.machine
+            .reason_class()
+            .is_some_and(toryo::engine::state::is_machine_caused)
+        && t.machine.escalated_from().is_some_and(|s| s.is_running())
+}
+
 fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
     let t = get(st, &lock.task)?;
     let protected = t.state == PipelineState::Escalated
@@ -991,6 +1001,9 @@ fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Res
         "recovery"
     } else if r.note.is_some() {
         "resume_with_note"
+    } else if machine_caused_stop(&t) {
+        // M11-R16: a plain resume after a machine-caused escalation is `ResumeStage`
+        "resume_stage"
     } else {
         "unpause"
     };
@@ -1052,12 +1065,7 @@ fn resume_before_drive(st: &Store, t: &TaskRow, r: &ResumeArgs, protected: bool)
                 t.machine.reason().unwrap_or("")
             ),
         )?;
-    } else if t.state == PipelineState::Escalated
-        && t.machine
-            .reason_class()
-            .is_some_and(toryo::engine::state::is_machine_caused)
-        && t.machine.escalated_from().is_some_and(|s| s.is_running())
-    {
+    } else if machine_caused_stop(t) {
         // M11-R11 (X8): the machine caused this (a missing skill, a context over budget, a gate
         // the machine cannot run) — a plain `toryo resume` goes back into the stage, which
         // checks its precondition again. No fix cycle, no implementer turn for nothing.

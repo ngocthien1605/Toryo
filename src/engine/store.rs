@@ -677,6 +677,26 @@ pub fn set_reason_class(tx: &Transaction, task_id: &str, class: &str) -> Result<
     Ok(())
 }
 
+/// M11-R16: [`transition`] and — for an escalation — its typed class on the machine, in the
+/// caller's transaction: there is no moment at which a crash leaves an escalation without its
+/// class (a later plain `toryo resume` reads it). For any other event `class` is ignored.
+pub fn transition_classed(
+    tx: &Transaction,
+    task_id: &str,
+    e: PipelineEvent,
+    class: Option<&str>,
+) -> Result<Machine> {
+    let escalation = matches!(e, PipelineEvent::Escalate { .. });
+    let m = transition(tx, task_id, e)?;
+    match class.filter(|_| escalation) {
+        Some(c) => {
+            set_reason_class(tx, task_id, c)?;
+            Ok(get_task(tx, task_id)?.machine)
+        }
+        None => Ok(m),
+    }
+}
+
 pub fn transition(tx: &Transaction, task_id: &str, e: PipelineEvent) -> Result<Machine> {
     let t = get_task(tx, task_id)?;
     let before = t.machine.clone();
@@ -1557,6 +1577,54 @@ mod tests {
             reviewer: "claude".into(),
             budget_tokens: None,
         }
+    }
+
+    /// M11-R16 AC-3: an escalation and its typed class are written in one transaction — both
+    /// or neither; for another event the class is ignored.
+    #[test]
+    fn an_escalation_and_its_class_are_one_transaction() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open(&d.path().join("t.db")).unwrap();
+        s.call(|tx| insert_task(tx, &new_task("T-1"))).unwrap();
+        let m = s
+            .call(|tx| transition_classed(tx, "T-1", E::Start, Some("skill_unavailable")))
+            .unwrap();
+        assert_eq!(m.reason_class(), None, "not an escalation");
+        // the transaction fails after the escalation: neither the state nor the class is kept
+        let r: Result<()> = s.call(|tx| {
+            transition_classed(
+                tx,
+                "T-1",
+                E::Escalate { reason: "x".into() },
+                Some("environment_gate_unavailable"),
+            )?;
+            anyhow::bail!("the process died here")
+        });
+        assert!(r.is_err());
+        let t = s.call(|tx| get_task(tx, "T-1")).unwrap();
+        assert_eq!(
+            (t.state, t.machine.reason_class()),
+            (PipelineState::Planning, None)
+        );
+        let m = s
+            .call(|tx| {
+                transition_classed(
+                    tx,
+                    "T-1",
+                    E::Escalate { reason: "x".into() },
+                    Some("environment_gate_unavailable"),
+                )
+            })
+            .unwrap();
+        assert_eq!(m.reason_class(), Some("environment_gate_unavailable"));
+        let t = s.call(|tx| get_task(tx, "T-1")).unwrap();
+        assert_eq!(
+            (t.state, t.machine.reason_class()),
+            (
+                PipelineState::Escalated,
+                Some("environment_gate_unavailable")
+            )
+        );
     }
 
     #[test]

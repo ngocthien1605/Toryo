@@ -250,7 +250,8 @@ NuGet) và `scope: compile`. Các property `/p:…` được truyền qua một 
 và metadata phải có sẵn trong repo khi `task create` (nếu thiếu: `xpp_project_missing`). Project build và mọi `Directory.Build.*` được bảo vệ: agent sửa project →
 bị trả lại (fix cycle); agent thêm `Directory.Build.props` → Escalated (`protected_config_changed`).
 Thiếu MSBuild hay thiếu gói NuGet: `task create` từ chối; nếu hỏng sau đó thì verify dừng ở Escalated
-(`xpp_toolchain_unavailable`) — sửa toolchain rồi `toryo resume ID`.
+(`xpp_toolchain_unavailable`) — đặt lại toolchain rồi `toryo resume ID`; nếu phải sửa đường dẫn `toolchains.xpp`
+trong machine config thì `toryo task config ID --reload` trước (cấu hình của task đã đóng băng).
 
 Lỗi compile được tách khỏi output MSBuild (có thể dài hàng nghìn dòng): mỗi mục `xpp` trong
 `VERIFY_RESULT.json` có `diagnostics` (50 lỗi đầu, mỗi lỗi một lần, đường dẫn tương đối với checkout),
@@ -676,7 +677,12 @@ Bộ mẫu: `templates\d365fo\.toryo\`, `templates\d365fo\CULTURE.md`, `template
   dẫn đã tìm; chưa chạy lượt nào, không tốn token) — đặt skill lại rồi `toryo resume <id>`. Ngữ cảnh có skill mà vẫn
   quá ngân sách → escalate `context_over_budget`. Các lỗi này, cùng gate/toolchain/boundary máy không cung cấp được,
   là **do máy** (M11-R11, X8): `toryo resume <id>` (không `--note`) quay lại stage sau khi sửa nguyên nhân — không
-  tốn vòng sửa, không chạy implementer; `--note` chỉ để cấp thêm một vòng cho implementer.
+  tốn vòng sửa, không chạy implementer; `--note` chỉ để cấp thêm một vòng cho implementer. **Sửa ở đâu thì làm bước
+  nào (M11-R16):** sửa trên máy (thêm giá trị vào Credential Manager, cài chương trình, đặt lại thư mục skill) →
+  `toryo resume <id>`. Sửa trong file config (`environment_gates.<tên>` trong machine config, `context.budget_kb` trong
+  `toryo.yaml`, một profile, `verify.verify_root`) → `toryo task config <id> --reload`, rồi `toryo resume <id>`: task
+  chạy theo cấu hình đã **đóng băng** lúc `task create`, nên chỉ sửa file thì chưa có gì thay đổi (lý do escalate và
+  `status` đều ghi rõ).
 - **Hàng rào ghi (write fence)** của implementer: `writes:` = chỉ được sửa các file này (`writes: []` hoặc không ghi = không giới hạn, chỉ áp `never`); `never:` = không bao giờ,
   kể cả trong `writes`. Kế hoạch đụng file ngoài hàng rào → lập lại kế hoạch; implementer sửa file ngoài hàng rào →
   khôi phục và trả lại, nêu rõ luật. `## Allow protected` trong TASK.md mở được một mục, như file được bảo vệ.
@@ -1029,11 +1035,11 @@ CI chạy: `cargo fmt --check`, `clippy -D warnings` (có và không có M0 kit)
 | Muốn xem AI "nghĩ" gì | `runs\<ID>\captures\*.stdout.jsonl` (stream đầy đủ), `*.prompt.md`, và `toryo context show` |
 | Ký tự lạ kiểu `ΓòÉΓòÉ`, `ΓåÆ` khi **pipe** output của toryo (`toryo … \| Tee-Object`, `\| Select-String`) | toryo in UTF-8, còn PowerShell giải mã output qua pipe bằng code page OEM 437. Thêm vào `$PROFILE`: `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)` (các script trong `scripts\` đã tự đặt). Chạy trực tiếp không pipe thì luôn hiển thị đúng |
 | `protected_config_changed` | Mở file diff được nêu trong lý do; khôi phục rồi `toryo resume ID`, hoặc `--accept-protected-change <path>` |
-| `verify_boundary_unavailable` | `verify_root` không gán được Low label (thiếu WRITE_OWNER) → để mặc định `%LOCALAPPDATA%\toryo-verify`; `toryo doctor` nêu nguyên nhân |
+| `verify_boundary_unavailable` | `verify_root` không gán được Low label (thiếu WRITE_OWNER), hoặc (M11-R13) `verify_root` nằm trong cây thư mục mà tiến trình Low ghi được (ví dụ dưới `AppData\LocalLow`) → để mặc định `%LOCALAPPDATA%\toryo-verify`; `toryo doctor` nêu nguyên nhân. Đổi `verify.verify_root` cho task đang có: `toryo task config ID --reload`, rồi `toryo resume ID` |
 | `verify_mutated_tree` | Script verify đã sửa file đã track / `.git` của bản checkout → sửa script (hoặc code agent viết), rồi `toryo resume ID --note "…"` |
 | `!! a check gate left files in the verify checkout — they are not deployed` (M11) | Chỉ là cảnh báo: gate môi trường deploy từ bản xuất mới của commit, không từ checkout. Nên cho check gate ghi output vào `TORYO_VERIFY_BUILD`; danh sách nằm ở `checkout_extra` trong `VERIFY_RESULT.json` |
-| `environment_gate_unavailable` (M11) | Máy không chạy được gate môi trường: secret chưa có, chương trình không tìm thấy hoặc nằm trong repo/worktrees/verify root → sửa machine config, rồi `toryo resume ID` (do máy; không tốn vòng sửa); task tạo trước bản này mà có `%VAR%` trong `program`/`args` → `toryo task config ID --reload` |
-| `skill_unavailable` / `context_over_budget` (M11) | Skill cần cho lượt này không tìm thấy (lý do nêu cả hai đường dẫn) → đặt lại rồi `toryo resume ID` (do máy; không tốn vòng sửa); ngữ cảnh có skill vẫn quá ngân sách → tăng `context.budget_kb.<role>` hoặc chọn ít skill hơn |
+| `environment_gate_unavailable` (M11) | Máy không chạy được gate môi trường: secret chưa có, chương trình không tìm thấy hoặc nằm trong repo/worktrees/verify root. Được kiểm tra **trước khi chạy các check gate** (M11-R16), nên không tốn một lần build. Sửa trên máy (thêm secret vào Credential Manager, cài chương trình) → `toryo resume ID`; sửa `environment_gates.<tên>` trong machine config → `toryo task config ID --reload`, rồi `toryo resume ID` (lệnh của gate đã đóng băng theo task). Do máy: không tốn vòng sửa. Task tạo trước bản này mà có `%VAR%` trong `program`/`args` → `toryo task config ID --reload` |
+| `skill_unavailable` / `context_over_budget` (M11) | Skill cần cho lượt này không tìm thấy (lý do nêu cả hai đường dẫn) → đặt lại rồi `toryo resume ID` (do máy; không tốn vòng sửa); ngữ cảnh có skill vẫn quá ngân sách → tăng `context.budget_kb.<role>` trong `toryo.yaml` (hoặc chọn ít skill hơn), `toryo task config ID --reload`, rồi `toryo resume ID` — ngân sách đã đóng băng theo task |
 | `artifact_tampered` / `artifact_missing` | Có người sửa/xoá file trong `runstore\artifacts\` → khôi phục file, hoặc `toryo task cleanup ID` |
 | `Paused` — `admission cap reached` | `toryo budget set ID --tokens N` rồi `toryo resume ID` |
 | `unverified profiles (R51)` nhắc `claude-implementer-isolation` | `toryo spike claude-implementer-isolation --profile claude-max` (hoặc `doctor --canaries`) |

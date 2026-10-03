@@ -785,7 +785,7 @@ round is the new branch `m11/review-3` from `main`. One commit per task; it ends
 - [x] R13 — the export proves its bytes; the verify root cannot be Low-writable
 - [x] R14 — M18: protection comes from the base commit; build output may exist
 - [x] R15 — command strings and `cmd` bare names
-- [ ] R16 — a gate the machine cannot run is found before the build; the hints tell the whole fix
+- [x] R16 — a gate the machine cannot run is found before the build; the hints tell the whole fix
 - [ ] R17 — Low fixes, missing tests, stale docs
 - [ ] Finish — notes, README, HUONG-DAN
 - [ ] Push and pull request
@@ -942,6 +942,49 @@ round is the new branch `m11/review-3` from `main`. One commit per task; it ends
   failed: both `cd` configurations were refused at `task create`, and with the planted `npm.cmd` the task
   **completed** — the implementer's file had run as the gate.
 - Docs: the README paragraph on M18 and HUONG-DAN §5.9 rewritten with these rules.
+
+#### R16 — a gate the machine cannot run is found before the build; the hints tell the whole fix
+
+- **Preflight (X12).** `Engine::gate_ready(t, name, gate)` holds what an environment gate needs from the machine:
+  no `%NAME%` left in its command, a valid lock name (`lock::lock_name_problem`), every `secret_env` reference
+  resolved, the program found and outside the roots agent code can write (`env_gate_program`). `verify()` calls it
+  for every environment gate of the run this machine defines (`environment_gates_preflight`) right after the
+  X++ toolchain check and **before** the verify checkout and the check gates: a failure escalates
+  `environment_gate_unavailable` at once — no `verify_command` event, no `VERIFY_RESULT.json`, no deployment row.
+  The resolved secrets are dropped. `run_environment_gates` calls the same function again when each gate starts
+  (the build may have taken long). An invalid lock name was a hard error at gate start; it is this escalation now.
+- **Hints.** `runner::machine_fix_hint(id, on_machine, in_config)`: "fixed on the machine (…): `toryo resume <id>`;
+  fixed in a config file (… — frozen with the task): `toryo task config <id> --reload`, then `toryo resume <id>`".
+  It ends all five machine-caused reasons: `environment_gate_unavailable` (Credential Manager / a program installed
+  vs. `environment_gates.<name>`), `skill_unavailable` (the folder put back vs. `skills_dir` / a role file),
+  `context_over_budget` (a smaller skill file vs. `context.budget_kb` in toryo.yaml; both escalation sites),
+  `xpp_toolchain_unavailable` (a NuGet folder or MSBuild put back vs. `toolchains.xpp`),
+  `verify_boundary_unavailable` (the rights on the verify root vs. `verify.verify_root` / `verify.boundary`).
+  `status`'s next action for a machine-caused stop adds "A fix in a config file … is used only after `toryo task
+  config <id> --reload` — the task runs on its frozen configuration". README and HUONG-DAN (§5.9 and the
+  troubleshooting rows) say the same.
+- **The class is typed and written with the escalation.** `store::transition_classed(tx, id, event, class)` applies
+  the transition and, for an escalation, sets `reason_class` in the same transaction; `Engine::escalate` and
+  `escalate_attempt` (through `finish_classed`) use it and `record_reason_class` is gone — a crash can no longer
+  leave an escalation whose reason says `toryo resume` without the class that makes a plain resume work. The class
+  of a verify-stage stop no longer comes from the reason text: `verify::prepare` / `boundary` / `probe` return a
+  typed `verify::Stop { class, reason }` (the reason still begins with the class), and `verify_checkout` reads
+  `class` by downcast. (`reason_class(&reason, …)` is left only for `artifact_tampered`, which is not one of the
+  five.)
+- **Flight record:** a machine-caused plain resume is `event: "resume_stage"` (it was `unpause`);
+  `engine_cli::machine_caused_stop` is the one condition for both the transition and the event name.
+- **Round-2 assertion changed** (named in the commit body): `an_environment_gate_that_cannot_run_escalates`
+  asserted the hint "fix the machine config, then `toryo resume`"; it now asserts the two-step hint, and that no
+  check gate ran.
+- **Tests:** `tests/m11_env_gates.rs::plain_resume_after_an_unavailable_gate_costs_no_fix_cycle` (AC-1 + AC-4,
+  extended: no `verify_command` before the escalation; after the fix the check gate and the environment gate ran;
+  `resume_stage` and no `unpause` in `events.jsonl`), `::a_wrong_gate_program_needs_a_reload_before_resume` (AC-2:
+  the file is corrected → plain resume escalates again, the reason and `status` name `task config --reload`; after
+  the reload the gate runs; fix cycle and both split counters unchanged, no implementer turn),
+  `::a_crash_right_after_a_machine_caused_escalation_keeps_its_class` (AC-3: `TORYO_TEST_CRASH_AT=escalate:after`,
+  then plain resume completes), `store::tests::an_escalation_and_its_class_are_one_transaction` (both or neither),
+  `runner::tests::next_action_of_the_five_machine_caused_classes` (the `status` text of the five classes, the hint,
+  and that the text is never parsed for the class).
 
 ## Progress
 

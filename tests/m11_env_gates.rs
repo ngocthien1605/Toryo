@@ -762,13 +762,29 @@ fn an_environment_gate_that_cannot_run_escalates() {
             err.contains("environment_gate_unavailable: environment gate `dbsync`"),
             "{id}: {err}"
         );
-        // M11-R12 (item 3): the hint names no machine-config file (a frozen config has no path)
+        // M11-R12 (item 3): the hint names no machine-config file (a frozen config has no path).
+        // M11-R16 (changed): it tells both ways out — fixed on the machine: plain resume; fixed
+        // in the machine config: `task config --reload` first (the gate's command is frozen)
         assert!(
             !err.contains("toryo.local.yaml")
-                && err.contains("fix the machine config, then `toryo resume"),
+                && err.contains(&format!(
+                    "fixed on the machine (a value added to Credential Manager, a program installed): `toryo resume {id}`; fixed in a config file (`environment_gates.dbsync` in the machine config — frozen with the task): `toryo task config {id} --reload`, then `toryo resume {id}`"
+                )),
             "{id}: {err}"
         );
         let ev = events(&env, id);
+        // M11-R16 (X12): found before the build — no check gate ran, no result was written
+        assert!(
+            !ev.iter().any(|e| e["type"] == "verify_command"),
+            "{id}: {ev:?}"
+        );
+        assert!(
+            !task(&env, id)
+                .artifacts()
+                .join("VERIFY_RESULT.json")
+                .exists(),
+            "{id}"
+        );
         assert!(
             ev.iter()
                 .any(|e| e["type"] == "escalated"
@@ -1558,6 +1574,13 @@ fn plain_resume_after_an_unavailable_gate_costs_no_fix_cycle() {
         Some("environment_gate_unavailable")
     );
     assert_eq!(t.fix_cycle, 0);
+    // M11-R16 AC-1 (X12): the gate's needs were checked before the build — no check gate ran
+    let ev = events(&env, "RS-E");
+    assert!(
+        !ev.iter().any(|e| e["type"] == "verify_command"),
+        "no `verify_command` before the escalation: {ev:?}"
+    );
+    assert!(deployments(&env).is_empty());
     // fix the cause (the secret is now resolvable) and plain-resume
     let (code, err) = toryo(
         &env,
@@ -1582,6 +1605,20 @@ fn plain_resume_after_an_unavailable_gate_costs_no_fix_cycle() {
     );
     let vr = verify_result(&env, "RS-E");
     assert_eq!(vr["commands"][0]["name"], "divide-present");
+    // M11-R16 AC-1: after the fix the check gate and the environment gate ran; AC-4: the flight
+    // record calls the plain resume `resume_stage`, not `unpause`
+    let ev = events(&env, "RS-E");
+    let ran: Vec<&str> = ev
+        .iter()
+        .filter(|e| e["type"] == "verify_command")
+        .map(|e| e["name"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(ran, ["divide-present", "dbsync"], "{ev:?}");
+    assert!(
+        ev.iter().any(|e| e["event"] == "resume_stage")
+            && !ev.iter().any(|e| e["event"] == "unpause"),
+        "{ev:?}"
+    );
     assert_eq!(
         deployments(&env)
             .iter()
@@ -1594,4 +1631,162 @@ fn plain_resume_after_an_unavailable_gate_costs_no_fix_cycle() {
         dec.contains("resumed after environment_gate_unavailable"),
         "{dec}"
     );
+}
+
+/// M11-R16 AC-2: a wrong `program` in the machine config. The gate's command is **frozen with
+/// the task**, so correcting the file is not enough: a plain `resume` escalates again — before
+/// any check gate — and its text names `task config --reload`. After the reload, `resume` runs
+/// the gate. No fix cycle and no implementer turn is spent on the way.
+#[test]
+fn a_wrong_gate_program_needs_a_reload_before_resume() {
+    let env = env_gate_setup(
+        "codex-openai",
+        "error",
+        "limits:\n  max_gate_retries: 3\n  max_review_rounds: 3\n",
+    );
+    let base = std::fs::read_to_string(&env.machine).unwrap();
+    let good = machine_gate(&env, "dbsync", "d365-env", "exit 0\n", "exit 0\n", "");
+    let bad = {
+        let program = good.lines().find(|l| l.contains("program:")).unwrap();
+        let args = good.lines().find(|l| l.contains("args:")).unwrap();
+        good.replace(
+            program,
+            if cfg!(windows) {
+                "    program: 'C:/no/such/sync.exe'"
+            } else {
+                "    program: '/no/such/sync'"
+            },
+        )
+        .replace(args, "    args: []")
+    };
+    std::fs::write(&env.machine, format!("{base}environment_gates:\n{bad}")).unwrap();
+    create(&env, "R16-P");
+    let s = script(
+        &env,
+        "r16p.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let counters = |env: &Env| {
+        let t = task(env, "R16-P");
+        let l = t.machine.split_limits().unwrap();
+        (t.fix_cycle, l.gate_retries, l.review_rounds)
+    };
+    let (_, err) = toryo(&env, &["run", "R16-P", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R16-P");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_unavailable")
+    );
+    let before = counters(&env);
+    // the file is corrected — but the task still runs on its frozen configuration
+    std::fs::write(&env.machine, format!("{base}environment_gates:\n{good}")).unwrap();
+    let (_, err) = toryo(
+        &env,
+        &["resume", "R16-P", "--yes", "--fake-agents", &s],
+        &[],
+    );
+    let t = task(&env, "R16-P");
+    assert_eq!(t.state, St::Escalated, "the same escalation: {err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_unavailable")
+    );
+    let why = t.machine.reason().unwrap_or_default().to_string();
+    assert!(
+        why.contains("program `")
+            && why.contains("`toryo task config R16-P --reload`, then `toryo resume R16-P`"),
+        "{why}"
+    );
+    assert!(
+        status_out(&env, "R16-P").contains("`toryo task config R16-P --reload`"),
+        "status says so too"
+    );
+    assert_eq!(counters(&env), before);
+    assert!(
+        !events(&env, "R16-P")
+            .iter()
+            .any(|e| e["type"] == "verify_command"),
+        "still no check gate ran"
+    );
+    // reload, then resume: the gate runs
+    let (code, err) = toryo(&env, &["task", "config", "R16-P", "--reload"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "R16-P").state, St::Escalated);
+    let (code, err) = toryo(
+        &env,
+        &["resume", "R16-P", "--yes", "--fake-agents", &s],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R16-P");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert_eq!(counters(&env), before, "no cycle was spent");
+    let d = deployments(&env);
+    assert_eq!((d.len(), d[0].ok), (1, Some(true)));
+    assert_eq!(
+        calls(&env, "R16-P")
+            .iter()
+            .filter(|c| c["key"]
+                .as_str()
+                .is_some_and(|k| k.starts_with("implementer")))
+            .count(),
+        0,
+        "no implementer turn during the last resume"
+    );
+}
+
+/// M11-R16 AC-3: the escalation and its class are one transaction. A process that dies right
+/// after it has escalated leaves a task whose plain `resume` works — there is no window in
+/// which the reason says `toryo resume` while the class that makes it work is missing.
+#[test]
+fn a_crash_right_after_a_machine_caused_escalation_keeps_its_class() {
+    let env = env_gate_setup("codex-openai", "error", "");
+    define_gates(
+        &env,
+        &machine_gate(
+            &env,
+            "dbsync",
+            "d365-env",
+            "exit 0\n",
+            "exit 0\n",
+            "    secret_env: { K: 'env:TORYO_M11_R16_SECRET' }\n",
+        ),
+    );
+    create(&env, "R16-C");
+    let s = script(
+        &env,
+        "r16c.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["run", "R16-C", "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "escalate:after")],
+    );
+    assert_eq!(code, 86, "crashed at the crash point: {err}");
+    let t = task(&env, "R16-C");
+    assert_eq!(t.state, St::Escalated);
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_unavailable"),
+        "written with the escalation"
+    );
+    let (code, err) = toryo(
+        &env,
+        &["resume", "R16-C", "--yes", "--fake-agents", &s],
+        &[("TORYO_M11_R16_SECRET", "ok")],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R16-C");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert_eq!(t.fix_cycle, 0);
 }

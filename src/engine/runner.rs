@@ -245,19 +245,23 @@ impl<'a> Engine<'a> {
         self.apply_with(e, false, None)
     }
 
-    /// Escalate with `reason`, printed as `!! reason` before the `[state]` line.
+    /// Escalate with `reason`, printed as `!! reason` before the `[state]` line. M11-R11/R16:
+    /// the typed `class` is stored on the machine **in the same transaction** as the
+    /// escalation, so a plain `toryo resume` can tell a machine-caused escalation from one a
+    /// fix cycle should repair — also after a crash right behind it.
     fn escalate(&self, class: &str, reason: String) -> Result<St> {
-        let st = self.apply_with(Ev::Escalate { reason }, true, Some(class))?;
-        self.record_reason_class(class)?;
-        Ok(st)
-    }
-
-    /// M11-R11: store the escalation class on the machine, so a plain `toryo resume` can tell a
-    /// machine-caused escalation from one a fix cycle should repair.
-    fn record_reason_class(&self, class: &str) -> Result<()> {
-        let (i, c) = (self.id.clone(), class.to_string());
-        self.store
-            .call(move |tx| store::set_reason_class(tx, &i, &c))
+        let i = self.id.clone();
+        let from = self.task()?.state;
+        let e = Ev::Escalate { reason };
+        let name = e.name();
+        let c = class.to_string();
+        let m = self
+            .store
+            .call(move |tx| store::transition_classed(tx, &i, e, Some(&c)))?;
+        crash_point("escalate:after");
+        self.rec
+            .transition_classed(from, name, &m, true, true, Some(class));
+        Ok(m.state())
     }
 
     /// M11-R5: before a turn of `stage` starts (no attempt, no tokens) — every skill it needs
@@ -285,7 +289,8 @@ impl<'a> Engine<'a> {
             ))
         } else {
             let c = context::assemble(&req)?;
-            context::over_budget(&c).map(|r| (context::CONTEXT_OVER_BUDGET, r))
+            context::over_budget(&c)
+                .map(|r| (context::CONTEXT_OVER_BUDGET, over_budget_reason(t, r)))
         };
         match blocked {
             Some((class, reason)) => {
@@ -1437,11 +1442,25 @@ impl<'a> Engine<'a> {
         let xpp = match xpp::for_config(&self.cfg) {
             Ok(x) => x,
             Err(e) => {
-                let reason = format!("{e:#}");
+                let reason = format!(
+                    "{e:#} — {}",
+                    machine_fix_hint(
+                        &t.id,
+                        "a NuGet folder or MSBuild put back",
+                        "`toolchains.xpp` in the machine config"
+                    )
+                );
                 self.escalate_attempt(&a, xpp::UNAVAILABLE.into(), reason)?;
                 return Ok(Flow::Next);
             }
         };
+        // M11-R16 (X12): what the environment gates of this run need from the machine is
+        // checked before any check gate runs — a build of tens of minutes is not spent on a
+        // gate that cannot start. (Checked again when each gate starts: things can change.)
+        if let Some(reason) = self.environment_gates_preflight(t) {
+            self.escalate_attempt(&a, ENV_UNAVAILABLE.into(), reason)?;
+            return Ok(Flow::Next);
+        }
         let Some((b, co)) = self.verify_checkout(t, &a, &head)? else {
             return Ok(Flow::Next);
         };
@@ -1568,16 +1587,88 @@ impl<'a> Engine<'a> {
             .and_then(|b| verify::prepare(&self.g, t, &self.cfg, head, b).map(|c| (b, c)));
         match prepared {
             Ok(x) => Ok(Some(x)),
-            Err(e)
-                if format!("{e:#}").starts_with(verify::UNAVAILABLE)
-                    || format!("{e:#}").starts_with(verify::MUTATED) =>
-            {
-                let reason = format!("{e:#}");
-                self.escalate_attempt(a, reason_class(&reason, verify::UNAVAILABLE), reason)?;
-                Ok(None)
-            }
-            Err(e) => Err(e),
+            // M11-R16 (X8): the class comes typed with the error, never from its text
+            Err(e) => match e.downcast_ref::<verify::Stop>().map(|s| s.class) {
+                Some(class) => {
+                    let mut reason = format!("{e:#}");
+                    if class == verify::UNAVAILABLE {
+                        reason = format!(
+                            "{reason} — {}",
+                            machine_fix_hint(
+                                &t.id,
+                                "the rights on the verify root",
+                                "`verify.verify_root` or `verify.boundary`"
+                            )
+                        );
+                    }
+                    self.escalate_attempt(a, class.to_string(), reason)?;
+                    Ok(None)
+                }
+                None => Err(e),
+            },
         }
+    }
+
+    /// M11-R16 (X12): the reason the first environment gate of this run that the machine
+    /// defines cannot start here ([`Self::gate_ready`]), or `None`. Nothing is run, locked or
+    /// recorded; a resolved secret is dropped at once.
+    fn environment_gates_preflight(&self, t: &TaskRow) -> Option<String> {
+        let team = self.cfg.team.as_ref()?;
+        team.handoff_gates()
+            .into_iter()
+            .filter(|(_, g)| g.decl.kind == crate::team::GateType::Environment)
+            .find_map(|(name, g)| {
+                g.machine
+                    .as_ref()
+                    .and_then(|m| self.gate_ready(t, name, m).err())
+            })
+    }
+
+    /// M11-R16: what the environment gate `name` needs from this machine before it can start —
+    /// no `%NAME%` left in its command (a task frozen before M11-R3), a valid lock name, every
+    /// `secret_env` reference resolved, the program found and outside the roots agent code can
+    /// write. `Ok`: the program to start and the resolved secrets; `Err`: the
+    /// `environment_gate_unavailable` reason, with the way out.
+    fn gate_ready(
+        &self,
+        t: &TaskRow,
+        name: &str,
+        m: &crate::config::EnvGate,
+    ) -> std::result::Result<(PathBuf, BTreeMap<String, String>), String> {
+        // M11-R12 (item 3): a frozen config has no machine path, so the hint names no file
+        let unavailable = |what: String| {
+            format!(
+                "{ENV_UNAVAILABLE}: environment gate `{name}`: {what} — {}",
+                machine_fix_hint(
+                    &t.id,
+                    "a value added to Credential Manager, a program installed",
+                    &format!("`environment_gates.{name}` in the machine config")
+                )
+            )
+        };
+        // M11-R12 (item 2): a task frozen before R3 may still hold `%VAR%` in program/args
+        // (they are expanded at load now, not at run time) — do not run it half-expanded
+        if let Some(var) = gate_residual_var(&m.program, &m.args) {
+            return Err(format!(
+                "{ENV_UNAVAILABLE}: environment gate `{name}`: the command still contains `%{var}%` (a task created before M11 expanded gate variables at load) — run `toryo task config {} --reload`, then `toryo resume {}`",
+                t.id, t.id
+            ));
+        }
+        if let Some(problem) = super::lock::lock_name_problem(&super::lock::lock_key(&m.lock)) {
+            return Err(unavailable(format!("lock `{}`: {problem}", m.lock)));
+        }
+        let mut secrets = BTreeMap::new();
+        for (k, r) in &m.secret_env {
+            match crate::config::resolve_secret(r) {
+                Ok(v) => {
+                    secrets.insert(k.clone(), v);
+                }
+                Err(e) => return Err(unavailable(format!("secret_env.{k}: {e:#}"))),
+            }
+        }
+        let program = env_gate_program(&self.cfg, &m.program, std::env::var_os("PATH").as_deref())
+            .map_err(unavailable)?;
+        Ok((program, secrets))
     }
 
     /// Run the verify commands in the checkout, inside the boundary, and stop at the first
@@ -1748,37 +1839,10 @@ impl<'a> Engine<'a> {
             };
             // M11-R8: one lock and one deployment row whatever the case it is written in
             let lock_name = super::lock::lock_key(&m.lock);
-            // M11-R12 (item 3): a frozen config has no machine path, so the hint names no file
-            let unavailable = |what: String| {
-                Ok(EnvGates::Unavailable(format!(
-                    "{ENV_UNAVAILABLE}: environment gate `{name}`: {what} — fix the machine config, then `toryo resume {}`",
-                    t.id
-                )))
-            };
-            // M11-R12 (item 2): a task frozen before R3 may still hold `%VAR%` in program/args
-            // (they are expanded at load now, not at run time) — do not run it half-expanded
-            if let Some(var) = gate_residual_var(&m.program, &m.args) {
-                return Ok(EnvGates::Unavailable(format!(
-                    "{ENV_UNAVAILABLE}: environment gate `{name}`: the command still contains `%{var}%` (a task created before M11 expanded gate variables at load) — run `toryo task config {} --reload`, then `toryo resume {}`",
-                    t.id, t.id
-                )));
-            }
-            let mut secrets = BTreeMap::new();
-            for (k, r) in &m.secret_env {
-                match crate::config::resolve_secret(r) {
-                    Ok(v) => {
-                        secrets.insert(k.clone(), v);
-                    }
-                    Err(e) => return unavailable(format!("secret_env.{k}: {e:#}")),
-                }
-            }
-            let program = match env_gate_program(
-                &self.cfg,
-                &m.program,
-                std::env::var_os("PATH").as_deref(),
-            ) {
-                Ok(p) => p,
-                Err(e) => return unavailable(e),
+            // M11-R16: the checks of the preflight again — the build may have taken long
+            let (program, secrets) = match self.gate_ready(t, name, m) {
+                Ok(x) => x,
+                Err(reason) => return Ok(EnvGates::Unavailable(reason)),
             };
             let Some(lock) = self.env_lock(t, &lock_name, stop)? else {
                 return Ok(EnvGates::Stopped);
@@ -2456,6 +2520,7 @@ impl<'a> Engine<'a> {
             return Ok(None);
         }
         if let Some(reason) = context::over_budget(&c) {
+            let reason = over_budget_reason(t, reason);
             self.escalate_attempt(a, context::CONTEXT_OVER_BUDGET.into(), reason)?;
             return Ok(None);
         }
@@ -2692,6 +2757,20 @@ impl<'a> Engine<'a> {
         feedback: Option<Option<String>>,
         e: Option<Ev>,
     ) -> Result<()> {
+        self.finish_classed(a, status, end, feedback, e, None)
+    }
+
+    /// [`Self::finish_and`]; `escalation`: the typed class of an escalation, stored on the
+    /// machine in the same transaction (M11-R16).
+    fn finish_classed(
+        &self,
+        a: &AttemptRow,
+        status: AttemptStatus,
+        end: AttemptEnd,
+        feedback: Option<Option<String>>,
+        e: Option<Ev>,
+        escalation: Option<String>,
+    ) -> Result<()> {
         let (i, aid) = (self.id.clone(), a.id.clone());
         let from = self.task()?.state;
         let name = e.as_ref().map(|e| e.name());
@@ -2702,7 +2781,12 @@ impl<'a> Engine<'a> {
                 store::set_feedback(tx, &i, f.as_deref())?;
             }
             match e {
-                Some(e) => Ok(Some(store::transition(tx, &i, e)?)),
+                Some(e) => Ok(Some(store::transition_classed(
+                    tx,
+                    &i,
+                    e,
+                    escalation.as_deref(),
+                )?)),
                 None => Ok(None),
             }
         })?;
@@ -2714,10 +2798,11 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    /// Fail the attempt with `class` and escalate the task with `reason` (one transaction;
-    /// its reason is printed with the escalation, R5).
+    /// Fail the attempt with `class` and escalate the task with `reason` — one transaction,
+    /// the typed class on the machine included (M11-R16); its reason is printed with the
+    /// escalation (R5).
     fn escalate_attempt(&self, a: &AttemptRow, class: String, reason: String) -> Result<()> {
-        self.finish_and(
+        self.finish_classed(
             a,
             AttemptStatus::Failed,
             AttemptEnd {
@@ -2726,8 +2811,10 @@ impl<'a> Engine<'a> {
             },
             None,
             Some(Ev::Escalate { reason }),
+            Some(class),
         )?;
-        self.record_reason_class(&class)
+        crash_point("escalate:after");
+        Ok(())
     }
 }
 
@@ -3951,14 +4038,41 @@ fn deployment_ok(res: &CommandResult) -> Option<bool> {
     (!res.timed_out && !res.cancelled).then(|| res.ok())
 }
 
+/// M11-R16 (X12): the way out of a machine-caused escalation, in two steps — a fix on the
+/// machine itself needs only `toryo resume <id>`; a fix in a config file needs `toryo task config
+/// <id> --reload` first, because the task runs on its frozen configuration (the gate's command,
+/// the budget, the toolchain paths, the profiles).
+pub fn machine_fix_hint(id: &str, on_machine: &str, in_config: &str) -> String {
+    format!(
+        "fixed on the machine ({on_machine}): `toryo resume {id}`; fixed in a config file ({in_config} — frozen with the task): `toryo task config {id} --reload`, then `toryo resume {id}`"
+    )
+}
+
 /// M11-R5: the `skill_unavailable` reason — the skills that do not resolve, with both lookup
 /// paths, and the way out.
 fn skill_unavailable_reason(t: &TaskRow, stage: &str, profile: &str, missing: &[String]) -> String {
     format!(
-        "{}: the {stage} turn ({profile}) was not started — {}; put the skill back, then `toryo resume {}`",
+        "{}: the {stage} turn ({profile}) was not started — {}; {}",
         context::SKILL_UNAVAILABLE,
         missing.join("; "),
-        t.id
+        machine_fix_hint(
+            &t.id,
+            "the skill folder put back",
+            "`skills_dir` in the machine config, a role file's `skills`"
+        )
+    )
+}
+
+/// M11-R16: the `context_over_budget` reason with the way out — the budget is frozen with the
+/// task.
+fn over_budget_reason(t: &TaskRow, reason: String) -> String {
+    format!(
+        "{reason} — {}",
+        machine_fix_hint(
+            &t.id,
+            "a skill file made smaller",
+            "`context.budget_kb` in toryo.yaml"
+        )
     )
 }
 
@@ -4495,8 +4609,9 @@ pub fn next_action(t: &TaskRow) -> String {
                 .reason_class()
                 .is_some_and(crate::engine::state::is_machine_caused)
             {
-                // M11-R11 (X8): the machine caused it — plain resume goes back into the stage
-                format!("{why}\n  → fix the cause, then `toryo resume {id}` (no fix cycle; the stage is checked again)")
+                // M11-R11 (X8): the machine caused it — plain resume goes back into the stage.
+                // M11-R16: a fix in a config file is not used until the task is reloaded
+                format!("{why}\n  → fix the cause, then `toryo resume {id}` (no fix cycle; the stage is checked again). A fix in a config file (the machine config, toryo.yaml, a profile) is used only after `toryo task config {id} --reload` — the task runs on its frozen configuration")
             } else if why.starts_with(protect::REASON) {
                 format!("{why}\n  → restore the file(s) and `toryo resume {id}`, or `toryo resume {id} --accept-protected-change <path>` (recorded in DECISIONS.md)")
             } else if why.starts_with("recovery_policy_violation") {
@@ -5632,6 +5747,55 @@ mod tests {
     fn gate_names_match_the_approval_rows() {
         assert_eq!(gate_name(GateKind::Plan), "plan");
         assert_eq!(gate_name(GateKind::Final), "final");
+    }
+
+    /// M11-R16 / R17: after each of the five machine-caused escalations `status` names both
+    /// ways out — plain `toryo resume`, and `task config --reload` first for a fix in a config
+    /// file — and never `--note`; the reasons the engine writes say which fix needs which step.
+    #[test]
+    fn next_action_of_the_five_machine_caused_classes() {
+        for class in crate::engine::state::MACHINE_CAUSED {
+            let mut t = task_in(&[
+                Ev::Start,
+                Ev::Escalate {
+                    reason: format!("{class}: x"),
+                },
+            ]);
+            t.machine.set_reason_class(class);
+            assert_eq!(
+                next_action(&t),
+                format!("{class}: x\n  → fix the cause, then `toryo resume T-1` (no fix cycle; the stage is checked again). A fix in a config file (the machine config, toryo.yaml, a profile) is used only after `toryo task config T-1 --reload` — the task runs on its frozen configuration"),
+                "{class}"
+            );
+        }
+        // the same reason without the typed class is an ordinary escalation: the text is never
+        // parsed for it
+        let t = task_in(&[
+            Ev::Start,
+            Ev::Escalate {
+                reason: "skill_unavailable: x".into(),
+            },
+        ]);
+        assert!(next_action(&t).contains("--note"), "{}", next_action(&t));
+        // the reasons
+        let t = task_in(&[]);
+        let hint = machine_fix_hint("T-1", "a program installed", "`environment_gates.g`");
+        assert_eq!(
+            hint,
+            "fixed on the machine (a program installed): `toryo resume T-1`; fixed in a config file (`environment_gates.g` — frozen with the task): `toryo task config T-1 --reload`, then `toryo resume T-1`"
+        );
+        let skill = skill_unavailable_reason(&t, "implement", "codex", &["`a` not found".into()]);
+        assert!(
+            skill.starts_with("skill_unavailable: the implement turn (codex) was not started — `a` not found; fixed on the machine (the skill folder put back): `toryo resume T-1`;")
+                && skill.contains("`toryo task config T-1 --reload`"),
+            "{skill}"
+        );
+        let budget = over_budget_reason(&t, "context_over_budget: too big".into());
+        assert!(
+            budget.starts_with("context_over_budget: too big — fixed on the machine")
+                && budget.contains("(`context.budget_kb` in toryo.yaml — frozen with the task): `toryo task config T-1 --reload`, then `toryo resume T-1`"),
+            "{budget}"
+        );
     }
 
     #[test]
