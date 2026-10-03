@@ -304,7 +304,8 @@ from the repository checkout (`project.root`), never from a task worktree, and e
     `node`/`ruby`/`perl`/`php`/`bun`/`tsx`/`ts-node` that is not a flag or a flag's value (`-o`, `-W`, `-r`, `-I`,
     `--env-file`, `--rcfile`, …), and of `deno run`.
     In a **command string** (`pwsh -Command`, `cmd /c`, a shell's `-c`, also `-ec`, `-lc`) Toryo reads the string:
-    it is split, with its quotes, into simple commands at `&&`, `||`, `;`, `|`, `&`, newlines and `( ) { }`. Only the
+    it is split, with its quotes, into simple commands at `&&`, `||`, `;`, `|`, `&`, newlines and `( ) { }` (in a
+    `cmd` string `;` separates arguments, not commands, and `rem` comments out its line). Only the
     **head** of each simple command — its first word after an optional `call`, `.`, `exec`, `time` or `NAME=value` —
     is an entry script, and only when it is a relative path with a separator (`& './my scripts/x.ps1'` keeps its
     space). It is refused when missing only if it clearly names a script: it starts with `./` or `../` (`./gradlew`
@@ -313,9 +314,12 @@ from the repository checkout (`project.root`), never from a task worktree, and e
     (`scripts\build`, `.\gradlew`) stands for `scripts\build.cmd`, `.ps1`, …: every such name is protected, none is
     refused. A `cd` / `chdir` / `pushd` / `Set-Location` / `sl` / `Push-Location` with a literal relative folder
     moves where the rest resolves (`popd` / `Pop-Location` go back; `pwsh -WorkingDirectory ci` starts there):
-    `bash -lc "cd ci && ./x.sh"` runs — and protects — `ci/x.sh`. Toryo stops reading — and refuses and protects
-    nothing more in the string — when it cannot follow it: a `cd` with a variable, an absolute path, `-` or no
-    argument; a `cd` that is not the head of its command (`if [ -d web ]; then cd web; fi`); a here-document. A
+    `bash -lc "cd ci && ./x.sh"` runs — and protects — `ci/x.sh`. Toryo **stops reading** when it cannot follow the
+    string: a `cd` with a variable, an absolute path, `-` or no argument; a `cd` that runs only sometimes — after
+    `&&` / `||` (`[ -d ci ] && cd ci`), in a pipeline, inside a block or a function body (`if (…) { cd build }`), or
+    not as the head of its command (`if [ -d web ]; then cd web; fi`); a here-document. From there on nothing is an
+    entry script and nothing is refused; the words of the rest are still protected where they name a file of the
+    base commit (as written from the folder reached so far, and from the folder such a `cd` names). A
     quoted string in head position of a PowerShell string is an expression, not a command (`'out/x.txt' | Should
     -Exist`, `@('a/b','c/d')`), unless `&` or `.` runs it. A bare head of a `cmd` string that is not a built-in
     (`cmd /c build`, `cmd /c "npm.cmd run build"`) is protected — never refused — as `<name>` and `<name>` + each
@@ -344,7 +348,14 @@ from the repository checkout (`project.root`), never from a task worktree, and e
     **never reads the checkout the check gates used** (M11 review X6): once it holds its lock, Toryo exports the
     checkpoint commit afresh from the repository's object store into `<verify_root>\<task>\deploy`, a folder no agent
     code can write — that export is its `TORYO_VERIFY_CHECKOUT` (no `.git`; its tree id is in `VERIFY_RESULT.json`,
-    `source: "export"`). What a check gate left in the checkout is listed (`checkout_extra`, one warning), never
+    `source: "export"`). (M11-R13) Before the gate starts — and again after it — **every exported file is hashed**
+    against the commit's tree (no size-and-timestamp shortcut): a file whose content is not the commit's stops the
+    gate (`environment_gate_unavailable` before it, `verify_mutated_tree` after it — a gate script never writes
+    there). With the `low_integrity` boundary Toryo also proves, before each verify run, that the task's folder
+    under `verify_root` is **not writable at Low integrity** (a Low process tries to create a folder there and must
+    fail): a `verify_root` inside a Low-writable tree such as `AppData\LocalLow` would hand the export and the
+    gate's working folder to the code under test — `verify_boundary_unavailable`, and `toryo doctor` / `task
+    create` say the same. What a check gate left in the checkout is listed (`checkout_extra`, one warning), never
     deployed; `verify.checkout: tracked` works with environment gates too. It runs in an **empty working directory**
     that agent code cannot write (`<verify_root>\<task>\envgate`), inside a Job Object, with an
     environment from scratch + the gate variables + `env` + the resolved
@@ -455,7 +466,7 @@ cargo test --release
 | `tests/m11_trust.rs` | Windows + Linux | M11-A: the machine floor for `verify.boundary`, the machine `verify_root` and its origin in `doctor` |
 | `tests/m11_orgchart.rs` | Windows + Linux | M11-B/C1: `config show` (text, `--json`), a task frozen and reloaded with the same digest, a fake run to the final gate in org chart mode, layered role instructions in `context show` |
 | `tests/m11_roles.rs` | Windows + Linux | M11-C: the write fence at plan time and after a build turn (`## Allow protected`), `reviewer-differs-from-builder` off/warn/error after a fallback, split limits end to end |
-| `tests/m11_gates.rs` | Windows + Linux | M11-E1/E2: the gate variables, M18 admission, verify output redacted with the task's secrets, stdout/stderr order kept |
+| `tests/m11_gates.rs` | Windows + Linux | M11-E1/E2: the gate variables, M18 admission, verify output redacted with the task's secrets, stdout/stderr order kept; round 3: build-output entry scripts (R14), a `cd` in a command string and `cmd` bare names (R15), a reload after a changed `verify_root` |
 | `tests/m11_env_gates.rs` | Windows + Linux (normal-token vs Low-IL test Windows only) | M11-E3: environment gates after the checks, the deployment record in every view, the shared lock with `stop`, secrets, `if_missing: skip`, a mutated checkout, an unavailable gate, a crash during the gate |
 | `tests/m11_skills.rs` | Windows + Linux | M11-D: the planner's menu, the plan's `skills` (off the menu, over the budget, none), skills per role in `context show`, a changed SKILL.md, the Claude implementer's context file |
 

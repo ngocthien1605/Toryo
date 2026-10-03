@@ -718,7 +718,8 @@ trượt đầu tiên; exit code quyết định; mọi gate có `TORYO_TASK`, `
   `ruby`/`perl`/`php`/`bun`/`tsx`/`ts-node` (bỏ qua giá trị của `-o`, `-W`, `-r`, `--env-file`, `--rcfile`…) và của
   `deno run`.
   Với **chuỗi lệnh** (`pwsh -Command`, `cmd /c`, `-c` của shell, cả `-ec`, `-lc`), Toryo đọc chuỗi đó: tách theo dấu
-  nháy thành các lệnh đơn tại `&&`, `||`, `;`, `|`, `&`, xuống dòng và `( ) { }`. Chỉ **từ đầu** của mỗi lệnh đơn (sau
+  nháy thành các lệnh đơn tại `&&`, `||`, `;`, `|`, `&`, xuống dòng và `( ) { }` (trong chuỗi `cmd`, `;` ngăn cách đối
+  số chứ không ngăn cách lệnh, và `rem` biến cả dòng thành chú thích). Chỉ **từ đầu** của mỗi lệnh đơn (sau
   `call`, `.`, `exec`, `time` hoặc `TÊN=giá_trị` nếu có) mới là script đầu vào, và chỉ khi nó là đường dẫn tương đối có
   `/` hoặc `\` (`& './my scripts/x.ps1'` giữ nguyên dấu cách). Nó chỉ bị từ chối khi thiếu nếu rõ ràng là script: bắt
   đầu bằng `./` hoặc `../` (`./gradlew` trong chuỗi shell không cần đuôi) hoặc có đuôi script (`scripts\x.cmd`); các
@@ -726,9 +727,12 @@ trượt đầu tiên; exit code quyết định; mọi gate có `TORYO_TASK`, `
   đuôi (`scripts\build`, `.\gradlew`) nghĩa là `scripts\build.cmd`, `.ps1`, …: mọi tên như vậy được bảo vệ, không tên
   nào bị từ chối. `cd` / `chdir` / `pushd` / `Set-Location` / `sl` / `Push-Location` với thư mục tương đối viết thẳng
   sẽ đổi chỗ phân giải phần còn lại (`popd` / `Pop-Location` quay lại; `pwsh -WorkingDirectory ci` bắt đầu ở đó):
-  `bash -lc "cd ci && ./x.sh"` chạy — và bảo vệ — `ci/x.sh`. Toryo **dừng đọc** — phần còn lại của chuỗi không bị từ
-  chối và không được bảo vệ — khi không theo được: `cd` dùng biến, đường dẫn tuyệt đối, `-` hoặc không có đối số;
-  `cd` không đứng đầu lệnh (`if [ -d web ]; then cd web; fi`); here-document. Chuỗi trong dấu nháy đứng đầu lệnh của
+  `bash -lc "cd ci && ./x.sh"` chạy — và bảo vệ — `ci/x.sh`. Toryo **dừng đọc** khi không theo được: `cd` dùng biến,
+  đường dẫn tuyệt đối, `-` hoặc không có đối số; `cd` chỉ chạy trong một số trường hợp — sau `&&` / `||`
+  (`[ -d ci ] && cd ci`), trong pipeline, trong khối lệnh hay thân hàm (`if (…) { cd build }`), hoặc không đứng đầu
+  lệnh (`if [ -d web ]; then cd web; fi`); here-document. Từ chỗ đó trở đi không có gì là script đầu vào và không có
+  gì bị từ chối; các từ còn lại vẫn được bảo vệ nếu chúng là tên file có trong commit gốc (tính từ thư mục đã theo
+  được, và từ thư mục mà lệnh `cd` đó nêu). Chuỗi trong dấu nháy đứng đầu lệnh của
   PowerShell là biểu thức, không phải lệnh (`'out/x.txt' | Should -Exist`, `@('a/b','c/d')`), trừ khi có `&` hoặc `.`
   chạy nó. Tên trần đứng đầu lệnh trong chuỗi `cmd` (`cmd /c build`, `cmd /c "npm.cmd run build"`, không phải lệnh nội
   bộ như `cd`, `echo`, `set`) được **bảo vệ, không bao giờ bị từ chối**, dưới các tên `<tên>` và `<tên>` + từng đuôi
@@ -751,6 +755,13 @@ trượt đầu tiên; exit code quyết định; mọi gate có `TORYO_TASK`, `
   nào chạy, `verify_mutated_tree`), và **không bao giờ đọc bản checkout mà check gate đã dùng** (X6): khi đã giữ lock,
   Toryo xuất lại commit checkpoint từ kho object của repo vào `<verify_root>\<task>\deploy`, thư mục mà code agent không
   ghi được — bản xuất đó là `TORYO_VERIFY_CHECKOUT` của gate (không có `.git`; tree id ghi trong `VERIFY_RESULT.json`).
+  (M11-R13) Trước khi gate chạy — và một lần nữa sau khi chạy — **mọi file đã xuất được băm lại** và so với tree của
+  commit (không tin kích thước hay thời gian sửa): file có nội dung khác commit → gate không chạy
+  (`environment_gate_unavailable`), hoặc `verify_mutated_tree` nếu chính script gate ghi vào đó. Với boundary
+  `low_integrity`, trước mỗi lần verify Toryo còn kiểm tra thư mục của task dưới `verify_root` **không ghi được ở mức
+  Low integrity** (cho một tiến trình Low thử tạo thư mục ở đó — phải thất bại): `verify_root` nằm trong cây thư mục
+  Low ghi được (như `AppData\LocalLow`) sẽ trao bản xuất và thư mục làm việc của gate cho code đang được kiểm tra →
+  `verify_boundary_unavailable`; `toryo doctor` và `task create` báo cùng lỗi.
   File check gate để lại trong checkout chỉ được liệt kê (`checkout_extra`, một dòng cảnh báo), không bao giờ được
   deploy; `verify.checkout: tracked` dùng được cùng gate môi trường. Gate chạy trong một **thư mục làm việc trống** mà code của
   agent không ghi được (`envgate`). `%VAR%` trong `program`/`args` được thay **một lần, lúc nạp config** (`task create`;

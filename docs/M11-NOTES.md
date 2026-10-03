@@ -2,6 +2,90 @@
 
 Every entry: what was decided, why, and where. The owner folds these into plan v0.9.
 
+## Morning summary — review fixes round 3 (2026-10-03, after `M11-review-fixes-3.md`)
+
+**R13–R17 of `M11-review-fixes-3.md` are DONE.** New branch `m11/review-3` from `main` @ `df84b02` (M11 is merged:
+pull request #3). One commit per task, plus one follow-up commit per independent review; the round ends with a push
+and a pull request (see "Progress (round 3)" for where that stands).
+
+| Commit | Task | Tests (Windows) |
+|---|---|---|
+| `59fded3` | R13 — the export proves its bytes; a Low-writable verify root is refused | 574 |
+| `8da7d61` | R14 — M18 protection comes from the base commit; build output may exist (X9; everyone) | 578 |
+| `21e83c9` | R15 — command strings are read; `cmd` bare names are protected (X10; everyone) | 586 |
+| `36e28d4` | R16 — an environment gate's needs are checked before the build; two-step hints (X12) | 590 |
+| `35522d3` | review of R13–R15 — lines the reader must not refuse, PATHEXT, the probe's control | 596 |
+| `227c70d` | R17 — Low fixes, missing tests, flake diagnostics, stale docs | 599 |
+| `645e89b` | review of R16–R17 — a conditional `cd` is not followed, `-WorkingDirectory`, escapes; the rest of a string that cannot be followed is still protected | 601 |
+| (this) | Finish — this summary, README / HUONG-DAN | 601 |
+
+**Checks** (§0.2) green before every commit **on this Windows machine**: `cargo fmt --check`, both
+`clippy --all-targets -D warnings`, `cargo test --locked`. Tests: 570 passed at `df84b02` → **601 passed, 0 failed,
+6 ignored** at the end (599 at `227c70d`). **Unix-only code of this round was not compiled here** (WSL has no cargo) — it was
+changed by reading and read again by the second reviewer: `src/process/unix.rs` (the signal that ended a command),
+`tests/spike_e2e.rs` (`verify_diag`), the symlink branch of one `team` test, the `sh` branches of the new e2e tests,
+and one Unix-only unit test (`process::tests::the_signal_that_ended_a_process_is_kept`), which has never run.
+**The `ubuntu-latest` job of the pull request is its first Linux build.** No real agent was run, nothing ran against
+a D365FO environment, your configs and data dirs were not touched.
+
+**Windows-only tests, by name, on this machine (all `ok`):**
+- `tests/m11_env_gates.rs::a_low_writable_verify_root_is_refused` (R13 AC-2, new)
+- `tests/m11_env_gates.rs::a_same_length_forgery_in_the_checkout_is_never_deployed` (R13 AC-3, rewritten: the gate
+  must run and deploy the committed bytes)
+- `tests/m11_env_gates.rs::plain_resume_after_an_unavailable_boundary_costs_no_fix_cycle` (R17, new)
+- `tests/m11_env_gates.rs::a_low_integrity_check_gate_cannot_write_the_export`, `::a_low_integrity_check_gate_
+  cannot_write_the_envgate_folder`, `::an_environment_gate_has_the_normal_token_a_check_gate_low_integrity` (as in
+  round 2)
+- `engine::verify::tests::emptying_a_folder_never_follows_a_junction`; the junction and 8.3-name parts of
+  `team::tests::a_path_spelled_another_way_is_still_inside` (R17: a junction inside the repository)
+- the toast tests of `m10_notify` as before (`notify_test_shows_a_real_toast` stays ignored); 5 Unix-only tests
+  remain `ignored` here and run on CI.
+
+**What changed for a repository without an org chart** (R14 and R15 "apply to everyone"; a configuration keeps its
+hash unless it has a build-output entry script):
+- **R14 — what M18 protects comes from the task's base commit.** An argument of a verify command is protected when
+  it names a file of the base commit — not when a file of that name happens to exist in the worktree. So build
+  output left by an earlier run (`build/app.exe`, `out/test/index.js`) no longer stops a resumed task with
+  `protected_config_changed`. An entry script that is missing at base **and ignored** (`node dist/cli.js`) is
+  recorded with the task (`build_entries` in `toryo task config <id>`); the implementer may build it, but it can
+  never be committed (un-ignoring it is a path-policy violation with a fix note). A task created before this
+  change gets the new behaviour after `toryo task config <id> --reload`.
+- **R15 — command strings are read, not scanned.** In `pwsh -Command`, `cmd /c`, `sh -c` only the head of each
+  simple command is an entry script; a `cd` is followed (`bash -lc "cd ci && ./x.sh"` is `ci/x.sh` — round 2
+  refused it) unless it runs only sometimes (after `&&` / `||`, in a block: then Toryo stops reading, refuses
+  nothing, and protects the rest where the base commit has it); arguments are never refused (`tsc --outFile
+  build/x.js`, `Invoke-Pester tests/New.Tests.ps1`);
+  `./gradlew` is found; a path with a space stays whole. A head is refused when missing only if it clearly names a
+  script (`./…`, `../…` or a script extension). A bare head of a `cmd` string (`cmd /c build`, `npm.cmd`) is
+  protected under `<name>` + the default PATHEXT whether or not it is on PATH — creating one stops the task
+  (`protected_config_changed`, X11). New in the table: `php`, `bun`, `tsx`, `ts-node`, `deno run`, `make -f`.
+  **A configuration round 2 admitted can now be refused** only in these cases, each with the script missing at the
+  base commit and not ignored: a `sh -c` head without an extension that starts with `./` (`bash -c "./gradlew
+  test"`); the script of the new table rows (`deno run x.ts`, `bun x.ts`, `tsx x.ts`, `ts-node x.ts`, `php
+  tools/x.php`); `make -f dir/x.mk` (a makefile named with a separator). Several it refused are admitted now.
+- R13 (the export and the `verify_root` check) and R16 (the preflight, the hints) concern environment gates and the
+  five machine-caused stops; without an org chart only `xpp_toolchain_unavailable` and
+  `verify_boundary_unavailable` arise — their reasons now end with the two-step hint. R17: a fence pattern is
+  org-chart only; `doctor` warns about a legacy pattern with `{ } [ ] !`; the reach check through a link concerns
+  `environment_gates` and `skills_dir`.
+
+**Open (the conservative choice is in place) — added this round; the round-1/2 items below still stand:**
+- R13: the after-gate export check guards the owner's own script (a contract, not a boundary — the gate runs with
+  the owner's rights). A changed `verify_root` leaves the old checkout folder behind.
+- R14: `checks::verify_commands` still takes the `scripts/build.ps1` / `test.ps1` fallback from the worktree as it
+  is; "ignored" is asked of the repository's working tree at `task create` / reload, not of the base commit.
+- R15, **for the owner to confirm**: where Toryo stops reading a command string, the rest is still protected when
+  it names a file of the base commit (never refused). R15 Do 2 said "nothing more is refused or protected"; the
+  second review showed that this leaves a gate script of the base commit open to the implementer.
+- R15: a file an entry script itself loads (dot-sourced, imported) is not seen (unchanged); the interpreter and
+  `make` rules are not applied inside a command string (`sh -c "make test"`, `bash -c "node dist/cli.js"`); a script
+  behind `env`, `timeout`, `!`, `then`, `source` is an argument (protected when it exists, not refused); `nmake /f`;
+  a machine with a custom `%PATHEXT%` has more extensions than the fixed list.
+- R17: the `spike_e2e` flake's cause is not known — the diagnostics are in place (the signal number and the output
+  of the failing `pwsh` step); the hypothesis is the shared `HOME` cache of two `pwsh` started in parallel.
+- Outside this round (the R13–R15 reviewer): `verify::mutated` looks at tracked files only, so code a check gate ran
+  can leave an untracked `npm.cmd` in the verify checkout that a later `cmd` gate of the same run would find first.
+
 ## Morning summary — review fixes round 2 (2026-10-02, after `M11-review-fixes-2.md`)
 
 **R9–R12 of `M11-review-fixes-2.md` are DONE.** Branch `m11/orgchart`, from `f77fc49` (round 1); this round adds
@@ -676,7 +760,9 @@ An independent review of `29226ec` found two must-fix bypasses of X6, fixed here
   it proved nothing; an implementer agent that ran `git replace <blob> <evil>` in the shared common dir changed the
   exported bytes. Fixed: the export (and `export_changed`) run with `GIT_NO_REPLACE_OBJECTS=1`, and `deploy_source`
   now runs `export_changed` **before** the gate starts (the files on disk must be the commit's), failing as
-  `environment_gate_unavailable` rather than catching it only after the deploy.
+  `environment_gate_unavailable` rather than catching it only after the deploy. **(Corrected in round 3, R13:**
+  this check trusted Git's size-and-timestamp data, so "the files on disk are the commit's" was claimed, not
+  proven — on a large export a file with other bytes passed. It hashes every file now.)
 - Also: a stale `deploy.index.lock` (a killed git) is removed before the export; the export-failure message is its
   own (`… could not be exported … resume … exports it again`), not "fix the machine config"; `checkout_extra` is best
   effort and capped at 1000 (a Low check gate cannot make verify *error* with an unreadable or huge tree) and no
@@ -806,7 +892,8 @@ round is the new branch `m11/review-3` from `main`. One commit per task; it ends
 - [x] R16 — a gate the machine cannot run is found before the build; the hints tell the whole fix
 - [x] Review of R13–R15 (independent subagent) — its findings fixed in one follow-up commit
 - [x] R17 — Low fixes, missing tests, stale docs
-- [ ] Finish — notes, README, HUONG-DAN
+- [x] Review of R16–R17 and of the first follow-up (independent subagent) — fixed in one follow-up commit
+- [x] Finish — notes (the round-3 summary at the top), README, HUONG-DAN
 - [ ] Push and pull request
 - [ ] CI
 
@@ -1114,6 +1201,51 @@ realistic command lines**, several of them regressions against round 2. Fixed he
   #3 merged as `df84b02`; the first CI attempt on `main` hit the flake, the re-run was green); the round-1 summary
   marks X2 as replaced by X6; `templates/toryo.local.yaml.example` (and the D365FO one) name plain `toryo resume`
   and `task config --reload` next to `environment_gates`.
+
+#### Review of R16–R17 and of the first follow-up (independent subagent) — follow-up commit
+
+The second reviewer read `36e28d4`, `35522d3`, `227c70d` (no Linux toolchain here either: the Unix-only code was
+read line by line — **no build or clippy problem found by reading**), ran the unit and e2e tests of R16/R17, about
+120 command lines of its own and 200 000 random strings through the reader (no panic, no loop). **R16: no issue**
+(all seven escalation sites of the five classes go through `transition_classed`; no class is derived from text;
+the preflight uses the run's own filter; secrets are dropped). **`team::inside`: no issue.** Fixed here:
+
+- **`pwsh_dir`** took `-WorkingDirectory` from the script's own parameters (`pwsh -File scripts/build.ps1
+  -WorkingDirectory src` became `src/scripts/build.ps1` — a false refusal). It now looks only before `-File`,
+  `-Command` or the script.
+- **A conditional `cd` was followed as if it always ran** (`[ -d ci ] && cd ci; ./x.sh`, `cd a || cd b`,
+  `cd a | …`, `f() { cd sub; }`, `if (…) { cd build }`, `if exist sub (cd sub)`). The lexer now tells `;` / line
+  break, `&&` / `||`, `|`, and blocks apart; a `cd`-family command is followed only when it runs whatever came
+  before — at the top level, not after `&&` / `||`, not in a pipeline, not in a block (`cmd` and PowerShell
+  parentheses count as blocks; a shell's `( … )` stays a scope). Otherwise the reading stops. `cd ci && ./x.sh` is
+  unaffected (the `cd` comes first).
+- **After a stop the rest is still protected where the base commit has it** (`Parsed::maybe`): the literal words of
+  the rest, as written from the folder reached so far and from the folder a `cd` that may or may not have run
+  names. Never an entry, never refused, no note. **This departs from the letter of R15 Do 2** ("nothing more is
+  refused or protected") and follows the owner's rule for the round ("refuse nothing, protect what clearly exists
+  at the base commit") and X10, which says only "refuses nothing": without it `bash -c "if [ -d frontend ]; then cd
+  frontend; fi; ./run-tests.sh"` left a `run-tests.sh` of the base commit open to the implementer. Under "Open"
+  for the owner to confirm.
+- **Escapes and `cmd` syntax:** an escape character (`\`, a backtick, `^`) takes the next character as it is, also
+  inside double quotes (`\"`), so an escaped separator or quote no longer splits (`echo a \; ./nope.sh`); `''`
+  inside PowerShell single quotes; in a `cmd` string `;` separates arguments, not commands; a `rem` head comments
+  out the rest of its line, separators included.
+- **R16 details:** an invalid lock name gets a config-only hint (no "fixed on the machine" half);
+  `config::resolve_secret("env:X")` no longer formats `VarError` — its `NotUnicode` form prints the value (it
+  predates this round, and the preflight would have put it into the escalation reason).
+- **R17 details:** a fence pattern whose first segment is `$env:NAME` is refused like `$NAME`; `doctor`'s
+  "matched literally" warning fires for `!` only in front (elsewhere it is a character of a file name); the signal
+  is also recorded by the engine (`VERIFY_RESULT.json` `signal`, "exited -1 (killed by signal 9)" in the fix
+  note), and a Unix-only unit test exercises it (`process::tests::the_signal_that_ended_a_process_is_kept` — never
+  run here).
+- **Tests:** `cmdline::tests::a_conditional_cd_is_not_followed`, `::escapes_and_cmd_comments`, the `cd` test
+  rewritten for the new rule (`pushd sub && … && popd && …` now stops at `popd`; with `&` it is followed);
+  7 rows added to `checks::tests::command_strings_and_cmd_bare_names`;
+  `m11_gates::lines_the_reader_must_not_refuse` asserts that `run-tests.sh` is protected.
+- **Recorded, not changed:** the AC-3 e2e test of R16 crashes *after* the escalation's transaction, so it would
+  also pass on two-transaction code with a crash point at the same place — atomicity is by construction and is
+  what `store::tests::an_escalation_and_its_class_are_one_transaction` shows; `~user/x` and `$(NAME)/x` are accepted
+  as fence patterns (literal, per the list); `[` `]` in a legacy pattern always warns (`app/[id]/page.tsx`).
 
 ## Progress
 
