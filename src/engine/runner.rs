@@ -5656,7 +5656,31 @@ mod tests {
             cancelled: false,
             duration_ms: 1500,
             output,
+            signal: None,
         };
+        // M11-R17: how a command ended, in words
+        assert_eq!(res.ended(), "exit 1");
+        let killed = CommandResult {
+            exit: Some(-1),
+            signal: Some(9),
+            ..res.clone()
+        };
+        assert_eq!(killed.ended(), "exit -1 (killed by signal 9, SIGKILL)");
+        assert_eq!(
+            serde_json::to_value(&killed).unwrap()["signal"],
+            json!(9),
+            "recorded when there is one"
+        );
+        assert!(
+            serde_json::to_value(&res).unwrap().get("signal").is_none(),
+            "left out otherwise"
+        );
+        let timed_out = CommandResult {
+            exit: None,
+            timed_out: true,
+            ..res.clone()
+        };
+        assert_eq!(timed_out.ended(), "no exit code (timed out)");
         let tail: Vec<String> = (6..=45).map(|i| format!("line {i}")).collect();
         assert_eq!(
             command_result(&c, &res),
@@ -5681,6 +5705,7 @@ mod tests {
                 cancelled,
                 duration_ms: 10,
                 output: output.into(),
+                signal: None,
             };
         let many: String = (1..=45).map(|i| format!("line {i}\n")).collect();
         let tail: Vec<String> = (6..=45).map(|i| format!("line {i}")).collect();
@@ -5935,6 +5960,7 @@ mod tests {
             cancelled,
             duration_ms: 1,
             output: String::new(),
+            signal: None,
         };
         // finished: its own result — also when a stop came afterwards (the stop flag is not
         // an input)

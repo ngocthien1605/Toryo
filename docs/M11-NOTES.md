@@ -17,10 +17,19 @@ after R12).
 | `e9a5b0c` | R9 review — harden the export against links and replace objects | 564 |
 | `341673a` | R11 — plain `resume` after a machine-caused escalation costs no fix cycle (X8) | 567 |
 | `be494d4` | R12 — cheap Low fixes (gate `%VAR%`, `dead_pattern`, fence syntax) | 569 |
-| (this) | Finish — the round-2 summary, docs | 569 |
+| `b17bdcd` | Finish — the round-2 summary, docs | 569 |
+| `c6555c6` | R10–R12 review — `cmd` chained entry scripts, test gaps | 569 |
+| `b7046ab` | notes — the push was blocked here by the environment (the owner pushed) | 569 |
+| `512708d` | CI (windows-latest) — the reach check compares a path that does not exist yet in the root's spelling | 570 |
+| `062938b` | CI (windows-latest) — the env-gate test probe lists files by relative name (test only) | 570 |
+| `f5ad5e1` | CI (ubuntu-latest, Rust 1.99) — the deprecated `AtomicU64::fetch_update` replaced | 570 |
+| `e3a199e` | notes — the pull request and CI round 1 | 570 |
+
+(Table completed in round 3: it stopped at "Finish" and said 569.) **Merged:** pull request #3 as `df84b02`.
 
 **Checks** (§0.2) green before every commit **on this Windows machine**: `cargo fmt --check`, both
-`clippy --all-targets -D warnings`, `cargo test --locked`. Tests: **569 passed, 0 failed, 6 ignored** (round 1 ended
+`clippy --all-targets -D warnings`, `cargo test --locked`. Tests: **570 passed, 0 failed, 6 ignored** at the end
+(569 before the CI commits; round 1 ended
 at 557). **The round-2 commits were not compiled on Linux here** (WSL has no cargo); every Unix-only block touched
 and every Unix-only use of a changed signature was read by hand, and the R9/R10–R12 reviewers checked Linux by
 reading — but **the `ubuntu-latest` job of the pull request is their first Linux build**.
@@ -113,8 +122,10 @@ change):
   machine config names that file; `doctor` warns about a `deny_paths` / `protected_paths` pattern that can never
   match (R4).
 
-**Decisions X1–X5** are in force (section below, with the answers to the old Open list). **Deviations** worth
-knowing: `verify.checkout: clean` is required with an environment gate (X2); a fence pattern without a wildcard in
+**Decisions X1–X5** are in force (section below, with the answers to the old Open list) — **except X2, which round 2
+replaced by X6**: an environment gate deploys from a fresh export of the commit, and `verify.checkout: clean` is no
+longer required. **Deviations** worth knowing: ~~`verify.checkout: clean` is required with an environment gate
+(X2)~~ (withdrawn with X2); a fence pattern without a wildcard in
 its last segment covers what is under it and a wildcard pattern without `/` matches at any depth (gitignore-like,
 from the second review); the skills text is not frozen (draft deviation, R8); R7 "turn started" is read from the
 stored context (the `pid` column is never filled).
@@ -573,7 +584,14 @@ the push and the pull request.
 - [x] Finish — notes, README, HUONG-DAN, templates
 - [x] Push and pull request — `git push` was denied here by the environment permission layer; the owner pushed
   `m11/orgchart` and opened https://github.com/ngocthien1605/Toryo/pull/3
-- [~] CI — round 1 on `b7046ab`: both `test` jobs red, `toryo.exe (release)` skipped. Fixed in three `M11-ci` commits:
+- [x] CI — green in the end, and **pull request #3 was merged as `df84b02`**. Round 2 (on `e3a199e`):
+  `test (ubuntu-latest)` green; `test (windows-latest)` failed its first attempt on two `m10_notify` toast tests
+  that hit their 10 s limit on a slow runner (M11 did not touch them), the re-run was green; `toryo.exe (release)`
+  green. The first CI attempt on `main` after the merge (run #20, `df84b02`, `ubuntu-latest`) failed
+  `pipeline_plan_gate_fix_cycle_and_approval` and `pipeline_falls_back_to_claude_when_codex_is_out_of_quota`
+  (`tests/spike_e2e.rs`): the `pwsh` `build` step ended with `exit Some(-1)` after about 2 s, three times in a row;
+  the re-run of the same commit was green (a flake — round 3, R17, adds the diagnostics).
+  Round 1 on `b7046ab`: both `test` jobs red, `toryo.exe (release)` skipped. Fixed in three `M11-ci` commits:
   - `512708d` **windows-latest**, 4 `team::tests`: the reach check failed open when the path did not exist yet and
     the root was spelled another way (the runner temp folder is `C:\Users\RUNNER~1\…`, an 8.3 name; a junction or
     symlink does the same anywhere). `lexical()` now canonicalises the longest existing ancestor. New test
@@ -582,7 +600,7 @@ the push and the pull request.
     the length of the short-named path (`oy/` prefix); it now lists with `Get-ChildItem -Name`. Test-only.
   - `f5ad5e1` **ubuntu-latest**, clippy: Rust 1.99 (the new CI stable) deprecates `AtomicU64::fetch_update`;
     `try_update` is newer than `rust-version = 1.89`, so a `compare_exchange_weak` loop (all Linux tests had passed).
-  Windows here: 570 passed, 0 failed, 6 ignored. CI round 2 runs on the next push.
+  Windows here: 570 passed, 0 failed, 6 ignored.
 
 #### Decisions X6–X8 (binding)
 
@@ -787,7 +805,7 @@ round is the new branch `m11/review-3` from `main`. One commit per task; it ends
 - [x] R15 — command strings and `cmd` bare names
 - [x] R16 — a gate the machine cannot run is found before the build; the hints tell the whole fix
 - [x] Review of R13–R15 (independent subagent) — its findings fixed in one follow-up commit
-- [ ] R17 — Low fixes, missing tests, stale docs
+- [x] R17 — Low fixes, missing tests, stale docs
 - [ ] Finish — notes, README, HUONG-DAN
 - [ ] Push and pull request
 - [ ] CI
@@ -1043,6 +1061,59 @@ realistic command lines**, several of them regressions against round 2. Fixed he
   later `cmd` gate of the same run would find first (outside this round); the R13 commit body says each new test
   fails before the fix — `the_content_check_follows_the_line_ending_settings` is a guard that passes on the old code
   too.
+
+#### R17 — Low fixes, missing tests, stale docs
+
+- **Reach check through a link** (`team::inside`): a path is inside a root by where it **leads** (canonical form,
+  as since `512708d`) or by where it is **written** — any folder on the way to it is the root or inside it. So
+  `<repo>\link\new.ps1` and a `skills_dir` under a junction or symlink that sits inside the repository and points
+  out of it are refused (agent code can write the repository, and so replace the link). Test: the link cases added
+  to `team::tests::a_path_spelled_another_way_is_still_inside` (junction on Windows, symlink on Unix; the folder the
+  link points to is not inside by itself).
+- **Fence patterns** (`checks::fence_pattern`): only what is a variable or the home shortcut is refused — a `%NAME%`
+  anywhere, `~` as the whole first segment, `$NAME` / `${NAME}` as the whole first segment (the message names it:
+  "uses `$HOME`"). Elsewhere `%`, `~`, `$` are literal: `routes/$id.tsx`, `~$x.docx`, `50%.txt` can be fenced (they
+  were refused). Round-2 assertions changed in `fence_patterns_are_normalised_or_refused`: the three messages
+  "uses `%`" / "uses `~`" / "uses `$`" now name the whole token (`%APPDATA%`, `~`, `$HOME`); new rows for the
+  literal forms. README and HUONG-DAN list the forms.
+- **`doctor`** (`checks::literal_pattern`, `doctor::policy_checks`): a legacy `policy.deny_paths` /
+  `protected_paths` pattern with `{ } [ ] !` gets a WARN "uses `{` `}` — matched literally: Toryo patterns have no
+  braces, classes or negation (only `*`, `**`, `?`)". Behaviour and config hash unchanged (test).
+- **Missing tests, now there:**
+  - `tests/m11_env_gates.rs::a_gate_frozen_with_a_variable_does_not_start` — a task frozen before R3 with `%X%` in
+    its gate's arguments, end to end (the frozen configuration is forged the way an older binary left it): the gate
+    does not start, no deployment row, no check gate ran, the reason says to reload; after `--reload` it runs.
+  - `state_tests::the_escalation_class_is_cleared_on_every_way_out` — `Reverify`, `ForceFinal`, `Cancel`, `Fail`.
+  - Plain resume after the other machine-caused classes: `context_over_budget`
+    (`m11_skills::a_skill_that_grew_past_the_budget_stops_the_turn`, extended: the skill file is small again →
+    the turn runs as `implement`, no fix cycle), `xpp_toolchain_unavailable`
+    (`m9_xpp::a_broken_xpp_toolchain_refuses_admission_or_escalates`, extended: the package is back → the build
+    runs, no implementer turn), `verify_boundary_unavailable`
+    (`m11_env_gates::plain_resume_after_an_unavailable_boundary_costs_no_fix_cycle`, Windows: the injected
+    WRITE_OWNER error, then a plain resume completes).
+  - The `next_action` text of the five classes: `runner::tests::next_action_of_the_five_machine_caused_classes`
+    (in the R16 commit).
+  - `engine_scenarios::max_fix_cycles_escalates` (extended, CLI level): a task escalated at the fix-cycle bound has
+    no class; a plain `toryo resume` makes no transition and starts no turn; `--note` grants the cycle.
+- **The CI flake on `main`** (`spike_e2e`, `exit Some(-1)`): on Unix an exit code of -1 means **a signal ended the
+  process** (`ExitStatus::code()` is `None`; a program that cannot be started is an error of `spawn`, never an exit
+  code). The signal is now kept: `process::unix::Child::signal()` → `ExitInfo.signal` → `CommandResult.signal`
+  (both left out of the JSON when there is none; always `None` on Windows), `CommandResult::ended()` says it in
+  words (`exit -1 (killed by signal 9, SIGKILL)`). `toryo spike pipeline` prints the signal on the verify line,
+  prints the **output tail of a failing verify command** to stderr, and records `signal` in its
+  `VERIFY_RESULT.json`; both tests' failure messages add `verify_diag` (exit, signal, output tail of every verify
+  command of the run). **Cause: not clear from reading** — no retry was added. What reading shows: the M0 kit's
+  `run_command` gives the verify command the parent's whole environment, so the two pipeline tests, which run in
+  parallel, start `pwsh` with the same `HOME` — the same `~/.cache/powershell` (module analysis cache, startup
+  profile data) — and the same temp folder; the engine's own verify (`verify::env`) gives each run its own cache
+  and temp, the M0 kit does not. A .NET process that dies on an unhandled exception aborts (signal 6), which would
+  fit; a signal 9 would point elsewhere (the OOM killer, or a `kill` of the process group). The next occurrence
+  shows the number and what `pwsh` printed.
+- **Stale docs:** the round-2 commit table (it stopped at "Finish" and said 569) now lists `b17bdcd`, `c6555c6`,
+  `b7046ab`, `512708d`, `062938b`, `f5ad5e1`, `e3a199e` and 570; the round-2 CI line is closed (`[x]`: pull request
+  #3 merged as `df84b02`; the first CI attempt on `main` hit the flake, the re-run was green); the round-1 summary
+  marks X2 as replaced by X6; `templates/toryo.local.yaml.example` (and the D365FO one) name plain `toryo resume`
+  and `task config --reload` next to `environment_gates`.
 
 ## Progress
 

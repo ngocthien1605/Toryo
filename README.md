@@ -282,8 +282,12 @@ from the repository checkout (`project.root`), never from a task worktree, and e
   entry like a protected path. Patterns are normalised at load (`./src/**`, `src/` and `src` all mean `src/**`: the
   path and everything under it; a last segment without a wildcard covers what is under it too, `**/secrets` is
   `**/secrets/**`; a wildcard pattern without a `/` matches at any depth, `*.pfx` is `**/*.pfx`); an absolute pattern, `..`, an empty one or syntax the matcher lacks (`{ } [ ] !`;
-  it has `*`, `**`, `?`) is a load error. (`policy.deny_paths` / `protected_paths` keep their M10 behaviour;
-  `toryo doctor` warns about a pattern there that can never match.)
+  it has `*`, `**`, `?`) is a load error; so is a variable or the home shortcut, which a fence never expands — a
+  `%NAME%` anywhere, `~` or `$NAME` / `${NAME}` as the whole first segment (`~/x`, `$HOME/x`). Elsewhere `%`, `~`
+  and `$` are ordinary characters of a file name (`routes/$id.tsx`, `~$draft.docx`, `50%.txt`).
+  (`policy.deny_paths` / `protected_paths` keep their M10 behaviour; `toryo doctor` warns about a pattern there
+  that can never match, and about one with `{ } [ ] !` — there those characters are matched literally: Toryo
+  patterns have no braces, classes or negation.)
 - **The culture file is protected** (org chart mode) like the verify files: an agent's change is restored, unless
   TASK.md lists it under `## Allow protected`.
 - **Gates.** The implementer's `before_handoff` lists gates by name, every `check` gate before every `environment`

@@ -364,6 +364,11 @@ impl Child {
             }
         }
     }
+
+    /// M11-R17: the signal that ended the process — a Unix notion; always `None` here.
+    pub fn signal(&self) -> Option<i32> {
+        None
+    }
 }
 
 pub struct Spawned {

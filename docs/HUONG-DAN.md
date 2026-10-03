@@ -688,8 +688,12 @@ Bộ mẫu: `templates\d365fo\.toryo\`, `templates\d365fo\CULTURE.md`, `template
   khôi phục và trả lại, nêu rõ luật. `## Allow protected` trong TASK.md mở được một mục, như file được bảo vệ.
   Mẫu được chuẩn hoá lúc nạp: `./src/**`, `src/` và `src` đều là `src/**` (thư mục và mọi thứ bên trong; `**/secrets` là `**/secrets/**`; mẫu có ký tự đại
   diện mà không có `/` khớp ở mọi cấp: `*.pfx` là `**/*.pfx`); mẫu tuyệt
-  đối, có `..`, rỗng, hoặc dùng cú pháp không hỗ trợ (`{ } [ ] !` — chỉ có `*`, `**`, `?`) → lỗi nạp. (`policy.deny_paths`
-  / `protected_paths` giữ hành vi M10; `toryo doctor` cảnh báo mẫu không bao giờ khớp.)
+  đối, có `..`, rỗng, hoặc dùng cú pháp không hỗ trợ (`{ } [ ] !` — chỉ có `*`, `**`, `?`) → lỗi nạp; biến hoặc lối tắt
+  thư mục home cũng vậy (hàng rào không bao giờ thay biến): `%TÊN%` ở bất kỳ đâu, `~` hoặc `$TÊN` / `${TÊN}` là cả
+  đoạn đầu (`~/x`, `$HOME/x`). Ở chỗ khác `%`, `~`, `$` là ký tự thường của tên file (`routes/$id.tsx`,
+  `~$draft.docx`, `50%.txt`). (`policy.deny_paths` / `protected_paths` giữ hành vi M10; `toryo doctor` cảnh báo mẫu
+  không bao giờ khớp, và mẫu có `{ } [ ] !` — ở đó các ký tự này được so khớp nguyên văn: mẫu của Toryo không có ngoặc
+  nhọn, lớp ký tự hay phủ định.)
 - **File `culture` được bảo vệ** (chế độ org chart) như script của gate: agent sửa → khôi phục, trừ khi TASK.md
   liệt kê nó dưới `## Allow protected`.
 - **Giới hạn**: `limits: { max_gate_retries, max_review_rounds }` — gate trượt tính vào cái đầu, review bị từ chối

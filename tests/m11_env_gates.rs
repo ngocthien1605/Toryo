@@ -1790,3 +1790,151 @@ fn a_crash_right_after_a_machine_caused_escalation_keeps_its_class() {
     assert_eq!(t.state, St::Completed, "{err}");
     assert_eq!(t.fix_cycle, 0);
 }
+
+/// M11-R17 (X8): plain resume after `verify_boundary_unavailable` (Windows: the Low label cannot
+/// be set — the injected error of a folder without WRITE_OWNER). Once the cause is gone a plain
+/// `toryo resume` goes back into verify: no fix cycle, no implementer turn.
+#[cfg(windows)]
+#[test]
+fn plain_resume_after_an_unavailable_boundary_costs_no_fix_cycle() {
+    let (env, marker) = probe_then_dbsync("exit 0\n", "");
+    let cfg = std::fs::read_to_string(&env.config)
+        .unwrap()
+        .replace("boundary: none", "boundary: low_integrity");
+    std::fs::write(&env.config, cfg).unwrap();
+    create(&env, "R17-B");
+    let s = script(
+        &env,
+        "r17b.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(
+        &env,
+        &["run", "R17-B", "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_LABEL_ERROR", "5")],
+    );
+    let t = task(&env, "R17-B");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("verify_boundary_unavailable")
+    );
+    let why = t.machine.reason().unwrap_or_default().to_string();
+    assert!(
+        why.starts_with("verify_boundary_unavailable: ")
+            && why.contains("WRITE_OWNER")
+            && why.contains("`toryo resume R17-B`")
+            && why.contains("`toryo task config R17-B --reload`"),
+        "{why}"
+    );
+    assert_eq!(t.fix_cycle, 0);
+    assert!(!marker.exists());
+    let (code, err) = toryo(
+        &env,
+        &["resume", "R17-B", "--yes", "--fake-agents", &s],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R17-B");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert_eq!(t.fix_cycle, 0, "no fix cycle was spent");
+    assert!(t.machine.reason_class().is_none());
+    assert!(marker.exists(), "the gates ran");
+    assert_eq!(
+        calls(&env, "R17-B")
+            .iter()
+            .filter(|c| c["key"]
+                .as_str()
+                .is_some_and(|k| k.starts_with("implementer")))
+            .count(),
+        0
+    );
+}
+
+/// M11-R17 (R12 item 2, end to end): a task frozen before M11-R3 still holds `%X%` in its
+/// environment gate's arguments (they are expanded at load now). The gate does not start —
+/// found before any check gate, no deployment row, no fix cycle — and the reason says to
+/// reload; after `task config --reload` the gate runs.
+#[test]
+fn a_gate_frozen_with_a_variable_does_not_start() {
+    let env = env_gate_setup("codex-openai", "error", "");
+    define_gates(
+        &env,
+        &machine_gate(&env, "dbsync", "d365-env", "exit 0\n", "exit 0\n", ""),
+    );
+    create(&env, "R17-V");
+    // forge what an older binary froze: the script path written with a variable. The frozen
+    // configuration is the version whose SHA-256 the task row names; a run store from before
+    // the immutable versions has only the view, which is used when its hash matches
+    let t = task(&env, "R17-V");
+    let (_, text) = toryo::engine::task::frozen_config_text(&t).unwrap();
+    let gates = fwd(&env.root.join("gates"));
+    assert!(text.contains(&gates), "{text}");
+    let old = text.replace(&gates, "%TORYO_R17_GATES%");
+    std::fs::write(t.artifacts().join("config.json"), &old).unwrap();
+    let sha = toryo::engine::task::sha256_hex(old.as_bytes());
+    let (i, p, im, rv, idx) = (
+        t.id.clone(),
+        t.planner.clone(),
+        t.implementers.clone(),
+        t.reviewer.clone(),
+        t.implementer_index,
+    );
+    db(&env)
+        .call(move |tx| store::set_config(tx, &i, &sha, &p, &im, &rv, idx))
+        .unwrap();
+    let s = script(
+        &env,
+        "r17v.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    // the variable is even set: the frozen text is never expanded at run time
+    let gates_var = [("TORYO_R17_GATES", gates.as_str())];
+    let (_, err) = toryo(
+        &env,
+        &["run", "R17-V", "--yes", "--fake-agents", &s],
+        &gates_var,
+    );
+    let t = task(&env, "R17-V");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_unavailable")
+    );
+    let why = t.machine.reason().unwrap_or_default().to_string();
+    assert!(
+        why.contains("environment gate `dbsync`: the command still contains `%TORYO_R17_GATES%`")
+            && why.contains("run `toryo task config R17-V --reload`, then `toryo resume R17-V`"),
+        "{why}"
+    );
+    assert_eq!(t.fix_cycle, 0);
+    assert!(deployments(&env).is_empty(), "no deployment row");
+    assert!(
+        !events(&env, "R17-V")
+            .iter()
+            .any(|e| e["type"] == "verify_command"),
+        "no gate ran"
+    );
+    // the way out the reason names
+    let (code, err) = toryo(&env, &["task", "config", "R17-V", "--reload"], &[]);
+    assert_eq!(code, 0, "{err}");
+    let (code, err) = toryo(
+        &env,
+        &["resume", "R17-V", "--yes", "--fake-agents", &s],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R17-V");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert_eq!(t.fix_cycle, 0);
+    let d = deployments(&env);
+    assert_eq!((d.len(), d[0].ok), (1, Some(true)));
+}

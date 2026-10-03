@@ -291,16 +291,38 @@ pub fn fence_pattern(p: &str) -> std::result::Result<String, String> {
     if t.starts_with('/') || t.chars().nth(1) == Some(':') {
         return Err("is absolute — a pattern is relative to the repository root".into());
     }
+    // M11-R12 / R17: a variable or home shortcut is not expanded for a fence, so it would
+    // match nothing — refused, rather than a pattern that silently protects no file. Only the
+    // forms that are one: a `%NAME%` variable, `~` as the whole first segment, `$NAME` or
+    // `${NAME}` as the whole first segment. Elsewhere `%`, `~` and `$` are literal characters
+    // of a file name (`routes/$id.tsx`, `~$x.docx`, `50%.txt`).
+    let first = t.split('/').find(|c| !c.is_empty() && *c != ".");
+    let variable = |s: &str| {
+        let name = s
+            .strip_prefix("${")
+            .and_then(|n| n.strip_suffix('}'))
+            .or_else(|| s.strip_prefix('$'));
+        name.is_some_and(|n| {
+            !n.is_empty()
+                && !n.starts_with(|c: char| c.is_ascii_digit())
+                && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
+    let shortcut = if let Some(v) = crate::config::residual_var(&t) {
+        Some(format!("%{v}%"))
+    } else {
+        first
+            .filter(|f| *f == "~" || variable(f))
+            .map(str::to_string)
+    };
+    if let Some(s) = shortcut {
+        return Err(format!(
+            "uses `{s}` — a fence pattern is not variable-expanded; write the repository-relative path"
+        ));
+    }
     if let Some(c) = t.chars().find(|c| "{}[]!".contains(*c)) {
         return Err(format!(
             "uses `{c}`, which the matcher does not support — only `*` (within one folder), `**` (any depth) and `?` (one character)"
-        ));
-    }
-    // M11-R12: a variable or home shortcut is not expanded for a fence, so it would match
-    // nothing — refuse it rather than accept a pattern that silently protects no file
-    if let Some(c) = t.chars().find(|c| "%~$".contains(*c)) {
-        return Err(format!(
-            "uses `{c}` — a fence pattern is not variable-expanded; write the repository-relative path"
         ));
     }
     let parts: Vec<&str> = t
@@ -329,6 +351,29 @@ pub fn fence_pattern(p: &str) -> std::result::Result<String, String> {
 
 /// M11-R4: why a `policy.deny_paths` / `protected_paths` glob (compared as written) can never
 /// match a repository path, or None. Those keep their behaviour; `doctor` warns.
+/// M11-R17: what `toryo doctor` says about a legacy `policy.deny_paths` / `protected_paths`
+/// pattern that uses glob syntax Toryo does not have — braces, a character class, a negation.
+/// The legacy matcher takes those characters literally, so `**/*.{pfx,key}` matches a file
+/// named `x.{pfx,key}` and neither `x.pfx` nor `x.key`. The behaviour (and the config hash) is
+/// unchanged; the owner is told.
+pub fn literal_pattern(p: &str) -> Option<String> {
+    let t = p.trim();
+    if t == VERIFY_SCRIPTS {
+        return None;
+    }
+    let found: Vec<String> = "{}[]!"
+        .chars()
+        .filter(|c| t.contains(*c))
+        .map(|c| format!("`{c}`"))
+        .collect();
+    (!found.is_empty()).then(|| {
+        format!(
+            "uses {} — matched literally: Toryo patterns have no braces, classes or negation (only `*`, `**`, `?`)",
+            found.join(" ")
+        )
+    })
+}
+
 pub fn dead_pattern(p: &str) -> Option<String> {
     let t = p.trim().replace('\\', "/");
     if t == VERIFY_SCRIPTS {
@@ -1573,6 +1618,28 @@ mod tests {
                 assert!(!writes.violates("secrets/key.pfx"), "writes {written}");
             }
         }
+        // M11-R17: `%`, `~` and `$` are refused only as a variable or the home shortcut;
+        // elsewhere they are characters of a file name, and the fence matches them
+        for (written, want, path) in [
+            ("routes/$id.tsx", "routes/$id.tsx/**", "routes/$id.tsx"),
+            (
+                "docs/~$draft.docx",
+                "docs/~$draft.docx/**",
+                "docs/~$draft.docx",
+            ),
+            ("~$x.docx", "~$x.docx/**", "~$x.docx"),
+            ("reports/50%.txt", "reports/50%.txt/**", "reports/50%.txt"),
+            ("src/$*/x.ts", "src/$*/x.ts/**", "src/$slug/x.ts"),
+            ("a~b/**", "a~b/**", "a~b/c.txt"),
+            ("$/x", "$/x/**", "$/x"),
+            ("$1/x", "$1/x/**", "$1/x"),
+        ] {
+            let n = fence_pattern(written).unwrap_or_else(|e| panic!("{written}: {e}"));
+            assert_eq!(n, want, "{written}");
+            let never = Protected::new(vec![], &[]).with_fence(&[], std::slice::from_ref(&n));
+            assert!(never.violates(path), "{written} fences {path}");
+            assert!(!never.violates("routes/other.tsx"), "{written}");
+        }
         // a pattern without a wildcard: the path itself and everything under it
         let f =
             Protected::new(vec![], &[]).with_fence(&[], &[fence_pattern("CULTURE.md").unwrap()]);
@@ -1601,9 +1668,13 @@ mod tests {
             ("secrets/[ab].pfx", "uses `[`"),
             ("!secrets/**", "uses `!`"),
             // M11-R12: a variable or home shortcut is refused (never expanded for a fence)
-            ("%APPDATA%/x", "uses `%`"),
+            ("%APPDATA%/x", "uses `%APPDATA%`"),
+            ("docs/%NAME%.md", "uses `%NAME%`"),
             ("~/secrets/**", "uses `~`"),
-            ("$HOME/x", "uses `$`"),
+            ("./~/secrets", "uses `~`"),
+            ("$HOME/x", "uses `$HOME`"),
+            ("${HOME}/x", "uses `${HOME}`"),
+            ("$HOME", "uses `$HOME`"),
             ("src/../secrets/**", "may not contain `..`"),
             ("", "is empty"),
             ("  ", "is empty"),
@@ -1640,6 +1711,21 @@ mod tests {
             VERIFY_SCRIPTS,
         ] {
             assert_eq!(dead_pattern(p), None, "{p}");
+        }
+        // M11-R17: … but `doctor` says that they are matched literally
+        for (p, want) in [
+            ("**/*.{pfx,key}", "uses `{` `}` — matched literally"),
+            ("secrets/[ab].pfx", "uses `[` `]` — matched literally"),
+            ("!x", "uses `!` — matched literally"),
+        ] {
+            let w = literal_pattern(p).unwrap_or_else(|| panic!("{p}"));
+            assert!(
+                w.contains(want) && w.contains("no braces, classes or negation"),
+                "{p}: {w}"
+            );
+        }
+        for p in ["**/ZZZ/**", "docs/*.md", "routes/$id.tsx", VERIFY_SCRIPTS] {
+            assert_eq!(literal_pattern(p), None, "{p}");
         }
     }
 

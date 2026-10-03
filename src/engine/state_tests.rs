@@ -795,3 +795,54 @@ fn a_machine_caused_class_is_recorded_and_cleared_on_resume() {
     r.set_reason_class("skill_unavailable");
     assert_eq!(r.reason_class(), None);
 }
+
+/// M11-R17: the escalation class is cleared on every way out of `Escalated` — also `Reverify`,
+/// `ForceFinal`, `Cancel` and `Fail` (the resumes are in the test above) — and is then no longer
+/// serialised.
+#[test]
+fn the_escalation_class_is_cleared_on_every_way_out() {
+    let escalated = |verified: bool| {
+        let mut m = Machine::new(2);
+        to_verifying(&mut m, "c1");
+        if verified {
+            m.apply(E::VerifyPassed { head: "c1".into() }).unwrap();
+        }
+        m.apply(E::Escalate {
+            reason: "environment_gate_unavailable: x".into(),
+        })
+        .unwrap();
+        m.set_reason_class("environment_gate_unavailable");
+        assert_eq!(m.reason_class(), Some("environment_gate_unavailable"));
+        assert!(serde_json::to_string(&m).unwrap().contains("reason_class"));
+        m
+    };
+    for (e, verified, want) in [
+        (E::Reverify, false, S::Verifying),
+        (E::ForceFinal, true, S::WaitingFinalApproval),
+        (E::Cancel, false, S::Cancelled),
+        (
+            E::Fail {
+                error: "boom".into(),
+            },
+            false,
+            S::Failed,
+        ),
+    ] {
+        let mut m = escalated(verified);
+        let name = e.name();
+        assert_eq!(m.apply(e), Ok(want), "{name}");
+        assert_eq!(m.reason_class(), None, "{name}");
+        assert!(
+            !serde_json::to_string(&m).unwrap().contains("reason_class"),
+            "{name}"
+        );
+    }
+    // a second escalation without a class does not inherit the first one's
+    let mut m = escalated(false);
+    m.apply(E::Reverify).unwrap();
+    m.apply(E::Escalate {
+        reason: "verify_mutated_tree: x".into(),
+    })
+    .unwrap();
+    assert_eq!(m.reason_class(), None);
+}

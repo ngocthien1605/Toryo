@@ -645,8 +645,10 @@ fn a_missing_planner_or_reviewer_skill_stops_their_turn() {
 fn a_skill_that_grew_past_the_budget_stops_the_turn() {
     let env = skills_env("context: { budget_kb: { implementer: 8 } }\n", &[]);
     approved_plan(&env, "SK-OB", json!(["xpp-batch"]));
+    let skill = env.repo.join(".toryo/skills/xpp-batch/SKILL.md");
+    let small = std::fs::read(&skill).unwrap();
     let big = format!("---\ndescription: d\n---\n{}", "x".repeat(10 * 1024));
-    std::fs::write(env.repo.join(".toryo/skills/xpp-batch/SKILL.md"), big).unwrap();
+    std::fs::write(&skill, big).unwrap();
     let (err, _) = context_show(&env, "SK-OB", "implement");
     assert!(
         err.contains("!! the turn would not start: context_over_budget"),
@@ -668,6 +670,43 @@ fn a_skill_that_grew_past_the_budget_stops_the_turn() {
         "{why}"
     );
     assert!(attempts(&env, "SK-OB").iter().all(|a| a.stage == "plan"));
+    // M11-R16: the reason tells both ways out — the budget is frozen with the task
+    assert!(
+        why.contains("`toryo resume SK-OB`")
+            && why.contains("(`context.budget_kb` in toryo.yaml — frozen with the task): `toryo task config SK-OB --reload`, then `toryo resume SK-OB`"),
+        "{why}"
+    );
+    // M11-R17 (X8): plain resume after `context_over_budget` — fixed on the machine (the skill
+    // file is small again): the implement turn runs as `implement`, no fix cycle
+    assert_eq!(t.machine.reason_class(), Some("context_over_budget"));
+    std::fs::write(&skill, small).unwrap();
+    let s = script(
+        &env,
+        "ob2.json",
+        json!({
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["resume", "SK-OB", "--yes", "--fake-agents", &s],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "SK-OB");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert_eq!(t.fix_cycle, 0, "no fix cycle was spent");
+    assert!(t.machine.reason_class().is_none());
+    assert!(
+        attempts(&env, "SK-OB")
+            .iter()
+            .any(|a| a.stage == "implement")
+            && attempts(&env, "SK-OB")
+                .iter()
+                .all(|a| !a.stage.starts_with("fix-")),
+        "the turn ran as `implement`"
+    );
 }
 
 /// R4–R8 review (M11-R5): the plan-time budget check uses the attempt's test (the rendered

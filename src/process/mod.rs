@@ -86,6 +86,10 @@ pub struct ExitInfo {
     /// The root exited but descendants were still in the Job (holding the pipes or not):
     /// they were terminated with the Job at the end of the stage.
     pub lingering_killed: bool,
+    /// M11-R17: the signal that ended the root process (Unix; `code` is then -1). Left out
+    /// when there is none, so the records keep their shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
 }
 
 #[cfg(unix)]
@@ -270,6 +274,7 @@ impl Running {
             duration_ms: self.started.elapsed().as_millis(),
             tree_gone,
             lingering_killed,
+            signal: self.child.signal(),
         })
     }
 }

@@ -148,15 +148,17 @@ pub fn policy_checks(cfg: &Effective) -> Vec<Check> {
     ]
     .into_iter()
     .flat_map(|(key, list)| list.iter().map(move |g| (key, g)))
-    .filter_map(|(key, g)| {
-        let why = crate::engine::checks::dead_pattern(g).or_else(|| folder(g));
-        why.map(|why| Check {
+    .flat_map(|(key, g)| {
+        let dead = crate::engine::checks::dead_pattern(g)
+            .or_else(|| folder(g))
+            .map(|why| format!("`{g}` {why} (this pattern protects nothing)"));
+        // M11-R17: glob syntax Toryo does not have is matched literally — say so (the
+        // behaviour is unchanged)
+        let literal = crate::engine::checks::literal_pattern(g).map(|why| format!("`{g}` {why}"));
+        dead.into_iter().chain(literal).map(move |what| Check {
             level: Level::Warn,
             area: "policy".into(),
-            message: format!(
-                "{}: policy.{key}: `{g}` {why} (this pattern protects nothing)",
-                cfg.repo_path.display()
-            ),
+            message: format!("{}: policy.{key}: {what}", cfg.repo_path.display()),
             source: None,
         })
     })
@@ -1093,6 +1095,31 @@ mod tests {
         // a clean policy: no warning
         std::fs::write(&p, format!("{base}policy: {{ deny_paths: ['x/**'] }}\n")).unwrap();
         assert!(policy_checks(&Effective::load(&p, None).unwrap()).is_empty());
+        // M11-R17: braces, a class, a negation — matched literally, and `doctor` says so
+        std::fs::write(
+            &p,
+            format!("{base}policy: {{ deny_paths: ['**/*.{{pfx,key}}', 'x/**'], protected_paths: ['secrets/[ab].pfx', '!keep'] }}\n"),
+        )
+        .unwrap();
+        let cfg = Effective::load(&p, None).unwrap();
+        let w: Vec<String> = policy_checks(&cfg)
+            .into_iter()
+            .inspect(|c| assert_eq!(c.level, Level::Warn))
+            .map(|c| c.message)
+            .collect();
+        assert_eq!(w.len(), 3, "{w:#?}");
+        assert!(
+            w[0].contains("policy.deny_paths: `**/*.{pfx,key}` uses `{` `}` — matched literally: Toryo patterns have no braces, classes or negation")
+                && !w[0].contains("protects nothing"),
+            "{w:#?}"
+        );
+        assert!(
+            w[1].contains("policy.protected_paths: `secrets/[ab].pfx` uses `[` `]`")
+                && w[2].contains("`!keep` uses `!`"),
+            "{w:#?}"
+        );
+        // behaviour unchanged: the pattern is kept as written and matches its own characters
+        assert_eq!(cfg.repo.policy.deny_paths, ["**/*.{pfx,key}", "x/**"]);
         // R4–R8 review: `secrets` naming a folder of the repository matches none of its files
         let repo = d.path().join("repo");
         std::fs::create_dir_all(repo.join("secrets")).unwrap();

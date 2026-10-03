@@ -499,6 +499,34 @@ fn a_broken_xpp_toolchain_refuses_admission_or_escalates() {
         .unwrap();
     assert_eq!(v.error_class.as_deref(), Some("xpp_toolchain_unavailable"));
     assert!(built(&x).is_empty());
+    // M11-R16: the reason tells both ways out — the toolchain paths are frozen with the task
+    let why = t.machine.reason().unwrap_or_default().to_string();
+    assert!(
+        why.contains("(a NuGet folder or MSBuild put back): `toryo resume X-4`")
+            && why.contains("(`toolchains.xpp` in the machine config — frozen with the task): `toryo task config X-4 --reload`, then `toryo resume X-4`"),
+        "{why}"
+    );
+    // M11-R17 (X8): plain resume after `xpp_toolchain_unavailable` — the package is back: verify
+    // runs, no fix cycle, no implementer turn
+    assert_eq!(t.machine.reason_class(), Some("xpp_toolchain_unavailable"));
+    std::fs::rename(&aside, &suite).unwrap();
+    let (code, err) = toryo(env, &["resume", "X-4", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    let t = task(env, "X-4");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert_eq!(t.fix_cycle, 0);
+    assert!(t.machine.reason_class().is_none());
+    assert!(!built(&x).is_empty(), "the build ran");
+    assert_eq!(
+        calls(env, "X-4")
+            .iter()
+            .filter(|c| c["key"]
+                .as_str()
+                .is_some_and(|k| k.starts_with("implementer")))
+            .count(),
+        0,
+        "no implementer turn during the resume"
+    );
 }
 
 /// M9-B3 AC-2/AC-3 (`xpp_diagnostics`, plan §16): the fake MSBuild prints 3 000 lines with two
