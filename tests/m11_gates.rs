@@ -513,6 +513,82 @@ fn admission_refuses_only_entry_scripts_the_implementer_could_write() {
     );
 }
 
+/// M11-R18 AC-1/AC-3 (X14, applies to everyone): an entry that is a **folder** of the base
+/// commit (`node --test tests/unit`, `node packages/cli`, `python tools/gen`) is admitted — at
+/// `task create`, in `doctor` and at `task config --reload` — and refused again when the folder
+/// is not there and not ignored. (Round 3 listed files only and refused them all.)
+#[test]
+fn an_entry_that_is_a_folder_of_the_base_commit_is_admitted() {
+    for (i, (program, args, folder)) in [
+        ("node", r#""--test", "tests/unit""#, "tests/unit"),
+        ("node", r#""packages/cli""#, "packages/cli"),
+        ("python", r#""tools/gen""#, "tools/gen"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let line = format!(r#"    - {{ name: dir, program: {program}, args: [{args}] }}"#);
+        let env = setup("codex-openai");
+        commit_repo(&env, &[(&format!("{folder}/a.txt"), "x\n")], "a folder");
+        with_verify_command(&env, &line);
+        let id = format!("R18-{i}");
+        let (code, err) = create_as(&env, &id);
+        assert_eq!(code, 0, "{folder} is in the base commit: {err}");
+        let o = command(&env, &["doctor"], &[]).output().unwrap();
+        let out = format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        assert!(!out.contains("verify_script_missing"), "doctor: {out}");
+        let s = script(
+            &env,
+            &format!("r18-{i}.json"),
+            json!({ "planner": [turn(vec![plan()])] }),
+        );
+        let (_, err) = toryo(&env, &["run", &id, "--fake-agents", &s], &[]);
+        assert_eq!(task(&env, &id).state, St::WaitingPlanApproval, "{err}");
+        let (code, err) = toryo(&env, &["task", "config", &id, "--reload"], &[]);
+        assert_eq!(code, 0, "--reload: {err}");
+        let y = std::fs::read_to_string(&env.config).unwrap();
+        std::fs::write(&env.config, y.replace(folder, "nowhere/at/all")).unwrap();
+        let (code, err) = toryo(&env, &["task", "config", &id, "--reload"], &[]);
+        assert_ne!(code, 0, "--reload of a folder the base commit lacks");
+        assert!(err.contains("verify_script_missing"), "{err}");
+        std::fs::write(&env.config, y).unwrap();
+        // admitted as that exact name only: nothing inside the folder is protected because of it
+        let t = task(&env, &id);
+        let cfgv = toryo::engine::task::frozen_config(&t).unwrap();
+        let (_, prot, _) = toryo::engine::runner::task_policy(&t, &cfgv).unwrap();
+        // AC-2: the set that protects arguments lists files only; admission's lists folders too
+        let g = toryo::git::default_gitcmd().unwrap();
+        let files = toryo::engine::task::base_files(&g, &t.repo, &t.base_commit).unwrap();
+        let paths = toryo::engine::task::base_paths(&g, &t.repo, &t.base_commit).unwrap();
+        assert!(
+            !files.contains(folder) && paths.contains(folder),
+            "{folder}"
+        );
+        assert!(files.contains(&format!("{folder}/a.txt")));
+        assert!(prot.violates(folder), "{folder} itself");
+        assert!(
+            !prot.violates(&format!("{folder}/a.txt")),
+            "nothing inside {folder} is protected because of the entry"
+        );
+
+        // the same line without the folder: refused (not ignored), at create and in doctor
+        let env = setup("codex-openai");
+        with_verify_command(&env, &line);
+        let (code, err) = create_as(&env, &id);
+        assert_ne!(code, 0);
+        assert!(
+            err.contains(&format!(
+                "verify_script_missing: verify command `dir` runs `{folder}`, which is not in the base commit"
+            )),
+            "{err}"
+        );
+    }
+}
+
 /// M11-R10 AC-3: `sh check` (no separator, no extension) missing at the base commit is
 /// admitted — and protected: a fake implementer that creates `check` cannot pass its own gate.
 /// (Deviation, recorded: a new untracked protected file is caught by the R35 protected-state

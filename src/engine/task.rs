@@ -127,17 +127,38 @@ pub fn build_entries(
 }
 
 /// The files of commit `base` in `repo` (M11-R14): repository-relative, `/`, lower-case.
+/// What protects arguments: never a folder.
 pub fn base_files(
     g: &GitCmd,
     repo: &Path,
     base: &str,
 ) -> Result<std::collections::HashSet<String>> {
+    ls_base(g, repo, base, false)
+}
+
+/// The files **and folders** of commit `base` (M11-R18, X14): what admission asks "is it in the
+/// base commit" of — an entry that is a folder (`node --test tests/unit`) is there.
+pub fn base_paths(
+    g: &GitCmd,
+    repo: &Path,
+    base: &str,
+) -> Result<std::collections::HashSet<String>> {
+    ls_base(g, repo, base, true)
+}
+
+fn ls_base(
+    g: &GitCmd,
+    repo: &Path,
+    base: &str,
+    folders: bool,
+) -> Result<std::collections::HashSet<String>> {
+    let mut args = vec!["ls-tree", "-r", "-z", "--name-only"];
+    if folders {
+        args.push("-t");
+    }
+    args.push(base);
     let listing = g
-        .run(
-            &Loc::Discover(repo.to_path_buf()),
-            true,
-            &["ls-tree", "-r", "-z", "--name-only", base],
-        )
+        .run(&Loc::Discover(repo.to_path_buf()), true, &args)
         .with_context(|| {
             format!(
                 "listing the files of the base commit {}",
@@ -181,7 +202,7 @@ fn admission(cfg: &Effective, g: &GitCmd, repo: &Path, base: &str) -> Result<Adm
         return Ok(found);
     }
     let repol = Loc::Discover(repo.to_path_buf());
-    let tree = base_files(g, repo, base)?;
+    let tree = base_paths(g, repo, base)?;
     let what = if cfg.team.is_some() {
         "gate"
     } else {

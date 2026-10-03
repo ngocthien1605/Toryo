@@ -1251,6 +1251,46 @@ the preflight uses the run's own filter; secrets are dropped). **`team::inside`:
   what `store::tests::an_escalation_and_its_class_are_one_transaction` shows; `~user/x` and `$(NAME)/x` are accepted
   as fence patterns (literal, per the list); `[` `]` in a legacy pattern always warns (`app/[id]/page.tsx`).
 
+### Round 4
+
+Task list: `M11-review-fixes-4.md` (review of round 3 on 2026-10-03; the reviewer built `8d9796d` on Linux with
+Rust 1.99: fmt and both clippy clean, 628 tests passed; R13, R16, R17 sound, 4 Medium in R14/R15 and the export
+check). Same branch `m11/review-3` (rounds 3 and 4 go into one pull request). The push of round 3 was denied by the
+environment's permission layer, so nothing is pushed yet.
+
+#### Progress (round 4)
+
+- [x] R18 — a gate entry that is a folder is admitted again
+- [ ] R19 — protect what exists at base wherever the reader cannot go; `popd`; `-WorkingDirectory`
+- [ ] R20 — the export check is byte-exact
+- [ ] R21 — Low fixes
+- [ ] Review of R18–R20 (independent subagent)
+- [ ] Finish — notes, README, HUONG-DAN
+- [ ] Push and pull request, CI
+
+#### Decisions X13–X15 (binding)
+
+- **X13 — "Refusing needs certainty; protecting does not."** For every verify command and gate, next to what the
+  reader finds, every word of every argument that names a file of the base commit is protected — also inside an
+  argument that is itself a command line, after a here-document, after any point where reading stopped — looked up
+  from the checkout root and from every folder the command names as a change of folder (followed or not). It never
+  refuses and never prints a note. (Confirms the round-3 deviation "after a stop the rest is still protected".)
+- **X14** A gate's entry may be a **folder** of the base commit (`node --test tests/unit`). It is admitted; nothing
+  inside it is protected because of that.
+- **X15** The export check compares **bytes**, not Git's view after line-ending conversion.
+
+#### R18 — a gate entry that is a folder is admitted again
+
+- `task::base_files` (what protects arguments) stays files-only; the new `task::base_paths` is the same listing with
+  `-t`, files **and folders**, and admission (`admission`) asks "is it in the base commit" of it — as `main` did
+  since `056e98d`. `task create`, `doctor` and `task config --reload` all go through `admission`, so they agree.
+  A folder entry is protected as that exact name only (the entry scripts are protected whether or not they exist);
+  nothing inside the folder is protected because of it.
+- Why round 3 missed it: R14 changed the listing to files-only (`ls-tree -r`, no `-t`) and no test had a folder
+  entry. Test: `m11_gates::an_entry_that_is_a_folder_of_the_base_commit_is_admitted` (`node --test tests/unit`,
+  `node packages/cli`, `python tools/gen`: admitted at create, in `doctor` and at reload; refused when the folder
+  is not in the base commit and not ignored; the file set has no folder, the admission set has).
+
 ## Progress
 
 Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
