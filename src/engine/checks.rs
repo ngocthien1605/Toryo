@@ -998,6 +998,17 @@ fn plain_path(p: &str) -> bool {
         .any(|c| c.is_whitespace() || "*?[]$%~".contains(c))
 }
 
+/// The last segment ends in `.ext` — one to eight letters or digits after a name (not a hidden
+/// file such as `.env`): `ci/settings.json`, `data/model.xml`.
+fn has_file_ext(p: &str) -> bool {
+    let name = p.rsplit(['/', '\\']).next().unwrap_or(p);
+    name.rsplit_once('.').is_some_and(|(stem, ext)| {
+        !stem.is_empty()
+            && (1..=8).contains(&ext.len())
+            && ext.chars().all(|c| c.is_ascii_alphanumeric())
+    })
+}
+
 pub(super) fn has_script_ext(p: &str) -> bool {
     let lower = p.to_ascii_lowercase();
     SCRIPT_EXTENSIONS.iter().any(|x| lower.ends_with(x))
@@ -1158,7 +1169,11 @@ fn make_entries(args: &[String]) -> Vec<Entry> {
             }
         };
         if let Some(d) = value_of(&["-C", "--directory"], short("-C")) {
-            let Some(d) = d.filter(|d| is_literal(d) && !Path::new(d).has_root()) else {
+            // (R21) `-C sub/`: a trailing separator is the same folder
+            let Some(d) = d.filter(|d| {
+                let t = d.trim_end_matches(['/', '\\']);
+                !t.is_empty() && plain_path(t) && !Path::new(d).has_root()
+            }) else {
                 return Vec::new();
             };
             dir = format!("{dir}{}/", d.trim_end_matches(['/', '\\']));
@@ -1355,14 +1370,23 @@ pub fn script_like_args(cmds: &[CommandSpec], repo: &Path) -> Vec<(String, Strin
             candidates.extend(s.read().args);
         }
         for t in candidates {
-            if !t.contains(['/', '\\']) || !has_script_ext(&t) || has_scheme(&t) {
+            // (R21) clearly a path: a separator and a script extension — or any file extension
+            // (`-Config ci/settings.json`)
+            if !t.contains(['/', '\\'])
+                || !(has_script_ext(&t) || has_file_ext(&t))
+                || has_scheme(&t)
+            {
                 continue;
             }
             let Some(r) = repo_relative(repo, &t) else {
                 continue;
             };
             let e = (c.name.clone(), r);
-            if !entries.contains(&e.1) && !out.contains(&e) {
+            // (an entry written under a `make -C dir` is `dir/<value>`: its value is no extra path)
+            let is_entry = entries
+                .iter()
+                .any(|x| *x == e.1 || x.ends_with(&format!("/{}", e.1)));
+            if !is_entry && !out.contains(&e) {
                 out.push(e);
             }
         }
@@ -2918,6 +2942,41 @@ mod tests {
                 // (R19, X13: protected all the same — the net does not know `rem`; protecting
                 // needs no certainty. Nothing is an entry, nothing is refused)
                 Some(&["scripts/x.cmd"]),
+            ),
+            // ── R21 ──
+            // `source` is a head prefix like `.`; a PowerShell block comment is no command; a
+            // trailing separator of `make -C`; a path argument with any file extension is noted
+            (
+                "bash",
+                &["-c", "source ./ci/x.sh"],
+                one("./ci/x.sh", true),
+                &[],
+                Some(&["ci/x.sh"]),
+            ),
+            (
+                "pwsh",
+                &["-Command", "<# ./nope.ps1 #> ./x.ps1"],
+                one("./x.ps1", true),
+                &[],
+                Some(&["x.ps1"]),
+            ),
+            (
+                "make",
+                &["-C", "sub/", "all"],
+                vec![
+                    ("sub/GNUmakefile".to_string(), false),
+                    ("sub/makefile".to_string(), false),
+                    ("sub/Makefile".to_string(), false),
+                ],
+                &[],
+                None,
+            ),
+            (
+                "pwsh",
+                &["-File", "scripts/x.ps1", "-Config", "ci/settings.json"],
+                one("scripts/x.ps1", true),
+                &["ci/settings.json"],
+                Some(&["scripts/x.ps1"]),
             ),
             // a module specifier is no repository path
             (

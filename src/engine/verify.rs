@@ -315,6 +315,43 @@ fn remove_link(p: &Path) -> std::io::Result<()> {
     std::fs::remove_file(p).or_else(|_| std::fs::remove_dir(p))
 }
 
+/// M11-R21: remove the build-output entry `rel` (a frozen `BuildEntry` path: repository-relative,
+/// as written) from the checkout `root`: a file, or a folder with what is in it. Never through
+/// a link — a link or junction on the way (code under test may have planted one) is removed as a
+/// link, its target is left alone. Missing, absolute or leaving the folder: nothing to do.
+fn remove_entry(root: &Path, rel: &str) -> Result<()> {
+    let rel = rel.replace('\\', "/");
+    let parts: Vec<&str> = rel
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    if parts.is_empty()
+        || parts.contains(&"..")
+        || rel.starts_with('/')
+        || rel.as_bytes().get(1) == Some(&b':')
+    {
+        return Ok(());
+    }
+    let mut p = root.to_path_buf();
+    for (i, c) in parts.iter().enumerate() {
+        p.push(c);
+        let Ok(m) = std::fs::symlink_metadata(&p) else {
+            return Ok(());
+        };
+        let removed = if m.file_type().is_symlink() {
+            remove_link(&p)
+        } else if i + 1 < parts.len() {
+            continue;
+        } else if m.is_dir() {
+            std::fs::remove_dir_all(&p)
+        } else {
+            std::fs::remove_file(&p)
+        };
+        return removed.with_context(|| format!("removing {}", p.display()));
+    }
+    Ok(())
+}
+
 /// Create the checkout once (or again, if it is gone), then reset it to `sha` for this run.
 pub fn prepare(
     g: &GitCmd,
@@ -399,6 +436,13 @@ pub fn prepare(
     if clean {
         empty_dir(&co.build())?;
         empty_dir(&co.cache())?;
+    } else {
+        // (R21) `clean -ffd` keeps ignored files, so an entry script built from a checkpoint the
+        // reviewer rejected would be the entry of the next run when no gate builds it again: the
+        // task's build-output entries start every run absent, before any gate
+        for e in &cfg.build_entries {
+            remove_entry(&co.dir, &e.path)?;
+        }
     }
     let head = g.run_str(&loc, true, &["rev-parse", "HEAD"])?;
     let status = g.run(
@@ -1501,6 +1545,49 @@ mod tests {
         std::fs::remove_file(e.dir.join("src").join("lib.txt")).unwrap();
         let why = check(&e).expect("missing");
         assert!(why.contains("src/lib.txt (missing)"), "{why}");
+    }
+
+    /// M11-R21: a frozen build-output entry is removed from a `tracked` checkout — a file, a
+    /// folder, one under a folder — and never through a link; what is missing is no error.
+    #[test]
+    fn a_build_output_entry_is_removed_without_following_a_link() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("co");
+        std::fs::create_dir_all(root.join("dist").join("deep")).unwrap();
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::write(root.join("dist").join("cli.js"), "x").unwrap();
+        std::fs::write(root.join("dist").join("deep").join("a.txt"), "x").unwrap();
+        std::fs::write(root.join("build").join("keep.txt"), "x").unwrap();
+        remove_entry(&root, "./dist/cli.js").unwrap();
+        assert!(!root.join("dist").join("cli.js").exists());
+        assert!(root.join("dist").join("deep").exists(), "only the entry");
+        remove_entry(&root, r"dist\deep").unwrap();
+        assert!(!root.join("dist").join("deep").exists(), "a folder entry");
+        remove_entry(&root, "nowhere/at/all.js").unwrap();
+        for bad in ["", "..", "../x", "/etc/passwd", "C:/x"] {
+            remove_entry(&root, bad).unwrap();
+        }
+        assert!(root.join("build").join("keep.txt").exists());
+        // a link on the way is removed as a link, whatever it points to
+        let target = d.path().join("precious");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("cli.js"), "keep").unwrap();
+        std::fs::remove_dir_all(root.join("dist")).unwrap();
+        #[cfg(windows)]
+        let linked = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(root.join("dist"))
+            .arg(&target)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, root.join("dist")).is_ok();
+        assert!(linked, "a link could be made");
+        remove_entry(&root, "dist/cli.js").unwrap();
+        assert!(target.join("cli.js").exists(), "the target keeps its file");
+        assert!(std::fs::symlink_metadata(root.join("dist")).is_err());
     }
 
     /// M11-R13: hashing every file is not fooled by line-ending conversion — with

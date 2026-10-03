@@ -64,7 +64,9 @@ hash unless it has a build-output entry script):
   base commit and not ignored: a `sh -c` head without an extension that starts with `./` (`bash -c "./gradlew
   test"`); the script of the new table rows (`deno run x.ts`, `bun x.ts`, `tsx x.ts`, `ts-node x.ts`, `php
   tools/x.php`); `make -f dir/x.mk` (a makefile named with a separator). Several it refused are admitted now.
-- R13 (the export and the `verify_root` check) and R16 (the preflight, the hints) concern environment gates and the
+- R13's `verify_root` check applies to **every** repository with the `low_integrity` boundary — at `task create`,
+  in `doctor` and before each verify run (corrected in round 4: this line said it concerned environment gates);
+  the export check concerns environment gates. R16 (the preflight, the hints) concerns environment gates and the
   five machine-caused stops; without an org chart only `xpp_toolchain_unavailable` and
   `verify_boundary_unavailable` arise — their reasons now end with the two-step hint. R17: a fence pattern is
   org-chart only; `doctor` warns about a legacy pattern with `{ } [ ] !`; the reach check through a link concerns
@@ -1263,7 +1265,7 @@ environment's permission layer, so nothing is pushed yet.
 - [x] R18 — a gate entry that is a folder is admitted again
 - [x] R19 — protect what exists at base wherever the reader cannot go; `popd`; `-WorkingDirectory`
 - [x] R20 — the export check is byte-exact
-- [ ] R21 — Low fixes
+- [x] R21 — Low fixes
 - [ ] Review of R18–R20 (independent subagent)
 - [ ] Finish — notes, README, HUONG-DAN
 - [ ] Push and pull request, CI
@@ -1391,6 +1393,41 @@ environment's permission layer, so nothing is pushed yet.
   tests (`a_same_length_change_with_restored_timestamps_is_seen`, `the_content_check_follows_the_line_ending_settings`,
   the forgery test, the `tracked` run) pass unchanged.
 - README / HUONG-DAN §5.9: the byte-exact check.
+
+#### R21 — Low fixes (one commit)
+
+- **`checkout: tracked` and build output.** `verify::prepare`, in `tracked` mode only (`clean -ffdx` already removes
+  ignored files), removes every frozen build-output entry (`cfg.build_entries`) from the checkout before the
+  gates (`remove_entry`: a file or a folder; a link or junction on the way is removed as a link, never followed).
+  Other ignored files stay. Tests: `verify::tests::a_build_output_entry_is_removed_without_following_a_link`,
+  `m11_gates::a_tracked_checkout_starts_every_run_without_the_build_output_entries` (calls `prepare` twice).
+- **`toryo config show`** says next to the digest (text form; the JSON value is unchanged, as the digest of a task
+  without build-output entries equals it) that a task's digest also covers its build-output entry scripts, which only
+  `task create` / `--reload` know. The list allowed "say so or show both"; showing both would need a base commit.
+  README: the `config_sha256` comment says the same.
+- **A path argument with any file extension** (a separator and one to eight letters or digits after a name:
+  `-Config ci/settings.json`) that the base commit lacks gets the `note:` at `task create` and in `doctor`, as a
+  script-like one did; never a refusal. Not a path for this rule: no separator, no extension (`build/out`), a hidden
+  file. The net ignores a value that is the tail of an entry under a `make -C dir` prefix. Test:
+  `m11_gates::a_missing_path_argument_with_a_file_extension_gets_a_note` (and a row in the R15 table).
+- **`task config --reload`** probes a changed `verify_root` like `task create` and `doctor` (`verify::probe`): a root
+  a Low-integrity process can write is refused and nothing changes. Only when the root changed (the probe starts
+  processes). Test (Windows): `m11_gates::a_reload_probes_a_changed_verify_root`.
+- **Reader, small.** `source` is a head prefix like `.`; `make -C sub/` with a trailing separator; a PowerShell
+  block comment `<# … #>` is skipped (the catch-all of X13 still sees its words as `sh` would read them). Tests:
+  `cmdline::tests::source_is_a_head_prefix_and_a_block_comment_is_skipped`, four rows in the R15 table.
+- **Docs.** The line above ("R13 … concerns environment gates") corrected; README and HUONG-DAN fence list names the
+  refused `$env:NAME`.
+- **Leftover branches `worktree-agent-ac1999026e124d50b` and `worktree-agent-ace35f955409e603a`** (both at
+  `df84b02`): **left alone**. `git worktree list` shows their two worktrees under `.claude/worktrees/` (detached at
+  `21e83c9` and `227c70d`), and each holds an untracked `target-review/` (the cargo build output of the reviewers I
+  started): that is something uncommitted, so, as the list says, nothing was removed and no branch deleted. Remove
+  them with `git worktree remove --force .claude/worktrees/agent-…` and `git branch -d worktree-agent-…` when you
+  like.
+- **Recorded, not fixed (the list's three):** the R16 preflight checks every environment gate up front, so a gate
+  whose program or secret an earlier gate creates can never start; a symlinked parent folder can carry a
+  build-output entry into a checkpoint on Unix or with `core.symlinks=true`; the interpreter and `make` rules are
+  still not applied inside a command string (X13 protects an existing makefile only when the string names it).
 
 ## Progress
 

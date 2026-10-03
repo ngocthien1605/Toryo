@@ -589,6 +589,130 @@ fn an_entry_that_is_a_folder_of_the_base_commit_is_admitted() {
     }
 }
 
+/// M11-R21: with `verify.checkout: tracked` `clean -ffd` keeps ignored files between verify
+/// runs; the task's frozen build-output entries are removed before each run — an entry script
+/// built from a checkpoint the reviewer rejected must not be what a later run starts — and
+/// other ignored files stay (that is what `tracked` is for).
+#[test]
+fn a_tracked_checkout_starts_every_run_without_the_build_output_entries() {
+    let (env, entry) = build_output_repo();
+    let y = std::fs::read_to_string(&env.config).unwrap();
+    assert!(y.contains("boundary: none"), "{y}");
+    std::fs::write(
+        &env.config,
+        y.replace("boundary: none", "boundary: none, checkout: tracked"),
+    )
+    .unwrap();
+    let (code, err) = create_as(&env, "R21-T");
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R21-T");
+    let cfg = toryo::engine::task::frozen_config(&t).unwrap();
+    assert_eq!(cfg.build_entries.len(), 1, "{:?}", cfg.build_entries);
+    let g = toryo::engine::task::task_git(&cfg, &t.repo).unwrap();
+    let prepare = || {
+        toryo::engine::verify::prepare(&g, &t, &cfg, &t.base_commit, toryo::process::Boundary::None)
+            .unwrap()
+    };
+    let co = prepare();
+    // a gate of an earlier run built the entry; another ignored file is there too
+    let built = co.dir.join(entry);
+    std::fs::create_dir_all(built.parent().unwrap()).unwrap();
+    std::fs::write(&built, "stale\n").unwrap();
+    let other = co.dir.join("build").join("cache.txt");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    std::fs::write(&other, "kept\n").unwrap();
+    prepare();
+    assert!(!built.exists(), "the entry starts every run absent");
+    assert!(other.exists(), "`tracked` keeps the other ignored files");
+}
+
+/// M11-R21: an argument that is clearly a path — a separator and a file extension — and is not
+/// in the base commit gets the `note:` at `task create` and in `doctor`, as a script-like one
+/// does (`-Config ci/settings.json`); one the base commit has gets none, and is protected.
+#[test]
+fn a_missing_path_argument_with_a_file_extension_gets_a_note() {
+    let line = r#"    - { name: smoke, program: pwsh, args: ["-File", "scripts/smoke.ps1", "-Config", "ci/settings.json"] }"#;
+    let note =
+        "note: verify command `smoke` passes `ci/settings.json`, which is not in the base commit";
+    let env = setup("codex-openai");
+    commit_repo(&env, &[("scripts/smoke.ps1", "exit 0\n")], "a smoke script");
+    with_verify_command(&env, line);
+    let (code, err) = create_as(&env, "R21-N");
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains(note), "{err}");
+    let o = command(&env, &["doctor"], &[]).output().unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains(note), "{out}");
+    // in the base commit: no note, and protected
+    let env = setup("codex-openai");
+    commit_repo(
+        &env,
+        &[
+            ("scripts/smoke.ps1", "exit 0\n"),
+            ("ci/settings.json", "{}\n"),
+        ],
+        "a smoke script and its settings",
+    );
+    with_verify_command(&env, line);
+    let (code, err) = create_as(&env, "R21-M");
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("ci/settings.json"), "{err}");
+    let t = task(&env, "R21-M");
+    let cfgv = toryo::engine::task::frozen_config(&t).unwrap();
+    let (_, prot, _) = toryo::engine::runner::task_policy(&t, &cfgv).unwrap();
+    assert!(prot.violates("ci/settings.json"));
+}
+
+/// M11-R21: `task config --reload` probes a changed `verify_root` as `task create` and `doctor`
+/// do: one a Low-integrity process can write is refused, nothing is changed; an ordinary one
+/// is accepted. (Windows: the boundary is the Low integrity level.)
+#[cfg(windows)]
+#[test]
+fn a_reload_probes_a_changed_verify_root() {
+    let env = setup("codex-openai");
+    let y = std::fs::read_to_string(&env.config).unwrap();
+    assert!(
+        y.contains("boundary: none") && y.contains("/verify\""),
+        "{y}"
+    );
+    std::fs::write(
+        &env.config,
+        y.replace("boundary: none", "boundary: low_integrity"),
+    )
+    .unwrap();
+    let (code, err) = create_as(&env, "R21-P");
+    assert_eq!(code, 0, "{err}");
+    let s = script(
+        &env,
+        "r21p.json",
+        json!({ "planner": [turn(vec![plan()])] }),
+    );
+    // to the plan gate: a waiting state, where a reload is allowed
+    let (_, err) = toryo(&env, &["run", "R21-P", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "R21-P").state, St::WaitingPlanApproval, "{err}");
+    let digest = task(&env, "R21-P").config_sha256;
+    // the new root carries a Low label (inherited by everything created under it)
+    let low = env.root.join("verify-low");
+    std::fs::create_dir_all(&low).unwrap();
+    toryo::process::label_low(std::slice::from_ref(&low)).unwrap();
+    let y = std::fs::read_to_string(&env.config).unwrap();
+    std::fs::write(&env.config, y.replace("/verify\"", "/verify-low\"")).unwrap();
+    let (code, err) = toryo(&env, &["task", "config", "R21-P", "--reload"], &[]);
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains("verify_boundary_unavailable")
+            && err.contains("a Low-integrity process can create files in"),
+        "{err}"
+    );
+    assert_eq!(task(&env, "R21-P").config_sha256, digest, "nothing changed");
+    // an ordinary folder is accepted
+    let y = std::fs::read_to_string(&env.config).unwrap();
+    std::fs::write(&env.config, y.replace("/verify-low\"", "/verify-ok\"")).unwrap();
+    let (code, err) = toryo(&env, &["task", "config", "R21-P", "--reload"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_ne!(task(&env, "R21-P").config_sha256, digest);
+}
+
 /// M11-R10 AC-3: `sh check` (no separator, no extension) missing at the base commit is
 /// admitted — and protected: a fake implementer that creates `check` cannot pass its own gate.
 /// (Deviation, recorded: a new untracked protected file is caught by the R35 protected-state

@@ -169,6 +169,11 @@ pub fn text(cfg: &Effective) -> String {
             .unwrap_or_default(),
         crate::git::short(v["config_sha256"].as_str().unwrap_or_default())
     );
+    // (M11-R21) the digest of a task also covers the build-output entry scripts of its base
+    // commit, which only `task create` / `task config --reload` can know
+    s.push_str(
+        "  (a task's digest also covers its build-output entry scripts — gate scripts that a gate builds, missing at the task's base commit and ignored — and then differs from this one)\n",
+    );
     s.push_str("\nfiles read:\n");
     for f in &cfg.files {
         s.push_str(&format!(

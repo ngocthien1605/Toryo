@@ -283,7 +283,7 @@ from the repository checkout (`project.root`), never from a task worktree, and e
   path and everything under it; a last segment without a wildcard covers what is under it too, `**/secrets` is
   `**/secrets/**`; a wildcard pattern without a `/` matches at any depth, `*.pfx` is `**/*.pfx`); an absolute pattern, `..`, an empty one or syntax the matcher lacks (`{ } [ ] !`;
   it has `*`, `**`, `?`) is a load error; so is a variable or the home shortcut, which a fence never expands — a
-  `%NAME%` anywhere, `~` or `$NAME` / `${NAME}` as the whole first segment (`~/x`, `$HOME/x`). Elsewhere `%`, `~`
+  `%NAME%` anywhere, `~` or `$NAME` / `${NAME}` / `$env:NAME` as the whole first segment (`~/x`, `$HOME/x`). Elsewhere `%`, `~`
   and `$` are ordinary characters of a file name (`routes/$id.tsx`, `~$draft.docx`, `50%.txt`).
   (`policy.deny_paths` / `protected_paths` keep their M10 behaviour; `toryo doctor` warns about a pattern there
   that can never match, and about one with `{ } [ ] !` — there those characters are matched literally: Toryo
@@ -428,7 +428,7 @@ came from. Sources: `repo`, `machine`, `repo_overridden_by_machine` (a machine s
 
 ```jsonc
 { "schema": 1, "mode": "org chart",                 // or "toryo.yaml only"
-  "config_sha256": "…",                             // what `task create` records as tasks.config_sha256
+  "config_sha256": "…",                             // what `task create` records as tasks.config_sha256 — plus the build-output entry scripts of the task's base commit, if any (then the task's digest differs)
   "team": "d365fo-dev",                             // null in toryo.yaml-only mode
   "files": [ { "what": "toryo.yaml", "path": "…", "sha256": "…" } ],   // + machine config, org chart, role <seat>
   "seats": [ { "seat": "implementer", "profile": "codex-openai", "model": null, "fallback": ["claude-max"], "source": "repo" } ],

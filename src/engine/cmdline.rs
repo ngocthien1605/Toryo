@@ -313,6 +313,14 @@ fn tokens(s: &str, shell: Shell) -> Vec<Tok> {
                 }
                 i += 1;
             }
+            // (R21) a PowerShell block comment `<# … #>` is no command
+            '<' if shell == Shell::Pwsh && !lx.started && cs.get(i) == Some(&'#') => {
+                i += 1;
+                while i < cs.len() && !(cs[i] == '#' && cs.get(i + 1) == Some(&'>')) {
+                    i += 1;
+                }
+                i = (i + 2).min(cs.len());
+            }
             '\n' => {
                 lx.sep(Tok::Seq);
                 // (R19) the bodies of the here-documents of the line just ended are data: skipped,
@@ -578,7 +586,7 @@ fn simple(
         let dot = w.literal && !w.quoted && w.text == ".";
         let prefix = (w.literal
             && !w.quoted
-            && (one_of(&w.text, &["call", "exec", "time"])
+            && (one_of(&w.text, &["call", "exec", "time", "source"])
                 || dot
                 || (shell == Shell::Cmd && one_of(&w.text, &["do", "else"]))))
             || (shell == Shell::Sh && assignment(&w.text));
@@ -1248,6 +1256,31 @@ mod tests {
     /// from the folder reached so far and from the folder the `cd` names.
     /// M11-R19 (X13): where the reader stops it keeps the folders it could not follow — the
     /// folder a `popd` returns to, the folder a `cd` that is not a head names.
+    /// M11-R21: `source` runs the script that follows it like `.`; a PowerShell block comment
+    /// `<# … #>` holds no command.
+    #[test]
+    fn source_is_a_head_prefix_and_a_block_comment_is_skipped() {
+        use Shell::{Pwsh, Sh};
+        assert_eq!(
+            entries("source ./ci/x.sh --fast", Sh),
+            [("./ci/x.sh".to_string(), true)]
+        );
+        assert_eq!(
+            entries("A=1 source ci/x.sh", Sh),
+            [("ci/x.sh".to_string(), true)]
+        );
+        assert_eq!(
+            entries("<# ./nope.ps1\n./nor.ps1 #> ./x.ps1", Pwsh),
+            [("./x.ps1".to_string(), true)]
+        );
+        assert_eq!(
+            entries("./a.ps1 <# ./nope.ps1 #>; ./b.ps1", Pwsh),
+            [("./a.ps1".to_string(), true), ("./b.ps1".to_string(), true)]
+        );
+        // an unterminated block comment swallows the rest, and nothing panics
+        assert_eq!(entries("./a.ps1; <# ./b.ps1", Pwsh).len(), 1);
+    }
+
     #[test]
     fn the_folders_it_cannot_follow_are_kept() {
         use Shell::{Cmd, Pwsh, Sh};
