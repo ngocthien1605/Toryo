@@ -1020,6 +1020,64 @@ fn a_script_behind_a_cd_is_protected_from_the_implementer() {
     );
 }
 
+/// M11-R19 AC-2 (X13, applies to everyone): a gate script behind a command line the reader
+/// cannot use as a head — here a PowerShell expression, a nested `sh` — is protected all the
+/// same: a fake implementer that edits it gets a path-policy violation (restored, fix note).
+/// Nothing is refused and nothing noted when it is missing at the base commit.
+#[test]
+fn a_script_behind_a_wrapper_is_protected_from_the_implementer() {
+    let env = setup("codex-openai");
+    let (file, line) = if cfg!(windows) {
+        (
+            "ci/x.ps1",
+            // a command line inside a PowerShell expression: no head the reader could use
+            r#"    - { name: ci, program: pwsh, args: ["-NoProfile", "-Command", "Invoke-Expression './ci/x.ps1 -a'"] }"#,
+        )
+    } else {
+        (
+            "ci/x.sh",
+            // a nested shell
+            r#"    - { name: ci, program: sh, args: ["-c", "sh -c '. ./ci/x.sh --fast'"] }"#,
+        )
+    };
+    commit_repo(&env, &[(file, "exit 0\n")], "a gate script in ci/");
+    with_verify_command(&env, line);
+    let (code, err) = create_as(&env, "R19-E");
+    assert_eq!(code, 0, "{err}");
+    let s = script(
+        &env,
+        "r19e.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write(file, "# always green\n"), write("src/Calculator.psm1", DIVIDE), implementation()]),
+                turn(vec![implementation()]),
+            ],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R19-E", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R19-E");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert!(
+        err.contains("protected or denied paths changed") && err.contains(file),
+        "{err}"
+    );
+    assert_eq!(t.fix_cycle, 1);
+    let files = git(&wt(&env, "R19-E"), &["diff", "--name-only", "main..HEAD"]);
+    assert!(
+        !files.lines().any(|f| f == file) && files.contains("src/Calculator.psm1"),
+        "{files}"
+    );
+    // X13 refuses nothing and says nothing: the same line with the script missing at the base
+    // commit is admitted, no note
+    let env = setup("codex-openai");
+    with_verify_command(&env, line);
+    let (code, err) = create_as(&env, "R19-N");
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("ci/x"), "{err}");
+}
+
 /// M11-R15 AC-3 (X10, X11): `cmd.exe` looks in the working directory before PATH, and a check
 /// gate's working directory is the checkout root — so a bare head of a `cmd` string is
 /// protected under every name `cmd` would try, whether or not a program of that name is on

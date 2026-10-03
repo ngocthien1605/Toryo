@@ -825,7 +825,7 @@ fn verify_files_with(
         // their own
         let string = command_string(&program, args);
         for (i, a) in args.iter().enumerate() {
-            if string.as_ref().is_some_and(|s| s.3.contains(&i)) {
+            if string.as_ref().is_some_and(|s| s.args.contains(&i)) {
                 continue;
             }
             for v in arg_values(a) {
@@ -834,17 +834,70 @@ fn verify_files_with(
                 }
             }
         }
-        if let Some((s, shell, dir, _)) = string {
+        if let Some(s) = &string {
             // … and, where the string could not be followed, the words of the rest
-            let parsed = super::cmdline::parse_in(&s, shell, &dir);
+            let parsed = s.read();
             for v in parsed.args.iter().chain(&parsed.maybe) {
                 if let Some(r) = names_file(v) {
                     add(r);
                 }
             }
         }
+        // M11-R19 (X13): and, next to all that, every word of every argument — also inside a
+        // command line an argument holds, after a here-document, after where the reader
+        // stopped — from the root and from every folder a change of folder names, followed or
+        // not. Protected when it names a file; never refused, never noted.
+        for v in super::cmdline::everywhere(args.iter().map(String::as_str)) {
+            if let Some(r) = names_file(&v) {
+                add(r);
+            }
+        }
     }
     out
+}
+
+/// A command string and how to read it ([`command_string`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandString {
+    pub text: String,
+    pub shell: Shell,
+    /// The folder it starts in: repository-relative, `/`; `""` is the checkout root.
+    pub dir: String,
+    /// (R19) Where it starts depends on the PowerShell version (`-Command` with
+    /// `-WorkingDirectory`): it is read from `dir` and from the root, and nothing in it is
+    /// refused.
+    pub both: bool,
+    /// The range of the verify command's arguments that make up the string.
+    pub args: std::ops::Range<usize>,
+}
+
+impl CommandString {
+    /// What [`super::cmdline`] finds in it.
+    pub fn read(&self) -> super::cmdline::Parsed {
+        let mut p = super::cmdline::parse_in(&self.text, self.shell, &self.dir);
+        if self.both {
+            let q = super::cmdline::parse_in(&self.text, self.shell, "");
+            for e in q.entries {
+                if !p.entries.iter().any(|x| x.path == e.path) {
+                    p.entries.push(e);
+                }
+            }
+            for a in q.args {
+                if !p.args.contains(&a) {
+                    p.args.push(a);
+                }
+            }
+            for m in q.maybe {
+                if !p.maybe.contains(&m) {
+                    p.maybe.push(m);
+                }
+            }
+            for e in &mut p.entries {
+                e.refusable = false;
+            }
+        }
+        p
+    }
 }
 
 /// PowerShell's `-File` parameter (and its abbreviations), case-insensitive.
@@ -982,32 +1035,36 @@ fn is_command_flag(a: &str) -> bool {
 /// (unless `-File` is given) or after `/c` (`/k`) of `cmd`, joined; the argument after a
 /// `sh`-family `-c`, also inside a short-flag cluster (`-ec`, `-lc`, `-euxc`) — with the folder
 /// it starts in (`""`: the checkout root; PowerShell's `-WorkingDirectory`). `None`: the command
-/// runs no command string, or where it runs cannot be followed. The last part is the range of
-/// `args` that make up the string: they are read by [`super::cmdline`], not as arguments of
+/// runs no command string, or where it runs cannot be followed. `args` is the range of the
+/// arguments that make up the string: they are read by [`super::cmdline`], not as arguments of
 /// their own.
-pub fn command_string(
-    program: &str,
-    args: &[String],
-) -> Option<(String, Shell, String, std::ops::Range<usize>)> {
+pub fn command_string(program: &str, args: &[String]) -> Option<CommandString> {
     let base = program_base(program);
+    let make = |text: String, shell, args| CommandString {
+        text,
+        shell,
+        dir: String::new(),
+        both: false,
+        args,
+    };
     if base == "pwsh" || base == "powershell" {
         if args.iter().any(|a| is_file_flag(a)) {
             return None;
         }
         let dir = pwsh_dir(args)?;
         let i = args.iter().position(|a| is_command_flag(a))?;
-        return Some((args[i + 1..].join(" "), Shell::Pwsh, dir, i..args.len()));
+        let mut s = make(args[i + 1..].join(" "), Shell::Pwsh, i..args.len());
+        // (R19) PowerShell 7 runs `-Command` under `-WorkingDirectory`; Windows PowerShell 5.1
+        // ignores the flag (both measured, see the notes): both folders are read, none refused
+        s.both = !dir.is_empty();
+        s.dir = dir;
+        return Some(s);
     }
     if base == "cmd" {
         let i = args
             .iter()
             .position(|a| a.eq_ignore_ascii_case("/c") || a.eq_ignore_ascii_case("/k"))?;
-        return Some((
-            args[i + 1..].join(" "),
-            Shell::Cmd,
-            String::new(),
-            i..args.len(),
-        ));
+        return Some(make(args[i + 1..].join(" "), Shell::Cmd, i..args.len()));
     }
     if !SH_FAMILY.contains(&base.as_str()) {
         return None;
@@ -1020,9 +1077,7 @@ pub fn command_string(
     while let Some((_, a)) = it.next() {
         let cluster = a.len() > 2 && a.starts_with('-') && !a.starts_with("--");
         if a == "-c" || (cluster && a.contains('c')) {
-            return it
-                .next()
-                .map(|(j, s)| (s.clone(), Shell::Sh, String::new(), j..j + 1));
+            return it.next().map(|(j, s)| make(s.clone(), Shell::Sh, j..j + 1));
         }
         if valued.iter().any(|f| a == f) || (cluster && a.ends_with(['o', 'O'])) {
             it.next(); // the flag's value
@@ -1035,9 +1090,10 @@ pub fn command_string(
     None
 }
 
-/// PowerShell's `-WorkingDirectory` / `-wd` (R13–R15 review): the folder the command starts
+/// PowerShell's `-WorkingDirectory` / `-wd` (R13–R15 review): the folder a `-Command` starts
 /// in, repository-relative with `/` — `Some("")` when it is not given, `None` when it cannot be
-/// followed (a variable, an absolute path, a `..`).
+/// followed (a variable, an absolute path, a `..`). It does not move a `-File` script (R19: the
+/// script is found from the folder PowerShell was started in, under both versions).
 fn pwsh_dir(args: &[String]) -> Option<String> {
     // (R16–R17 review) PowerShell's own parameters end at `-File`, `-Command` or the script:
     // a `-WorkingDirectory` after that belongs to the script
@@ -1151,29 +1207,20 @@ fn make_entries(args: &[String]) -> Vec<Entry> {
 ///   none; a folder or a glob is no script;
 /// - any other program: none (`-f` of `dotnet`, `docker` or `grep` is not a script).
 pub fn entry_scripts(program: &str, args: &[String]) -> Vec<Entry> {
-    if let Some((s, shell, dir, _)) = command_string(program, args) {
-        return super::cmdline::parse_in(&s, shell, &dir).entries;
+    if let Some(s) = command_string(program, args) {
+        return s.read().entries;
     }
     let base = program_base(program);
     if base == "pwsh" || base == "powershell" {
-        // `-WorkingDirectory ci`: the script is looked for there; not followed → nothing
-        let Some(dir) = pwsh_dir(args) else {
-            return Vec::new();
-        };
-        let under = |a: &str| {
-            if dir.is_empty() || Path::new(a).has_root() {
-                a.to_string()
-            } else {
-                format!("{dir}/{a}")
-            }
-        };
+        // (R19) `-WorkingDirectory ci` does not move the script: `-File x.ps1` is `x.ps1`
+        // from the folder PowerShell is started in (the working directory changes after)
         if let Some(i) = args.iter().position(|a| is_file_flag(a)) {
             return args
                 .get(i + 1)
                 .filter(|a| !a.ends_with(['/', '\\']))
                 .map(|a| {
                     vec![Entry {
-                        path: under(a),
+                        path: a.clone(),
                         refusable: sure(a),
                     }]
                 })
@@ -1186,7 +1233,7 @@ pub fn entry_scripts(program: &str, args: &[String]) -> Vec<Entry> {
             })
             .map(|a| {
                 vec![Entry {
-                    path: under(a),
+                    path: a.clone(),
                     refusable: true,
                 }]
             })
@@ -1292,7 +1339,7 @@ pub fn script_like_args(cmds: &[CommandSpec], repo: &Path) -> Vec<(String, Strin
         let mut prev: Option<&String> = None;
         for (i, a) in args.iter().enumerate() {
             let skip = prev.is_some_and(|p| super::cmdline::output_flag(p))
-                || string.as_ref().is_some_and(|s| s.3.contains(&i));
+                || string.as_ref().is_some_and(|s| s.args.contains(&i));
             prev = Some(a);
             if !skip {
                 candidates.extend(
@@ -1304,8 +1351,8 @@ pub fn script_like_args(cmds: &[CommandSpec], repo: &Path) -> Vec<(String, Strin
         }
         // the argument words of a command string (literal by construction; a path may hold a
         // space there)
-        if let Some((s, shell, dir, _)) = string {
-            candidates.extend(super::cmdline::parse_in(&s, shell, &dir).args);
+        if let Some(s) = &string {
+            candidates.extend(s.read().args);
         }
         for t in candidates {
             if !t.contains(['/', '\\']) || !has_script_ext(&t) || has_scheme(&t) {
@@ -2321,6 +2368,212 @@ mod tests {
         assert_eq!(got(&["/c", "setup.exe && run.cmd"]), two);
     }
 
+    /// M11-R19 AC-1 (X13, applies to everyone): "refusing needs certainty, protecting does not".
+    /// For each command line, over a base commit holding `base`: the protected names (exactly)
+    /// and what is refused when missing (exactly) — X13 adds protected names, never a refusal.
+    /// Wrapper programs, nested command lines, here-documents, `popd` and a `cd` that is not a
+    /// head; the body of a here-document is skipped.
+    #[test]
+    fn protection_reaches_where_the_reader_cannot_go() {
+        type Case<'a> = (
+            &'a str,
+            &'a [&'a str],
+            &'a [&'a str],
+            &'a [&'a str],
+            &'a [&'a str],
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "docker",
+                &["run", "img", "sh", "-c", "npm ci && ./scripts/test.sh --ci"],
+                &["scripts/test.sh"],
+                &["scripts/test.sh"],
+                &[],
+            ),
+            (
+                "wsl",
+                &["bash", "-lc", "./scripts/test.sh --fast"],
+                &["scripts/test.sh"],
+                &["scripts/test.sh"],
+                &[],
+            ),
+            (
+                "bash",
+                &["-c", "bash -c './x.sh --fast'"],
+                &["x.sh"],
+                &["x.sh"],
+                &[],
+            ),
+            (
+                "pwsh",
+                &["-Command", "Invoke-Expression './x.ps1 -a'"],
+                &["x.ps1"],
+                &["x.ps1"],
+                &[],
+            ),
+            // a here-document: its body is data, the words after it are read
+            (
+                "bash",
+                &["-c", "cat > .env <<EOF\n./nope.sh\nEOF\n./x.sh"],
+                &["x.sh", "nope.sh"],
+                &["x.sh"],
+                &[],
+            ),
+            (
+                "bash",
+                &[
+                    "-c",
+                    "cat <<-'EOF' | ./filter.sh\n\t./nope.sh\n\tEOF\n./x.sh",
+                ],
+                &["x.sh", "filter.sh", "nope.sh"],
+                &["x.sh", "filter.sh"],
+                &[],
+            ),
+            // `popd`: the folder it returns to is where the rest runs
+            (
+                "cmd",
+                &["/c", r"pushd sub && .\a.cmd && popd && .\b.cmd"],
+                &["sub/a.cmd", "b.cmd", "sub/b.cmd"],
+                &["sub/a.cmd", "b.cmd", "sub/b.cmd"],
+                &["sub/a.cmd"],
+            ),
+            (
+                "pwsh",
+                &[
+                    "-Command",
+                    "Push-Location ci; try { ./x.ps1 } finally { Pop-Location }; ./y.ps1",
+                ],
+                &["ci/x.ps1", "y.ps1"],
+                &["ci/x.ps1", "y.ps1"],
+                &["ci/x.ps1"],
+            ),
+            (
+                "bash",
+                &["-c", "pushd ci && ./x.sh && popd && ./y.sh"],
+                &["ci/x.sh", "y.sh"],
+                &["ci/x.sh", "y.sh"],
+                &["ci/x.sh"],
+            ),
+            // a `cd` that is not the head of its command
+            (
+                "bash",
+                &[
+                    "-c",
+                    "if [ -d frontend ]; then cd frontend; fi; ./run-tests.sh",
+                ],
+                &["run-tests.sh", "frontend/run-tests.sh"],
+                &["run-tests.sh", "frontend/run-tests.sh"],
+                &[],
+            ),
+            // `-C` and `-WorkingDirectory` name folders too, followed or not
+            (
+                "git",
+                &["-C", "tools", "run", "./gen.sh"],
+                &["tools/gen.sh", "gen.sh"],
+                &["tools/gen.sh", "gen.sh"],
+                &[],
+            ),
+            // refused when missing: unchanged (the base commit lacks them)
+            (
+                "bash",
+                &["-c", "./ci/new.sh --fast"],
+                &[],
+                &["ci/new.sh"], // an entry: protected whether or not it exists
+                &["ci/new.sh"],
+            ),
+            (
+                "docker",
+                &["run", "img", "sh", "-c", "./ci/new.sh"],
+                &[],
+                &[],
+                &[],
+            ),
+        ];
+        let d = tempfile::tempdir().unwrap();
+        for (program, args, base, protected, refusable) in cases {
+            let base: std::collections::HashSet<String> =
+                base.iter().map(|b| b.to_string()).collect();
+            let cmd = [CommandSpec::program("g", program, args, None)];
+            let mut files = verify_files_at_base(&cmd, d.path(), &base);
+            files.sort();
+            let mut want: Vec<String> = protected.iter().map(|x| x.to_string()).collect();
+            want.sort();
+            assert_eq!(files, want, "protected: {program} {args:?}");
+            let refused: Vec<String> = verify_entry_points(&cmd, d.path())
+                .into_iter()
+                .map(|e| e.1)
+                .collect();
+            assert_eq!(refused, refusable, "refused: {program} {args:?}");
+        }
+    }
+
+    /// M11-R19 Do 3 / AC-3: what PowerShell does with `-WorkingDirectory` (measured on this
+    /// machine, transcript in `docs/M11-NOTES.md`): `-File x.ps1` is found from the folder it
+    /// was started in under pwsh 7.6.6 and Windows PowerShell 5.1 alike (the working directory
+    /// changes afterwards); `-Command ./x.ps1` runs under the folder in pwsh 7 and ignores the
+    /// flag in 5.1. So `-File` is the root script, and `-Command` is read both ways and refuses
+    /// nothing.
+    #[test]
+    fn working_directory_moves_a_command_not_a_script_file() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let got = |program: &str, args: &[&str]| -> Vec<(String, bool)> {
+            entry_scripts(program, &s(args))
+                .into_iter()
+                .map(|e| (e.path, e.refusable))
+                .collect()
+        };
+        let want = |v: &[(&str, bool)]| -> Vec<(String, bool)> {
+            v.iter().map(|(p, r)| (p.to_string(), *r)).collect()
+        };
+        for program in ["pwsh", "powershell"] {
+            assert_eq!(
+                got(program, &["-WorkingDirectory", "sub", "-File", "x.ps1"]),
+                want(&[("x.ps1", true)]),
+                "{program} -File: the root script"
+            );
+            assert_eq!(
+                got(program, &["-WorkingDirectory", "sub", "x.ps1"]),
+                want(&[("x.ps1", true)]),
+                "{program}: a positional script is -File"
+            );
+            assert_eq!(
+                got(
+                    program,
+                    &["-WorkingDirectory", "sub", "-Command", "./x.ps1"]
+                ),
+                want(&[("sub/x.ps1", false), ("./x.ps1", false)]),
+                "{program} -Command: both, nothing refused"
+            );
+        }
+        // the folder cannot be followed: `-File` still has its script; `-Command` has no string
+        assert_eq!(
+            got("pwsh", &["-WorkingDirectory", "%X%", "-File", "x.ps1"]),
+            want(&[("x.ps1", true)])
+        );
+        let base: std::collections::HashSet<String> = ["x.ps1", "sub/x.ps1", "sub/only.ps1"]
+            .map(String::from)
+            .into();
+        let d = tempfile::tempdir().unwrap();
+        for (args, protected) in [
+            (
+                &["-WorkingDirectory", "sub", "-File", "x.ps1"][..],
+                &["x.ps1", "sub/x.ps1"][..],
+            ),
+            (
+                &["-WorkingDirectory", "sub", "-Command", "./only.ps1"][..],
+                &["sub/only.ps1", "only.ps1"][..],
+            ),
+        ] {
+            let cmd = [CommandSpec::program("g", "pwsh", args, None)];
+            let mut files = verify_files_at_base(&cmd, d.path(), &base);
+            files.sort();
+            let mut w: Vec<String> = protected.iter().map(|x| x.to_string()).collect();
+            w.sort();
+            // (`sub/only.ps1` exists at base; `only.ps1` is an entry of the 5.1 reading)
+            assert_eq!(files, w, "protected: {args:?}");
+        }
+    }
+
     /// M11-R15 AC-1 (X10): command strings and `cmd` bare names — for each command line its
     /// entries (path, refused-when-missing), the net (notes, never refused) and the protected
     /// names of a task whose base commit holds the files in `base`. After the 16 lines of the
@@ -2550,7 +2803,9 @@ mod tests {
                 &["-Command", "Push-Location ci; ./x.ps1; Pop-Location"],
                 one("ci/x.ps1", true),
                 &[],
-                Some(&["ci/x.ps1"]),
+                // (R19, X13: `ci` is a folder the command names, so the root `x.ps1` of this
+                // base commit is protected as well — the protected set grew, the entry did not)
+                Some(&["ci/x.ps1", "x.ps1"]),
             ),
             (
                 "pwsh",
@@ -2562,37 +2817,43 @@ mod tests {
                 &[],
                 Some(&[]),
             ),
-            // `-WorkingDirectory`: the script is looked for there; not followed → nothing
+            // `-WorkingDirectory` (R19, measured): `-Command` runs under it in PowerShell 7 and
+            // not in 5.1 — both folders are read, nothing is refused; `-File` is found from the
+            // folder PowerShell was started in, whatever the flag says
             (
                 "pwsh",
                 &["-WorkingDirectory", "ci", "-Command", "./x.ps1"],
-                one("ci/x.ps1", true),
+                vec![
+                    ("ci/x.ps1".to_string(), false),
+                    ("./x.ps1".to_string(), false),
+                ],
                 &[],
-                Some(&["ci/x.ps1"]),
+                Some(&["ci/x.ps1", "x.ps1"]),
             ),
             (
                 "pwsh",
                 &["-wd", "ci", "-File", "x.ps1"],
-                one("ci/x.ps1", true),
+                one("x.ps1", true),
                 &[],
-                // (the argument `x.ps1` also names a root file of this base commit: protected too)
+                // (X13: `ci` is a folder the command names: its `x.ps1` is protected too)
                 Some(&["ci/x.ps1", "x.ps1"]),
             ),
             (
                 "pwsh",
                 &["-WorkingDirectory", "%CI%", "-File", "x.ps1"],
-                none(),
+                one("x.ps1", true),
                 &[],
-                // (the bare argument `x.ps1` names a file of the base commit: protected)
                 Some(&["x.ps1"]),
             ),
-            // a `cd` that is not a head stops the reading; a here-document too
+            // a `cd` that is not a head stops the reading (nothing refused, no entry); a
+            // here-document too. (R19, X13: the folder the `cd` names is looked in as well, so
+            // `ci/x.sh` of this base commit is protected — the protected set grew)
             (
                 "bash",
                 &["-c", "if [ -d ci ]; then cd ci; fi; ./x.sh"],
                 none(),
                 &[],
-                Some(&[]),
+                Some(&["ci/x.sh"]),
             ),
             (
                 "bash",
@@ -2654,7 +2915,9 @@ mod tests {
                 &["/c", "rem see a.cmd & scripts\\x.cmd"],
                 none(),
                 &[],
-                Some(&[]),
+                // (R19, X13: protected all the same — the net does not know `rem`; protecting
+                // needs no certainty. Nothing is an entry, nothing is refused)
+                Some(&["scripts/x.cmd"]),
             ),
             // a module specifier is no repository path
             (

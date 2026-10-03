@@ -1261,7 +1261,7 @@ environment's permission layer, so nothing is pushed yet.
 #### Progress (round 4)
 
 - [x] R18 — a gate entry that is a folder is admitted again
-- [ ] R19 — protect what exists at base wherever the reader cannot go; `popd`; `-WorkingDirectory`
+- [x] R19 — protect what exists at base wherever the reader cannot go; `popd`; `-WorkingDirectory`
 - [ ] R20 — the export check is byte-exact
 - [ ] R21 — Low fixes
 - [ ] Review of R18–R20 (independent subagent)
@@ -1290,6 +1290,62 @@ environment's permission layer, so nothing is pushed yet.
   entry. Test: `m11_gates::an_entry_that_is_a_folder_of_the_base_commit_is_admitted` (`node --test tests/unit`,
   `node packages/cli`, `python tools/gen`: admitted at create, in `doctor` and at reload; refused when the folder
   is not in the base commit and not ignored; the file set has no folder, the admission set has).
+
+#### R19 — protect what exists at base wherever the reader cannot go (applies to everyone)
+
+- **The catch-all (X13), `cmdline::everywhere`.** Next to what the reader finds, `verify_files_with` (so the task's
+  protected set, for every verify command, gate and `tool` command) adds the result of `everywhere(args)`: every
+  word of every argument, tokenised as `sh`, PowerShell and `cmd` would (quotes removed, the reader's tokeniser
+  reused), recursively through every word that is itself a command line (it holds a space or a quote; at most 6
+  levels; `\"` taken off), looked up from the checkout root **and** from every folder the arguments name as a change
+  of folder anywhere — `cd` / `chdir` / `pushd` / `Set-Location` / `sl` / `Push-Location`, `-C`, `-WorkingDirectory`
+  / `-wd` — whether or not the reader followed it. The arguments are scanned one by one (nested strings) and joined
+  with spaces (a `cd` and its folder are separate arguments of `cmd /c cd sub && …`; `-C tools`). A word protects
+  only when the base commit has it as a **file**. It is never an entry and never refused, and it prints no note.
+  It also protects a few names the reader rightly ignores (the line after `rem` in a `cmd` string): protecting
+  needs no certainty. Departure from the letter: the three shells are all tried, except for a string that holds a
+  here-document — that is a `sh` script, and PowerShell and `cmd` would read its body as commands.
+- **Here-documents.** The tokeniser no longer ends at `<<`: it reads the delimiter (`<<EOF`, `<<-'EOF'`, `<<"EOF"`),
+  skips the body at the next line break up to the delimiter alone on a line (`<<-` strips tabs), and carries on —
+  so what follows the delimiter on its line (`cat <<EOF | ./filter.sh`) and what follows the body are words. The
+  reader itself still stops at the here-document (`Tok::Stop`): no entry after it.
+- **`popd`.** When the reader is not sure it runs (after `&&` / `||`, in a block) it still pops: `Stop(Some(folder
+  popped to))`, so the rest is also looked up there (`maybe`). `cmd /c "pushd sub && .\a.cmd && popd && .\b.cmd"`
+  protects `sub/a.cmd` (entry) and the root `b.cmd`; `bash -c "pushd ci && ./x.sh && popd && ./y.sh"` the root
+  `y.sh`. A **`cd` that is not the head** (`then cd frontend`) names its folder too (`Stop(Some(frontend))`).
+- **`-WorkingDirectory` (Do 3) — measured, pwsh 7.6.6 and Windows PowerShell 5.1.26100, in a temp folder with a
+  different `x.ps1` at the root and in `sub\`** (`sub\only.ps1` only in `sub`):
+
+  ```
+  pwsh -NoProfile -WorkingDirectory sub -File x.ps1            → ROOT x.ps1 cwd=sub
+  pwsh -NoProfile -WorkingDirectory sub -File ./x.ps1          → ROOT x.ps1 cwd=sub
+  pwsh -NoProfile -wd sub -File x.ps1                          → ROOT x.ps1 cwd=sub
+  pwsh -NoProfile -WorkingDirectory sub -File only.ps1         → error: 'only.ps1' is not recognized as the name of a script file (exit 64)
+  pwsh -NoProfile -File x.ps1 -WorkingDirectory sub            → ROOT x.ps1 cwd=wd   (a parameter of the script)
+  pwsh -NoProfile -WorkingDirectory sub -Command "./x.ps1"     → SUB x.ps1 cwd=sub
+  pwsh -NoProfile -WorkingDirectory sub -Command "./only.ps1"  → SUB only.ps1 cwd=sub
+  powershell.exe -NoProfile -WorkingDirectory sub -File x.ps1  → ROOT x.ps1 cwd=wd   (the flag is ignored)
+  powershell.exe -NoProfile -WorkingDirectory sub -Command "./x.ps1" → ROOT x.ps1 cwd=wd   (the flag is ignored)
+  ```
+
+  So the reviewer was right for `-File` (round 3 looked for the script under the folder: wrong, and it refused
+  `pwsh -WorkingDirectory src -File scripts/build.ps1` with the script at the root — a regression against `main`),
+  and `-Command` differs between the two PowerShell versions. Now: **`-File x.ps1` (and a positional script) is the
+  root script** whatever the flag says (refusable as before); **`-Command` with `-WorkingDirectory` is read from the
+  folder and from the root, every entry non-refusable** (`CommandString::read`, `both`); X13 protects the
+  folder's copy of an argument as well. Earlier assertions changed: the three `-WorkingDirectory` / `-wd` rows of
+  `checks::tests::command_strings_and_cmd_bare_names` (a `-File` row had `ci/x.ps1`, one with an unfollowable folder
+  had none; the `-Command` row had `ci/x.ps1` refusable) — they now say what was measured.
+- **Rows of the R15 AC-1 table whose protected set grew (AC-4; every verdict — entries, refused, notes — is
+  unchanged):** `pwsh -Command "Push-Location ci; ./x.ps1; Pop-Location"` (+ root `x.ps1`);
+  `bash -c "if [ -d ci ]; then cd ci; fi; ./x.sh"` (+ `ci/x.sh`: the case the list was written for);
+  `cmd /c "rem see a.cmd & scripts\x.cmd"` (+ `scripts/x.cmd`, which `rem` comments out: protecting needs no
+  certainty); and the `-WorkingDirectory` rows above. Test: `checks::tests::protection_reaches_where_the_reader_cannot_go`
+  (the nine lines of the list and more; protected set and refused list exactly), `working_directory_moves_a_command_not_a_script_file`,
+  `cmdline::tests::the_folders_it_cannot_follow_are_kept`, `::every_word_is_looked_up_from_the_root_and_from_every_named_folder`,
+  end to end `m11_gates::a_script_behind_a_wrapper_is_protected_from_the_implementer` (fails on the old code).
+- README: the M18 paragraph (here-document, `-WorkingDirectory`, X13 in one sentence). Why round 3 lost the
+  protection: `21e83c9` removed the token scan of arguments that hold a command line (it was not in its commit body).
 
 ## Progress
 

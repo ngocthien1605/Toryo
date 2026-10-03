@@ -238,6 +238,8 @@ fn tokens(s: &str, shell: Shell) -> Vec<Tok> {
     let cs: Vec<char> = s.chars().collect();
     let mut lx = Lexer::default();
     let mut i = 0;
+    // here-documents whose body starts at the next line break: (delimiter, `<<-`)
+    let mut heredocs: Vec<(String, bool)> = Vec::new();
     // a line break (`\n` or `\r\n`) at `i`: how many characters it takes
     let newline = |i: usize| match (cs.get(i), cs.get(i + 1)) {
         (Some('\n'), _) => 1,
@@ -311,7 +313,30 @@ fn tokens(s: &str, shell: Shell) -> Vec<Tok> {
                 }
                 i += 1;
             }
-            '\n' => lx.sep(Tok::Seq),
+            '\n' => {
+                lx.sep(Tok::Seq);
+                // (R19) the bodies of the here-documents of the line just ended are data: skipped,
+                // each up to its delimiter alone on a line; what follows them is read again
+                for (delim, strip) in std::mem::take(&mut heredocs) {
+                    while i < cs.len() {
+                        let end = cs[i..]
+                            .iter()
+                            .position(|d| *d == '\n')
+                            .map_or(cs.len(), |p| i + p);
+                        let line: String = cs[i..end].iter().collect();
+                        i = (end + 1).min(cs.len());
+                        let line = line.trim_end_matches('\r');
+                        let line = if strip {
+                            line.trim_start_matches('\t')
+                        } else {
+                            line
+                        };
+                        if line == delim {
+                            break;
+                        }
+                    }
+                }
+            }
             c if c.is_whitespace() => lx.flush(),
             '#' if !lx.started && shell != Shell::Cmd => {
                 // a comment, to the end of the line
@@ -320,9 +345,28 @@ fn tokens(s: &str, shell: Shell) -> Vec<Tok> {
                 }
             }
             '<' if shell == Shell::Sh && cs.get(i) == Some(&'<') && cs.get(i + 1) != Some(&'<') => {
-                // a here-document: its body is data, and where it ends is not followed
+                // a here-document: its body is data (skipped at the next line break), and where
+                // it ends is not followed — the reader stops here ([`Tok::Stop`]); the words
+                // after the delimiter and after the body are still tokenised (R19, X13)
                 lx.sep(Tok::Stop);
-                break;
+                let strip = cs.get(i + 1) == Some(&'-');
+                i += 1 + usize::from(strip);
+                while cs.get(i).is_some_and(|d| matches!(d, ' ' | '\t')) {
+                    i += 1;
+                }
+                let mut delim = String::new();
+                while let Some(&d) = cs.get(i) {
+                    if d.is_whitespace() || matches!(d, ';' | '|' | '&' | '(' | ')' | '<' | '>') {
+                        break;
+                    }
+                    if !matches!(d, '\'' | '"' | '\\') {
+                        delim.push(d);
+                    }
+                    i += 1;
+                }
+                if !delim.is_empty() {
+                    heredocs.push((delim, strip));
+                }
             }
             '>' | '<' => {
                 // an fd number in front (`2>`) belongs to the redirection
@@ -601,18 +645,27 @@ fn simple(
         return Step::Next;
     }
     if head.literal && !head.quoted && one_of(head_text, POPD) {
-        return match dirs.pop().filter(|_| sure) {
-            Some(d) => {
+        return match dirs.pop() {
+            Some(d) if sure => {
                 *cur = d;
                 Step::Next
             }
+            // (R19) not sure it runs: the reading stops, but the folder it returns to is where
+            // the rest may run
+            Some(d) => Step::Stop(Some(d)),
             None => Step::Stop(None),
         };
     }
     // a change of folder that is not the head (`if … then cd x`, `command cd x`, `if exist x cd
-    // x`): whether it happens is not known — the rest is not followed
-    if rest.iter().any(|w| cd_word(shell, w)) {
-        return Step::Stop(None);
+    // x`): whether it happens is not known — the rest is not followed (R19: the folder it names
+    // is where the rest may run)
+    if let Some(n) = rest.iter().position(|w| cd_word(shell, w)) {
+        let folder = rest[n + 1..]
+            .iter()
+            .find(|w| !(w.literal && w.text.starts_with('-') || w.text.eq_ignore_ascii_case("/d")))
+            .filter(|w| w.literal && relative(&w.text))
+            .and_then(|w| join(cur, &w.text, backslash));
+        return Step::Stop(folder);
     }
     // PowerShell: a quoted string in head position is an expression unless `&` or `.` runs it
     let expression = shell == Shell::Pwsh && head.quoted && !(called || dotted);
@@ -673,6 +726,111 @@ fn simple(
         }
     }
     Step::Next
+}
+
+/// How deep [`everywhere`] looks into words that are command lines themselves.
+const NESTING: usize = 6;
+
+/// M11-R19 (X13): **every word of every argument that could name a repository file** — the net
+/// under the reader, for protection only (never a refusal, never a note). The words are those of
+/// the arguments tokenised as `sh`, PowerShell and `cmd` would (quotes removed, here-document
+/// bodies skipped), and, recursively, of every word that is itself a command line (a wrapper's
+/// string, a nested shell, `Invoke-Expression '…'`) — whatever the reader could follow. Each is
+/// returned as a repository-relative path with `/` looked up from the checkout root **and** from
+/// every folder the arguments name as a change of folder anywhere (`cd`, `pushd`, `Set-Location`,
+/// `-C`, `-WorkingDirectory`), whether or not the reader followed it. The caller keeps those that
+/// are files of the base commit.
+pub fn everywhere<'a>(args: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut folders: Vec<String> = vec![String::new()];
+    let args: Vec<&str> = args.into_iter().collect();
+    for a in &args {
+        scan(a, 0, &mut words, &mut folders);
+    }
+    // the arguments side by side as a shell would read them (`cmd /c cd sub && x`, `-C sub`):
+    // a change of folder and the folder it names are separate arguments
+    scan(&args.join(" "), 0, &mut words, &mut folders);
+    let mut out: Vec<String> = Vec::new();
+    for w in &words {
+        for v in arg_values(w) {
+            if v.starts_with('-') || !relative(&v) {
+                continue;
+            }
+            for f in &folders {
+                if let Some(p) = join(f, &v, true).filter(|p| !p.is_empty()) {
+                    if !out.contains(&p) {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A word with its quoting escapes taken off (`\"` → `"`), to be tokenised again.
+fn unescape(s: &str) -> String {
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < cs.len() {
+        if matches!(cs[i], '\\' | '`') && matches!(cs.get(i + 1), Some('"' | '\'')) {
+            i += 1;
+        }
+        out.push(cs[i]);
+        i += 1;
+    }
+    out
+}
+
+fn scan(s: &str, depth: usize, words: &mut Vec<String>, folders: &mut Vec<String>) {
+    // a string with a here-document is a `sh` script: PowerShell and `cmd` would read its body
+    // as commands, so only `sh` reads it
+    let sh = tokens(s, Shell::Sh);
+    let mut reads = vec![sh];
+    if !reads[0].iter().any(|t| matches!(t, Tok::Stop)) {
+        reads.push(tokens(s, Shell::Pwsh));
+        reads.push(tokens(s, Shell::Cmd));
+    }
+    for toks in reads {
+        // the next word is a folder: after `cd`, `pushd`, `Set-Location`, `-C`, `-WorkingDirectory`
+        let mut folder_next = false;
+        for t in toks {
+            let Tok::Word(w) = t else {
+                folder_next = false;
+                continue;
+            };
+            let flag = w.literal
+                && (w.text.eq_ignore_ascii_case("/d")
+                    || one_of(&w.text, &["-path", "-literalpath"])
+                    || w.text == "--");
+            if folder_next && flag {
+                continue;
+            }
+            if folder_next && w.literal && relative(&w.text) && !w.text.starts_with('-') {
+                if let Some(f) = join("", &w.text, true).filter(|f| !f.is_empty()) {
+                    if !folders.contains(&f) {
+                        folders.push(f);
+                    }
+                }
+            }
+            folder_next = w.literal
+                && (one_of(&w.text, CD)
+                    || one_of(&w.text, PUSHD)
+                    || w.text == "-C"
+                    || one_of(&w.text, &["-workingdirectory", "-wd"]));
+            if w.literal && !w.text.is_empty() && !words.contains(&w.text) {
+                words.push(w.text.clone());
+            }
+            // a word that is a command line itself: quoted, or holding a space
+            if depth < NESTING
+                && w.text
+                    .contains(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+            {
+                scan(&unescape(&w.text), depth + 1, words, folders);
+            }
+        }
+    }
 }
 
 /// Read the command string `s` (see the module text).
@@ -1088,6 +1246,94 @@ mod tests {
     /// a pipeline, inside a block or a function body: where the rest runs is not known, so
     /// nothing after it is an entry. The words of the rest are kept as `maybe`, as written
     /// from the folder reached so far and from the folder the `cd` names.
+    /// M11-R19 (X13): where the reader stops it keeps the folders it could not follow — the
+    /// folder a `popd` returns to, the folder a `cd` that is not a head names.
+    #[test]
+    fn the_folders_it_cannot_follow_are_kept() {
+        use Shell::{Cmd, Pwsh, Sh};
+        // (a name is kept as written while no `cd` moved the folder: `..cmd`, `./y.sh`)
+        let has = |p: &Parsed, v: &str| {
+            p.maybe
+                .iter()
+                .any(|m| m.trim_start_matches("./").trim_start_matches(".\\") == v)
+        };
+        let p = parse(r"pushd sub && .\a.cmd && popd && .\b.cmd", Cmd);
+        assert_eq!(
+            p.entries
+                .iter()
+                .map(|e| e.path.as_str())
+                .collect::<Vec<_>>(),
+            ["sub/a.cmd"]
+        );
+        assert!(has(&p, "b.cmd") && has(&p, "sub/b.cmd"), "{p:?}");
+        let p = parse("pushd ci && ./x.sh && popd && ./y.sh", Sh);
+        assert!(has(&p, "y.sh") && has(&p, "ci/y.sh"), "{p:?}");
+        let p = parse(
+            "Push-Location ci; try { ./x.ps1 } finally { Pop-Location }; ./y.ps1",
+            Pwsh,
+        );
+        assert!(has(&p, "y.ps1"), "{p:?}");
+        let p = parse(
+            "if [ -d frontend ]; then cd frontend; fi; ./run-tests.sh",
+            Sh,
+        );
+        assert!(
+            has(&p, "run-tests.sh") && has(&p, "frontend/run-tests.sh"),
+            "{p:?}"
+        );
+        assert!(p.entries.is_empty(), "{p:?}");
+    }
+
+    /// M11-R19 (X13): [`everywhere`] — every word, recursively through words that are command
+    /// lines, with the folders the arguments name; a here-document's body is skipped.
+    #[test]
+    fn every_word_is_looked_up_from_the_root_and_from_every_named_folder() {
+        let all = |args: &[&str]| everywhere(args.iter().copied());
+        let has = |v: &[String], p: &str| v.iter().any(|x| x == p);
+        let v = all(&["run", "img", "sh", "-c", "npm ci && ./scripts/test.sh --ci"]);
+        assert!(has(&v, "scripts/test.sh"), "{v:?}");
+        let v = all(&["-c", "bash -c './x.sh --fast'"]);
+        assert!(has(&v, "x.sh"), "{v:?}");
+        let v = all(&["-Command", "Invoke-Expression './x.ps1 -a'"]);
+        assert!(has(&v, "x.ps1"), "{v:?}");
+        // nested twice, with escaped quotes
+        let v = all(&[r#"sh -c "bash -c \"./deep.sh x\"""#]);
+        assert!(has(&v, "deep.sh"), "{v:?}");
+        // the body of a here-document is data, what follows it is not
+        let v = all(&["-c", "cat <<EOF\n./body.sh\nEOF\n./after.sh"]);
+        assert!(!has(&v, "body.sh") && has(&v, "after.sh"), "{v:?}");
+        // a `-C`, `-WorkingDirectory`, `cd` anywhere names a folder, followed or not
+        let v = all(&["-C", "tools", "./gen.sh"]);
+        assert!(has(&v, "gen.sh") && has(&v, "tools/gen.sh"), "{v:?}");
+        let v = all(&["-WorkingDirectory", "sub", "-File", "x.ps1"]);
+        assert!(has(&v, "x.ps1") && has(&v, "sub/x.ps1"), "{v:?}");
+        let v = all(&["/c", "cd", "/d", "sub", "&&", r".\a.cmd"]);
+        assert!(has(&v, "a.cmd") && has(&v, "sub/a.cmd"), "{v:?}");
+        // never an absolute path, a flag, or a path out of the repository
+        let v = all(&["--out", "/etc/passwd", "../x.sh", "-f"]);
+        assert!(
+            v.iter()
+                .all(|p| !p.starts_with('/') && !p.starts_with("..")),
+            "{v:?}"
+        );
+        // odd input does not panic
+        for s in [
+            "",
+            "<<",
+            "<<EOF",
+            "<<-",
+            "'",
+            "\"",
+            "\\",
+            "`\n",
+            "cd",
+            "-C",
+            "a <<E\n\n",
+        ] {
+            let _ = everywhere([s]);
+        }
+    }
+
     #[test]
     fn a_conditional_cd_is_not_followed() {
         use Shell::*;

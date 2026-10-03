@@ -313,13 +313,21 @@ from the repository checkout (`project.root`), never from a task worktree, and e
     separator is protected, not refused. In a `cmd` or PowerShell string a head without an extension
     (`scripts\build`, `.\gradlew`) stands for `scripts\build.cmd`, `.ps1`, …: every such name is protected, none is
     refused. A `cd` / `chdir` / `pushd` / `Set-Location` / `sl` / `Push-Location` with a literal relative folder
-    moves where the rest resolves (`popd` / `Pop-Location` go back; `pwsh -WorkingDirectory ci` starts there):
-    `bash -lc "cd ci && ./x.sh"` runs — and protects — `ci/x.sh`. Toryo **stops reading** when it cannot follow the
+    moves where the rest resolves (`popd` / `Pop-Location` go back):
+    `bash -lc "cd ci && ./x.sh"` runs — and protects — `ci/x.sh`. `pwsh -WorkingDirectory ci -File x.ps1` runs the
+    root `x.ps1` (PowerShell finds a `-File` script from the folder it was started in, then changes folder), but
+    `-Command ./x.ps1` runs under `ci` in PowerShell 7 and under the root in Windows PowerShell 5.1, which ignores
+    the flag: that form is read both ways and nothing in it is refused. Toryo **stops reading** when it cannot follow the
     string: a `cd` with a variable, an absolute path, `-` or no argument; a `cd` that runs only sometimes — after
     `&&` / `||` (`[ -d ci ] && cd ci`), in a pipeline, inside a block or a function body (`if (…) { cd build }`), or
-    not as the head of its command (`if [ -d web ]; then cd web; fi`); a here-document. From there on nothing is an
-    entry script and nothing is refused; the words of the rest are still protected where they name a file of the
-    base commit (as written from the folder reached so far, and from the folder such a `cd` names). A
+    not as the head of its command (`if [ -d web ]; then cd web; fi`); a here-document (its body is skipped).
+    From there on nothing is an entry script and nothing is refused. **Refusing needs certainty; protecting does
+    not:** for every verify command and gate, next to what Toryo finds, every word of every argument that names a
+    file of the base commit is protected — also inside an argument that is itself a command line (`docker run img sh
+    -c "…"`, `wsl bash -lc "…"`, `bash -c "bash -c '…'"`, `Invoke-Expression '…'`), after a here-document and after
+    any point where reading stopped — looked up from the checkout root **and** from every folder the command names
+    as a change of folder anywhere (`cd`, `pushd`, `Set-Location`, `-C`, `-WorkingDirectory`), followed or not.
+    This never refuses and never prints a note. A
     quoted string in head position of a PowerShell string is an expression, not a command (`'out/x.txt' | Should
     -Exist`, `@('a/b','c/d')`), unless `&` or `.` runs it. A bare head of a `cmd` string that is not a built-in
     (`cmd /c build`, `cmd /c "npm.cmd run build"`) is protected — never refused — as `<name>` and `<name>` + each
