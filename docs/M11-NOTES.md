@@ -784,7 +784,7 @@ round is the new branch `m11/review-3` from `main`. One commit per task; it ends
 
 - [x] R13 — the export proves its bytes; the verify root cannot be Low-writable
 - [x] R14 — M18: protection comes from the base commit; build output may exist
-- [ ] R15 — command strings and `cmd` bare names
+- [x] R15 — command strings and `cmd` bare names
 - [ ] R16 — a gate the machine cannot run is found before the build; the hints tell the whole fix
 - [ ] R17 — Low fixes, missing tests, stale docs
 - [ ] Finish — notes, README, HUONG-DAN
@@ -884,6 +884,64 @@ round is the new branch `m11/review-3` from `main`. One commit per task; it ends
 - **Open:** `checks::verify_commands` still falls back to `scripts/build.ps1` / `scripts/test.ps1` *as they exist in
   the worktree* when `commands.verify` is empty (M10 behaviour, toryo.yaml-only) — the command list, unlike the
   protected files, is not taken from the base commit.
+
+#### R15 — command strings and `cmd` bare names (applies to everyone)
+
+- **A reader for command strings (X10)**, new module `src/engine/cmdline.rs` (`parse(s, Shell) -> Parsed { entries,
+  args }`), used for `pwsh -Command` / `-c`, `cmd /c` / `/k` and a shell's `-c` (also inside `-ec`, `-lc`;
+  `checks::command_string` finds the string and the shell):
+  - tokenised with quotes (single and double; `cmd` knows only double quotes), split into simple commands at `&&`,
+    `||`, `;`, `|`, `&`, newlines, `(` `)` and `{` `}` (for `sh` a brace only when it stands alone — else it is brace
+    expansion; for `cmd` braces are ordinary characters); a redirection is dropped with its target (`> out.log`,
+    `2>&1`), a `#` comment to the end of the line;
+  - the **head** is the first word after `call`, `.`, `exec`, `time` (`do`, `else` and a leading `@` for `cmd`) or
+    `NAME=value`; PowerShell's `&` is a separator, so the word after it is a head;
+  - `cd` / `chdir` / `pushd` / `Set-Location` / `sl` with one literal relative folder (after `/d`, `-Path`,
+    `-LiteralPath`, `--`) moves the folder; `popd` goes back; a shell's `( … )` scopes it (`cmd` parentheses only
+    group). Any other argument — a variable, an absolute path, `-`, nothing, two folders, a folder above the root —
+    stops the reading: what was found before stays, nothing more is refused or protected;
+  - **entry script** = a head that is a relative path with a separator, no extension needed (`./gradlew`), resolved
+    in the folder — refusable; an absolute head is kept as written (the caller drops one outside the repository);
+  - **`cmd` bare head** that is not a built-in → `<name>`, `<name>.com`, `.exe`, `.bat`, `.cmd` in the folder:
+    protected, **never refused**, whether or not a program of that name is on PATH (the `on_path` parameter and
+    `entry_scripts_with` are gone);
+  - every other literal word is an **argument** (`Parsed::args`, also the value of `KEY=value` and the like; the
+    value of `-o` / `--out…` / `-OutFile` skipped): `verify_files` protects it when it names a file of the base
+    commit, `script_like_args` gives a `note:` when it is missing and has a separator and a script or program
+    extension. Never refused;
+  - a word with a variable, a glob, an escape (`$x`, `%X%`, backtick, `*`, a backslash in `sh`, `~`) is not literal:
+    never an entry, never an argument.
+- **Interpreter table:** `php`, `bun` (`bun run x` or `bun x`), `tsx`, `ts-node`, `deno` (only after `run`) with
+  their value flags. **`make` / `gmake`:** `-f x`, `-fx`, `--file=x`, `--makefile=x` name the makefile (an entry;
+  refusable only with a separator or a script extension, like every table entry); plain `make` protects
+  `GNUmakefile`, `makefile`, `Makefile` whether or not they exist, never refused; `-C dir` moves the folder (one that
+  cannot be followed gives nothing).
+- **Decisions not in the list (conservative):** `make -f ci.mk` is protected but not refused when missing (`.mk` is
+  no script extension — the existing "separator or script extension" rule); `popd` is followed (else a script after
+  it would be looked for in the wrong folder); shell keywords are not head prefixes (`if ./x.sh; then` makes
+  `./x.sh` an argument: protected when it exists, never refused) and neither is `source` — "when not sure, refuse
+  nothing"; a note for an argument still needs a path separator (as in the direct forms).
+- **AC-4 — round-2 assertions that changed** (all in `checks::tests`, named in the commit body):
+  `entry_scripts_refusals_and_protection`: `cmd /c "x.cmd arg"` and `cmd /c "setup.exe && run.cmd"` — the bare heads
+  were refusable entries, now five protected names each, not refusable; `make SCRIPT=ci/x.sh test` had no entry, now
+  the three default makefiles (protected, not refusable); the closing assertion "with `x.cmd` on PATH there is no
+  entry" is removed (X10: protected whether or not it is on PATH).
+  `script_detection_skips_flag_values_and_finds_more_scripts`: `pwsh -Command "Invoke-Pester tests/x.Tests.ps1"` —
+  the path was an entry script, now an argument (it joins the net); added: `bash -c "cd src && ./test.sh"` is the
+  entry `src/test.sh`, not `test.sh`. Every other row of both tables, and of `m18_script_arguments_per_program`,
+  gives the same verdict.
+- **Tests:** `cmdline::tests` (four: words and quotes, heads and arguments, `cd`, `cmd` bare heads),
+  `checks::tests::command_strings_and_cmd_bare_names` (AC-1: the 16 lines of the list and 9 more — entries with
+  their resolved path, refused-when-missing, the net, the protected names against a base commit),
+  `tests/m11_gates.rs::a_cd_in_a_command_string_is_followed_at_admission` (AC-2: both `cd` lines accepted with the
+  script at base and protected under `ci/` / `sub/`; a missing head refused by its resolved path; a `cd $DIR`, an
+  output file and an `Invoke-Pester` argument refuse nothing), `::a_script_behind_a_cd_is_protected_from_the_
+  implementer` (AC-2 end to end: the edit is restored with a fix note, the gate then runs the committed script),
+  `::a_bare_cmd_name_cannot_be_planted_by_the_implementer` (AC-3: `npm.cmd` and `build.cmd` →
+  `protected_config_changed`, nothing committed). The three e2e tests were run against the round-2 detection and
+  failed: both `cd` configurations were refused at `task create`, and with the planted `npm.cmd` the task
+  **completed** — the implementer's file had run as the gate.
+- Docs: the README paragraph on M18 and HUONG-DAN §5.9 rewritten with these rules.
 
 ## Progress
 

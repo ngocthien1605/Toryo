@@ -3,6 +3,7 @@
 
 pub mod artifacts;
 pub mod checks;
+pub mod cmdline;
 pub mod context;
 pub mod contracts;
 pub mod decisions;

@@ -831,3 +831,167 @@ fn build_output_left_in_the_worktree_is_not_protected_on_resume() {
     assert_eq!(t.state, St::Completed, "{err}");
     assert!(!err.contains("protected_config_changed"), "{err}");
 }
+
+/// M11-R15 AC-2 (X10, applies to everyone): a `cd` in a command string is followed. The two
+/// lines of the list are accepted with the script at the base commit — round 2 looked for
+/// `x.sh` / `run.bat` in the repository root and refused them — and the script is protected
+/// where the `cd` put it. A head that is missing there is refused by its resolved path; a `cd`
+/// that cannot be followed refuses nothing.
+#[test]
+fn a_cd_in_a_command_string_is_followed_at_admission() {
+    let env = setup("codex-openai");
+    commit_repo(
+        &env,
+        &[("ci/x.sh", "exit 0\n"), ("sub/run.bat", "exit /b 0\n")],
+        "scripts in sub-folders",
+    );
+    with_verify_command(
+        &env,
+        "    - { name: ci, program: bash, args: [\"-lc\", \"cd ci && ./x.sh\"] }\n    - { name: sub, program: cmd, args: [\"/c\", \"cd sub && run.bat\"] }",
+    );
+    let (code, err) = create_as(&env, "R15-1");
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R15-1");
+    let cfgv = toryo::engine::task::frozen_config(&t).unwrap();
+    let (_, prot, _) = toryo::engine::runner::task_policy(&t, &cfgv).unwrap();
+    for p in [
+        "ci/x.sh",
+        "sub/run.bat",
+        "sub/run.bat.cmd",
+        "sub/run.bat.exe",
+    ] {
+        assert!(prot.violates(p), "{p} is protected");
+    }
+    for p in ["x.sh", "run.bat", "ci/other.sh"] {
+        assert!(!prot.violates(p), "{p} is not");
+    }
+
+    let env = setup("codex-openai");
+    with_verify_command(
+        &env,
+        r#"    - { name: ci, program: bash, args: ["-lc", "cd ci && ./new.sh"] }"#,
+    );
+    let (code, err) = create_as(&env, "R15-2");
+    assert_ne!(code, 0);
+    assert!(
+        err.contains(
+            "verify_script_missing: verify command `ci` runs `ci/new.sh`, which is not in the base commit"
+        ),
+        "{err}"
+    );
+
+    // not followed (a variable): nothing is refused; an argument is never refused either
+    let env = setup("codex-openai");
+    with_verify_command(
+        &env,
+        "    - { name: var, program: bash, args: [\"-c\", \"cd $DIR && ./x.sh\"] }\n    - { name: out, program: bash, args: [\"-c\", \"tsc --outFile build/x.js\"] }\n    - { name: pester, program: pwsh, args: [\"-Command\", \"Invoke-Pester tests/New.Tests.ps1\"] }",
+    );
+    let (code, err) = create_as(&env, "R15-3");
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("note: verify command `pester` passes `tests/New.Tests.ps1`, which is not in the base commit"),
+        "the direct form's note: {err}"
+    );
+    assert!(!err.contains("build/x.js"), "an output file: {err}");
+}
+
+/// M11-R15 AC-2, end to end: the gate `cd`s into `ci/` and runs its script there. The
+/// implementer edits that script → a path-policy violation: restored, nothing committed, a fix
+/// note; then the gate runs the committed script and passes.
+#[test]
+fn a_script_behind_a_cd_is_protected_from_the_implementer() {
+    let env = setup("codex-openai");
+    let (file, line) = if cfg!(windows) {
+        (
+            "ci/x.ps1",
+            r#"    - { name: ci, program: pwsh, args: ["-NoProfile", "-Command", "cd ci; ./x.ps1"] }"#,
+        )
+    } else {
+        (
+            "ci/x.sh",
+            // sourced (`.`): the file needs no executable bit
+            r#"    - { name: ci, program: sh, args: ["-c", "cd ci && . ./x.sh"] }"#,
+        )
+    };
+    commit_repo(&env, &[(file, "exit 0\n")], "a gate script in ci/");
+    with_verify_command(&env, line);
+    let (code, err) = create_as(&env, "R15-E");
+    assert_eq!(code, 0, "{err}");
+    let s = script(
+        &env,
+        "r15e.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write(file, "# always green\n"), write("src/Calculator.psm1", DIVIDE), implementation()]),
+                turn(vec![implementation()]),
+            ],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R15-E", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R15-E");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert!(
+        err.contains("protected or denied paths changed") && err.contains(file),
+        "{err}"
+    );
+    assert_eq!(t.fix_cycle, 1);
+    let files = git(&wt(&env, "R15-E"), &["diff", "--name-only", "main..HEAD"]);
+    assert!(
+        !files.lines().any(|f| f == file) && files.contains("src/Calculator.psm1"),
+        "{files}"
+    );
+}
+
+/// M11-R15 AC-3 (X10, X11): `cmd.exe` looks in the working directory before PATH, and a check
+/// gate's working directory is the checkout root — so a bare head of a `cmd` string is
+/// protected under every name `cmd` would try, whether or not a program of that name is on
+/// PATH. A fake implementer that adds `npm.cmd` for `cmd /c "npm.cmd run build"`, or
+/// `build.cmd` for `cmd /c build`, is stopped: `protected_config_changed`, nothing committed.
+/// (The configuration is admitted: a bare head is never refused.)
+#[test]
+fn a_bare_cmd_name_cannot_be_planted_by_the_implementer() {
+    for (id, line, planted) in [
+        (
+            "R15-N",
+            r#"    - { name: build, program: cmd, args: ["/c", "npm.cmd run build"] }"#,
+            "npm.cmd",
+        ),
+        (
+            "R15-B",
+            r#"    - { name: build, program: cmd, args: ["/c", "build"] }"#,
+            "build.cmd",
+        ),
+    ] {
+        let env = setup("codex-openai");
+        with_verify_command(&env, line);
+        let (code, err) = create_as(&env, id);
+        assert_eq!(code, 0, "{id}: {err}");
+        let s = script(
+            &env,
+            "r15c.json",
+            json!({
+                "planner": [turn(vec![plan()])],
+                "implementer": [
+                    turn(vec![write("src/Calculator.psm1", DIVIDE), write(planted, "@exit /b 0\n"), implementation()]),
+                    turn(vec![implementation()]),
+                ],
+                "reviewer": [turn(vec![approved()])],
+            }),
+        );
+        let (_, err) = toryo(&env, &["run", id, "--yes", "--fake-agents", &s], &[]);
+        let t = task(&env, id);
+        assert_eq!(t.state, St::Escalated, "{id}: {err}");
+        let why = t.machine.reason().unwrap_or_default().to_string();
+        assert!(
+            why.starts_with(&format!("protected_config_changed: added {planted}")),
+            "{id}: {why}"
+        );
+        let files = git(&wt(&env, id), &["diff", "--name-only", "main..HEAD"]);
+        assert!(
+            !files.lines().any(|f| f == planted),
+            "{id}: never committed: {files}"
+        );
+    }
+}

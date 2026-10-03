@@ -9,6 +9,7 @@ use anyhow::{bail, Result};
 use regex::Regex;
 use serde_json::Value;
 
+use super::cmdline::Shell;
 use crate::config::{expand_vars, CommandKind, CommandSpec, Effective};
 
 /// An acceptance-criteria item: an optional bullet (`-`, `*`, `+`), number (`1.`, `1)`) or
@@ -767,10 +768,12 @@ fn verify_files_with(
                 }
             }
         }
-        // what the net finds (inside a command line, too) — protected when it exists (X7)
-        for (_, r) in script_like_args(std::slice::from_ref(c), repo) {
-            if let Some(r) = names_file(&r) {
-                add(r);
+        // M11-R15 (X10): the words of a command string that are not heads are arguments too
+        if let Some((s, shell)) = command_string(&program, args) {
+            for v in super::cmdline::parse(&s, shell).args {
+                if let Some(r) = names_file(&v) {
+                    add(r);
+                }
             }
         }
     }
@@ -818,6 +821,46 @@ const INTERPRETERS: &[(&str, &[&str], &[&str])] = &[
     ),
     ("ruby", &["-e"], &["-I", "-r"]),
     ("perl", &["-e", "-E"], &["-I"]),
+    // M11-R15
+    ("php", &["-r"], &["-c", "-d", "-z", "-t", "-S"]),
+    (
+        "bun",
+        &["-e", "-p", "--eval", "--print"],
+        &["-r", "--preload", "--cwd", "--config", "-c"],
+    ),
+    (
+        "tsx",
+        &["-e", "--eval"],
+        &["-r", "--require", "--import", "--tsconfig", "--env-file"],
+    ),
+    (
+        "ts-node",
+        &["-e", "-p", "--eval", "--print"],
+        &[
+            "-r",
+            "--require",
+            "-P",
+            "--project",
+            "-O",
+            "--compiler-options",
+            "--cwd",
+        ],
+    ),
+    (
+        "deno",
+        &["eval"],
+        &[
+            "-c",
+            "--config",
+            "--import-map",
+            "--lock",
+            "-L",
+            "--log-level",
+            "--cert",
+            "--location",
+            "--seed",
+        ],
+    ),
 ];
 
 /// M11-R6: what a script or program file ends with — a candidate with one of these (or a path
@@ -860,60 +903,6 @@ fn sure(t: &str) -> bool {
     t.contains(['/', '\\']) || has_script_ext(t)
 }
 
-/// The tokens of a command line: split at whitespace and `; & | ( ) { }`, quotes removed.
-fn command_tokens(s: &str) -> Vec<String> {
-    s.split(|c: char| c.is_whitespace() || ";&|(){}".contains(c))
-        .map(|w| w.trim_matches(['\'', '"']).to_string())
-        .filter(|w| !w.is_empty())
-        .collect()
-}
-
-/// The entry scripts of a command line (X7): every token that is a literal path with a
-/// separator and a script extension (`& { ./x.ps1 }`, `call scripts\x.cmd`, `./ci/x.sh
-/// --fast`). PowerShell never runs a bare name from the working directory, `cmd` does: for
-/// `cmd` the head command of **each** segment of a `&&`/`&`/`|`/`;`/parenthesised chain (after
-/// an optional `call`), without a separator, is an entry too when it has a script extension and
-/// no program of that name is on PATH (R10 review: not only the first segment).
-fn command_line_entries(s: &str, cmd: bool, on_path: &dyn Fn(&str) -> bool) -> Vec<Entry> {
-    let mut out: Vec<Entry> = Vec::new();
-    if cmd {
-        for seg in s.split(|c| "&|;()".contains(c)) {
-            let mut words = seg.split_whitespace().map(|w| w.trim_matches(['\'', '"']));
-            let mut head = words.next();
-            if head.is_some_and(|h| h.eq_ignore_ascii_case("call")) {
-                head = words.next();
-            }
-            if let Some(f) = head.filter(|f| {
-                !f.is_empty()
-                    && !f.contains(['/', '\\'])
-                    && is_literal(f)
-                    && has_script_ext(f)
-                    && !on_path(f)
-            }) {
-                if !out.iter().any(|e| e.path == f) {
-                    out.push(Entry {
-                        path: f.to_string(),
-                        refusable: true,
-                    });
-                }
-            }
-        }
-    }
-    for t in command_tokens(s) {
-        if is_literal(&t)
-            && t.contains(['/', '\\'])
-            && has_script_ext(&t)
-            && !out.iter().any(|e| e.path == t)
-        {
-            out.push(Entry {
-                path: t,
-                refusable: true,
-            });
-        }
-    }
-    out
-}
-
 /// PowerShell's `-Command` / `-c`.
 fn is_command_flag(a: &str) -> bool {
     ["-command", "-c", "/command", "/c"]
@@ -921,24 +910,127 @@ fn is_command_flag(a: &str) -> bool {
         .any(|f| a.eq_ignore_ascii_case(f))
 }
 
-/// M18 (M11-R6, R10): the entry scripts of a verify command, as written ([`Entry`]):
-/// - `pwsh` / `powershell`: the argument after the first `-File` (later arguments belong to the
-///   script); else the entry scripts of the `-Command` / `-c` line ([`command_line_entries`]);
-///   else the first positional `.ps1`;
-/// - `cmd`: the entry scripts of the command line after `/c` (`/k`);
-/// - a table interpreter (`sh`, `bash`, `python`, `node`, …): the first argument that is neither
-///   a flag nor a flag's value — protected whether or not it exists, also without a separator
-///   or an extension (`sh check`), refusable only with one; a shell's `-c` (also inside a flag
-///   cluster: `-ec`, `-euxc`) gives the entries of its command line; inline code and modules
-///   (`python -m`, `node -e`) give none; a folder or a glob is no script;
+/// M11-R15 (X10): the **command string** a verify command hands to a shell, and which shell
+/// reads it — the rest of the arguments after `-Command` / `-c` of `pwsh` / `powershell`
+/// (unless `-File` is given) or after `/c` (`/k`) of `cmd`, joined; the argument after a
+/// `sh`-family `-c`, also inside a short-flag cluster (`-ec`, `-lc`, `-euxc`). `None`: the
+/// command runs no command string.
+pub fn command_string(program: &str, args: &[String]) -> Option<(String, Shell)> {
+    let base = program_base(program);
+    if base == "pwsh" || base == "powershell" {
+        if args.iter().any(|a| is_file_flag(a)) {
+            return None;
+        }
+        let i = args.iter().position(|a| is_command_flag(a))?;
+        return Some((args[i + 1..].join(" "), Shell::Pwsh));
+    }
+    if base == "cmd" {
+        let i = args
+            .iter()
+            .position(|a| a.eq_ignore_ascii_case("/c") || a.eq_ignore_ascii_case("/k"))?;
+        return Some((args[i + 1..].join(" "), Shell::Cmd));
+    }
+    if !SH_FAMILY.contains(&base.as_str()) {
+        return None;
+    }
+    let valued = INTERPRETERS
+        .iter()
+        .find(|(n, _, _)| *n == base)
+        .map(|(_, _, v)| *v)?;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let cluster = a.len() > 2 && a.starts_with('-') && !a.starts_with("--");
+        if a == "-c" || (cluster && a.contains('c')) {
+            return it.next().map(|s| (s.clone(), Shell::Sh));
+        }
+        if valued.iter().any(|f| a == f) || (cluster && a.ends_with(['o', 'O'])) {
+            it.next(); // the flag's value
+            continue;
+        }
+        if !a.starts_with('-') {
+            return None; // a script file, not a command string
+        }
+    }
+    None
+}
+
+/// M11-R15: `make` / `gmake` — the makefile is the entry script. `-f <file>` / `--file=<file>`
+/// (`--makefile`) name it: protected whether or not it exists, refusable only with a separator
+/// or a script extension. Plain `make` reads `GNUmakefile`, `makefile` or `Makefile`: all three
+/// are protected whether or not they exist, never refused. `-C <dir>` moves the folder; one that
+/// cannot be followed gives nothing.
+fn make_entries(args: &[String]) -> Vec<Entry> {
+    let mut dir = String::new();
+    let mut files: Vec<String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let (flag, value) = match a.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (a.as_str(), None),
+        };
+        let short = |f: &str| {
+            (a.len() > 2 && a.starts_with(f) && !a.starts_with("--")).then(|| a[2..].to_string())
+        };
+        let mut value_of = |names: &[&str], attached: Option<String>| -> Option<Option<String>> {
+            if names.contains(&flag) {
+                Some(value.clone().or_else(|| it.next().cloned()))
+            } else {
+                attached.map(Some)
+            }
+        };
+        if let Some(d) = value_of(&["-C", "--directory"], short("-C")) {
+            let Some(d) = d.filter(|d| is_literal(d) && !Path::new(d).has_root()) else {
+                return Vec::new();
+            };
+            dir = format!("{dir}{}/", d.trim_end_matches(['/', '\\']));
+        } else if let Some(f) = value_of(&["-f", "--file", "--makefile"], short("-f")) {
+            match f.filter(|f| is_literal(f)) {
+                Some(f) => files.push(f),
+                None => return Vec::new(),
+            }
+        }
+    }
+    if files.is_empty() {
+        return ["GNUmakefile", "makefile", "Makefile"]
+            .iter()
+            .map(|f| Entry {
+                path: format!("{dir}{f}"),
+                refusable: false,
+            })
+            .collect();
+    }
+    files
+        .into_iter()
+        .map(|f| Entry {
+            refusable: sure(&f),
+            path: if Path::new(&f).has_root() {
+                f
+            } else {
+                format!("{dir}{f}")
+            },
+        })
+        .collect()
+}
+
+/// M18 (M11-R6, R10, R15): the entry scripts of a verify command ([`Entry`]) — what the gate
+/// starts, and so what the implementer must not be able to write:
+/// - a **command string** ([`command_string`]: `pwsh -Command`, `cmd /c`, `sh -c`): the head of
+///   each simple command that is a relative path with a separator, resolved where a `cd` put it
+///   (X10; [`super::cmdline`]) — and, for `cmd`, the names a bare head resolves to in the working
+///   directory (protected, never refused);
+/// - `pwsh` / `powershell` otherwise: the argument after the first `-File` (later arguments
+///   belong to the script); else the first positional `.ps1`;
+/// - `make`: its makefile ([`make_entries`]);
+/// - a table interpreter (`sh`, `bash`, `python`, `node`, `php`, `bun`, `tsx`, `ts-node`, …): the
+///   first argument that is neither a flag nor a flag's value — protected whether or not it
+///   exists, also without a separator or an extension (`sh check`, `php artisan`), refusable only
+///   with one; `deno` only after `run`; inline code and modules (`python -m`, `node -e`) give
+///   none; a folder or a glob is no script;
 /// - any other program: none (`-f` of `dotnet`, `docker` or `grep` is not a script).
-///
-/// `on_path`: whether a program of that name is on PATH (the `cmd` case).
-pub fn entry_scripts_with(
-    program: &str,
-    args: &[String],
-    on_path: &dyn Fn(&str) -> bool,
-) -> Vec<Entry> {
+pub fn entry_scripts(program: &str, args: &[String]) -> Vec<Entry> {
+    if let Some((s, shell)) = command_string(program, args) {
+        return super::cmdline::parse(&s, shell).entries;
+    }
     let base = program_base(program);
     if base == "pwsh" || base == "powershell" {
         if let Some(i) = args.iter().position(|a| is_file_flag(a)) {
@@ -953,9 +1045,6 @@ pub fn entry_scripts_with(
                 })
                 .unwrap_or_default();
         }
-        if let Some(i) = args.iter().position(|a| is_command_flag(a)) {
-            return command_line_entries(&args[i + 1..].join(" "), false, on_path);
-        }
         return args
             .iter()
             .find(|a| {
@@ -969,29 +1058,17 @@ pub fn entry_scripts_with(
             })
             .unwrap_or_default();
     }
-    if base == "cmd" {
-        let Some(i) = args
-            .iter()
-            .position(|a| a.eq_ignore_ascii_case("/c") || a.eq_ignore_ascii_case("/k"))
-        else {
-            return Vec::new();
-        };
-        return command_line_entries(&args[i + 1..].join(" "), true, on_path);
+    if base == "make" || base == "gmake" {
+        return make_entries(args);
     }
     let Some((_, inline, valued)) = INTERPRETERS.iter().find(|(n, _, _)| *n == base) else {
         return Vec::new();
     };
     let shell = SH_FAMILY.contains(&base.as_str());
+    // `deno run x.ts` (only `run` runs a script), `bun run x.ts` or `bun x.ts`
+    let mut run_seen = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        // a shell's command line: `-c`, also inside a short-flag cluster (`-ec`, `-euxc`)
-        let cluster = a.len() > 2 && a.starts_with('-') && !a.starts_with("--");
-        if shell && (a == "-c" || (cluster && a.contains('c'))) {
-            return it
-                .next()
-                .map(|s| command_line_entries(s, false, on_path))
-                .unwrap_or_default();
-        }
         if inline.iter().any(|f| a == f) {
             return Vec::new();
         }
@@ -1000,6 +1077,7 @@ pub fn entry_scripts_with(
             continue;
         }
         // a shell's short-flag cluster ending in `o` / `O` takes a value (`-euo pipefail`)
+        let cluster = a.len() > 2 && a.starts_with('-') && !a.starts_with("--");
         if shell && cluster {
             if a.ends_with(['o', 'O']) {
                 it.next();
@@ -1007,6 +1085,15 @@ pub fn entry_scripts_with(
             continue;
         }
         if !a.starts_with('-') {
+            if !run_seen && (base == "deno" || base == "bun") {
+                run_seen = true;
+                if a == "run" {
+                    continue;
+                }
+                if base == "deno" {
+                    return Vec::new(); // `deno test`, `deno task …`: no script argument
+                }
+            }
             return if is_literal(a) {
                 vec![Entry {
                     path: a.clone(),
@@ -1018,11 +1105,6 @@ pub fn entry_scripts_with(
         }
     }
     Vec::new()
-}
-
-/// [`entry_scripts_with`] with the real PATH ([`which`]).
-pub fn entry_scripts(program: &str, args: &[String]) -> Vec<Entry> {
-    entry_scripts_with(program, args, &|n| which(n).is_some())
 }
 
 /// The first entry script of a verify command, as written (see [`entry_scripts`]).
@@ -1042,7 +1124,7 @@ pub fn script_arg<'a>(program: &str, args: &'a [String]) -> Option<&'a String> {
 
 /// M11-R10: what an argument names — for `KEY=value`, `--flag=value`, `-Flag:value` and
 /// `/p:Name=value` the value (not the whole argument), else the argument.
-fn arg_values(a: &str) -> Vec<String> {
+pub(super) fn arg_values(a: &str) -> Vec<String> {
     if let Some((_, val)) = a.split_once('=') {
         return vec![val.to_string()];
     }
@@ -1054,11 +1136,12 @@ fn arg_values(a: &str) -> Vec<String> {
     vec![a.to_string()]
 }
 
-/// M11-R6/R10: the net under [`entry_scripts`] — every other argument (also the value of
-/// `KEY=value` and the like, and the tokens of a command line) of a verify command that is a
-/// literal repository path with a separator and a script or program extension, as `(command
-/// name, path)`. Never a refusal (X7): it is protected when it exists, and a missing one gets a
-/// note at admission (build output is fine). The value of `-o` / `--out…` / `-OutFile` is
+/// M11-R6/R10/R15: the net under [`entry_scripts`] — every other argument (also the value of
+/// `KEY=value` and the like, and the argument words of a command string, resolved where its
+/// `cd` put them) of a verify command that is a literal repository path with a separator and a
+/// script or program extension, as `(command name, path)`. Never a refusal (X7, X10): a missing
+/// one gets a note at admission (build output is fine); protection is [`verify_files`]'s — any
+/// argument naming a file of the base commit. The value of `-o` / `--out…` / `-OutFile` is
 /// skipped.
 pub fn script_like_args(cmds: &[CommandSpec], repo: &Path) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
@@ -1070,36 +1153,34 @@ pub fn script_like_args(cmds: &[CommandSpec], repo: &Path) -> Vec<(String, Strin
             .into_iter()
             .filter_map(|e| repo_relative(repo, &e.path))
             .collect();
-        let output_flag = |a: &str| {
-            let l = a.to_ascii_lowercase();
-            l == "-o" || l == "-outfile" || l.starts_with("--out")
-        };
+        let mut candidates: Vec<String> = Vec::new();
         let mut prev: Option<&String> = None;
         for a in args {
-            let skip = prev.is_some_and(|p| output_flag(p));
+            let skip = prev.is_some_and(|p| super::cmdline::output_flag(p));
             prev = Some(a);
-            if skip {
+            if !skip {
+                candidates.extend(
+                    arg_values(a)
+                        .into_iter()
+                        .filter(|t| !t.starts_with('-') && is_literal(t)),
+                );
+            }
+        }
+        // the argument words of a command string (literal by construction; a path may hold a
+        // space there)
+        if let Some((s, shell)) = command_string(program, args) {
+            candidates.extend(super::cmdline::parse(&s, shell).args);
+        }
+        for t in candidates {
+            if !t.contains(['/', '\\']) || !has_script_ext(&t) {
                 continue;
             }
-            let mut candidates = arg_values(a);
-            if a.contains(char::is_whitespace) {
-                candidates.extend(command_tokens(a));
-            }
-            for t in candidates {
-                if t.starts_with('-')
-                    || !is_literal(&t)
-                    || !t.contains(['/', '\\'])
-                    || !has_script_ext(&t)
-                {
-                    continue;
-                }
-                let Some(r) = repo_relative(repo, &t) else {
-                    continue;
-                };
-                let e = (c.name.clone(), r);
-                if !entries.contains(&e.1) && !out.contains(&e) {
-                    out.push(e);
-                }
+            let Some(r) = repo_relative(repo, &t) else {
+                continue;
+            };
+            let e = (c.name.clone(), r);
+            if !entries.contains(&e.1) && !out.contains(&e) {
+                out.push(e);
             }
         }
     }
@@ -1880,12 +1961,26 @@ mod tests {
         let net = script_like_args(&cmds, d.path());
         assert_eq!(
             net,
-            // M11-R10 (changed): `./ci/x.sh` in `bash -c` is an entry script now, not the net
-            [("t".to_string(), "tools/gen.exe".to_string())],
+            // M11-R10 (changed): `./ci/x.sh` in `bash -c` is an entry script now, not the net.
+            // M11-R15 (changed, X10): `tests/x.Tests.ps1` after `Invoke-Pester` is an argument
+            // of the command string — the net (a note), no longer an entry script
+            [
+                ("t".to_string(), "tools/gen.exe".to_string()),
+                ("pester".to_string(), "tests/x.Tests.ps1".to_string())
+            ],
             "{net:?}"
         );
-        assert!(verify_entry_points(&cmds, d.path())
-            .contains(&("sh".to_string(), "ci/x.sh".to_string())));
+        let entry = verify_entry_points(&cmds, d.path());
+        assert!(entry.contains(&("sh".to_string(), "ci/x.sh".to_string())));
+        // M11-R15 (changed, X10): the `cd` is followed — the script is `src/test.sh`, not a
+        // `test.sh` in the root
+        assert!(
+            entry.contains(&("cd".to_string(), "src/test.sh".to_string()))
+                && !entry
+                    .iter()
+                    .any(|e| e.1 == "test.sh" || e.1.contains("Tests.ps1")),
+            "{entry:?}"
+        );
         // the entry script is protected
         let files = verify_files(&cmds, d.path());
         assert!(files.contains(&"ci/x.sh".to_string()), "{files:?}");
@@ -1897,7 +1992,6 @@ mod tests {
     #[test]
     fn entry_scripts_refusals_and_protection() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        let off_path = |_: &str| false;
         // (program, args, entries as (path, refusable), net)
         type Case<'a> = (&'a str, &'a [&'a str], &'a [(&'a str, bool)], &'a [&'a str]);
         let cases: &[Case] = &[
@@ -1962,12 +2056,37 @@ mod tests {
                 &[("scripts/smoke.ps1", true)],
                 &["build/app.exe"],
             ),
-            ("cmd", &["/c", "x.cmd arg"], &[("x.cmd", true)], &[]),
+            // M11-R15 (changed, X10): a bare head of a `cmd` string is protected under every
+            // name `cmd.exe` tries in the working directory — and never refused (it was
+            // refusable, and only when no program of that name was on PATH)
+            (
+                "cmd",
+                &["/c", "x.cmd arg"],
+                &[
+                    ("x.cmd", false),
+                    ("x.cmd.com", false),
+                    ("x.cmd.exe", false),
+                    ("x.cmd.bat", false),
+                    ("x.cmd.cmd", false),
+                ],
+                &[],
+            ),
             // R10 review: a bare entry in a later `&&` segment, not only the first
             (
                 "cmd",
                 &["/c", "setup.exe && run.cmd"],
-                &[("setup.exe", true), ("run.cmd", true)],
+                &[
+                    ("setup.exe", false),
+                    ("setup.exe.com", false),
+                    ("setup.exe.exe", false),
+                    ("setup.exe.bat", false),
+                    ("setup.exe.cmd", false),
+                    ("run.cmd", false),
+                    ("run.cmd.com", false),
+                    ("run.cmd.exe", false),
+                    ("run.cmd.bat", false),
+                    ("run.cmd.cmd", false),
+                ],
                 &[],
             ),
             (
@@ -1976,7 +2095,18 @@ mod tests {
                 &[(r"scripts\x.cmd", true)],
                 &[],
             ),
-            ("make", &["SCRIPT=ci/x.sh", "test"], &[], &["ci/x.sh"]),
+            // M11-R15 (changed): plain `make` protects its three default makefiles (it had
+            // no entry)
+            (
+                "make",
+                &["SCRIPT=ci/x.sh", "test"],
+                &[
+                    ("GNUmakefile", false),
+                    ("makefile", false),
+                    ("Makefile", false),
+                ],
+                &["ci/x.sh"],
+            ),
             ("dotnet", &["test", "-f", "net8.0"], &[], &[]),
             ("mocha", &["out/test/index.js"], &[], &["out/test/index.js"]),
         ];
@@ -1985,7 +2115,7 @@ mod tests {
         std::fs::write(d.path().join("ci").join("x.sh"), "exit 0\n").unwrap();
         for (program, args, entries, net) in cases {
             let a = s(args);
-            let got: Vec<(String, bool)> = entry_scripts_with(program, &a, &off_path)
+            let got: Vec<(String, bool)> = entry_scripts(program, &a)
                 .into_iter()
                 .map(|e| (e.path, e.refusable))
                 .collect();
@@ -2015,9 +2145,256 @@ mod tests {
                 );
             }
         }
-        // `cmd` runs a bare name from PATH when there is one: then it is no entry script
-        let a = s(&["/c", "x.cmd arg"]);
-        assert!(entry_scripts_with("cmd", &a, &|n| n == "x.cmd").is_empty());
+        // M11-R15 (changed, X10): the assertion "with `x.cmd` on PATH, `cmd /c "x.cmd arg"` has
+        // no entry" is gone — `cmd.exe` looks in the working directory before PATH, so the name
+        // is protected whether or not a program of that name is on PATH (the rows above).
+    }
+
+    /// M11-R15 AC-1 (X10): command strings and `cmd` bare names — for each command line its
+    /// entries (path, refused-when-missing), the net (notes, never refused) and the protected
+    /// names of a task whose base commit holds the files in `base`.
+    #[test]
+    fn command_strings_and_cmd_bare_names() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let bare = |name: &str| -> Vec<(String, bool)> {
+            ["", ".com", ".exe", ".bat", ".cmd"]
+                .iter()
+                .map(|x| (format!("{name}{x}"), false))
+                .collect()
+        };
+        let one = |p: &str, refusable: bool| vec![(p.to_string(), refusable)];
+        let none = Vec::<(String, bool)>::new;
+        let base: std::collections::HashSet<String> = [
+            "ci/x.sh",
+            "sub/run.bat",
+            "my scripts/x.ps1",
+            "gradlew",
+            "app.sln",
+            "scripts/a.cmd",
+            "scripts/b.cmd",
+            "scripts/x.cmd",
+            "x.ps1",
+            "ci.mk",
+            "scripts/check.ts",
+            "artisan",
+            "src/main.ts",
+        ]
+        .map(String::from)
+        .into();
+        // (program, args, entries, net, protected)
+        type Case<'a> = (
+            &'a str,
+            &'a [&'a str],
+            Vec<(String, bool)>,
+            &'a [&'a str],
+            &'a [&'a str],
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "bash",
+                &["-lc", "cd ci && ./x.sh"],
+                one("ci/x.sh", true),
+                &[],
+                &["ci/x.sh"],
+            ),
+            (
+                "cmd",
+                &["/c", "cd sub && run.bat"],
+                bare("sub/run.bat"),
+                &[],
+                &[
+                    "sub/run.bat",
+                    "sub/run.bat.bat",
+                    "sub/run.bat.cmd",
+                    "sub/run.bat.com",
+                    "sub/run.bat.exe",
+                ],
+            ),
+            (
+                "pwsh",
+                &["-Command", "& './my scripts/x.ps1'"],
+                one("./my scripts/x.ps1", true),
+                &[],
+                &["my scripts/x.ps1"],
+            ),
+            (
+                "bash",
+                &["-c", "tsc --outFile build/x.js"],
+                none(),
+                &[],
+                &[],
+            ),
+            (
+                "pwsh",
+                &["-Command", "Invoke-Pester tests/New.Tests.ps1"],
+                none(),
+                &["tests/New.Tests.ps1"],
+                &[],
+            ),
+            (
+                "bash",
+                &["-c", "./gradlew test"],
+                one("./gradlew", true),
+                &[],
+                &["gradlew"],
+            ),
+            // not followed: nothing refused, nothing protected
+            ("bash", &["-c", "cd $DIR && ./x.sh"], none(), &[], &[]),
+            (
+                "cmd",
+                &["/c", "npm.cmd run build"],
+                bare("npm.cmd"),
+                &[],
+                &[
+                    "npm.cmd",
+                    "npm.cmd.bat",
+                    "npm.cmd.cmd",
+                    "npm.cmd.com",
+                    "npm.cmd.exe",
+                ],
+            ),
+            (
+                "cmd",
+                &["/c", "build"],
+                bare("build"),
+                &[],
+                &["build", "build.bat", "build.cmd", "build.com", "build.exe"],
+            ),
+            (
+                "cmd",
+                &["/c", r"scripts\a.cmd && scripts\b.cmd"],
+                vec![
+                    (r"scripts\a.cmd".to_string(), true),
+                    (r"scripts\b.cmd".to_string(), true),
+                ],
+                &[],
+                &["scripts/a.cmd", "scripts/b.cmd"],
+            ),
+            (
+                "cmd",
+                &["/c", r"call scripts\x.cmd"],
+                one(r"scripts\x.cmd", true),
+                &[],
+                &["scripts/x.cmd"],
+            ),
+            (
+                "pwsh",
+                &["-Command", "& { ./x.ps1 }"],
+                one("./x.ps1", true),
+                &[],
+                &["x.ps1"],
+            ),
+            // an argument naming a file of the base commit is protected, never refused
+            (
+                "pwsh",
+                &["-Command", "msbuild.exe App.sln"],
+                none(),
+                &[],
+                &["App.sln"],
+            ),
+            (
+                "make",
+                &["-f", "ci.mk", "test"],
+                one("ci.mk", false),
+                &[],
+                &["ci.mk"],
+            ),
+            (
+                "deno",
+                &["run", "scripts/check.ts"],
+                one("scripts/check.ts", true),
+                &[],
+                &["scripts/check.ts"],
+            ),
+            (
+                "php",
+                &["artisan", "test"],
+                one("artisan", false),
+                &[],
+                &["artisan"],
+            ),
+            // Do 6, the rest of the table
+            (
+                "bun",
+                &["run", "scripts/x.ts"],
+                one("scripts/x.ts", true),
+                &[],
+                &["scripts/x.ts"],
+            ),
+            (
+                "tsx",
+                &["--tsconfig", "tsconfig.ci.json", "src/main.ts"],
+                one("src/main.ts", true),
+                &[],
+                &["src/main.ts"],
+            ),
+            (
+                "ts-node",
+                &["-P", "tsconfig.json", "tools/gen.ts"],
+                one("tools/gen.ts", true),
+                &[],
+                &["tools/gen.ts"],
+            ),
+            ("deno", &["test", "tests/"], none(), &[], &[]),
+            ("php", &["-r", "echo 1;"], none(), &[], &[]),
+            (
+                "make",
+                &[],
+                vec![
+                    ("GNUmakefile".to_string(), false),
+                    ("makefile".to_string(), false),
+                    ("Makefile".to_string(), false),
+                ],
+                &[],
+                &["GNUmakefile", "Makefile", "makefile"],
+            ),
+            (
+                "make",
+                &["-C", "sub", "--file=build/gen.mk", "all"],
+                one("sub/build/gen.mk", true),
+                &[],
+                &["sub/build/gen.mk"],
+            ),
+            ("make", &["-C", "$OUT", "all"], none(), &[], &[]),
+            // an argument is resolved where the `cd` put it; a quoted path keeps its space
+            (
+                "sh",
+                &["-c", "cd ci; sh x.sh 'my notes/a.sh'"],
+                none(),
+                // (`x.sh` is an argument of the inner `sh`: the net sees it, the base commit has it)
+                &["ci/x.sh", "ci/my notes/a.sh"],
+                &["ci/x.sh"],
+            ),
+        ];
+        let d = tempfile::tempdir().unwrap();
+        for (program, args, entries, net, protected) in cases {
+            let a = s(args);
+            let got: Vec<(String, bool)> = entry_scripts(program, &a)
+                .into_iter()
+                .map(|e| (e.path, e.refusable))
+                .collect();
+            assert_eq!(got, entries, "entries: {program} {args:?}");
+            let cmd = [CommandSpec::program("g", program, args, None)];
+            let got_net: Vec<String> = script_like_args(&cmd, d.path())
+                .into_iter()
+                .map(|(_, p)| p)
+                .collect();
+            assert_eq!(got_net, *net, "net: {program} {args:?}");
+            let mut files = verify_files_at_base(&cmd, d.path(), &base);
+            files.sort();
+            assert_eq!(files, *protected, "protected: {program} {args:?}");
+            // refused-when-missing: exactly the refusable entries
+            let refused: Vec<String> = verify_entry_points(&cmd, d.path())
+                .into_iter()
+                .map(|e| e.1)
+                .collect();
+            let want: Vec<String> = entries
+                .iter()
+                .filter(|e| e.1)
+                .filter_map(|e| repo_relative(d.path(), &e.0))
+                .collect();
+            assert_eq!(refused, want, "refusable: {program} {args:?}");
+        }
     }
 
     /// R59 (as EC-07): `@verify-scripts` covers the projects of a `tool: xpp` command — also

@@ -287,20 +287,39 @@ from the repository checkout (`project.root`), never from a task worktree, and e
   (legacy verify commands too).
   - `kind: check` — defined in the repository (`program`/`args` or `tool: xpp` + `metadata`/`projects`, `timeout:
     30s | 20m | 1h`), runs exactly like a verify command: clean checkout, Low integrity, no secrets, its script
-    protected. (M18, for everyone; M11-R10, X7) a gate's **entry script** — the file that decides pass or fail — is
-    protected before it exists, and `task create` refuses a configuration whose base commit lacks it, because the
-    implementer could write it: the program when it is a repository path; `-File x` of PowerShell, else every literal
-    path with a separator and a script extension in a `-Command` line (`& { ./x.ps1 }`), else the first positional
-    `.ps1`; the same in a `cmd /c` line (`call scripts\x.cmd`), where a bare command name (the head of any `&&` / `&`
-    / `|` / `;` segment) with a script extension counts too unless a program of that name is on PATH; in a shell's `-c` line (also `-ec`, `-euxc`); the first argument of
-    `sh`/`bash`/`python`/`node`/`ruby`/`perl` that is not a flag or a flag's value (`-o`, `-W`, `-r`, `-I`,
-    `--env-file`, `--rcfile`, …). A missing entry script is refused only when it has a separator or a script extension
-    (`sh check` is protected, not refused) and the repository does not ignore it (`node dist/cli.js` with `dist/`
-    ignored is build output: admitted, still protected). **Every other argument** — also the value of `KEY=value`,
-    `--flag=value`, `-Flag:value`, `/p:Name=value` — is protected when it names a file of the base commit and never
-    refused; a missing one with a script or program extension gets a `note:` at `task create` and in `doctor`.
+    protected. (M18, for everyone; M11-R10/R14/R15: X7, X9, X10) a gate's **entry script** — the file that decides
+    pass or fail — is protected before it exists, and `task create` refuses a configuration whose base commit lacks
+    it, because the implementer could write it. Entry scripts are: the program when it is a repository path;
+    `-File x` of PowerShell, else the first positional `.ps1`; the makefile of `make -f x` / `--file=x` (plain `make`
+    protects `GNUmakefile`, `makefile` and `Makefile`, never refused); the first argument of `sh`/`bash`/`python`/
+    `node`/`ruby`/`perl`/`php`/`bun`/`tsx`/`ts-node` that is not a flag or a flag's value (`-o`, `-W`, `-r`, `-I`,
+    `--env-file`, `--rcfile`, …), and of `deno run`.
+    In a **command string** (`pwsh -Command`, `cmd /c`, a shell's `-c`, also `-ec`, `-lc`) Toryo reads the string:
+    it is split, with its quotes, into simple commands at `&&`, `||`, `;`, `|`, `&`, newlines and `( ) { }`. Only the
+    **head** of each simple command — its first word after an optional `call`, `.`, `exec`, `time` or `NAME=value` —
+    is an entry script, and only when it is a relative path with a separator (`./x.sh`, `scripts\x.cmd`, `./gradlew`
+    without an extension; `& './my scripts/x.ps1'` keeps its space). A `cd` / `chdir` / `pushd` / `Set-Location` /
+    `sl` with a literal relative folder moves where the rest resolves: `bash -lc "cd ci && ./x.sh"` runs — and
+    protects — `ci/x.sh`. With a variable, an absolute path, `-` or no argument Toryo cannot follow the string and
+    refuses and protects nothing more in it. A bare head of a `cmd` string that is not a built-in (`cmd /c build`,
+    `cmd /c "npm.cmd run build"`) is protected — never refused — as `<name>`, `<name>.com`, `.exe`, `.bat`, `.cmd`
+    in that folder, whether or not a program of that name is on PATH: `cmd.exe` looks in the working directory
+    first, and a gate's working directory is the checkout (an implementer that creates one stops the task with
+    `protected_config_changed`). PowerShell and `sh` never run a bare name from the working directory.
+    A missing entry script is refused only when it has a separator or a script extension (`sh check`, `php artisan`,
+    `make -f ci.mk` are protected, not refused) and the repository does not ignore it. One that is missing **and
+    ignored** (`node dist/cli.js` with `dist/` ignored) is build output: admitted and recorded with the task
+    (`build_entries` in `toryo task config <id>`); the implementer may build it in its worktree, but it is never
+    committed — un-ignoring it is a path-policy violation with a fix note naming the gate.
+    **Every other word** — also the value of `KEY=value`, `--flag=value`, `-Flag:value`, `/p:Name=value`, and every
+    argument inside a command string — is protected when it names a file of the task's **base commit** (not of the
+    worktree: build output that appears later, `build/app.exe`, is not suddenly protected after a `resume`) and
+    never refused; a missing one with a separator and a script or program extension gets a `note:` at `task create`
+    and in `doctor`.
     Remaining limits: a file a gate script itself loads (dot-sourced, imported) is not seen; a script without an
-    extension, in the repository root, run by a program outside this table.
+    extension, in the repository root, run by a program outside this table; a shell keyword in front of a command
+    (`if ./x.sh; then …`) makes it an argument (protected when it exists, not refused); `source x.sh` is read like
+    any command (`x.sh` is an argument), `. x.sh` as a head.
   - `kind: environment` — the repository only declares it (`timeout`, `if_missing: error | skip`); the command is
     `environment_gates.<name>` in the machine config (`program`, `args`, `lock`, `env`, `secret_env`), frozen with the
     task. It runs only after every check gate passed (a check gate that changed a tracked file of the verify checkout

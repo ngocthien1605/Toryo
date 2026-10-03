@@ -701,16 +701,33 @@ trượt đầu tiên; exit code quyết định; mọi gate có `TORYO_TASK`, `
 `TORYO_VERIFY_BUILD`):
 - `kind: check` — khai báo đầy đủ trong repo, chạy trong checkout sạch với quyền **Low integrity**, không có secret.
   Script của gate được bảo vệ kể cả khi chưa tồn tại (M18), và `task create` từ chối nếu commit gốc chưa có nó.
-  (M11-R10, X7, áp dụng cho mọi repo) Chỉ **script đầu vào** của gate (file quyết định đạt/không đạt) mới bị từ chối khi
-  commit gốc chưa có, vì implementer có thể tự viết nó: `-File x` của PowerShell, các đường dẫn có `/` hoặc `\` và đuôi
-  script trong dòng `-Command` (`& { ./x.ps1 }`), dòng `cmd /c` (`call scripts\x.cmd`; tên trần có đuôi script cũng tính,
-  trừ khi PATH có chương trình cùng tên), dòng `-c` của shell (cả `-ec`, `-euxc`), và đối số đầu tiên không phải cờ của
-  `sh`/`bash`/`python`/`node`/… (bỏ qua giá trị của `-o`, `-W`, `-r`, `--env-file`, `--rcfile`…). Script đầu vào thiếu
-  chỉ bị từ chối khi có `/`/`\` hoặc đuôi script **và** repo không ignore nó (`node dist/cli.js` với `dist/` bị ignore là
-  output build: cho qua, vẫn được bảo vệ); `sh check` được bảo vệ, không bị từ chối. **Mọi đối số khác** (cả giá trị của
-  `KEY=value`, `--flag=value`, `/p:Name=value`) được bảo vệ nếu có trong commit gốc và không bao giờ bị từ chối; thiếu thì
-  chỉ in một dòng `note:` khi `task create` và trong `doctor`. Giới hạn còn lại: file mà script tự nạp (dot-source,
-  import) không được nhìn thấy; script không có đuôi, ở gốc repo, chạy bằng chương trình ngoài bảng.
+  (M11-R10/R14/R15: X7, X9, X10 — áp dụng cho mọi repo) Chỉ **script đầu vào** của gate (file quyết định đạt/không
+  đạt) mới bị từ chối khi commit gốc chưa có, vì implementer có thể tự viết nó: chương trình nếu là đường dẫn trong
+  repo; `-File x` của PowerShell (hoặc `.ps1` đứng một mình); makefile của `make -f x` (`make` trần thì bảo vệ
+  `GNUmakefile`, `makefile`, `Makefile`, không từ chối); đối số đầu tiên không phải cờ của `sh`/`bash`/`python`/`node`/
+  `ruby`/`perl`/`php`/`bun`/`tsx`/`ts-node` (bỏ qua giá trị của `-o`, `-W`, `-r`, `--env-file`, `--rcfile`…) và của
+  `deno run`.
+  Với **chuỗi lệnh** (`pwsh -Command`, `cmd /c`, `-c` của shell, cả `-ec`, `-lc`), Toryo đọc chuỗi đó: tách theo dấu
+  nháy thành các lệnh đơn tại `&&`, `||`, `;`, `|`, `&`, xuống dòng và `( ) { }`. Chỉ **từ đầu** của mỗi lệnh đơn (sau
+  `call`, `.`, `exec`, `time` hoặc `TÊN=giá_trị` nếu có) mới là script đầu vào, và chỉ khi nó là đường dẫn tương đối có
+  `/` hoặc `\` (`./x.sh`, `scripts\x.cmd`, `./gradlew` không cần đuôi; `& './my scripts/x.ps1'` giữ nguyên dấu cách).
+  `cd` / `chdir` / `pushd` / `Set-Location` / `sl` với thư mục tương đối viết thẳng sẽ đổi chỗ phân giải phần còn lại:
+  `bash -lc "cd ci && ./x.sh"` chạy — và bảo vệ — `ci/x.sh`. Nếu `cd` dùng biến, đường dẫn tuyệt đối, `-` hoặc không có
+  đối số thì Toryo không theo được: phần còn lại của chuỗi **không bị từ chối và không được bảo vệ**. Tên trần đứng đầu
+  lệnh trong chuỗi `cmd` (`cmd /c build`, `cmd /c "npm.cmd run build"`, không phải lệnh nội bộ như `cd`, `echo`, `set`)
+  được **bảo vệ, không bao giờ bị từ chối**, dưới các tên `<tên>`, `<tên>.com`, `.exe`, `.bat`, `.cmd` trong thư mục đó,
+  kể cả khi PATH có chương trình cùng tên: `cmd.exe` tìm trong thư mục làm việc trước PATH, mà thư mục làm việc của
+  gate là checkout (implementer tạo file như vậy → task dừng với `protected_config_changed`).
+  Script đầu vào thiếu chỉ bị từ chối khi có `/`/`\` hoặc đuôi script **và** repo không ignore nó; `sh check`,
+  `php artisan`, `make -f ci.mk` được bảo vệ, không bị từ chối. Script thiếu **và bị ignore** (`node dist/cli.js` với
+  `dist/` bị ignore) là output build: được nhận và ghi vào task (`build_entries` trong `toryo task config <id>`);
+  implementer được build nó trong worktree của mình, nhưng nó không bao giờ được commit — bỏ ignore nó là vi phạm
+  path policy, kèm ghi chú sửa nêu tên gate. **Mọi từ khác** (cả giá trị của `KEY=value`, `--flag=value`,
+  `/p:Name=value`, và mọi đối số trong chuỗi lệnh) được bảo vệ nếu có trong **commit gốc** của task (không phải trong
+  worktree: output build xuất hiện sau, như `build/app.exe`, không tự nhiên bị bảo vệ sau `resume`) và không bao giờ bị
+  từ chối; thiếu thì chỉ in một dòng `note:` khi `task create` và trong `doctor`. Giới hạn còn lại: file mà script tự
+  nạp (dot-source, import) không được nhìn thấy; script không có đuôi, ở gốc repo, chạy bằng chương trình ngoài bảng;
+  từ khóa shell đứng trước lệnh (`if ./x.sh; then …`) biến lệnh đó thành đối số (được bảo vệ nếu có, không bị từ chối).
 - `kind: environment` — **thay đổi môi trường D365FO** của máy này (deploy, DB sync), chạy bằng **quyền bình thường
   của anh**, nên lệnh chỉ nằm trong machine config (`environment_gates`), ngoài tầm với của mọi agent. Chỉ chạy
   sau khi **mọi** check gate cùng lượt đã qua (check gate sửa file đã track trong checkout → không gate môi trường
