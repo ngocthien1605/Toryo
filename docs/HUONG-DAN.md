@@ -726,19 +726,29 @@ trượt đầu tiên; exit code quyết định; mọi gate có `TORYO_TASK`, `
   từ đầu khác có dấu phân cách thì được bảo vệ, không bị từ chối. Trong chuỗi `cmd` hoặc PowerShell, từ đầu không có
   đuôi (`scripts\build`, `.\gradlew`) nghĩa là `scripts\build.cmd`, `.ps1`, …: mọi tên như vậy được bảo vệ, không tên
   nào bị từ chối. `cd` / `chdir` / `pushd` / `Set-Location` / `sl` / `Push-Location` với thư mục tương đối viết thẳng
-  sẽ đổi chỗ phân giải phần còn lại (`popd` / `Pop-Location` quay lại; `pwsh -WorkingDirectory ci` bắt đầu ở đó):
-  `bash -lc "cd ci && ./x.sh"` chạy — và bảo vệ — `ci/x.sh`. Toryo **dừng đọc** khi không theo được: `cd` dùng biến,
+  sẽ đổi chỗ phân giải phần còn lại (`popd` / `Pop-Location` quay lại):
+  `bash -lc "cd ci && ./x.sh"` chạy — và bảo vệ — `ci/x.sh`. `pwsh -WorkingDirectory ci -File x.ps1` chạy `x.ps1` ở
+  **gốc** (PowerShell tìm script của `-File` từ thư mục nó được khởi động, rồi mới đổi thư mục), còn
+  `-Command ./x.ps1` chạy trong `ci` ở PowerShell 7 nhưng ở gốc ở Windows PowerShell 5.1 (bỏ qua cờ này): dạng đó
+  được đọc theo cả hai cách và không có gì bị từ chối (đã đo, R19). Toryo **dừng đọc** khi không theo được: `cd` dùng biến,
   đường dẫn tuyệt đối, `-` hoặc không có đối số; `cd` chỉ chạy trong một số trường hợp — sau `&&` / `||`
   (`[ -d ci ] && cd ci`), trong pipeline, trong khối lệnh hay thân hàm (`if (…) { cd build }`), hoặc không đứng đầu
-  lệnh (`if [ -d web ]; then cd web; fi`); here-document. Từ chỗ đó trở đi không có gì là script đầu vào và không có
-  gì bị từ chối; các từ còn lại vẫn được bảo vệ nếu chúng là tên file có trong commit gốc (tính từ thư mục đã theo
-  được, và từ thư mục mà lệnh `cd` đó nêu). Chuỗi trong dấu nháy đứng đầu lệnh của
+  lệnh (`if [ -d web ]; then cd web; fi`); here-document (thân của nó được bỏ qua). Từ chỗ đó trở đi không có gì là
+  script đầu vào và không có gì bị từ chối. **Từ chối cần chắc chắn; bảo vệ thì không (X13):** với mọi lệnh verify và
+  gate, bên cạnh những gì Toryo tìm thấy, **mọi từ của mọi đối số** là tên file có trong commit gốc đều được bảo vệ —
+  kể cả bên trong một đối số mà tự nó là một dòng lệnh (`docker run img sh -c "…"`, `wsl bash -lc "…"`,
+  `bash -c "bash -c '…'"`, `Invoke-Expression '…'`), sau here-document và sau mọi chỗ việc đọc dừng lại — tra từ thư
+  mục checkout **và** từ mọi thư mục mà lệnh nêu như một lần đổi thư mục ở bất kỳ đâu (`cd`, `pushd`, `Set-Location`,
+  `-C`, `-WorkingDirectory`), dù có theo được hay không. Quy tắc này không bao giờ từ chối và không in `note:`. Chuỗi
+  trong dấu nháy đứng đầu lệnh của
   PowerShell là biểu thức, không phải lệnh (`'out/x.txt' | Should -Exist`, `@('a/b','c/d')`), trừ khi có `&` hoặc `.`
   chạy nó. Tên trần đứng đầu lệnh trong chuỗi `cmd` (`cmd /c build`, `cmd /c "npm.cmd run build"`, không phải lệnh nội
   bộ như `cd`, `echo`, `set`) được **bảo vệ, không bao giờ bị từ chối**, dưới các tên `<tên>` và `<tên>` + từng đuôi
   `PATHEXT` mặc định (`.com .exe .bat .cmd .vbs .vbe .js .jse .wsf .wsh .msc`) trong thư mục đó, kể cả khi PATH có
   chương trình cùng tên: `cmd.exe` tìm trong thư mục làm việc trước PATH, mà thư mục làm việc của gate là checkout
   (implementer tạo file như vậy → task dừng với `protected_config_changed`).
+  Mục vào là **thư mục** của commit gốc (`node --test tests/unit`, `node packages/cli`) được chấp nhận như trước vòng 3
+  (R18): nó được bảo vệ với đúng tên đó, không có gì bên trong bị bảo vệ vì nó.
   Script đầu vào thiếu chỉ bị từ chối khi có `/`/`\` hoặc đuôi script **và** repo không ignore nó; `sh check`,
   `php artisan`, `make -f ci.mk` được bảo vệ, không bị từ chối. Script thiếu **và bị ignore** (`node dist/cli.js` với
   `dist/` bị ignore) là output build: được nhận và ghi vào task (`build_entries` trong `toryo task config <id>`);

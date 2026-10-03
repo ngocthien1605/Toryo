@@ -2,7 +2,104 @@
 
 Every entry: what was decided, why, and where. The owner folds these into plan v0.9.
 
-## Morning summary — review fixes round 3 (2026-10-03, after `M11-review-fixes-3.md`)
+## Morning summary — review fixes rounds 3 and 4 (2026-10-03, after `M11-review-fixes-3.md` and `-4.md`)
+
+**R13–R21 are DONE** on the branch `m11/review-3` (from `main` @ `df84b02`; M11 is merged, pull request #3). One
+commit per task, plus one follow-up commit per independent review; rounds 3 and 4 go into **one pull request**. Round
+3 could not be pushed (the environment's permission layer denied `git push`); the push and the pull request are the
+last step — see "Progress (round 4)" for where that stands.
+
+| Commit | Task | Tests (Windows) |
+|---|---|---|
+| `59fded3` | R13 — the export proves its bytes; a Low-writable verify root is refused | 574 |
+| `8da7d61` | R14 — M18 protection comes from the base commit; build output may exist (X9; everyone) | 578 |
+| `21e83c9` | R15 — command strings are read; `cmd` bare names are protected (X10; everyone) | 586 |
+| `36e28d4` | R16 — an environment gate's needs are checked before the build; two-step hints (X12) | 590 |
+| `35522d3` | review of R13–R15 | 596 |
+| `227c70d` | R17 — Low fixes, missing tests, flake diagnostics, stale docs | 599 |
+| `645e89b` | review of R16–R17 | 601 |
+| `686cb86`, `8d9796d` | Finish of round 3; the push was blocked | 601 |
+| `b82e6c7` | R18 — a gate entry that is a folder of the base commit is admitted again (X14; everyone) | 602 |
+| `a878e68` | R19 — protect what exists at base wherever the reader cannot go; `popd`; `-WorkingDirectory` (X13; everyone) | 607 |
+| `3aef67f` | R20 — the export check is byte-exact; line endings no longer block every environment gate (X15) | 611 |
+| `919f034` | R21 — Low fixes (tracked checkouts, config show, path notes, reload probe, reader) | 616 |
+| `d5b884b` | review of R18–R21 — a `-Command` with an unfollowable folder, fewer false notes, capped net, byte-check holes | 618 |
+| (this) | Finish of round 4 — this summary, README / HUONG-DAN | 618 |
+
+**Checks** (§0.2) green before every commit **on this Windows machine**. Tests: 570 passed at `df84b02` → **618
+passed, 0 failed, 6 ignored** at the end. **Unix-only code was not compiled here**: round 3's (`src/process/unix.rs`,
+`tests/spike_e2e.rs`, `process::tests::the_signal_that_ended_a_process_is_kept`, the symlink branch of one `team` test)
+was built on Linux by the round-3 reviewer (628 passed there); round 4 added one Unix-only line (the `symlink` branch
+of `verify::tests::a_build_output_entry_is_removed_without_following_a_link`) and the `sh` variants of three new e2e
+tests (`a_script_behind_a_wrapper_is_protected_from_the_implementer`, `a_tracked_checkout_starts_every_run_without_the_build_output_entries`,
+`an_entry_that_is_a_folder_of_the_base_commit_is_admitted`) — read, never run here. **The `ubuntu-latest` job of the
+pull request is the first Linux build of the round-4 commits.** No real agent was run, nothing ran against a D365FO
+environment, your configs and data dirs were not touched (the PowerShell experiment of R19 used a temp folder in the
+scratchpad).
+
+**Windows-only tests, by name, on this machine (all `ok`):** as in round 3 (`m11_env_gates::a_low_writable_verify_root_is_refused`,
+`::a_same_length_forgery_in_the_checkout_is_never_deployed`, `::plain_resume_after_an_unavailable_boundary_costs_no_fix_cycle`,
+the three Low-integrity tests, `verify::tests::emptying_a_folder_never_follows_a_junction`, the junction part of
+`team::tests::a_path_spelled_another_way_is_still_inside`) and, new in round 4,
+`m11_gates::a_reload_probes_a_changed_verify_root` (R21) and the junction branch of
+`verify::tests::a_build_output_entry_is_removed_without_following_a_link`. 5 Unix-only tests stay `ignored` here.
+
+**What changed for a repository without an org chart** (R14, R15, R18, R19, R21 "apply to everyone"; a configuration
+keeps its hash unless it has a build-output entry script):
+- **R14 — what M18 protects comes from the task's base commit**, not from what exists in the worktree; an entry
+  script missing at base **and ignored** (`node dist/cli.js`) is recorded with the task (`build_entries`), may be
+  built by the implementer, and can never be committed. A task created before this change gets it after
+  `toryo task config <id> --reload`. R21: with `verify.checkout: tracked` those entries are removed from the verify
+  checkout before each run.
+- **R15 — command strings are read, not scanned** (`pwsh -Command`, `cmd /c`, `sh -c`): only the head of each simple
+  command is an entry script; a `cd` is followed (`bash -lc "cd ci && ./x.sh"` is `ci/x.sh`); arguments are never
+  refused; a head is refused when missing only if it clearly names a script (`./…`, `../…`, a script extension); a
+  bare head of a `cmd` string is protected (never refused) under `<name>` + the 11 default `PATHEXT` names. New in
+  the table: `php`, `bun`, `tsx`, `ts-node`, `deno run`, `make -f`; R21: `source` is a head prefix, `make -C sub/`.
+  A configuration round 2 admitted can now be refused only for: `bash -c "./gradlew test"` with the script missing,
+  the script of the new table rows, `make -f dir/x.mk`.
+- **R18 — an entry that is a folder of the base commit is admitted** (`node --test tests/unit`,
+  `node packages/cli`): round 3 had broken that against `main`.
+- **R19 (X13) — refusing needs certainty; protecting does not.** Every word of every argument that names a file of
+  the base commit is protected — inside a wrapper's command line (`docker run img sh -c "…"`), a nested shell,
+  `Invoke-Expression '…'`, after a here-document and after where the reader stopped — looked up from the root and from
+  every folder named by `cd`, `pushd`, `Set-Location`, `-C`, `-WorkingDirectory`. Never a refusal, never a note.
+  `-WorkingDirectory` (measured): `-File x.ps1` is the root script under pwsh 7 and Windows PowerShell 5.1;
+  `-Command` runs under the folder in pwsh 7 and not in 5.1 — read both ways, nothing refused.
+- **R21 — a path argument with a data extension** (`-Config ci/settings.json`) missing at base and not ignored gets
+  a `note:` at `task create` and in `doctor`; `task config --reload` probes a changed `verify_root`; `config show`
+  says a task's digest can differ from the printed one.
+- R13's `verify_root` check applies to every repository with `low_integrity` (create, `doctor`, each verify run); the
+  byte-exact export check (R20) concerns environment gates; R16's preflight and hints concern environment gates and
+  the five machine-caused stops (without an org chart only `xpp_toolchain_unavailable` and
+  `verify_boundary_unavailable` arise).
+
+**Open (the conservative choice is in place):**
+- R20: with `--filters` the header of `git cat-file --batch` names the stored blob size, so the answers are framed by
+  the on-disk size (a wrong length breaks the frame and is reported; the files after it are not compared — said in
+  the message). The end-to-end CRLF test cannot make the checkpoint keep its CRLF blob (racy-git timing in a tiny
+  repository); the unit test `verify::tests::crlf_blobs_under_eol_crlf_export_clean` pins the failure and fails on the
+  round-3 code. A file name with a line break is present-checked, not byte-compared.
+- R13: the after-gate export check guards the owner's own script (a contract, not a boundary). A changed
+  `verify_root` leaves the old checkout folder behind.
+- R14: `checks::verify_commands` still takes the `scripts/build.ps1` / `test.ps1` fallback from the worktree;
+  "ignored" is asked of the working tree, not of the base commit.
+- R15/R19: a file an entry script itself loads is not seen; the interpreter and `make` rules are not applied inside a
+  command string (X13 protects an existing makefile only when the string names it); `nmake /f`; a machine with a
+  custom `%PATHEXT%` has more extensions than the fixed list. The net protects a few names the reader rightly
+  ignores (the line after `rem`); `--directory=` / `--cwd` do not name a folder for it; a string with a here-document
+  is read as `sh` only, and a delimiter with spaces (`<<'E O'`) over-protects (never refuses).
+- R21: the R16 preflight checks every environment gate up front, so a gate whose program or secret an earlier gate
+  creates can never start; a symlinked parent folder can carry a build-output entry into a checkpoint on Unix or with
+  `core.symlinks=true`; the data-extension list of the path note is an allow-list (`example.com/a.json` is noted).
+- R17: the `spike_e2e` flake's cause is not known — the diagnostics are in place.
+- `verify::mutated` looks at tracked files only (an untracked `npm.cmd` left by a check gate).
+- Leftovers: the reviewers' worktrees `.claude/worktrees/agent-…` (three now, each with an untracked
+  `target-review/` build folder) and the branches `worktree-agent-ac1999026e124d50b`, `worktree-agent-ace35f955409e603a`,
+  `worktree-agent-a7ca9a0a604a0d54e` are left alone — remove them with `git worktree remove --force` and
+  `git branch -d` when you like.
+
+## Morning summary — review fixes round 3 (2026-10-03, after `M11-review-fixes-3.md`; as written before round 4)
 
 **R13–R17 of `M11-review-fixes-3.md` are DONE.** New branch `m11/review-3` from `main` @ `df84b02` (M11 is merged:
 pull request #3). One commit per task, plus one follow-up commit per independent review; the round ends with a push
@@ -1266,8 +1363,8 @@ environment's permission layer, so nothing is pushed yet.
 - [x] R19 — protect what exists at base wherever the reader cannot go; `popd`; `-WorkingDirectory`
 - [x] R20 — the export check is byte-exact
 - [x] R21 — Low fixes
-- [ ] Review of R18–R20 (independent subagent)
-- [ ] Finish — notes, README, HUONG-DAN
+- [x] Review of R18–R21 (independent subagent; 2 Medium, 5 Low — all fixed in one follow-up commit, see below)
+- [x] Finish — notes, README, HUONG-DAN
 - [ ] Push and pull request, CI
 
 #### Decisions X13–X15 (binding)
@@ -1428,6 +1525,31 @@ environment's permission layer, so nothing is pushed yet.
   whose program or secret an earlier gate creates can never start; a symlinked parent folder can carry a
   build-output entry into a checkpoint on Unix or with `core.symlinks=true`; the interpreter and `make` rules are
   still not applied inside a command string (X13 protects an existing makefile only when the string names it).
+
+#### Review of R18–R21 (independent subagent) — follow-up commit
+
+The reviewer read `8d9796d..919f034` in its own worktree (no Linux toolchain; the one new Unix line read), ran
+`cargo test --locked` (616 passed), a 40 000-input fuzz of `parse` / `parse_in` / `everywhere` (no panic, no loop),
+and re-measured both PowerShell versions (same as R19). **No Critical or High.** Checked and fine: R18 against
+`main` (the same `ls-tree -r -t` call), X13 never refuses or notes (`everywhere` only reaches `verify_files_with`),
+the byte-exact export over `text eol=crlf` + CRLF blobs, no deadlock or zombie in `batch_hashes`, here-documents
+(`<<-`, quoted delimiters, two on a line, CRLF), `popd` / non-head `cd`, `-WorkingDirectory`, the block-comment skip,
+no assertion removed. Fixed:
+- **Medium — a false refusal.** `pwsh -WorkingDirectory ../x -Command ./x.ps1` (a folder the reader cannot follow)
+  fell through to "the first `.ps1` argument" and was refused when missing; R19 had removed the guard. A pwsh line
+  with a command flag has no script argument then.
+- **Medium — noise.** "Any extension" noted tags and ranges (`myorg/app:1.2.3`, `release/1.2`, `origin/main..HEAD`,
+  `1.2/3.4`). Now: a data/configuration extension allow-list, a name starting with a letter or `_`, no `:` / `..`;
+  an ignored one gets no note (a script-like path keeps its note, ignored or not — the R10 test says so).
+- **Low — slow net.** `everywhere` used `Vec::contains` (100 KB of words took seconds to minutes): sets, caps of
+  4096 words and 32 folders; a test.
+- **Low — byte check.** Nothing was required after the last answer (a last file that is a prefix of what Git writes
+  passed): EOF is required; `<oid> missing` names its own item; the manifest opens regular files only (a pipe or
+  socket is recorded, never read); a name with a line break is not compared; a locked build-output entry in
+  `prepare` is a warning, not an error.
+- Recorded, not changed: a here-document string is read as `sh` only (the net skips PowerShell/`cmd` readings of
+  it); `<<'E O'` over-protects; `source ./venv/bin/activate` after a `python -m venv` is a refusable head when
+  `venv` is not ignored (the same as `.`, spec-driven).
 
 ## Progress
 

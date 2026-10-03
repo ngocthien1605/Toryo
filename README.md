@@ -335,6 +335,8 @@ from the repository checkout (`project.root`), never from a task worktree, and e
     not a program of that name is on PATH: `cmd.exe` looks in the working directory first, and a gate's working
     directory is the checkout (an implementer that creates one stops the task with `protected_config_changed`).
     PowerShell and `sh` never run a bare name from the working directory.
+    An entry that is a **folder** of the base commit (`node --test tests/unit`, `node packages/cli`) is admitted, as
+    before round 3 (M11-R18): it is protected as that name, and nothing inside it is protected because of it.
     A missing entry script is refused only when it has a separator or a script extension (`sh check`, `php artisan`,
     `make -f ci.mk` are protected, not refused) and the repository does not ignore it. One that is missing **and
     ignored** (`node dist/cli.js` with `dist/` ignored) is build output: admitted and recorded with the task
