@@ -17,7 +17,8 @@ and a pull request (see "Progress (round 3)" for where that stands).
 | `35522d3` | review of R13–R15 — lines the reader must not refuse, PATHEXT, the probe's control | 596 |
 | `227c70d` | R17 — Low fixes, missing tests, flake diagnostics, stale docs | 599 |
 | `645e89b` | review of R16–R17 — a conditional `cd` is not followed, `-WorkingDirectory`, escapes; the rest of a string that cannot be followed is still protected | 601 |
-| (this) | Finish — this summary, README / HUONG-DAN | 601 |
+| `686cb86` | Finish — this summary, README / HUONG-DAN | 601 |
+| (this) | notes — the push was blocked here by the environment (the owner pushes) | 601 |
 
 **Checks** (§0.2) green before every commit **on this Windows machine**: `cargo fmt --check`, both
 `clippy --all-targets -D warnings`, `cargo test --locked`. Tests: 570 passed at `df84b02` → **601 passed, 0 failed,
@@ -894,8 +895,11 @@ round is the new branch `m11/review-3` from `main`. One commit per task; it ends
 - [x] R17 — Low fixes, missing tests, stale docs
 - [x] Review of R16–R17 and of the first follow-up (independent subagent) — fixed in one follow-up commit
 - [x] Finish — notes (the round-3 summary at the top), README, HUONG-DAN
-- [ ] Push and pull request
-- [ ] CI
+- [~] Push and pull request — `git push -u origin m11/review-3` was denied here by the environment's permission
+  layer (as in round 2). Nothing else was tried: the owner runs that command; the pull request is then opened from
+  https://github.com/ngocthien1605/toryo/compare/main...m11/review-3?expand=1 (base `main`).
+- [ ] CI — `test (windows-latest)`, `test (ubuntu-latest)`, then `toryo.exe (release)`. The results are in the pull
+  request; this file is updated after the push only if CI needs a fix commit (subject `ci: … (M11-ci)`).
 
 #### Decisions X9–X12 (binding)
 
