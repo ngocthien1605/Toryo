@@ -31,7 +31,7 @@ use serde_json::{json, Value};
 
 use super::checks::{
     parse_allow_protected, resolve_program, review_violations, verify_commands, verify_files,
-    verify_globs, Protected,
+    verify_files_at_base, verify_globs, Protected,
 };
 use super::context;
 use super::contracts;
@@ -102,10 +102,17 @@ pub fn crash_point(name: &str) {
 }
 
 /// Git (with the admitted filter plan), protected paths and verify commands of a task.
+///
+/// M11-R14 (X9): which arguments of a verify command name a repository file — and so are
+/// protected — is decided from the task's **base commit**, not from the worktree as it is now,
+/// so every engine start gives the same set (build output left by an earlier run is not
+/// suddenly protected). The entry scripts frozen as build output (`cfg.build_entries`) are
+/// outside the R35 snapshot and barred from a change list instead.
 pub fn task_policy(t: &TaskRow, cfg: &Effective) -> Result<(GitCmd, Protected, Vec<CommandSpec>)> {
     let g = task_git(cfg, &t.repo)?;
     let cmds = verify_commands(cfg, &t.worktree)?;
-    let mut exact = verify_files(&cmds, &t.worktree);
+    let base = super::task::base_files(&g, &t.repo, &t.base_commit)?;
+    let mut exact = verify_files_at_base(&cmds, &t.worktree, &base);
     if let Ok(r) = rel(&t.repo, &t.task_file) {
         exact.push(r); // the task is the contract: agents may not edit it
     }
@@ -126,10 +133,12 @@ pub fn task_policy(t: &TaskRow, cfg: &Effective) -> Result<(GitCmd, Protected, V
     // R59: `tool: xpp` adds `**/Directory.Build.*` — MSBuild reads them from parent folders
     let mut globs = cfg.repo.policy.protected_paths.clone();
     globs.extend(verify_globs(&cmds));
-    let p = Protected::new(exact, &globs).with_policy(
-        &parse_allow_protected(&task_md),
-        &cfg.repo.policy.deny_paths,
-    );
+    let p = Protected::new(exact, &globs)
+        .with_build_entries(&cfg.build_entries)
+        .with_policy(
+            &parse_allow_protected(&task_md),
+            &cfg.repo.policy.deny_paths,
+        );
     // M11-C2: the implementer's write fence (org chart mode)
     let p = match cfg.team.as_ref().and_then(|t| t.role("implementer")) {
         Some(r) => p.with_fence(&r.writes, &r.never),
@@ -1032,17 +1041,33 @@ impl<'a> Engine<'a> {
                 Ok(Flow::Next)
             }
             ImplementOutcome::PathPolicy { paths } => {
-                let fb = match change_fence_feedback(&paths, &self.protect) {
-                    // M11-C2: the fix note names the fence rule each path breaks
-                    Some(fb) => {
-                        eprintln!("!! paths the implementer may not change were changed: {paths:?} — restored, nothing committed; sent back to the implementer (write fence)");
-                        fb
-                    }
-                    None => {
-                        eprintln!("!! protected or denied paths changed: {paths:?} — restored, nothing committed; sent back to the implementer");
-                        format!("- POLICY: you changed protected or denied paths {paths:?}. They were restored. Do not modify them; achieve the task another way.")
-                    }
-                };
+                // M11-R14: a build-output entry script that reached the change list gets its
+                // own note, naming the gate
+                let (built, others): (Vec<String>, Vec<String>) = paths
+                    .iter()
+                    .cloned()
+                    .partition(|p| self.protect.build_entry(p).is_some());
+                let mut notes: Vec<String> = Vec::new();
+                if !others.is_empty() {
+                    notes.push(match change_fence_feedback(&others, &self.protect) {
+                        // M11-C2: the fix note names the fence rule each path breaks
+                        Some(fb) => {
+                            eprintln!("!! paths the implementer may not change were changed: {others:?} — restored, nothing committed; sent back to the implementer (write fence)");
+                            fb
+                        }
+                        None => {
+                            eprintln!("!! protected or denied paths changed: {others:?} — restored, nothing committed; sent back to the implementer");
+                            format!("- POLICY: you changed protected or denied paths {others:?}. They were restored. Do not modify them; achieve the task another way.")
+                        }
+                    });
+                }
+                if let Some(fb) =
+                    build_output_feedback(&built, &self.protect, self.cfg.team.is_some())
+                {
+                    eprintln!("!! build output that a gate runs as its script reached the change list: {built:?} — removed, nothing committed; sent back to the implementer");
+                    notes.push(fb);
+                }
+                let fb = notes.join("\n");
                 wt.restore(&paths)?;
                 self.end_and(
                     a,
@@ -2799,6 +2824,29 @@ fn change_fence_feedback(paths: &[String], protect: &Protected) -> Option<String
         .collect();
     Some(format!(
         "- POLICY: you changed paths you may not change: {}. They were restored. Do not modify them; achieve the task another way.",
+        list.join("; ")
+    ))
+}
+
+/// M11-R14 (X9): the fix note when a build-output entry script reached the change list — the
+/// gate builds that file itself, in the clean verify checkout; the implementer's copy stays
+/// ignored and is never committed. `None` when `paths` is empty.
+fn build_output_feedback(paths: &[String], protect: &Protected, team: bool) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+    let what = if team { "gate" } else { "verify command" };
+    let list: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            format!(
+                "`{p}` (the script {what} `{}` runs)",
+                protect.build_entry(p).unwrap_or_default()
+            )
+        })
+        .collect();
+    Some(format!(
+        "- POLICY: build output must not be committed: {}. The {what} builds it itself in a clean checkout, so Git has to keep ignoring it. It was removed from your changes. Leave the ignore rules as they are and do not add it.",
         list.join("; ")
     ))
 }

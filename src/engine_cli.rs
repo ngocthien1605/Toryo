@@ -619,11 +619,19 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     }
     let (old_path, old_text) = task::frozen_config_text(&t)?;
     let old = toryo::config::Effective::from_frozen(&old_text, &old_path)?;
-    let new = load_config(cli)?;
+    let mut new = load_config(cli)?;
     // review H2 (M11-A2): a reload cannot go below the machine floor either
     if let Some(reason) = toryo::engine::verify::below_floor(&new) {
         bail!("{reason}");
     }
+    // M11-R14 (X9): the entry scripts that are build output are part of the frozen
+    // configuration — recomputed against the task's own base commit (the refusals follow below)
+    new.build_entries = task::build_entries(
+        &new,
+        &toryo::git::default_gitcmd()?,
+        &t.repo,
+        &t.base_commit,
+    )?;
     let new_text = new.canonical_json();
     let new_sha = sha256_hex(new_text.as_bytes());
     if new_sha == t.config_sha256 {

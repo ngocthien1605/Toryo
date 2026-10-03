@@ -198,6 +198,9 @@ pub struct Protected {
     deny: Vec<regex::Regex>,
     /// M11-C2: the implementer's write fence (org chart mode only).
     fence: Option<Fence>,
+    /// M11-R14 (X9): entry scripts admitted as build output — `(path, gate)`, the path
+    /// normalised and lower-case. Not in `exact`: see [`Protected::with_build_entries`].
+    build: Vec<(String, String)>,
 }
 
 /// The implementer's write fence (M11-C2): `writes` / `never` of its role file, as written
@@ -456,7 +459,43 @@ impl Protected {
             allowed: Vec::new(),
             deny: Vec::new(),
             fence: None,
+            build: Vec::new(),
         }
+    }
+
+    /// M11-R14 (X9): the entry scripts admitted as build output (missing at the base commit,
+    /// ignored by the repository). They leave the R35 filesystem snapshot — an ignored file the
+    /// implementer builds in its worktree is no change to protected state — and the path policy
+    /// takes over: such a path in a change list (someone un-ignored it, or force-added it) is a
+    /// violation, so a checkpoint never contains it. `## Allow protected` opens it like any
+    /// protected path.
+    pub fn with_build_entries(mut self, entries: &[crate::config::BuildEntry]) -> Self {
+        for e in entries {
+            let p = norm_path(&e.path).trim_end_matches('/').to_lowercase();
+            self.exact.retain(|x| *x != p);
+            if !self.build.iter().any(|(b, _)| *b == p) {
+                self.build.push((p, e.gate.clone()));
+            }
+        }
+        self
+    }
+
+    /// The gate whose build-output entry script `path` is (M11-R14), if any.
+    pub fn build_entry(&self, path: &str) -> Option<&str> {
+        let p = norm_path(path).trim_end_matches('/').to_lowercase();
+        self.build
+            .iter()
+            .find(|(b, _)| *b == p)
+            .map(|(_, g)| g.as_str())
+    }
+
+    /// The exact protected paths (verify files, the task file, the culture), normalised and
+    /// lower-case, sorted — what [`Protected::matches`] compares besides the globs and names.
+    pub fn exact_paths(&self) -> Vec<String> {
+        let mut v = self.exact.clone();
+        v.sort();
+        v.dedup();
+        v
     }
 
     /// M11-C2: the implementer's write fence — `writes` (an allowlist, when it lists anything)
@@ -531,9 +570,11 @@ impl Protected {
         self
     }
 
-    /// Protected and not allowed for this task: changing it is a path-policy violation.
+    /// Protected and not allowed for this task: changing it is a path-policy violation. A
+    /// build-output entry script (M11-R14) counts: it may exist, ignored, but never be changed
+    /// in a way Git sees.
     pub fn is_protected(&self, path: &str) -> bool {
-        self.matches(path) && !self.is_allowed(path)
+        (self.matches(path) || self.build_entry(path).is_some()) && !self.is_allowed(path)
     }
 
     /// A change here breaks the path policy: protected (and not allowed), denied, or outside
@@ -558,7 +599,8 @@ impl Protected {
     /// Protected by the policy, whether or not this task may change it (the R35 snapshot
     /// covers every match). A protected directory name matches the entry itself at any
     /// depth — a symlink or junction `.claude -> docs/agent` included — as well as every
-    /// path under it (EC-08).
+    /// path under it (EC-08). A build-output entry script (M11-R14) is not a match: it is
+    /// left out of the snapshot (see [`Protected::with_build_entries`]).
     pub fn matches(&self, path: &str) -> bool {
         let p = norm_path(path);
         let lower = p.to_lowercase();
@@ -646,14 +688,47 @@ fn repo_relative(repo: &Path, p: &str) -> Option<String> {
 ///
 /// Repo files are listed in `git status` form, once each; an argument naming a file outside
 /// the repo (an absolute path) is kept as written.
+///
+/// "Naming a file" is asked of the folder `repo` as it is now — right for the verify checkout,
+/// whose scripts are hashed into the result. A task's **protected set** uses
+/// [`verify_files_at_base`] instead (M11-R14).
 pub fn verify_files(cmds: &[CommandSpec], repo: &Path) -> Vec<String> {
+    verify_files_with(cmds, repo, &|v| {
+        repo_relative(repo, v)
+            .filter(|r| repo.join(r).is_file())
+            .or_else(|| repo.join(v).is_file().then(|| v.replace('\\', "/")))
+    })
+}
+
+/// M11-R14 (X9): [`verify_files`] for a task's protected set — "an argument naming a repository
+/// file" is decided against the **base commit** (`base`: its files, lower-case, `/`), never
+/// against what happens to exist in the task worktree. So the answer is the same on every
+/// engine start: build output that appears in the worktree later (`build/app.exe`,
+/// `out/test/index.js`) does not become protected. Entry scripts and repository programs are
+/// in the set whether or not they exist, as before.
+pub fn verify_files_at_base(
+    cmds: &[CommandSpec],
+    repo: &Path,
+    base: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    verify_files_with(cmds, repo, &|v| {
+        repo_relative(repo, v).filter(|r| base.contains(&r.to_lowercase()))
+    })
+}
+
+/// [`verify_files`]; `names_file`: the file an argument (as written) names, in the form it is
+/// listed, or `None`.
+fn verify_files_with(
+    cmds: &[CommandSpec],
+    repo: &Path,
+    names_file: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut add = |f: String| {
         if !out.contains(&f) {
             out.push(f);
         }
     };
-    let in_repo = |p: &str| repo_relative(repo, p).filter(|r| repo.join(r).is_file());
     for c in cmds {
         let (program, args) = match c.kind() {
             CommandKind::Program { program, args } => (program, args),
@@ -687,16 +762,14 @@ pub fn verify_files(cmds: &[CommandSpec], repo: &Path) -> Vec<String> {
         // `KEY=value`, `--flag=value`, `-Flag:value`, `/p:Name=value`, M11-R10)
         for a in args {
             for v in arg_values(a) {
-                if let Some(r) = in_repo(&v) {
+                if let Some(r) = names_file(&v) {
                     add(r);
-                } else if repo.join(&v).is_file() {
-                    add(v.replace('\\', "/"));
                 }
             }
         }
         // what the net finds (inside a command line, too) — protected when it exists (X7)
         for (_, r) in script_like_args(std::slice::from_ref(c), repo) {
-            if repo.join(&r).is_file() {
+            if let Some(r) = names_file(&r) {
                 add(r);
             }
         }
@@ -1040,7 +1113,19 @@ pub fn script_like_args(cmds: &[CommandSpec], repo: &Path) -> Vec<(String, Strin
 /// it): a script the task itself would create could be written by the implementer before
 /// verify runs it.
 pub fn verify_entry_points(cmds: &[CommandSpec], repo: &Path) -> Vec<(String, String)> {
-    let mut out = Vec::new();
+    verify_entries(cmds, repo)
+        .into_iter()
+        .filter(|e| e.2)
+        .map(|e| (e.0, e.1))
+        .collect()
+}
+
+/// M11-R14: every repository file a verify command starts — its program when it is a path in
+/// the repository, and each of its entry scripts ([`entry_scripts`]) — as `(command name, path,
+/// refusable)`. All of them are protected; [`verify_entry_points`] are the refusable ones. One
+/// that the base commit lacks and the repository ignores is build output (X9).
+pub fn verify_entries(cmds: &[CommandSpec], repo: &Path) -> Vec<(String, String, bool)> {
+    let mut out: Vec<(String, String, bool)> = Vec::new();
     for c in cmds {
         let CommandKind::Program { program, args } = c.kind() else {
             continue;
@@ -1048,17 +1133,14 @@ pub fn verify_entry_points(cmds: &[CommandSpec], repo: &Path) -> Vec<(String, St
         let program = expand_vars(program).unwrap_or_else(|_| program.to_string());
         if program.contains('/') || program.contains('\\') || Path::new(&program).is_absolute() {
             if let Some(r) = repo_relative(repo, &program) {
-                out.push((c.name.clone(), r));
+                out.push((c.name.clone(), r, true));
             }
         }
-        for e in entry_scripts(&program, args)
-            .into_iter()
-            .filter(|e| e.refusable)
-        {
+        for e in entry_scripts(&program, args) {
             if let Some(r) = repo_relative(repo, &e.path) {
-                let e = (c.name.clone(), r);
-                if !out.contains(&e) {
-                    out.push(e);
+                match out.iter_mut().find(|o| o.0 == c.name && o.1 == r) {
+                    Some(o) => o.2 |= e.refusable,
+                    None => out.push((c.name.clone(), r, e.refusable)),
                 }
             }
         }
@@ -1523,6 +1605,73 @@ mod tests {
             "the macro is not a literal path"
         );
         assert!(p.matches("docs/x.md"), "the other globs still apply");
+    }
+
+    /// M11-R14 AC-4 (X9): a task's protected set is decided from the base commit — files that
+    /// appear in the worktree later (build output passed to a gate) do not change it, while
+    /// the filesystem form (`verify_files`, right for the verify checkout) does see them. An
+    /// entry script admitted as build output leaves the snapshot matcher and stays a violation.
+    #[test]
+    fn the_protected_set_comes_from_the_base_commit() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path();
+        let cmd = |name: &str, program: &str, args: &[&str]| {
+            CommandSpec::program(name, program, args, None)
+        };
+        let cmds = [
+            cmd(
+                "smoke",
+                "pwsh",
+                &["-File", "scripts/smoke.ps1", "-Exe", "build/app.exe"],
+            ),
+            cmd(
+                "unit",
+                "mocha",
+                &["out/test/index.js", "Config=conf/ci.json"],
+            ),
+            cmd("cli", "node", &["dist/cli.js"]),
+        ];
+        let base: std::collections::HashSet<String> =
+            ["scripts/smoke.ps1", "conf/ci.json", "src/a.ts"]
+                .map(String::from)
+                .into();
+        let want = [
+            "scripts/smoke.ps1",
+            "conf/ci.json",
+            "dist/cli.js", // an entry script: protected whether or not it exists
+        ];
+        assert_eq!(verify_files_at_base(&cmds, repo, &base), want);
+        for f in ["build/app.exe", "out/test/index.js", "dist/cli.js"] {
+            let p = repo.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "x").unwrap();
+        }
+        assert_eq!(
+            verify_files_at_base(&cmds, repo, &base),
+            want,
+            "the same set after the files appeared"
+        );
+        let now = verify_files(&cmds, repo);
+        assert!(
+            now.contains(&"build/app.exe".to_string())
+                && now.contains(&"out/test/index.js".to_string()),
+            "the filesystem form sees them: {now:?}"
+        );
+        // `dist/cli.js` admitted as build output: out of the snapshot, still never committed
+        let entry = crate::config::BuildEntry {
+            gate: "cli".into(),
+            path: "dist/cli.js".into(),
+        };
+        let p = Protected::new(verify_files_at_base(&cmds, repo, &base), &[]);
+        assert!(p.matches("dist/cli.js"));
+        let p = p.with_build_entries(std::slice::from_ref(&entry));
+        assert!(!p.matches("dist/cli.js") && !p.matches("DIST\\CLI.js"));
+        assert!(p.violates("dist/cli.js") && p.is_protected("Dist/Cli.js"));
+        assert_eq!(p.build_entry("dist\\cli.js"), Some("cli"));
+        assert_eq!(p.exact_paths(), ["conf/ci.json", "scripts/smoke.ps1"]);
+        assert!(!p.violates("build/app.exe") && !p.violates("dist/other.js"));
+        let p = p.with_policy(&["dist/**".to_string()], &[]);
+        assert!(!p.violates("dist/cli.js"), "`## Allow protected` opens it");
     }
 
     /// M18 (M11-E1): the repository program and the `-File` script of a verify command are

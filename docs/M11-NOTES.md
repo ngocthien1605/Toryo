@@ -783,7 +783,7 @@ round is the new branch `m11/review-3` from `main`. One commit per task; it ends
 #### Progress (round 3)
 
 - [x] R13 — the export proves its bytes; the verify root cannot be Low-writable
-- [ ] R14 — M18: protection comes from the base commit; build output may exist
+- [x] R14 — M18: protection comes from the base commit; build output may exist
 - [ ] R15 — command strings and `cmd` bare names
 - [ ] R16 — a gate the machine cannot run is found before the build; the hints tell the whole fix
 - [ ] R17 — Low fixes, missing tests, stale docs
@@ -846,6 +846,44 @@ round is the new branch `m11/review-3` from `main`. One commit per task; it ends
   rewrite the export and the index alike; it is a contract ("a gate script never writes into
   `TORYO_VERIFY_CHECKOUT`"), not a boundary. Hashing every file twice per environment gate costs a few seconds on a
   very large repository.
+
+#### R14 — M18: protection comes from the base commit; build output may exist (applies to everyone)
+
+- **From the base commit (X9).** `runner::task_policy` no longer asks the worktree which arguments of a verify
+  command name a file: `checks::verify_files_at_base` asks the files of the task's base commit
+  (`task::base_files`: `git ls-tree -r <base_commit>`, lower-case). The answer is the same on every engine start, so
+  a `build/app.exe` or `out/test/index.js` left by an earlier run is not suddenly protected and the loop-top R35
+  check no longer stops a resumed task with `protected_config_changed: added …`. Entry scripts and repository
+  programs stay in the set whether or not they exist. `checks::verify_files` (the filesystem form) is kept for the
+  verify checkout, whose scripts are hashed into `VERIFY_RESULT.json`, and for the M0 spike pipeline.
+- **Build-output entries.** An entry script (or repository program) that the base commit lacks and the repository
+  ignores is recorded at admission: `Effective.build_entries: [{ gate, path }]`, set by `task::create` from
+  `check_entry_points`, frozen and hashed with the task, **left out of the JSON when empty** (every other
+  configuration keeps its hash; test). `Protected::with_build_entries` takes these paths out of the exact set — so
+  `Protected::matches`, which the R35 filesystem snapshot and the worktree snapshot walk with, no longer covers
+  them: the implementer may build `dist/cli.js` in its worktree. `Protected::is_protected` / `violates` still count
+  them, so the path policy refuses one in a change list (it gets there only when someone un-ignored or force-added
+  it): removed, nothing committed, and the fix note names the gate ("build output must not be committed: `dist/x`
+  (the script gate `g` runs) … Leave the ignore rules as they are"). `## Allow protected` opens it like any
+  protected path.
+- **`task config --reload`** recomputes `build_entries` for the new configuration against the task's own base
+  commit before the digest is compared (`task::build_entries`, never a refusal; the refusing check follows as
+  before). A task frozen before this change has no `build_entries`: it keeps the old behaviour until it is reloaded
+  (the reload then shows the new key as the only difference).
+- **Decision (not in the list):** not only refusable entries are recorded — any entry script that is missing at
+  base and ignored (also `sh check` with `check` ignored) is build output. In the clean verify checkout an ignored
+  file never comes from the implementer, so nothing is lost.
+- **Tests:** `checks::tests::the_protected_set_comes_from_the_base_commit` (AC-4, unit),
+  `tests/m11_gates.rs::a_build_output_entry_script_may_exist_in_the_worktree` (AC-1: two verify commands, the first
+  builds `dist/check.*` in the verify checkout, the second runs it; the fake implementer writes source and its own
+  `dist/check.*` → Completed, never committed; a repository without such an entry freezes no `build_entries`),
+  `::an_unignored_build_output_entry_is_a_path_policy_violation` (AC-2),
+  `::build_output_left_in_the_worktree_is_not_protected_on_resume` (AC-3 + AC-4 on a real task + the reload). All
+  three e2e tests were run against the old behaviour and failed (`protected_config_changed: added dist/check.ps1`;
+  the protected set gained `build/app.exe`).
+- **Open:** `checks::verify_commands` still falls back to `scripts/build.ps1` / `scripts/test.ps1` *as they exist in
+  the worktree* when `commands.verify` is empty (M10 behaviour, toryo.yaml-only) — the command list, unlike the
+  protected files, is not taken from the base commit.
 
 ## Progress
 
