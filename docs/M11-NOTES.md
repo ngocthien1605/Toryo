@@ -1567,7 +1567,7 @@ is pinned by the unit test; framing the `--filters` answers by the on-disk size 
 
 - [x] R22 — redirection targets (and whole arguments) are words of the catch-all
 - [x] R23 — the export comparison folds case on Windows (X16)
-- [ ] R24 — Low fixes
+- [x] R24 — Low fixes
 - [ ] Finish — notes, leftover worktrees, push, comment on the pull request, CI
 
 #### Decision X16
@@ -1621,6 +1621,28 @@ On a file system that does not tell `Src` from `src` (Windows), the export compa
   `::two_files_that_differ_only_in_case_are_named_on_windows` (AC-2), and end to end
   `m11_env_gates::an_environment_gate_runs_when_a_folder_is_spelled_two_ways` (the gate runs and deploys; fails on
   the round-4 code). The R20 tests pass unchanged (AC-3).
+
+#### R24 — Low fixes (one commit)
+
+- **`remove_entry`** rejects any component that contains `:` (a drive or a stream name; `push("C:")` replaces the path
+  built so far on Windows). The unit test plants a decoy file in the current folder of the drive and walks
+  `x/<drive>:/decoy` through an existing `x` — it fails on the old check.
+- **Batch read.** When Git stops (a non-zero status that is not our own closing of the pipe, or an error text while the
+  answers ran short) the message is "git cat-file stopped before it answered every request (status): <its stderr>",
+  not "its length differs". Test: `verify::tests::a_git_that_stops_is_named_with_its_error` (a required filter that
+  fails). Our own pipe close ends Git with SIGPIPE and an empty stderr, which is still the length message.
+- **The wrapper test** (`m11_gates::a_script_behind_a_wrapper_is_protected_from_the_implementer`): the two stale
+  comments are rewritten and "X13 prints no note" is pinned again on a line the ordinary argument rule leaves quiet
+  (`docker run img sh -c "run-checks --fast"`: admitted, no `note:`).
+- **README:** `## Allow protected` is named as the way out when X13 protects a file the task must edit; where R20 is
+  described, the `git add --renormalize .` note for the verify *checkout* (see Open).
+- **Open, not fixed (the list's):** the catch-all's caps (depth 6, 4096 words, 32 folders) are silent; the `-wo` alias
+  of `-WorkingDirectory` is not read and folders are not combined across nested strings (`cd ci && bash -c 'cd sub &&
+  ./x.sh'`); `verify::prepare` and `mutated` use Git's view of the verify checkout, so in a repository with `text` /
+  `eol=crlf` attributes over CRLF blobs verify can stop with `verify_mutated_tree` before any gate — also on `main`
+  (one `git add --renormalize .`); `cat-file --batch` strips leading white space from a path (a top-level folder named
+  ` d` with its own `.gitattributes` fails a clean export); the batch framing could be hardened with a marker request
+  after each object.
 
 ## Progress
 

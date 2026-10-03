@@ -327,7 +327,8 @@ from the repository checkout (`project.root`), never from a task worktree, and e
     -c "…"`, `wsl bash -lc "…"`, `bash -c "bash -c '…'"`, `Invoke-Expression '…'`), after a here-document and after
     any point where reading stopped — looked up from the checkout root **and** from every folder the command names
     as a change of folder anywhere (`cd`, `pushd`, `Set-Location`, `-C`, `-WorkingDirectory`), followed or not.
-    This never refuses and never prints a note. A
+    This never refuses and never prints a note; when it protects a file the task must edit, list that file under
+    `## Allow protected` in TASK.md. A
     quoted string in head position of a PowerShell string is an expression, not a command (`'out/x.txt' | Should
     -Exist`, `@('a/b','c/d')`), unless `&` or `.` runs it. A bare head of a `cmd` string that is not a built-in
     (`cmd /c build`, `cmd /c "npm.cmd run build"`) is protected — never refused — as `<name>` and `<name>` + each
@@ -366,7 +367,10 @@ from the repository checkout (`project.root`), never from a task worktree, and e
     difference stops the gate (`environment_gate_unavailable`, naming the first files). After the gate, a new walk
     must match the record: a changed, added or removed file or folder (an empty one, a `.git` entry too) is
     `verify_mutated_tree` — a gate script never writes there (this guards your own script: a contract, not a
-    boundary). With the `low_integrity` boundary Toryo also proves, before each verify run, that the task's folder
+    boundary). (In a repository whose `.gitattributes` says `text` / `eol=crlf` over blobs that still hold CRLF, Git
+    itself reports the files of the verify *checkout* as modified right after checkout, so verify can stop with
+    `verify_mutated_tree` before any gate — also before this change: run `git add --renormalize .` once and commit.)
+    With the `low_integrity` boundary Toryo also proves, before each verify run, that the task's folder
     under `verify_root` is **not writable at Low integrity** (a Low process tries to create a folder there and must
     fail): a `verify_root` inside a Low-writable tree such as `AppData\LocalLow` would hand the export and the
     gate's working folder to the code under test — `verify_boundary_unavailable`, and `toryo doctor` / `task

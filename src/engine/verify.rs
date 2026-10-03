@@ -325,11 +325,9 @@ fn remove_entry(root: &Path, rel: &str) -> Result<()> {
         .split('/')
         .filter(|c| !c.is_empty() && *c != ".")
         .collect();
-    if parts.is_empty()
-        || parts.contains(&"..")
-        || rel.starts_with('/')
-        || rel.as_bytes().get(1) == Some(&b':')
-    {
+    // (R24) a component with `:` is a drive or a stream name: on Windows `push("C:")` replaces
+    // the path built so far
+    if parts.is_empty() || parts.contains(&"..") || rel.starts_with('/') || rel.contains(':') {
         return Ok(());
     }
     let mut p = root.to_path_buf();
@@ -950,8 +948,15 @@ fn batch_hashes(
     let _ = writer.join();
     let stderr = errors.join().unwrap_or_default();
     let status = child.wait()?;
-    if read.lost.is_none() && !status.success() {
-        bail!("git cat-file failed ({status}): {}", stderr.trim());
+    // (when we closed the pipe ourselves git ends by SIGPIPE with nothing on stderr)
+    if (read.lost.is_none() && !status.success())
+        || (read.lost.is_some() && !stderr.trim().is_empty())
+    {
+        // (R24) git stopped — its own words, not "its length differs"
+        bail!(
+            "git cat-file stopped before it answered every request ({status}): {}",
+            stderr.trim()
+        );
     }
     Ok(read)
 }
@@ -1562,6 +1567,28 @@ mod tests {
         );
     }
 
+    /// M11-R24: when Git stops in the middle of the answers (here a required filter that
+    /// fails), the message says that Git stopped and carries its own error text.
+    #[test]
+    fn a_git_that_stops_is_named_with_its_error() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, co, head) = repo_and_checkout(d.path());
+        let e = deploy_source(&g, &co, &head).unwrap();
+        let repo = d.path().join("repo");
+        tgit(&repo, &["config", "filter.boom.smudge", "exit 1"]);
+        tgit(&repo, &["config", "filter.boom.required", "true"]);
+        std::fs::write(e.dir.join(".gitattributes"), "app.txt filter=boom\n").unwrap();
+        let found = manifest(&e.dir).unwrap();
+        let err = format!(
+            "{:#}",
+            bytes_are_the_commits(&g, &co, &e, &found).unwrap_err()
+        );
+        assert!(
+            err.contains("git cat-file stopped") && err.to_lowercase().contains("filter"),
+            "{err}"
+        );
+    }
+
     /// M11-R20 AC-2 (X15): inside a finished export each of these is reported, on every
     /// platform — a file whose bytes changed (same length, timestamps put back: the other test),
     /// an added file, a removed file, an empty folder, a `.git` file — and the export is clean
@@ -1669,10 +1696,35 @@ mod tests {
         remove_entry(&root, r"dist\deep").unwrap();
         assert!(!root.join("dist").join("deep").exists(), "a folder entry");
         remove_entry(&root, "nowhere/at/all.js").unwrap();
-        for bad in ["", "..", "../x", "/etc/passwd", "C:/x"] {
+        for bad in [
+            "",
+            "..",
+            "../x",
+            "/etc/passwd",
+            "C:/x",
+            "x/C:/y.ps1",
+            "x/y:stream",
+        ] {
             remove_entry(&root, bad).unwrap();
         }
         assert!(root.join("build").join("keep.txt").exists());
+        // (R24, Windows) `push("C:")` replaces the path built so far: `x/C:/decoy` would reach
+        // `C:decoy` — a file in the current folder of that drive — if the `:` were let through
+        #[cfg(windows)]
+        {
+            let cwd = std::env::current_dir().unwrap();
+            let drive = cwd.display().to_string().chars().next().unwrap();
+            let decoy = cwd.join("toryo-r24-decoy.txt");
+            std::fs::write(&decoy, "keep").unwrap();
+            std::fs::create_dir_all(root.join("x")).unwrap(); // the walk must reach `C:`
+            remove_entry(&root, &format!("x/{drive}:/toryo-r24-decoy.txt")).unwrap();
+            let kept = decoy.exists();
+            let _ = std::fs::remove_file(&decoy);
+            assert!(
+                kept,
+                "an entry with a drive in it stays inside the checkout"
+            );
+        }
         // a link on the way is removed as a link, whatever it points to
         let target = d.path().join("precious");
         std::fs::create_dir_all(&target).unwrap();

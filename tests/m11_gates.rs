@@ -1204,14 +1204,24 @@ fn a_script_behind_a_wrapper_is_protected_from_the_implementer() {
         !files.lines().any(|f| f == file) && files.contains("src/Calculator.psm1"),
         "{files}"
     );
-    // X13 refuses nothing and says nothing: the same line with the script missing at the base
-    // commit is admitted, no note
+    // X13 refuses nothing: the same line with the script missing at the base commit is
+    // admitted (the quoted word of the Unix line, `. ./ci/x.sh`, may get the older net note
+    // for arguments — a note, never a refusal)
     let env = setup("codex-openai");
     with_verify_command(&env, line);
     let (code, err) = create_as(&env, "R19-N");
     assert_eq!(code, 0, "{err}");
-    // (a script-like word of the line may get the old net note — never a refusal)
     assert!(!err.contains("verify_script_missing"), "{err}");
+    // … and X13 says nothing: a wrapper line whose words are no script path (no separator, no
+    // script extension) is admitted without a single note
+    let env = setup("codex-openai");
+    with_verify_command(
+        &env,
+        r#"    - { name: wrap, program: docker, args: ["run", "img", "sh", "-c", "run-checks --fast"] }"#,
+    );
+    let (code, err) = create_as(&env, "R19-Q");
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("note:"), "{err}");
 }
 
 /// M11-R22 AC-2 (applies to everyone): a script fed through standard input is an entry, as on
