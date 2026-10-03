@@ -312,7 +312,14 @@ pub fn fence_pattern(p: &str) -> std::result::Result<String, String> {
         Some(format!("%{v}%"))
     } else {
         first
-            .filter(|f| *f == "~" || variable(f))
+            .filter(|f| {
+                *f == "~"
+                    || variable(f)
+                    // PowerShell's spelling of an environment variable
+                    || f.to_ascii_lowercase()
+                        .strip_prefix("$env:")
+                        .is_some_and(|n| variable(&format!("${n}")))
+            })
             .map(str::to_string)
     };
     if let Some(s) = shortcut {
@@ -361,9 +368,16 @@ pub fn literal_pattern(p: &str) -> Option<String> {
     if t == VERIFY_SCRIPTS {
         return None;
     }
+    // a `!` means negation only in front; elsewhere it is a character of a file name
     let found: Vec<String> = "{}[]!"
         .chars()
-        .filter(|c| t.contains(*c))
+        .filter(|c| {
+            if *c == '!' {
+                t.starts_with('!')
+            } else {
+                t.contains(*c)
+            }
+        })
         .map(|c| format!("`{c}`"))
         .collect();
     (!found.is_empty()).then(|| {
@@ -821,8 +835,10 @@ fn verify_files_with(
             }
         }
         if let Some((s, shell, dir, _)) = string {
-            for v in super::cmdline::parse_in(&s, shell, &dir).args {
-                if let Some(r) = names_file(&v) {
+            // … and, where the string could not be followed, the words of the rest
+            let parsed = super::cmdline::parse_in(&s, shell, &dir);
+            for v in parsed.args.iter().chain(&parsed.maybe) {
+                if let Some(r) = names_file(v) {
                     add(r);
                 }
             }
@@ -1023,7 +1039,17 @@ pub fn command_string(
 /// in, repository-relative with `/` — `Some("")` when it is not given, `None` when it cannot be
 /// followed (a variable, an absolute path, a `..`).
 fn pwsh_dir(args: &[String]) -> Option<String> {
-    let Some(i) = args
+    // (R16–R17 review) PowerShell's own parameters end at `-File`, `-Command` or the script:
+    // a `-WorkingDirectory` after that belongs to the script
+    let own = args
+        .iter()
+        .position(|a| {
+            is_file_flag(a)
+                || is_command_flag(a)
+                || (!a.starts_with('-') && a.to_ascii_lowercase().ends_with(".ps1"))
+        })
+        .unwrap_or(args.len());
+    let Some(i) = args[..own]
         .iter()
         .position(|a| a.eq_ignore_ascii_case("-workingdirectory") || a.eq_ignore_ascii_case("-wd"))
     else {
@@ -1675,6 +1701,7 @@ mod tests {
             ("$HOME/x", "uses `$HOME`"),
             ("${HOME}/x", "uses `${HOME}`"),
             ("$HOME", "uses `$HOME`"),
+            ("$env:USERPROFILE/x", "uses `$env:USERPROFILE`"),
             ("src/../secrets/**", "may not contain `..`"),
             ("", "is empty"),
             ("  ", "is empty"),
@@ -1724,7 +1751,13 @@ mod tests {
                 "{p}: {w}"
             );
         }
-        for p in ["**/ZZZ/**", "docs/*.md", "routes/$id.tsx", VERIFY_SCRIPTS] {
+        for p in [
+            "**/ZZZ/**",
+            "docs/*.md",
+            "routes/$id.tsx",
+            "docs/hello!.md",
+            VERIFY_SCRIPTS,
+        ] {
             assert_eq!(literal_pattern(p), None, "{p}");
         }
     }
@@ -2564,6 +2597,61 @@ mod tests {
             (
                 "bash",
                 &["-c", "cat > .env <<EOF\n./not/a/command.sh\nEOF\n./x.sh"],
+                none(),
+                &[],
+                Some(&[]),
+            ),
+            // ── R16–R17 review ──
+            // `-WorkingDirectory` after the script belongs to the script
+            (
+                "pwsh",
+                &["-File", "scripts/build.ps1", "-WorkingDirectory", "src"],
+                one("scripts/build.ps1", true),
+                &[],
+                Some(&["scripts/build.ps1"]),
+            ),
+            (
+                "pwsh",
+                &["-Command", "./x.ps1", "-WorkingDirectory", "out"],
+                one("./x.ps1", true),
+                &[],
+                Some(&["x.ps1"]),
+            ),
+            // a `cd` that runs only sometimes is not followed: no entry, nothing refused —
+            // the rest is protected where the base commit has it, in either folder
+            (
+                "bash",
+                &["-c", "[ -d ci ] && cd ci; ./x.sh"],
+                none(),
+                &[],
+                Some(&["ci/x.sh"]),
+            ),
+            (
+                "bash",
+                &["-c", "cd $DIR; ./gradlew test"],
+                none(),
+                &[],
+                Some(&["gradlew"]),
+            ),
+            (
+                "pwsh",
+                &["-Command", "if (Test-Path ci) { cd ci }; ./x.ps1"],
+                none(),
+                &[],
+                Some(&["ci/x.ps1", "x.ps1"]),
+            ),
+            // an escaped separator is no separator; `rem` comments out its line
+            (
+                "bash",
+                &["-c", "echo a \\; ./nope.sh"],
+                none(),
+                // (an argument of `echo`: the net notes it, nothing is refused)
+                &["nope.sh"],
+                Some(&[]),
+            ),
+            (
+                "cmd",
+                &["/c", "rem see a.cmd & scripts\\x.cmd"],
                 none(),
                 &[],
                 Some(&[]),

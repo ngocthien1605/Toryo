@@ -9,8 +9,10 @@
 //! - A `cd` / `chdir` / `pushd` / `Set-Location` / `sl` / `Push-Location` with one literal
 //!   relative folder moves where the following commands resolve (`popd` / `Pop-Location` go
 //!   back; a shell's `( … )` scopes it). With any other argument — a variable, an absolute path,
-//!   `-`, nothing — or with a `cd` that is not the head of its command (`if … then cd x`), the
-//!   string cannot be followed: nothing more is found in the rest of it. A here-document stops
+//!   `-`, nothing — or with a `cd` that runs only sometimes (after `&&` / `||`, in a pipeline, in a
+//!   block) or is not the head of its command (`if … then cd x`), the
+//!   string cannot be followed: no more entries are found in the rest of it (its words are kept
+//!   as `maybe`: protected when the base commit has them, never refused). A here-document stops
 //!   the reading too.
 //! - A head that is a relative path with a path separator is an **entry script**: protected
 //!   whether or not it exists. It is **refusable** (admission refuses it when the base commit
@@ -55,6 +57,11 @@ pub struct Parsed {
     /// `--flag=value`, …), resolved like the entries; the value of an output flag (`-o`,
     /// `--out…`, `-OutFile`) and a redirection target are left out.
     pub args: Vec<String>,
+    /// (R16–R17 review) Where the reading stopped: the literal words of the rest, resolved in
+    /// the folder reached so far (and in the folder of a `cd` that may or may not have run).
+    /// They are only ever **protected when they name a file of the base commit** — never an
+    /// entry, never refused, no note.
+    pub maybe: Vec<String>,
 }
 
 /// One word: its text without quotes, whether nothing in it expands, and whether it began
@@ -68,12 +75,19 @@ struct Word {
 
 enum Tok {
     Word(Word),
-    /// The end of a simple command.
-    Sep,
+    /// `;` or a line break: the next command runs whatever the last one did.
+    Seq,
+    /// `&&`, `||`: the next command runs depending on the last one.
+    Cond,
+    /// `|`: both sides run in a pipeline.
+    Pipe,
     /// A single `&`: a separator, and PowerShell's call operator for the next word.
     Amp,
     Open,
     Close,
+    /// `{` / `}` of a block: PowerShell's script block, a shell's group or function body.
+    BlockOpen,
+    BlockClose,
     /// The rest cannot be read (a here-document).
     Stop,
 }
@@ -243,19 +257,50 @@ fn tokens(s: &str, shell: Shell) -> Vec<Tok> {
             i += newline(i);
             continue;
         }
+        if continues {
+            // an escape: the next character is taken as it is, never as a separator or a
+            // quote (`echo a \; ./x.sh`, `echo a ^& x.cmd`) — and the word is not literal
+            lx.push(c, false);
+            if let Some(n) = cs.get(i) {
+                lx.push(*n, false);
+                i += 1;
+            }
+            continue;
+        }
         match c {
             '\'' if shell != Shell::Cmd => {
                 lx.begin(true);
-                while i < cs.len() && cs[i] != '\'' {
-                    lx.push(cs[i], true);
-                    i += 1;
+                loop {
+                    while i < cs.len() && cs[i] != '\'' {
+                        lx.push(cs[i], true);
+                        i += 1;
+                    }
+                    i += 1; // the closing quote
+                            // PowerShell: `''` inside single quotes is one quote
+                    if shell == Shell::Pwsh && cs.get(i) == Some(&'\'') {
+                        lx.push('\'', true);
+                        i += 1;
+                    } else {
+                        break;
+                    }
                 }
-                i += 1; // the closing quote
             }
             '"' => {
                 lx.begin(true);
                 while i < cs.len() && cs[i] != '"' {
                     let d = cs[i];
+                    // an escaped character inside the quotes (`\"`, a backtick and `"`)
+                    let escape = match shell {
+                        Shell::Sh => d == '\\',
+                        Shell::Pwsh => d == '`',
+                        Shell::Cmd => false,
+                    };
+                    if escape && i + 1 < cs.len() {
+                        lx.push(d, false);
+                        lx.push(cs[i + 1], false);
+                        i += 2;
+                        continue;
+                    }
                     let expands = match shell {
                         Shell::Sh => matches!(d, '$' | '`' | '\\'),
                         Shell::Pwsh => matches!(d, '$' | '`'),
@@ -266,7 +311,7 @@ fn tokens(s: &str, shell: Shell) -> Vec<Tok> {
                 }
                 i += 1;
             }
-            '\n' => lx.sep(Tok::Sep),
+            '\n' => lx.sep(Tok::Seq),
             c if c.is_whitespace() => lx.flush(),
             '#' if !lx.started && shell != Shell::Cmd => {
                 // a comment, to the end of the line
@@ -304,15 +349,17 @@ fn tokens(s: &str, shell: Shell) -> Vec<Tok> {
                     lx.drop_next = true;
                 }
             }
-            ';' => lx.sep(Tok::Sep),
+            // `cmd`: `;` separates arguments, not commands (`set CLASSPATH=a.jar;b.jar`)
+            ';' if shell == Shell::Cmd => lx.push(c, true),
+            ';' => lx.sep(Tok::Seq),
             '&' | '|' => {
                 if i < cs.len() && cs[i] == c {
                     i += 1;
-                    lx.sep(Tok::Sep);
+                    lx.sep(Tok::Cond);
                 } else if c == '&' {
                     lx.sep(Tok::Amp);
                 } else {
-                    lx.sep(Tok::Sep);
+                    lx.sep(Tok::Pipe);
                 }
             }
             '(' if shell == Shell::Sh
@@ -327,15 +374,18 @@ fn tokens(s: &str, shell: Shell) -> Vec<Tok> {
             '(' => lx.sep(Tok::Open),
             ')' => lx.sep(Tok::Close),
             '{' | '}' => match shell {
-                Shell::Pwsh => lx.sep(Tok::Sep),
+                Shell::Pwsh if c == '{' => lx.sep(Tok::BlockOpen),
+                Shell::Pwsh => lx.sep(Tok::BlockClose),
                 // a reserved word only when it stands alone; else brace expansion
                 Shell::Sh => {
                     let alone = !lx.started
                         && cs.get(i).is_none_or(|n| {
                             n.is_whitespace() || matches!(n, ';' | ')' | '&' | '|')
                         });
-                    if alone {
-                        lx.sep(Tok::Sep);
+                    if alone && c == '{' {
+                        lx.sep(Tok::BlockOpen);
+                    } else if alone {
+                        lx.sep(Tok::BlockClose);
                     } else {
                         lx.push(c, false);
                     }
@@ -440,16 +490,26 @@ fn no_extension(p: &str) -> bool {
         .contains('.')
 }
 
-/// One simple command; `false`: the string cannot be followed any further. `called`: it follows
-/// PowerShell's call operator `&`.
+/// What one simple command means for the reading.
+enum Step {
+    Next,
+    /// The string cannot be followed any further. With a folder: a `cd` that may or may not
+    /// have run would have gone there.
+    Stop(Option<String>),
+}
+
+/// One simple command. `called`: it follows PowerShell's call operator `&`. `sure`: it runs
+/// whatever came before — at the top level, not after `&&` / `||`, not in a pipeline, not in a
+/// block; only then is a change of folder followed.
 fn simple(
     words: &[Word],
     shell: Shell,
     called: bool,
+    sure: bool,
     cur: &mut String,
     dirs: &mut Vec<String>,
     p: &mut Parsed,
-) -> bool {
+) -> Step {
     let backslash = shell != Shell::Sh;
     // `cmd`: `@call x.cmd` only hides the echo; an unquoted head ends at its first `/` (`rd/s/q`,
     // `cd/d`: the rest is a switch); `for /f` runs a command written in single quotes
@@ -485,7 +545,7 @@ fn simple(
         i += 1;
     }
     let Some(head) = words.get(i).cloned() else {
-        return true;
+        return Step::Next;
     };
     let mut rest: Vec<Word> = words[i + 1..].to_vec();
     let mut head_text = head.text.clone();
@@ -521,33 +581,38 @@ fn simple(
             dir.insert(0, (g.to_string(), true));
         }
         let [(dir, true)] = &dir[..] else {
-            return false;
+            return Step::Stop(None);
         };
         if !relative(dir) || dir.starts_with('-') {
-            return false;
+            return Step::Stop(None);
         }
         let Some(next) = join(cur, dir, backslash) else {
-            return false;
+            return Step::Stop(None);
         };
+        // (R16–R17 review) a `cd` that runs only sometimes — after `&&` / `||`, in a pipeline,
+        // inside a block or a function body — is not followed: where the rest runs is not known
+        if !sure {
+            return Step::Stop(Some(next));
+        }
         if is_push {
             dirs.push(cur.clone());
         }
         *cur = next;
-        return true;
+        return Step::Next;
     }
     if head.literal && !head.quoted && one_of(head_text, POPD) {
-        return match dirs.pop() {
+        return match dirs.pop().filter(|_| sure) {
             Some(d) => {
                 *cur = d;
-                true
+                Step::Next
             }
-            None => false,
+            None => Step::Stop(None),
         };
     }
     // a change of folder that is not the head (`if … then cd x`, `command cd x`, `if exist x cd
     // x`): whether it happens is not known — the rest is not followed
     if rest.iter().any(|w| cd_word(shell, w)) {
-        return false;
+        return Step::Stop(None);
     }
     // PowerShell: a quoted string in head position is an expression unless `&` or `.` runs it
     let expression = shell == Shell::Pwsh && head.quoted && !(called || dotted);
@@ -607,7 +672,7 @@ fn simple(
             }
         }
     }
-    true
+    Step::Next
 }
 
 /// Read the command string `s` (see the module text).
@@ -617,22 +682,75 @@ pub fn parse(s: &str, shell: Shell) -> Parsed {
 
 /// [`parse`], starting in the folder `start` (repository-relative, `/`; `""` = the root).
 pub fn parse_in(s: &str, shell: Shell, start: &str) -> Parsed {
+    let backslash = shell != Shell::Sh;
+    let mut toks = tokens(s, shell);
+    toks.push(Tok::Seq);
     let mut p = Parsed::default();
     let mut cur = start.trim_matches('/').to_string();
     let mut scopes: Vec<String> = Vec::new();
     let mut dirs: Vec<String> = Vec::new();
     let mut words: Vec<Word> = Vec::new();
+    // where the words of the simple command being read begin
+    let mut begin = 0;
     let mut called = false;
-    for t in tokens(s, shell).into_iter().chain([Tok::Sep]) {
+    // the command being read runs whatever came before: the start, `;`, a line break, a
+    // single `&`, the start of a group — not after `&&` / `||` / `|`
+    let mut plain = true;
+    // how deep it is in blocks (`{ … }`; for `cmd` and PowerShell also `( … )`)
+    let mut depth = 0usize;
+    // `cmd`: inside a `rem` line
+    let mut rem = false;
+    for (n, t) in toks.iter().enumerate() {
         if let Tok::Word(w) = t {
-            words.push(w);
+            if !rem {
+                words.push(w.clone());
+            }
+            continue;
+        }
+        if rem {
+            // the comment runs to the end of the line, separators included
+            rem = !matches!(t, Tok::Seq);
+            (begin, plain) = (n + 1, true);
             continue;
         }
         let cmd = std::mem::take(&mut words);
-        if !simple(&cmd, shell, called, &mut cur, &mut dirs, &mut p) {
+        if shell == Shell::Cmd
+            && cmd.first().is_some_and(|w| {
+                !w.quoted && w.text.trim_start_matches('@').eq_ignore_ascii_case("rem")
+            })
+        {
+            rem = !matches!(t, Tok::Seq);
+            (begin, plain) = (n + 1, true);
+            continue;
+        }
+        let sure = plain && depth == 0 && !matches!(t, Tok::Pipe);
+        if let Step::Stop(other) = simple(&cmd, shell, called, sure, &mut cur, &mut dirs, &mut p) {
+            // what is left is only ever protected when it names a file of the base commit —
+            // as written from the folder reached so far, and from the folder a `cd` that may
+            // or may not have run would have gone to
+            let folders: Vec<String> = std::iter::once(cur.clone()).chain(other).collect();
+            for w in toks[begin..].iter().filter_map(|t| match t {
+                Tok::Word(w) if w.literal => Some(w),
+                _ => None,
+            }) {
+                for v in arg_values(w.text.trim_start_matches('@')) {
+                    if v.starts_with('-') || !relative(&v) {
+                        continue;
+                    }
+                    for f in &folders {
+                        if let Some(path) = resolve(f, &v, backslash) {
+                            if !path.is_empty() && !p.maybe.contains(&path) {
+                                p.maybe.push(path);
+                            }
+                        }
+                    }
+                }
+            }
             break;
         }
         called = matches!(t, Tok::Amp) && shell == Shell::Pwsh;
+        plain = !matches!(t, Tok::Cond | Tok::Pipe);
+        begin = n + 1;
         match t {
             Tok::Stop => break,
             // a shell's `( … )` is a subshell: a `cd` inside does not leave it
@@ -642,6 +760,8 @@ pub fn parse_in(s: &str, shell: Shell, start: &str) -> Parsed {
                     cur = c;
                 }
             }
+            Tok::Open | Tok::BlockOpen => depth += 1,
+            Tok::Close | Tok::BlockClose => depth = depth.saturating_sub(1),
             _ => {}
         }
     }
@@ -709,8 +829,8 @@ mod tests {
         assert_eq!(
             p,
             Parsed {
-                entries: vec![],
-                args: vec!["x".into()]
+                args: vec!["x".into()],
+                ..Default::default()
             }
         );
         let p = parse("scripts\\a.cmd 1>nul 2>&1 & scripts\\b.cmd", Cmd);
@@ -897,21 +1017,17 @@ mod tests {
         );
         assert_eq!(entries("cd/d sub && .\\run.bat", Cmd), e(&["sub/run.bat"]));
         assert_eq!(
-            entries("pushd sub && .\\a.cmd && popd && .\\b.cmd", Cmd),
+            entries("pushd sub & .\\a.cmd & popd & .\\b.cmd", Cmd),
             e(&["sub/a.cmd", ".\\b.cmd"])
         );
         assert_eq!(
-            entries("cd tools && .\\build.cmd && cd.. && .\\test.cmd", Cmd),
+            entries("cd tools & .\\build.cmd & cd.. & .\\test.cmd", Cmd),
             e(&["tools/build.cmd", ".\\test.cmd"])
         );
-        // a subshell scopes the `cd` (sh); `cmd` parentheses only group
+        // a subshell scopes the `cd` (sh)
         assert_eq!(
             entries("(cd ci && ./x.sh); ./y.sh", Sh),
             e(&["ci/x.sh", "./y.sh"])
-        );
-        assert_eq!(
-            entries("(cd ci && .\\x.cmd) & .\\y.cmd", Cmd),
-            e(&["ci/x.cmd", "ci/y.cmd"])
         );
         // arguments resolve in the folder too
         assert_eq!(parse("cd ci && make -f x.mk", Sh).args, ["ci/x.mk"]);
@@ -923,7 +1039,12 @@ mod tests {
                 refusable: true
             }]
         );
-        // not followed: nothing more is found — what came before stays
+        // not followed: no entry, no argument — what came before stays
+        let nothing = |s: &str, shell: Shell| {
+            let p = parse(s, shell);
+            assert!(p.entries.is_empty() && p.args.is_empty(), "{s}: {p:?}");
+            p.maybe
+        };
         for s in [
             "cd $DIR && ./x.sh",
             "cd && ./x.sh",
@@ -934,27 +1055,111 @@ mod tests {
             "popd && ./x.sh",
             "command cd ci && ./x.sh",
         ] {
-            assert_eq!(parse(s, Sh), Parsed::default(), "{s}");
+            // … and the rest is kept only as "protect it if the base commit has it"
+            assert!(nothing(s, Sh).contains(&"./x.sh".to_string()), "{s}");
         }
-        // a `cd` that is not the head of its command: whether it runs is not known
-        for s in [
-            "if [ -d frontend ]; then cd frontend; fi; ./run-tests.sh",
-            "test -d ci && builtin cd ci; ./x.sh",
+        assert_eq!(entries("./a.sh; cd \"$D\"; ./b.sh", Sh), e(&["./a.sh"]));
+        assert_eq!(
+            parse("./a.sh; cd \"$D\"; ./b.sh", Sh).maybe,
+            ["cd", "./b.sh"]
+        );
+        for (s, shell) in [
+            ("cd C:\\ci && x.cmd", Cmd),
+            ("cd %CI% && x.cmd", Cmd),
+            ("cd\\ && x.cmd", Cmd),
+            ("cd.. && .\\run.cmd", Cmd),
+            // a `cd` that is not the head of its command: whether it runs is not known
+            ("if exist ci cd ci & .\\run.cmd", Cmd),
+            (
+                "if [ -d frontend ]; then cd frontend; fi; ./run-tests.sh",
+                Sh,
+            ),
         ] {
-            assert_eq!(entries(s, Sh), Vec::new(), "{s}");
+            let p = parse(s, shell);
+            assert!(p.entries.is_empty(), "{s}: {p:?}");
         }
         assert_eq!(
-            entries("if (Test-Path ci) { Set-Location ci }; ./x.ps1", Pwsh),
-            e(&["ci/x.ps1"]),
-            "a head `cd` inside a block is followed (the folder exists at the base commit or \
-             the gate fails)"
+            entries("test -d ci && builtin cd ci; ./x.sh", Sh),
+            Vec::new()
         );
-        assert_eq!(entries("./a.sh; cd \"$D\"; ./b.sh", Sh), e(&["./a.sh"]));
-        assert_eq!(entries("cd C:\\ci && x.cmd", Cmd), Vec::new());
-        assert_eq!(entries("cd %CI% && x.cmd", Cmd), Vec::new());
-        assert_eq!(entries("cd\\ && x.cmd", Cmd), Vec::new());
-        assert_eq!(entries("if exist ci cd ci & .\\run.cmd", Cmd), Vec::new());
-        assert_eq!(entries("cd.. && .\\run.cmd", Cmd), Vec::new());
+    }
+
+    /// (R16–R17 review) a `cd` that runs only sometimes is not followed — after `&&` / `||`, in
+    /// a pipeline, inside a block or a function body: where the rest runs is not known, so
+    /// nothing after it is an entry. The words of the rest are kept as `maybe`, as written
+    /// from the folder reached so far and from the folder the `cd` names.
+    #[test]
+    fn a_conditional_cd_is_not_followed() {
+        use Shell::*;
+        for (s, shell) in [
+            ("[ -d ci ] && cd ci; ./x.sh", Sh),
+            ("cd a || cd b; ./x.sh", Sh),
+            ("cd a | ./x.sh", Sh),
+            ("f() { cd sub; }; ./x.sh", Sh),
+            ("{ cd sub; ./x.sh; }", Sh),
+            ("npm ci && cd web && ./x.sh", Sh),
+            ("if (Test-Path build) { cd build }; ./x.ps1", Pwsh),
+            ("if exist sub (cd sub) & scripts\\x.cmd", Cmd),
+            ("(cd ci && .\\x.cmd) & .\\y.cmd", Cmd),
+            (
+                "pushd sub && .\\a.cmd && popd && .\\b.cmd && cd x && .\\c.cmd",
+                Cmd,
+            ),
+        ] {
+            let p = parse(s, shell);
+            assert!(
+                !p.entries.iter().any(|e| e.refusable
+                    && (e.path.ends_with("x.sh")
+                        || e.path.ends_with("x.ps1")
+                        || e.path.ends_with("x.cmd")
+                        || e.path.ends_with("y.cmd")
+                        || e.path.ends_with("b.cmd")
+                        || e.path.ends_with("c.cmd"))),
+                "{s}: {p:?}"
+            );
+        }
+        // what came before a conditional `cd` is read as usual
+        assert_eq!(
+            entries("pushd sub && .\\a.cmd && popd && .\\b.cmd", Cmd),
+            e(&["sub/a.cmd"])
+        );
+        // both folders are candidates for the rest
+        let p = parse("[ -d ci ] && cd ci; ./x.sh arg.txt", Sh);
+        for want in ["./x.sh", "ci/x.sh", "arg.txt", "ci/arg.txt"] {
+            assert!(p.maybe.contains(&want.to_string()), "{want}: {p:?}");
+        }
+        // the first `cd` of `cd a || cd b` is followed, the second is not
+        let p = parse("cd a || cd b; ./x.sh", Sh);
+        assert!(
+            p.maybe.contains(&"a/x.sh".to_string()) && p.maybe.contains(&"a/b/x.sh".to_string()),
+            "{p:?}"
+        );
+    }
+
+    /// (R16–R17 review) an escaped separator or quote is not a separator; `cmd`: `;` separates
+    /// arguments, and `rem` comments out the rest of its line.
+    #[test]
+    fn escapes_and_cmd_comments() {
+        use Shell::*;
+        for (s, shell) in [
+            ("echo a \\; ./nope.sh", Sh),
+            ("echo a ^& tools\\x.cmd", Cmd),
+            ("echo \"a \\\" ; ./nope.sh ; \\\" b\"", Sh),
+            ("Write-Host \"a `\" ; ./nope.ps1 ; `\" b\"", Pwsh),
+            ("Write-Host 'it''s ; ./nope.ps1'", Pwsh),
+            ("rem see a.cmd & tools\\old2.cmd", Cmd),
+            ("@rem tools\\old.cmd", Cmd),
+        ] {
+            assert_eq!(entries(s, shell), Vec::new(), "{s}");
+        }
+        assert_eq!(
+            entries("set CLASSPATH=lib\\a.jar;lib\\b.cmd & java Main", Cmd),
+            names("java")
+        );
+        assert_eq!(
+            entries("rem first line & skip.cmd\nscripts\\real.cmd", Cmd),
+            e(&["scripts\\real.cmd"])
+        );
     }
 
     /// A bare head of a `cmd` string: every name `cmd.exe` would try in the working directory

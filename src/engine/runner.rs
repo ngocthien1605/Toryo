@@ -1654,8 +1654,12 @@ impl<'a> Engine<'a> {
                 t.id, t.id
             ));
         }
+        // (only a change of the config helps here: no "fixed on the machine" half)
         if let Some(problem) = super::lock::lock_name_problem(&super::lock::lock_key(&m.lock)) {
-            return Err(unavailable(format!("lock `{}`: {problem}", m.lock)));
+            return Err(format!(
+                "{ENV_UNAVAILABLE}: environment gate `{name}`: lock `{}`: {problem} — change `environment_gates.{name}.lock` in the machine config, then `toryo task config {} --reload` and `toryo resume {}`",
+                m.lock, t.id, t.id
+            ));
         }
         let mut secrets = BTreeMap::new();
         for (k, r) in &m.secret_env {
@@ -3954,7 +3958,12 @@ fn command_result(c: &CommandSpec, res: &CommandResult) -> Value {
             .collect(),
         CommandKind::Xpp { .. } => Vec::new(),
     };
-    json!({"name": c.name, "argv": argv, "exit": res.exit, "ms": res.duration_ms, "output_tail": res.tail(40)})
+    let mut v = json!({"name": c.name, "argv": argv, "exit": res.exit, "ms": res.duration_ms, "output_tail": res.tail(40)});
+    // M11-R17: the signal that ended it (Unix), only when there is one
+    if let Some(s) = res.signal {
+        v["signal"] = json!(s);
+    }
+    v
 }
 
 /// The feedback of a failed verify for the implementer: the failing command, how it ended,
@@ -3974,6 +3983,11 @@ fn ended(res: &CommandResult) -> String {
     match (res.timed_out, res.cancelled, res.exit) {
         (true, _, _) => "timed out".into(),
         (_, true, _) => "was cancelled".into(),
+        // M11-R17: on Unix -1 means a signal ended it — say which
+        (_, _, Some(code)) if res.signal.is_some() => format!(
+            "exited {code} (killed by signal {})",
+            res.signal.unwrap_or_default()
+        ),
         (_, _, Some(code)) => format!("exited {code}"),
         (_, _, None) => "ended without an exit code (killed)".into(),
     }
@@ -5671,6 +5685,8 @@ mod tests {
             json!(9),
             "recorded when there is one"
         );
+        assert_eq!(command_result(&c, &killed)["signal"], json!(9));
+        assert_eq!(ended(&killed), "exited -1 (killed by signal 9)");
         assert!(
             serde_json::to_value(&res).unwrap().get("signal").is_none(),
             "left out otherwise"

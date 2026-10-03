@@ -1149,7 +1149,14 @@ fn lines_the_reader_must_not_refuse() {
     let t = task(&env, "R15-V");
     let cfgv = toryo::engine::task::frozen_config(&t).unwrap();
     let (_, prot, _) = toryo::engine::runner::task_policy(&t, &cfgv).unwrap();
-    for p in ["scripts/build.cmd", "scripts/build.bat", "ci/x.ps1"] {
+    // (R16–R17 review) `run-tests.sh` comes after a `cd` that may not run: Toryo stops reading
+    // there, refuses nothing, and still protects the script the base commit has
+    for p in [
+        "scripts/build.cmd",
+        "scripts/build.bat",
+        "ci/x.ps1",
+        "run-tests.sh",
+    ] {
         assert!(prot.violates(p), "{p} is protected");
     }
     for p in ["x.ps1", "tests/unit", "frontend/run-tests.sh"] {

@@ -1351,7 +1351,14 @@ pub fn expand_vars(s: &str) -> Result<String> {
 /// Resolve a `secret_env` reference. Never logs the value.
 pub fn resolve_secret(reference: &str) -> Result<String> {
     if let Some(var) = reference.strip_prefix("env:") {
-        return std::env::var(var).with_context(|| format!("secret env var `{var}` is not set"));
+        // (R16–R17 review) never through `VarError`: its `NotUnicode` form prints the value
+        return match std::env::var(var) {
+            Ok(v) => Ok(v),
+            Err(std::env::VarError::NotPresent) => bail!("secret env var `{var}` is not set"),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                bail!("secret env var `{var}` is not valid Unicode")
+            }
+        };
     }
     if let Some(target) = reference.strip_prefix("credman:") {
         return resolve_credman(target);

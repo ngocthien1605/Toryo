@@ -356,6 +356,31 @@ pub fn quote_windows_arg(arg: &str) -> String {
 mod tests {
     use super::*;
 
+    /// M11-R17: on Unix a process ended by a signal has the exit code -1 and its signal is
+    /// kept; one that exits by itself has none.
+    #[cfg(unix)]
+    #[test]
+    fn the_signal_that_ended_a_process_is_kept() {
+        let run = |script: &str| {
+            let spec = SpawnSpec {
+                program: PathBuf::from("/bin/sh"),
+                args: vec!["-c".to_string(), script.to_string()],
+                cwd: std::env::temp_dir(),
+                env: std::env::vars().collect(),
+                stdin: None,
+                boundary: Boundary::None,
+            };
+            spawn(&spec, &Redactions::empty())
+                .unwrap()
+                .wait(WaitOptions::default(), |_| {})
+                .unwrap()
+        };
+        let killed = run("kill -TERM $$");
+        assert_eq!((killed.code, killed.signal), (Some(-1), Some(15)));
+        let exited = run("exit 3");
+        assert_eq!((exited.code, exited.signal), (Some(3), None));
+    }
+
     #[test]
     fn strip_ansi_removes_colour_codes() {
         assert_eq!(
