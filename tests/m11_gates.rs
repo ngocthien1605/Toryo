@@ -1210,7 +1210,8 @@ fn a_script_behind_a_wrapper_is_protected_from_the_implementer() {
     with_verify_command(&env, line);
     let (code, err) = create_as(&env, "R19-N");
     assert_eq!(code, 0, "{err}");
-    assert!(!err.contains("ci/x"), "{err}");
+    // (a script-like word of the line may get the old net note — never a refusal)
+    assert!(!err.contains("verify_script_missing"), "{err}");
 }
 
 /// M11-R15 AC-3 (X10, X11): `cmd.exe` looks in the working directory before PATH, and a check
