@@ -2,12 +2,19 @@
 
 Every entry: what was decided, why, and where. The owner folds these into plan v0.9.
 
-## Morning summary — review fixes rounds 3 and 4 (2026-10-03, after `M11-review-fixes-3.md` and `-4.md`)
+## Morning summary — review fixes rounds 3, 4 and 5 (2026-10-03, after `M11-review-fixes-3.md`, `-4.md`, `-5.md`)
 
-**R13–R21 are DONE** on the branch `m11/review-3` (from `main` @ `df84b02`; M11 is merged, pull request #3). One
-commit per task, plus one follow-up commit per independent review; rounds 3 and 4 go into **one pull request**. Round
-3 could not be pushed (the environment's permission layer denied `git push`); the push and the pull request are the
-last step — see "Progress (round 4)" for where that stands.
+**R13–R24 are DONE** on the branch `m11/review-3` (from `main` @ `df84b02`; M11 is merged, pull request #3). One
+commit per task, plus one follow-up commit per independent review; everything goes into **one pull request, #4**
+(open, CI green at `df1ecb2`; the commits of round 5 are pushed on top of it). Rounds 2–4 hit the environment's
+permission layer on `git push`: the owner pushed.
+
+**Round 5 (small, `M11-review-fixes-5.md`):** R22 — a redirection target is a word of the catch-all, and `sh <
+scripts/test.sh` is an entry again as on `main`; `cmd` ends a name at `;` `,` `=` (measured). R23 — the export
+comparison folds case on Windows (X16). R24 — Low fixes. Decisions X13 unchanged; X16 new. Test counts: 618 at
+`df1ecb2` → 619 (R22) → 622 (R23) → 623 (R24) → **623 passed, 0 failed, 6 ignored** at the end; the review of round 5
+added a table row only. Not in the table below: `6696686` R22, `1be4e25` R23, `c0fcbd9` R24, then the review
+follow-up and this Finish.
 
 | Commit | Task | Tests (Windows) |
 |---|---|---|
@@ -26,8 +33,8 @@ last step — see "Progress (round 4)" for where that stands.
 | `d5b884b` | review of R18–R21 — a `-Command` with an unfollowable folder, fewer false notes, capped net, byte-check holes | 618 |
 | (this) | Finish of round 4 — this summary, README / HUONG-DAN | 618 |
 
-**Checks** (§0.2) green before every commit **on this Windows machine**. Tests: 570 passed at `df84b02` → **618
-passed, 0 failed, 6 ignored** at the end. **Unix-only code was not compiled here**: round 3's (`src/process/unix.rs`,
+**Checks** (§0.2) green before every commit **on this Windows machine**. Tests: 570 passed at `df84b02` → **623
+passed, 0 failed, 6 ignored** at the end (618 at the end of round 4). **Unix-only code was not compiled here**: round 3's (`src/process/unix.rs`,
 `tests/spike_e2e.rs`, `process::tests::the_signal_that_ended_a_process_is_kept`, the symlink branch of one `team` test)
 was built on Linux by the round-3 reviewer (628 passed there); round 4 added one Unix-only line (the `symlink` branch
 of `verify::tests::a_build_output_entry_is_removed_without_following_a_link`) and the `sh` variants of three new e2e
@@ -1568,7 +1575,10 @@ is pinned by the unit test; framing the `--filters` answers by the on-disk size 
 - [x] R22 — redirection targets (and whole arguments) are words of the catch-all
 - [x] R23 — the export comparison folds case on Windows (X16)
 - [x] R24 — Low fixes
-- [ ] Finish — notes, leftover worktrees, push, comment on the pull request, CI
+- [x] Review of R22–R24 (independent subagent, in place, no build; 1 Medium, 4 Low) — fixed in one follow-up commit
+- [~] Finish — notes (done); leftover worktrees: **left alone** (each holds `target-review/` **and** an ignored
+  `.claude/settings.local.json`, so not "nothing but `target-review/`"); push, comment on the pull request, CI: see
+  the pull request
 
 #### Decision X16
 
@@ -1643,6 +1653,19 @@ On a file system that does not tell `Src` from `src` (Windows), the export compa
   (one `git add --renormalize .`); `cat-file --batch` strips leading white space from a path (a top-level folder named
   ` d` with its own `.gitattributes` fails a clean export); the batch framing could be hardened with a marker request
   after each object.
+
+#### Review of R22–R24 (independent subagent, reading in place) — follow-up commit
+
+No Critical or High. **Medium:** `scan` and the `maybe` collection ignored `Tok::Input`, so an input-redirection
+target was a word only by accident of the PowerShell reading — and not at all after a here-document (the `sh` read
+alone is used then): `bash -c $'cat <<EOF\nx\nEOF\nsh < scripts/test.sh'` left `scripts/test.sh` unprotected. Both
+now take `Tok::Word | Tok::Input`; a table row pins it (fails before). **Low, fixed:** `remove_entry` rejected `:`
+on Unix too (`dist/app:v2.js` would never be removed) — only on Windows now; the "git stopped" message is chosen
+only when Git's output ended by itself (a Windows Git may print on stderr when we close the pipe). **Low, recorded:**
+a file and a folder that fold to the same name (file `X`, folder `x/y`) surface as a vague "missing" / "no such
+entry" (the gate still does not start); `to_lowercase` is not NTFS's up-case table and a per-directory
+case-sensitive NTFS folder would give a false collision; no test for an input redirection after an unfollowable
+`cd`.
 
 ## Progress
 

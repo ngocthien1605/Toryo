@@ -2556,6 +2556,15 @@ mod tests {
                 &["ci/check.sh"],
                 &["ci/check.sh"],
             ),
+            // (review) an input redirection after a here-document: the reader has stopped, the
+            // net still has the target
+            (
+                "bash",
+                &["-c", "cat <<EOF\nx\nEOF\nsh < scripts/test.sh"],
+                &["scripts/test.sh"],
+                &["scripts/test.sh"],
+                &[],
+            ),
             (
                 "bash",
                 &["-c", "bash <<< './x.sh --fast'"],

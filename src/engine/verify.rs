@@ -327,7 +327,11 @@ fn remove_entry(root: &Path, rel: &str) -> Result<()> {
         .collect();
     // (R24) a component with `:` is a drive or a stream name: on Windows `push("C:")` replaces
     // the path built so far
-    if parts.is_empty() || parts.contains(&"..") || rel.starts_with('/') || rel.contains(':') {
+    if parts.is_empty()
+        || parts.contains(&"..")
+        || rel.starts_with('/')
+        || (cfg!(windows) && rel.contains(':'))
+    {
         return Ok(());
     }
     let mut p = root.to_path_buf();
@@ -894,6 +898,8 @@ fn batch_hashes(
         lost: None,
     };
     let mut buf = vec![0u8; 64 * 1024];
+    // git's output ended by itself (not because we stopped reading): its stderr is then the story
+    let mut ended = false;
     'items: for (n, (oid, _, size)) in items.iter().enumerate() {
         // the header of this answer: `<object> blob <size>`
         let mut line = String::new();
@@ -906,6 +912,7 @@ fn batch_hashes(
                     if o == *oid && !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
             );
         if !framed {
+            ended |= got == 0;
             // `<object> missing` names this item; else the answer before it was longer or
             // shorter than the file: it is the one lost
             let lost = if line.trim_end().ends_with(" missing") {
@@ -927,6 +934,7 @@ fn batch_hashes(
                     left -= k as u64;
                 }
                 _ => {
+                    ended = true;
                     read.lost = Some(n);
                     break 'items;
                 }
@@ -934,6 +942,7 @@ fn batch_hashes(
         }
         let mut nl = [0u8; 1];
         if out.read_exact(&mut nl).is_err() || nl[0] != b'\n' {
+            ended |= nl[0] == 0;
             read.lost = Some(n);
             break;
         }
@@ -949,9 +958,7 @@ fn batch_hashes(
     let stderr = errors.join().unwrap_or_default();
     let status = child.wait()?;
     // (when we closed the pipe ourselves git ends by SIGPIPE with nothing on stderr)
-    if (read.lost.is_none() && !status.success())
-        || (read.lost.is_some() && !stderr.trim().is_empty())
-    {
+    if (read.lost.is_none() && !status.success()) || (ended && !stderr.trim().is_empty()) {
         // (R24) git stopped — its own words, not "its length differs"
         bail!(
             "git cat-file stopped before it answered every request ({status}): {}",

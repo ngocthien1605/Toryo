@@ -876,7 +876,8 @@ fn scan(s: &str, depth: usize, seen: &mut Seen) {
         // the next word is a folder: after `cd`, `pushd`, `Set-Location`, `-C`, `-WorkingDirectory`
         let mut folder_next = false;
         for t in toks {
-            let Tok::Word(w) = t else {
+            // (R22 review) the target of an input redirection is a word here too
+            let (Tok::Word(w) | Tok::Input(w)) = t else {
                 folder_next = false;
                 continue;
             };
@@ -986,7 +987,7 @@ pub fn parse_in(s: &str, shell: Shell, start: &str) -> Parsed {
             // or may not have run would have gone to
             let folders: Vec<String> = std::iter::once(cur.clone()).chain(other).collect();
             for w in toks[begin..].iter().filter_map(|t| match t {
-                Tok::Word(w) if w.literal => Some(w),
+                Tok::Word(w) | Tok::Input(w) if w.literal => Some(w),
                 _ => None,
             }) {
                 for v in arg_values(w.text.trim_start_matches('@')) {
