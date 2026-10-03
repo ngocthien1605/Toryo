@@ -1214,6 +1214,41 @@ fn a_script_behind_a_wrapper_is_protected_from_the_implementer() {
     assert!(!err.contains("verify_script_missing"), "{err}");
 }
 
+/// M11-R22 AC-2 (applies to everyone): a script fed through standard input is an entry, as on
+/// `main` — `bash -c "sh < scripts/missing.sh"` is refused like `./scripts/missing.sh`, with the
+/// script at the base commit it is protected; an input file that is no script (`sort <
+/// data/input.txt`) is admitted.
+#[test]
+fn a_script_fed_through_standard_input_is_an_entry() {
+    let line = r#"    - { name: feed, program: bash, args: ["-c", "sh < scripts/feed.sh"] }"#;
+    let env = setup("codex-openai");
+    with_verify_command(&env, line);
+    let (code, err) = create_as(&env, "R22-M");
+    assert_ne!(code, 0);
+    assert!(
+        err.contains(
+            "verify_script_missing: verify command `feed` runs `scripts/feed.sh`, which is not in the base commit"
+        ),
+        "{err}"
+    );
+    let env = setup("codex-openai");
+    commit_repo(&env, &[("scripts/feed.sh", "exit 0\n")], "a script");
+    with_verify_command(&env, line);
+    let (code, err) = create_as(&env, "R22-P");
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R22-P");
+    let cfgv = toryo::engine::task::frozen_config(&t).unwrap();
+    let (_, prot, _) = toryo::engine::runner::task_policy(&t, &cfgv).unwrap();
+    assert!(prot.violates("scripts/feed.sh"), "protected");
+    let env = setup("codex-openai");
+    with_verify_command(
+        &env,
+        r#"    - { name: sorted, program: bash, args: ["-c", "sort < data/input.txt"] }"#,
+    );
+    let (code, err) = create_as(&env, "R22-S");
+    assert_eq!(code, 0, "{err}");
+}
+
 /// M11-R15 AC-3 (X10, X11): `cmd.exe` looks in the working directory before PATH, and a check
 /// gate's working directory is the checkout root — so a bare head of a `cmd` string is
 /// protected under every name `cmd` would try, whether or not a program of that name is on

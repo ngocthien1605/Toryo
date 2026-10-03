@@ -81,6 +81,9 @@ struct Word {
 
 enum Tok {
     Word(Word),
+    /// The target of an input redirection (`< word`, not `<<` / `<<<`): a file the command
+    /// reads — an entry script when it is a script path (R22, as on `main`).
+    Input(Word),
     /// `;` or a line break: the next command runs whatever the last one did.
     Seq,
     /// `&&`, `||`: the next command runs depending on the last one.
@@ -177,6 +180,10 @@ struct Lexer {
     started: bool,
     /// The next word is a redirection target: dropped.
     drop_next: bool,
+    /// The next word is the target of an input redirection: [`Tok::Input`].
+    input_next: bool,
+    /// Keep every redirection target as a word (the catch-all of X13, R22).
+    keep_targets: bool,
 }
 
 impl Lexer {
@@ -200,18 +207,22 @@ impl Lexer {
             return;
         }
         let text = std::mem::take(&mut self.text);
+        let input = std::mem::take(&mut self.input_next);
         if !std::mem::take(&mut self.drop_next) {
-            self.out.push(Tok::Word(Word {
+            let w = Word {
                 text,
                 literal: self.literal,
                 quoted: self.quoted,
-            }));
+            };
+            self.out
+                .push(if input { Tok::Input(w) } else { Tok::Word(w) });
         }
     }
 
     fn sep(&mut self, t: Tok) {
         self.flush();
         self.drop_next = false;
+        self.input_next = false;
         self.out.push(t);
     }
 }
@@ -241,8 +252,16 @@ fn skip_parens(cs: &[char], mut i: usize) -> usize {
 /// continuation joins its lines; a shell's arithmetic (`$(( … ))`, `(( … ))`) and array
 /// (`NAME=( … )`) are skipped — nothing in them is a command.
 fn tokens(s: &str, shell: Shell) -> Vec<Tok> {
+    tokens_with(s, shell, false)
+}
+
+/// [`tokens`]; `keep_targets`: a redirection target is a word like any other (the catch-all).
+fn tokens_with(s: &str, shell: Shell, keep_targets: bool) -> Vec<Tok> {
     let cs: Vec<char> = s.chars().collect();
-    let mut lx = Lexer::default();
+    let mut lx = Lexer {
+        keep_targets,
+        ..Lexer::default()
+    };
     let mut i = 0;
     // here-documents whose body starts at the next line break: (delimiter, `<<-`)
     let mut heredocs: Vec<(String, bool)> = Vec::new();
@@ -391,9 +410,13 @@ fn tokens(s: &str, shell: Shell) -> Vec<Tok> {
                 } else {
                     lx.flush();
                 }
+                let mut more = 0;
                 while i < cs.len() && matches!(cs[i], '>' | '<') {
                     i += 1;
+                    more += 1;
                 }
+                // a single `<` reads a file (`sh < scripts/test.sh`); PowerShell has none
+                let input = c == '<' && more == 0 && shell != Shell::Pwsh;
                 if i < cs.len() && cs[i] == '&' {
                     // `>&1`, `<&-`: no target word
                     i += 1;
@@ -404,7 +427,11 @@ fn tokens(s: &str, shell: Shell) -> Vec<Tok> {
                     if i < cs.len() && cs[i] == '|' {
                         i += 1; // `>|`
                     }
-                    lx.drop_next = true;
+                    if input {
+                        lx.input_next = true;
+                    } else if !lx.keep_targets {
+                        lx.drop_next = true;
+                    }
                 }
             }
             // `cmd`: `;` separates arguments, not commands (`set CLASSPATH=a.jar;b.jar`)
@@ -608,6 +635,10 @@ fn simple(
     let mut rest: Vec<Word> = words[i + 1..].to_vec();
     let mut head_text = head.text.clone();
     if shell == Shell::Cmd && head.literal && !head.quoted {
+        // (R22, measured) `cmd` ends a name at `;`, `,` and `=` like at a space: `.\a.cmd; echo`
+        if let Some(n) = head_text.find([';', ',', '=']) {
+            head_text.truncate(n);
+        }
         if let Some((name, switch)) = head_text.clone().split_once('/') {
             rest.insert(
                 0,
@@ -763,6 +794,8 @@ pub fn everywhere<'a>(args: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     };
     let args: Vec<&str> = args.into_iter().collect();
     for a in &args {
+        // each whole argument is a word too (`build scripts\run.cmd`: a name with a space)
+        seen.word(a);
         scan(a, 0, &mut seen);
     }
     // the arguments side by side as a shell would read them (`cmd /c cd sub && x`, `-C sub`):
@@ -832,12 +865,12 @@ fn unescape(s: &str) -> String {
 
 fn scan(s: &str, depth: usize, seen: &mut Seen) {
     // a string with a here-document is a `sh` script: PowerShell and `cmd` would read its body
-    // as commands, so only `sh` reads it
-    let sh = tokens(s, Shell::Sh);
+    // as commands, so only `sh` reads it; every redirection target is a word here (R22)
+    let sh = tokens_with(s, Shell::Sh, true);
     let mut reads = vec![sh];
     if !reads[0].iter().any(|t| matches!(t, Tok::Stop)) {
-        reads.push(tokens(s, Shell::Pwsh));
-        reads.push(tokens(s, Shell::Cmd));
+        reads.push(tokens_with(s, Shell::Pwsh, true));
+        reads.push(tokens_with(s, Shell::Cmd, true));
     }
     for toks in reads {
         // the next word is a folder: after `cd`, `pushd`, `Set-Location`, `-C`, `-WorkingDirectory`
@@ -904,6 +937,26 @@ pub fn parse_in(s: &str, shell: Shell, start: &str) -> Parsed {
     // `cmd`: inside a `rem` line
     let mut rem = false;
     for (n, t) in toks.iter().enumerate() {
+        // (R22) `sh < scripts/test.sh`: the script is fed through standard input — an entry
+        // when it is a script path, as on `main`
+        if let Tok::Input(w) = t {
+            if !rem
+                && w.literal
+                && relative(&w.text)
+                && (w.text.contains('/') || (backslash && w.text.contains('\\')))
+                && has_script_ext(&w.text)
+            {
+                if let Some(path) = resolve(&cur, &w.text, backslash) {
+                    if !p.entries.iter().any(|e| e.path == path) {
+                        p.entries.push(Entry {
+                            path,
+                            refusable: true,
+                        });
+                    }
+                }
+            }
+            continue;
+        }
         if let Tok::Word(w) = t {
             if !rem {
                 words.push(w.clone());

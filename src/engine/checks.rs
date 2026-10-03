@@ -2533,6 +2533,72 @@ mod tests {
                 &["tools/gen.sh", "gen.sh"],
                 &[],
             ),
+            // (R22) a script fed through standard input is an entry (as on `main`), and a
+            // redirection target or a here-string is a word of the net
+            (
+                "bash",
+                &["-c", "sh < scripts/test.sh"],
+                &["scripts/test.sh"],
+                &["scripts/test.sh"],
+                &["scripts/test.sh"],
+            ),
+            (
+                "bash",
+                &["-c", "docker exec -i app sh < scripts/test.sh"],
+                &["scripts/test.sh"],
+                &["scripts/test.sh"],
+                &["scripts/test.sh"],
+            ),
+            (
+                "bash",
+                &["-c", "ssh host bash -s < ci/check.sh"],
+                &["ci/check.sh"],
+                &["ci/check.sh"],
+                &["ci/check.sh"],
+            ),
+            (
+                "bash",
+                &["-c", "bash <<< './x.sh --fast'"],
+                &["x.sh"],
+                &["x.sh"],
+                &[],
+            ),
+            (
+                "bash",
+                &["-c", "sort < data/input.txt > out/sorted.txt"],
+                &["data/input.txt", "out/sorted.txt"],
+                &["data/input.txt", "out/sorted.txt"],
+                &[],
+            ),
+            (
+                "pwsh",
+                &["-Command", "Get-Content ci/x.ps1 | pwsh -Command -"],
+                &["ci/x.ps1"],
+                &["ci/x.ps1"],
+                &[],
+            ),
+            // a whole argument that is a name with a space
+            (
+                "cmd",
+                &["/c", r"build scripts\run.cmd"],
+                &["build scripts/run.cmd"],
+                &[
+                    "build scripts/run.cmd", // the whole argument, and the bare head `build` as always
+                    "build",
+                    "build.com",
+                    "build.exe",
+                    "build.bat",
+                    "build.cmd",
+                    "build.vbs",
+                    "build.vbe",
+                    "build.js",
+                    "build.jse",
+                    "build.wsf",
+                    "build.wsh",
+                    "build.msc",
+                ],
+                &[],
+            ),
             // refused when missing: unchanged (the base commit lacks them)
             (
                 "bash",
@@ -2978,6 +3044,14 @@ mod tests {
                 // (R19, X13: protected all the same — the net does not know `rem`; protecting
                 // needs no certainty. Nothing is an entry, nothing is refused)
                 Some(&["scripts/x.cmd"]),
+            ),
+            // ── R22 ── `cmd` ends a name at `;` like at a space (measured)
+            (
+                "cmd",
+                &["/c", r".\a.cmd; echo done"],
+                one(r".\a.cmd", true),
+                &[],
+                Some(&["a.cmd"]),
             ),
             // ── R21 ──
             // `source` is a head prefix like `.`; a PowerShell block comment is no command; a

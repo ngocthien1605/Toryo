@@ -1555,6 +1555,56 @@ no assertion removed. Fixed:
   it); `<<'E O'` over-protects; `source ./venv/bin/activate` after a `python -m venv` is a refusable head when
   `venv` is not ignored (the same as `.`, spec-driven).
 
+### Round 5
+
+Task list: `M11-review-fixes-5.md` (review of round 4 on 2026-10-03; the reviewer built `df1ecb2` on Linux with Rust
+1.99: 644 tests passed; R18, R20, R21 meet their criteria; 2 Medium, both regressions against `main`). Same branch
+`m11/review-3`, pushed, pull request #4 open: the commits of this round go to it. Round 4 is accepted (the CRLF case
+is pinned by the unit test; framing the `--filters` answers by the on-disk size is fine); X13 unchanged; **X16** is new
+(R23).
+
+#### Progress (round 5)
+
+- [x] R22 — redirection targets (and whole arguments) are words of the catch-all
+- [ ] R23 — the export comparison folds case on Windows (X16)
+- [ ] R24 — Low fixes
+- [ ] Finish — notes, leftover worktrees, push, comment on the pull request, CI
+
+#### Decision X16
+
+On a file system that does not tell `Src` from `src` (Windows), the export comparison does not either (R23).
+
+#### R22 — a redirection target is a word too (applies to everyone)
+
+- **Why.** The tokeniser dropped the word after `<` / `>` and the catch-all of X13 reused it, so
+  `bash -c "sh < scripts/test.sh"`, `docker exec -i app sh < scripts/test.sh`, `ssh host bash -s < ci/check.sh` left the
+  script neither an entry nor protected (on `main` it was both, and refused when missing); round 3's R15 opened the gap
+  and X13 did not close it.
+- **Catch-all only.** `tokens_with(…, keep_targets)`: `scan` keeps the target of every redirection (`<`, `>`, `>>`,
+  `2>`, `&>`) as a word, and a here-string (`<<< './x.sh --fast'`) is a quoted word that is read as a nested command
+  line. The reader's tokens are unchanged — except: the target of an **input** redirection (`< word`; not `<<`,
+  `<<<`; not PowerShell, which has none) is a new `Tok::Input`; when it is a literal relative path **with a separator
+  and a script extension** it is an entry (protected, refused when missing at base and not ignored) — as on `main`.
+  `sort < data/input.txt` (no script extension) is admitted.
+- **Whole arguments.** `everywhere` adds each whole argument as one more word (`args: ["/c", "build scripts\\run.cmd"]`:
+  a name with a space).
+- **`cmd` ends a name at `;`, `,`, `=` (measured, in a temp folder with an `a.cmd` that echoes its first argument):**
+
+  ```
+  cmd /c ".\a.cmd; echo done"    → A.CMD RAN with [echo]
+  cmd /c ".\a.cmd, echo done"    → A.CMD RAN with [echo]
+  cmd /c ".\a.cmd=x echo done"   → A.CMD RAN with [x]
+  cmd /c ".\a.cmd;arg1"          → A.CMD RAN with [arg1]
+  ```
+
+  So the head of a `cmd` string ends at the first of them (`simple`): `cmd /c ".\a.cmd; echo done"` has the entry `.\a.cmd`
+  (round 3 looked for `.\a.cmd;` and refused it; `main` admitted it).
+- **Rows whose protected set grew (AC-4):** none of the existing R15 / R19 rows changed. New rows (R19 table): `sh <
+  scripts/test.sh`, `docker exec -i app sh < scripts/test.sh`, `ssh host bash -s < ci/check.sh`, `bash <<< './x.sh
+  --fast'`, `sort < data/input.txt > out/sorted.txt`, `Get-Content ci/x.ps1 | pwsh -Command -` (pinned), a whole `cmd`
+  argument `build scripts\run.cmd`; one row in the R15 table for `.\a.cmd; echo done`. End to end
+  `m11_gates::a_script_fed_through_standard_input_is_an_entry` (AC-2; fails on the round-4 code).
+
 ## Progress
 
 Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.
