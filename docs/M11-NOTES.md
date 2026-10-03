@@ -1566,7 +1566,7 @@ is pinned by the unit test; framing the `--filters` answers by the on-disk size 
 #### Progress (round 5)
 
 - [x] R22 — redirection targets (and whole arguments) are words of the catch-all
-- [ ] R23 — the export comparison folds case on Windows (X16)
+- [x] R23 — the export comparison folds case on Windows (X16)
 - [ ] R24 — Low fixes
 - [ ] Finish — notes, leftover worktrees, push, comment on the pull request, CI
 
@@ -1604,6 +1604,23 @@ On a file system that does not tell `Src` from `src` (Windows), the export compa
   --fast'`, `sort < data/input.txt > out/sorted.txt`, `Get-Content ci/x.ps1 | pwsh -Command -` (pinned), a whole `cmd`
   argument `build scripts\run.cmd`; one row in the R15 table for `.\a.cmd; echo done`. End to end
   `m11_gates::a_script_fed_through_standard_input_is_an_entry` (AC-2; fails on the round-4 code).
+
+#### R23 — the export comparison folds case on Windows (X16)
+
+- **Reproduced first** (Windows unit tests, plumbing commit with `core.ignorecase=false`, because with `ignorecase`
+  Git itself would rewrite the folder's case at `update-index`): a tree with `Src/a.txt` and `src/b.txt` lands in one
+  folder on NTFS; the round-4 comparison then reported `Src/b.txt (the commit has no such entry)`, `src/b.txt
+  (missing)` and no environment gate could ever start there. Both new tests fail on the round-4 code.
+- **Fix.** `bytes_are_the_commits` compares **folded** names on Windows (`to_lowercase`, as `checkout_extra` does):
+  files, folders, the manifest lookup and the hash comparison; the name Git is asked about stays as written in the
+  tree. Unix: unchanged (`fold` is the identity). When two **file** entries of the tree fold to the same name the
+  export fails with plain words: ``the commit holds both `docs/a.txt` and `docs/A.txt`: the names differ only in
+  case, and this file system cannot hold both files in one folder`` — the gate does not start
+  (`environment_gate_unavailable`, via `deploy_source`'s existing wrapper). Windows-only tests:
+  `verify::tests::a_folder_spelled_two_ways_exports_clean_on_windows` (AC-1: export and after-gate check clean),
+  `::two_files_that_differ_only_in_case_are_named_on_windows` (AC-2), and end to end
+  `m11_env_gates::an_environment_gate_runs_when_a_folder_is_spelled_two_ways` (the gate runs and deploys; fails on
+  the round-4 code). The R20 tests pass unchanged (AC-3).
 
 ## Progress
 

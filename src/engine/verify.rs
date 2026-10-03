@@ -999,9 +999,20 @@ fn bytes_are_the_commits(
             String::from_utf8_lossy(&o.stderr).trim()
         );
     }
-    // what the commit holds: files (object id, link?) and folders — the parents of every entry
-    // and a submodule's (checked out as an empty folder, which may be missing)
-    let mut files: BTreeMap<String, (String, bool)> = BTreeMap::new();
+    // (R23, X16) on a file system that does not tell `Src` from `src` (Windows) names are
+    // compared folded, as `checkout_extra` does: a tree that holds `Src/a.txt` and `src/b.txt`
+    // lands in one folder
+    let fold = |p: &str| {
+        if cfg!(windows) {
+            p.to_lowercase()
+        } else {
+            p.to_string()
+        }
+    };
+    // what the commit holds: files (name as in the tree, object id, link?) and folders — the
+    // parents of every entry and a submodule's (checked out as an empty folder, which may be
+    // missing)
+    let mut files: BTreeMap<String, (String, String, bool)> = BTreeMap::new();
     let mut dirs: std::collections::BTreeSet<String> = Default::default();
     for ent in o.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
         let ent = String::from_utf8_lossy(ent).to_string();
@@ -1013,21 +1024,27 @@ fn bytes_are_the_commits(
             bail!("git ls-tree printed `{ent}`");
         };
         if kind == "commit" {
-            dirs.insert(path.to_string());
-        } else {
-            files.insert(path.to_string(), (oid.to_string(), mode == "120000"));
+            dirs.insert(fold(path));
+        } else if let Some((other, _, _)) = files.insert(
+            fold(path),
+            (path.to_string(), oid.to_string(), mode == "120000"),
+        ) {
+            bail!(
+                "the commit holds both `{other}` and `{path}`: the names differ only in case, and this file system cannot hold both files in one folder"
+            );
         }
         let mut p = path;
         while let Some((parent, _)) = p.rsplit_once('/') {
-            dirs.insert(parent.to_string());
+            dirs.insert(fold(parent));
             p = parent;
         }
     }
+    let found_f: BTreeMap<String, &Item> = found.iter().map(|(p, i)| (fold(p), i)).collect();
     let mut problems: Vec<String> = Vec::new();
     for (p, item) in found {
         let ok = match item {
-            Item::File { .. } => files.contains_key(p),
-            Item::Dir => dirs.contains(p),
+            Item::File { .. } => files.contains_key(&fold(p)),
+            Item::Dir => dirs.contains(&fold(p)),
             Item::Link(_) | Item::Other => false,
         };
         if !ok {
@@ -1036,8 +1053,8 @@ fn bytes_are_the_commits(
     }
     type Asked<'a> = Vec<(&'a str, &'a str, u64)>;
     let (mut plain, mut stored): (Asked, Asked) = (Vec::new(), Vec::new());
-    for (p, (oid, link)) in &files {
-        let Some(Item::File { size, .. }) = found.get(p) else {
+    for (key, (p, oid, link)) in &files {
+        let Some(Item::File { size, .. }) = found_f.get(key).copied() else {
             problems.push(format!("{p} (missing)"));
             continue;
         };
@@ -1058,7 +1075,8 @@ fn bytes_are_the_commits(
         }
         let read = batch_hashes(g, &loc, &scratch, filters, &items)?;
         for ((_, p, _), sha) in items.iter().zip(&read.sums) {
-            if !matches!(found.get(*p), Some(Item::File { sha256, .. }) if sha256 == sha) {
+            if !matches!(found_f.get(&fold(p)).copied(), Some(Item::File { sha256, .. }) if sha256 == sha)
+            {
                 problems.push(format!(
                     "{p} (not the bytes Git writes for the commit's blob)"
                 ));
@@ -1481,6 +1499,67 @@ mod tests {
             b"<a>\r\n</a>\r\n"
         );
         assert_eq!(export_changed(&e), None);
+    }
+
+    /// Commit `files` (path, text) through plumbing with `core.ignorecase=false`, so that names
+    /// differing only in case stay as written; the new head.
+    #[cfg(windows)]
+    fn commit_cased(repo: &Path, files: &[(&str, &str)]) -> String {
+        for (i, (path, text)) in files.iter().enumerate() {
+            let src = repo.join(format!("..\\cased-{i}.txt"));
+            std::fs::write(&src, text).unwrap();
+            let blob = tgit(repo, &["hash-object", "-w", &src.display().to_string()]);
+            tgit(
+                repo,
+                &[
+                    "-c",
+                    "core.ignorecase=false",
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("100644,{blob},{path}"),
+                ],
+            );
+        }
+        tgit(repo, &["commit", "-q", "-m", "cased"]);
+        tgit(repo, &["rev-parse", "HEAD"])
+    }
+
+    /// M11-R23 AC-1 (X16, Windows): a tree that holds `Src/a.txt` and `src/b.txt` lands in one
+    /// folder on NTFS; the export check compares folded names, so it is clean — before and after
+    /// the gate. (Without the fold no environment gate ever started for such a repository.)
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_spelled_two_ways_exports_clean_on_windows() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, co, _) = repo_and_checkout(d.path());
+        let repo = d.path().join("repo");
+        let head = commit_cased(&repo, &[("Src/a.txt", "a\n"), ("src/b.txt", "b\n")]);
+        let e = deploy_source(&g, &co, &head).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(e.dir.join("Src").join("b.txt")).unwrap(),
+            "b\n"
+        );
+        assert_eq!(export_changed(&e), None);
+    }
+
+    /// M11-R23 AC-2 (X16, Windows): `a.txt` and `A.txt` in one folder cannot both exist there:
+    /// the export is refused in plain words, with both names.
+    #[cfg(windows)]
+    #[test]
+    fn two_files_that_differ_only_in_case_are_named_on_windows() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, co, _) = repo_and_checkout(d.path());
+        let repo = d.path().join("repo");
+        let head = commit_cased(&repo, &[("docs/a.txt", "1\n"), ("docs/A.txt", "2\n")]);
+        let err = format!("{:#}", deploy_source(&g, &co, &head).unwrap_err());
+        assert!(
+            err.contains("`docs/a.txt`")
+                && err.contains("`docs/A.txt`")
+                && err.contains("differ only in case")
+                && err.contains("cannot hold both"),
+            "{err}"
+        );
     }
 
     /// M11-R20 AC-2 (X15): inside a finished export each of these is reported, on every

@@ -1434,6 +1434,61 @@ fn a_low_writable_verify_root_is_refused() {
     assert!(err.contains("verify_boundary_unavailable"), "{err}");
 }
 
+/// M11-R23 AC-1 (X16, Windows): the tree holds `Src/a.txt` next to the fixture's `src/…` — one
+/// folder on NTFS. The export check folds names, so the environment gate runs and the
+/// after-gate check is clean. (Before the fix no gate ever started for such a repository.)
+#[cfg(windows)]
+#[test]
+fn an_environment_gate_runs_when_a_folder_is_spelled_two_ways() {
+    let (env, marker) = probe_then_dbsync("exit 0\n", "exit 0\n");
+    let source = env.root.join("cased-source.txt");
+    std::fs::write(&source, "cased\n").unwrap();
+    let blob = git(
+        &env.repo,
+        &["hash-object", "-w", &source.display().to_string()],
+    );
+    git(
+        &env.repo,
+        &[
+            "-c",
+            "core.ignorecase=false",
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{},Src/Cased.txt", blob.trim()),
+        ],
+    );
+    git(
+        &env.repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "a folder spelled two ways",
+        ],
+    );
+    create(&env, "R23-C");
+    let s = script(
+        &env,
+        "r23c.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R23-C", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R23-C");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert!(marker.exists(), "the environment gate ran");
+    let d = deployments(&env);
+    assert_eq!((d.len(), d[0].ok), (1, Some(true)));
+}
+
 /// M11-R20 AC-1 (X15): `.gitattributes` says `text eol=crlf` and the blobs still hold CRLF (never
 /// renormalised): the export is accepted, the environment gate runs and the after-gate check is
 /// clean. (Round 3 compared Git's view after its clean conversion and blocked every gate.)
