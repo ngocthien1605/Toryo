@@ -995,3 +995,164 @@ fn a_bare_cmd_name_cannot_be_planted_by_the_implementer() {
         );
     }
 }
+
+/// M11-R14 Do 3 (R13–R15 review): `task config --reload` recomputes the build-output entries
+/// against the task's base commit. With nothing changed the digest is the same — it would
+/// differ if the reload left them out; after the gate's script is renamed in the configuration
+/// the frozen list follows.
+#[test]
+fn a_reload_recomputes_the_build_output_entries() {
+    let (env, entry) = build_output_repo();
+    let (code, err) = create_as(&env, "R14-R");
+    assert_eq!(code, 0, "{err}");
+    let s = script(
+        &env,
+        "r14r.json",
+        json!({ "planner": [turn(vec![plan()])] }),
+    );
+    // to the plan gate: a waiting state, where a reload is allowed
+    let (_, err) = toryo(&env, &["run", "R14-R", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "R14-R").state, St::WaitingPlanApproval, "{err}");
+    let (code, err) = toryo(&env, &["task", "config", "R14-R", "--reload"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("the effective configuration is unchanged"),
+        "{err}"
+    );
+    let other = entry.replace("check", "other");
+    let y = std::fs::read_to_string(&env.config).unwrap();
+    std::fs::write(&env.config, y.replace(entry, &other)).unwrap();
+    let (code, err) = toryo(&env, &["task", "config", "R14-R", "--reload"], &[]);
+    assert_eq!(code, 0, "{err}");
+    let cfgv = toryo::engine::task::frozen_config(&task(&env, "R14-R")).unwrap();
+    assert_eq!(
+        cfgv.build_entries
+            .iter()
+            .map(|e| (e.gate.as_str(), e.path.as_str()))
+            .collect::<Vec<_>>(),
+        [("smoke", other.as_str())]
+    );
+}
+
+/// M11-R13 (R13–R15 review): a task that already has a verify checkout follows a changed
+/// `verify.verify_root` after `task config --reload` — a new checkout is made under the new
+/// root; the old folder is left alone.
+#[test]
+fn a_changed_verify_root_is_used_after_a_reload() {
+    let env = setup("codex-openai");
+    let (code, err) = toryo(
+        &env,
+        &[
+            "task",
+            "create",
+            "--file",
+            "TASK.md",
+            "--id",
+            "R13-V",
+            "--max-fix-cycles",
+            "1",
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    // two verify runs fail (no `Divide-Numbers` yet) → Escalated, with a checkout under `verify`
+    let s = script(
+        &env,
+        "r13v.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![implementation()]), turn(vec![implementation()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R13-V", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R13-V");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    let checkout = |env: &Env| -> std::path::PathBuf {
+        let vr: Value = serde_json::from_slice(
+            &std::fs::read(task(env, "R13-V").artifacts().join("VERIFY_RESULT.json")).unwrap(),
+        )
+        .unwrap();
+        std::path::PathBuf::from(vr["verify_checkout"].as_str().unwrap())
+    };
+    let old = checkout(&env);
+    assert!(
+        old.starts_with(env.root.join("verify")),
+        "{}",
+        old.display()
+    );
+    // the owner moves the verify root
+    let y = std::fs::read_to_string(&env.config).unwrap();
+    assert!(y.contains("/verify\""), "{y}");
+    std::fs::write(&env.config, y.replace("/verify\"", "/verify2\"")).unwrap();
+    let (code, err) = toryo(&env, &["task", "config", "R13-V", "--reload"], &[]);
+    assert_eq!(code, 0, "{err}");
+    let s = script(
+        &env,
+        "r13v2.json",
+        json!({
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "R13-V",
+            "--note",
+            "add Divide-Numbers",
+            "--yes",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(task(&env, "R13-V").state, St::Completed, "{err}");
+    let new = checkout(&env);
+    assert!(
+        new.starts_with(env.root.join("verify2")),
+        "{}",
+        new.display()
+    );
+    assert!(old.exists(), "the old checkout is left alone");
+}
+
+/// M11-R15 (R13–R15 review): command lines the first version of the reader refused although
+/// their script is in the base commit — a head without an extension in a `cmd` string
+/// (`scripts\build` runs `scripts\build.cmd`), a `Push-Location`, a quoted string that is an
+/// expression, a `cd` that is not the head of its command. All are admitted; what the gate
+/// clearly runs is protected.
+#[test]
+fn lines_the_reader_must_not_refuse() {
+    let env = setup("codex-openai");
+    commit_repo(
+        &env,
+        &[
+            ("scripts/build.cmd", "@exit /b 0\n"),
+            ("ci/x.ps1", "exit 0\n"),
+            ("run-tests.sh", "exit 0\n"),
+        ],
+        "gate scripts",
+    );
+    with_verify_command(
+        &env,
+        concat!(
+            "    - { name: build, program: cmd, args: ['/c', 'scripts\\build'] }\n",
+            "    - { name: ci, program: pwsh, args: ['-Command', 'Push-Location ci; ./x.ps1; Pop-Location'] }\n",
+            "    - { name: pester, program: pwsh, args: ['-Command', \"Invoke-Pester -Path @('tests/unit','tests/int')\"] }\n",
+            "    - { name: maybe, program: bash, args: ['-c', 'if [ -d frontend ]; then cd frontend; fi; ./run-tests.sh'] }\n",
+            "    - { name: deno, program: deno, args: ['run', '-A', 'npm:@biomejs/biome', 'check'] }"
+        ),
+    );
+    let (code, err) = create_as(&env, "R15-V");
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R15-V");
+    let cfgv = toryo::engine::task::frozen_config(&t).unwrap();
+    let (_, prot, _) = toryo::engine::runner::task_policy(&t, &cfgv).unwrap();
+    for p in ["scripts/build.cmd", "scripts/build.bat", "ci/x.ps1"] {
+        assert!(prot.violates(p), "{p} is protected");
+    }
+    for p in ["x.ps1", "tests/unit", "frontend/run-tests.sh"] {
+        assert!(!prot.violates(p), "{p} is not");
+    }
+}

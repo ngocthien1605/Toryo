@@ -786,6 +786,7 @@ round is the new branch `m11/review-3` from `main`. One commit per task; it ends
 - [x] R14 — M18: protection comes from the base commit; build output may exist
 - [x] R15 — command strings and `cmd` bare names
 - [x] R16 — a gate the machine cannot run is found before the build; the hints tell the whole fix
+- [x] Review of R13–R15 (independent subagent) — its findings fixed in one follow-up commit
 - [ ] R17 — Low fixes, missing tests, stale docs
 - [ ] Finish — notes, README, HUONG-DAN
 - [ ] Push and pull request
@@ -985,6 +986,63 @@ round is the new branch `m11/review-3` from `main`. One commit per task; it ends
   then plain resume completes), `store::tests::an_escalation_and_its_class_are_one_transaction` (both or neither),
   `runner::tests::next_action_of_the_five_machine_caused_classes` (the `status` text of the five classes, the hint,
   and that the text is never parsed for the class).
+
+#### Review of R13–R15 (independent subagent) — follow-up commit
+
+An independent reviewer read the three commits against the list, ran the unit and e2e tests in its own worktree,
+reverted the R13 fix to confirm its test fails, and put about 100 command lines of its own through the reader.
+**R13 and R14: sound** (no stat shortcut in `export_changed`; no path to commit a build entry; the hash unchanged
+without build entries; Unix-only code reads correctly). **R15 passed its own acceptance list but still refused
+realistic command lines**, several of them regressions against round 2. Fixed here:
+
+- **A change of folder that was neither followed nor stopped the reading** (the script was then looked for in the
+  root and refused, the real one unprotected): `Push-Location` / `Pop-Location` are followed like `pushd` / `popd`;
+  a `cd`-family word that is **not the head** of its command (`if [ -d web ]; then cd web; fi`, `command cd ci`,
+  `if exist ci cd ci`) stops the reading; `cmd`'s glued forms are read (`cd..`, `cd\`, `cd/d sub`).
+- **A head with a separator but no extension in a `cmd` / PowerShell string** (`cmd /c scripts\build` runs
+  `scripts\build.cmd`; `pwsh -Command ".\build …"` runs `build.ps1`; `.\gradlew` runs `gradlew.bat`): it is now
+  protected under `<head>`, `<head>.ps1` (PowerShell) and `<head>` + each PATHEXT extension — none refused.
+- **Refusable only when it clearly names a script** (the reviewer's safety net, the owner's rule "when not sure,
+  refuse nothing"): a head is refused-when-missing only if it starts with `./` / `../` (`.\`, `..\`) or has a script
+  extension; any other head with a separator (`ci/run`, `node_modules/.bin/jest`) is protected, not refused. The
+  16 lines of AC-1 keep their verdicts.
+- **A quoted string in head position in PowerShell is an expression**, not a command (`@('tests/unit','tests/int')`,
+  `[IO.File]::Exists('build/app.exe')`, `'out/x.txt' | Should -Exist`, a `switch` label): it is an entry only after
+  `&` or `.`; otherwise an argument.
+- **Syntax the reader walked through:** a here-document stops the reading (its body is data); a line continuation
+  (`\`, a backtick, `^` before a line break) joins its lines; a shell's `$(( … ))`, `(( … ))` and `NAME=( … )` are
+  skipped; `>|` is a redirection. **`cmd`:** an unquoted head ends at its first `/` (`rd/s/q`, `dir/b`); the command
+  of `for /f … in ('scripts\version.cmd')` is read without its quotes.
+- **`deno run npm:…` / `jsr:…` / `https://…`:** a module specifier is no repository path (no entry, no note).
+- **PATHEXT (extends Do 5):** `cmd.exe` tries every `PATHEXT` extension in the working directory, so a root `npm.js`
+  or `npm.vbs` would run through Windows Script Host for `cmd /c "npm run build"`. A bare head is now protected as
+  `<name>` + the **default** PATHEXT (`.com .exe .bat .cmd .vbs .vbe .js .jse .wsf .wsh .msc`) — a fixed list, not
+  this machine's `%PATHEXT%`, so the protected set is the same everywhere. Deviation from the letter of the list
+  (four extensions), in the direction it asks for: more is protected, nothing more is refused.
+- **`pwsh -WorkingDirectory ci`** (round-1 Open item): the `-Command` string, `-File x` and a positional `.ps1`
+  resolve under it; a folder that cannot be followed gives nothing.
+- **A double scan:** the words of a command string were also read as plain arguments of the program (in the root
+  folder). They are read once now, by the reader, where the `cd` put them (`command_string` returns the argument
+  range).
+- **R13:** the Low write probe checks that its process finished (a timeout is an error, never "cannot write"), and
+  `verify::probe` runs a **positive control** — in a folder that does carry a Low label the same Low process must
+  succeed, else `verify_boundary_unavailable`. **Test gaps closed:** `a_changed_verify_root_is_used_after_a_reload`
+  (a task with a recorded checkout follows the new root), `a_reload_recomputes_the_build_output_entries` (R14 Do 3:
+  "unchanged" with a build entry; a renamed script changes the frozen list).
+- **Tests:** `cmdline::tests` (now seven: `what_is_refused_when_missing`, `what_is_not_a_command`,
+  `odd_input_does_not_panic` added; `cd` and bare-name tests extended),
+  `checks::tests::command_strings_and_cmd_bare_names` (11 review rows added),
+  `tests/m11_gates.rs::lines_the_reader_must_not_refuse` (admission of five reviewer lines; `scripts/build.cmd` and
+  `ci/x.ps1` protected), and the two tests above.
+- **Recorded, not fixed:** the interpreter and `make` rules are not applied *inside* a command string
+  (`sh -c "make test"` protects no makefile; `bash -c "npm run build && node dist/cli.js"` sees `dist/cli.js` as an
+  argument); a script behind `env`, `timeout`, `!`, `then`, `source` is an argument (protected when it exists, not
+  refused); `nmake /f`; "ignored" is asked of the repository's working tree at `task create` / reload, not of the
+  base commit; a machine with a custom `%PATHEXT%` has more extensions than the fixed list; `verify::mutated` looks
+  at tracked files only, so code a check gate ran can leave an untracked `npm.cmd` in the verify checkout that a
+  later `cmd` gate of the same run would find first (outside this round); the R13 commit body says each new test
+  fails before the fix — `the_content_check_follows_the_line_ending_settings` is a guard that passes on the old code
+  too.
 
 ## Progress
 

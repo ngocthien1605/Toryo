@@ -761,16 +761,22 @@ fn verify_files_with(
         }
         // every other argument naming a file of the repository (also the value of
         // `KEY=value`, `--flag=value`, `-Flag:value`, `/p:Name=value`, M11-R10)
-        for a in args {
+        // M11-R15 (X10): the words of a command string that are not heads are arguments too —
+        // read by its shell's rules, in the folder its `cd` put them, not as arguments of
+        // their own
+        let string = command_string(&program, args);
+        for (i, a) in args.iter().enumerate() {
+            if string.as_ref().is_some_and(|s| s.3.contains(&i)) {
+                continue;
+            }
             for v in arg_values(a) {
                 if let Some(r) = names_file(&v) {
                     add(r);
                 }
             }
         }
-        // M11-R15 (X10): the words of a command string that are not heads are arguments too
-        if let Some((s, shell)) = command_string(&program, args) {
-            for v in super::cmdline::parse(&s, shell).args {
+        if let Some((s, shell, dir, _)) = string {
+            for v in super::cmdline::parse_in(&s, shell, &dir).args {
                 if let Some(r) = names_file(&v) {
                     add(r);
                 }
@@ -878,7 +884,7 @@ fn plain_path(p: &str) -> bool {
         .any(|c| c.is_whitespace() || "*?[]$%~".contains(c))
 }
 
-fn has_script_ext(p: &str) -> bool {
+pub(super) fn has_script_ext(p: &str) -> bool {
     let lower = p.to_ascii_lowercase();
     SCRIPT_EXTENSIONS.iter().any(|x| lower.ends_with(x))
 }
@@ -913,22 +919,34 @@ fn is_command_flag(a: &str) -> bool {
 /// M11-R15 (X10): the **command string** a verify command hands to a shell, and which shell
 /// reads it — the rest of the arguments after `-Command` / `-c` of `pwsh` / `powershell`
 /// (unless `-File` is given) or after `/c` (`/k`) of `cmd`, joined; the argument after a
-/// `sh`-family `-c`, also inside a short-flag cluster (`-ec`, `-lc`, `-euxc`). `None`: the
-/// command runs no command string.
-pub fn command_string(program: &str, args: &[String]) -> Option<(String, Shell)> {
+/// `sh`-family `-c`, also inside a short-flag cluster (`-ec`, `-lc`, `-euxc`) — with the folder
+/// it starts in (`""`: the checkout root; PowerShell's `-WorkingDirectory`). `None`: the command
+/// runs no command string, or where it runs cannot be followed. The last part is the range of
+/// `args` that make up the string: they are read by [`super::cmdline`], not as arguments of
+/// their own.
+pub fn command_string(
+    program: &str,
+    args: &[String],
+) -> Option<(String, Shell, String, std::ops::Range<usize>)> {
     let base = program_base(program);
     if base == "pwsh" || base == "powershell" {
         if args.iter().any(|a| is_file_flag(a)) {
             return None;
         }
+        let dir = pwsh_dir(args)?;
         let i = args.iter().position(|a| is_command_flag(a))?;
-        return Some((args[i + 1..].join(" "), Shell::Pwsh));
+        return Some((args[i + 1..].join(" "), Shell::Pwsh, dir, i..args.len()));
     }
     if base == "cmd" {
         let i = args
             .iter()
             .position(|a| a.eq_ignore_ascii_case("/c") || a.eq_ignore_ascii_case("/k"))?;
-        return Some((args[i + 1..].join(" "), Shell::Cmd));
+        return Some((
+            args[i + 1..].join(" "),
+            Shell::Cmd,
+            String::new(),
+            i..args.len(),
+        ));
     }
     if !SH_FAMILY.contains(&base.as_str()) {
         return None;
@@ -937,11 +955,13 @@ pub fn command_string(program: &str, args: &[String]) -> Option<(String, Shell)>
         .iter()
         .find(|(n, _, _)| *n == base)
         .map(|(_, _, v)| *v)?;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
+    let mut it = args.iter().enumerate();
+    while let Some((_, a)) = it.next() {
         let cluster = a.len() > 2 && a.starts_with('-') && !a.starts_with("--");
         if a == "-c" || (cluster && a.contains('c')) {
-            return it.next().map(|s| (s.clone(), Shell::Sh));
+            return it
+                .next()
+                .map(|(j, s)| (s.clone(), Shell::Sh, String::new(), j..j + 1));
         }
         if valued.iter().any(|f| a == f) || (cluster && a.ends_with(['o', 'O'])) {
             it.next(); // the flag's value
@@ -952,6 +972,38 @@ pub fn command_string(program: &str, args: &[String]) -> Option<(String, Shell)>
         }
     }
     None
+}
+
+/// PowerShell's `-WorkingDirectory` / `-wd` (R13–R15 review): the folder the command starts
+/// in, repository-relative with `/` — `Some("")` when it is not given, `None` when it cannot be
+/// followed (a variable, an absolute path, a `..`).
+fn pwsh_dir(args: &[String]) -> Option<String> {
+    let Some(i) = args
+        .iter()
+        .position(|a| a.eq_ignore_ascii_case("-workingdirectory") || a.eq_ignore_ascii_case("-wd"))
+    else {
+        return Some(String::new());
+    };
+    let d = args.get(i + 1)?;
+    if !plain_path(d) || Path::new(d).has_root() || d.as_bytes().get(1) == Some(&b':') {
+        return None;
+    }
+    let parts: Vec<&str> = d
+        .split(['/', '\\'])
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    (!parts.contains(&"..")).then(|| parts.join("/"))
+}
+
+/// `npm:pkg`, `jsr:@std/x`, `https://…`, `file:…` (R13–R15 review): a module specifier, not a
+/// repository path.
+fn has_scheme(a: &str) -> bool {
+    a.split_once(':').is_some_and(|(s, _)| {
+        s.len() >= 2
+            && s.starts_with(|c: char| c.is_ascii_alphabetic())
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+    })
 }
 
 /// M11-R15: `make` / `gmake` — the makefile is the entry script. `-f <file>` / `--file=<file>`
@@ -1028,18 +1080,29 @@ fn make_entries(args: &[String]) -> Vec<Entry> {
 ///   none; a folder or a glob is no script;
 /// - any other program: none (`-f` of `dotnet`, `docker` or `grep` is not a script).
 pub fn entry_scripts(program: &str, args: &[String]) -> Vec<Entry> {
-    if let Some((s, shell)) = command_string(program, args) {
-        return super::cmdline::parse(&s, shell).entries;
+    if let Some((s, shell, dir, _)) = command_string(program, args) {
+        return super::cmdline::parse_in(&s, shell, &dir).entries;
     }
     let base = program_base(program);
     if base == "pwsh" || base == "powershell" {
+        // `-WorkingDirectory ci`: the script is looked for there; not followed → nothing
+        let Some(dir) = pwsh_dir(args) else {
+            return Vec::new();
+        };
+        let under = |a: &str| {
+            if dir.is_empty() || Path::new(a).has_root() {
+                a.to_string()
+            } else {
+                format!("{dir}/{a}")
+            }
+        };
         if let Some(i) = args.iter().position(|a| is_file_flag(a)) {
             return args
                 .get(i + 1)
                 .filter(|a| !a.ends_with(['/', '\\']))
                 .map(|a| {
                     vec![Entry {
-                        path: a.clone(),
+                        path: under(a),
                         refusable: sure(a),
                     }]
                 })
@@ -1052,7 +1115,7 @@ pub fn entry_scripts(program: &str, args: &[String]) -> Vec<Entry> {
             })
             .map(|a| {
                 vec![Entry {
-                    path: a.clone(),
+                    path: under(a),
                     refusable: true,
                 }]
             })
@@ -1094,7 +1157,7 @@ pub fn entry_scripts(program: &str, args: &[String]) -> Vec<Entry> {
                     return Vec::new(); // `deno test`, `deno task …`: no script argument
                 }
             }
-            return if is_literal(a) {
+            return if is_literal(a) && !has_scheme(a) {
                 vec![Entry {
                     path: a.clone(),
                     refusable: sure(a),
@@ -1153,10 +1216,12 @@ pub fn script_like_args(cmds: &[CommandSpec], repo: &Path) -> Vec<(String, Strin
             .into_iter()
             .filter_map(|e| repo_relative(repo, &e.path))
             .collect();
+        let string = command_string(program, args);
         let mut candidates: Vec<String> = Vec::new();
         let mut prev: Option<&String> = None;
-        for a in args {
-            let skip = prev.is_some_and(|p| super::cmdline::output_flag(p));
+        for (i, a) in args.iter().enumerate() {
+            let skip = prev.is_some_and(|p| super::cmdline::output_flag(p))
+                || string.as_ref().is_some_and(|s| s.3.contains(&i));
             prev = Some(a);
             if !skip {
                 candidates.extend(
@@ -1168,11 +1233,11 @@ pub fn script_like_args(cmds: &[CommandSpec], repo: &Path) -> Vec<(String, Strin
         }
         // the argument words of a command string (literal by construction; a path may hold a
         // space there)
-        if let Some((s, shell)) = command_string(program, args) {
-            candidates.extend(super::cmdline::parse(&s, shell).args);
+        if let Some((s, shell, dir, _)) = string {
+            candidates.extend(super::cmdline::parse_in(&s, shell, &dir).args);
         }
         for t in candidates {
-            if !t.contains(['/', '\\']) || !has_script_ext(&t) {
+            if !t.contains(['/', '\\']) || !has_script_ext(&t) || has_scheme(&t) {
                 continue;
             }
             let Some(r) = repo_relative(repo, &t) else {
@@ -2056,39 +2121,7 @@ mod tests {
                 &[("scripts/smoke.ps1", true)],
                 &["build/app.exe"],
             ),
-            // M11-R15 (changed, X10): a bare head of a `cmd` string is protected under every
-            // name `cmd.exe` tries in the working directory — and never refused (it was
-            // refusable, and only when no program of that name was on PATH)
-            (
-                "cmd",
-                &["/c", "x.cmd arg"],
-                &[
-                    ("x.cmd", false),
-                    ("x.cmd.com", false),
-                    ("x.cmd.exe", false),
-                    ("x.cmd.bat", false),
-                    ("x.cmd.cmd", false),
-                ],
-                &[],
-            ),
-            // R10 review: a bare entry in a later `&&` segment, not only the first
-            (
-                "cmd",
-                &["/c", "setup.exe && run.cmd"],
-                &[
-                    ("setup.exe", false),
-                    ("setup.exe.com", false),
-                    ("setup.exe.exe", false),
-                    ("setup.exe.bat", false),
-                    ("setup.exe.cmd", false),
-                    ("run.cmd", false),
-                    ("run.cmd.com", false),
-                    ("run.cmd.exe", false),
-                    ("run.cmd.bat", false),
-                    ("run.cmd.cmd", false),
-                ],
-                &[],
-            ),
+            // (`cmd /c "x.cmd arg"` and `cmd /c "setup.exe && run.cmd"`: below the table)
             (
                 "cmd",
                 &["/c", r"call scripts\x.cmd"],
@@ -2145,20 +2178,41 @@ mod tests {
                 );
             }
         }
-        // M11-R15 (changed, X10): the assertion "with `x.cmd` on PATH, `cmd /c "x.cmd arg"` has
-        // no entry" is gone — `cmd.exe` looks in the working directory before PATH, so the name
-        // is protected whether or not a program of that name is on PATH (the rows above).
+        // M11-R15 (changed, X10): a bare head of a `cmd` string is protected under every name
+        // `cmd.exe` tries in the working directory (`<name>` and the default PATHEXT) — and
+        // never refused. Round 2: a refusable entry, and only when no program of that name was
+        // on PATH; its assertion "with `x.cmd` on PATH there is no entry" is gone — `cmd.exe`
+        // looks in the working directory before PATH.
+        let bare = |name: &str| -> Vec<(String, bool)> {
+            [""].into_iter()
+                .chain(crate::engine::cmdline::PATHEXT)
+                .map(|x| (format!("{name}{x}"), false))
+                .collect()
+        };
+        let got = |args: &[&str]| -> Vec<(String, bool)> {
+            entry_scripts("cmd", &s(args))
+                .into_iter()
+                .map(|e| (e.path, e.refusable))
+                .collect()
+        };
+        assert_eq!(got(&["/c", "x.cmd arg"]), bare("x.cmd"));
+        // R10 review: a bare entry in a later `&&` segment, not only the first
+        let mut two = bare("setup.exe");
+        two.extend(bare("run.cmd"));
+        assert_eq!(got(&["/c", "setup.exe && run.cmd"]), two);
     }
 
     /// M11-R15 AC-1 (X10): command strings and `cmd` bare names — for each command line its
     /// entries (path, refused-when-missing), the net (notes, never refused) and the protected
-    /// names of a task whose base commit holds the files in `base`.
+    /// names of a task whose base commit holds the files in `base`. After the 16 lines of the
+    /// list: the rest of Do 6, and the lines the R13–R15 review found.
     #[test]
     fn command_strings_and_cmd_bare_names() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // `<name>` and `<name>` + each default PATHEXT extension: protected, never refused
         let bare = |name: &str| -> Vec<(String, bool)> {
-            ["", ".com", ".exe", ".bat", ".cmd"]
-                .iter()
+            [""].into_iter()
+                .chain(crate::engine::cmdline::PATHEXT)
                 .map(|x| (format!("{name}{x}"), false))
                 .collect()
         };
@@ -2166,6 +2220,7 @@ mod tests {
         let none = Vec::<(String, bool)>::new;
         let base: std::collections::HashSet<String> = [
             "ci/x.sh",
+            "ci/x.ps1",
             "sub/run.bat",
             "my scripts/x.ps1",
             "gradlew",
@@ -2173,6 +2228,8 @@ mod tests {
             "scripts/a.cmd",
             "scripts/b.cmd",
             "scripts/x.cmd",
+            "scripts/build.cmd",
+            "build.ps1",
             "x.ps1",
             "ci.mk",
             "scripts/check.ts",
@@ -2181,13 +2238,13 @@ mod tests {
         ]
         .map(String::from)
         .into();
-        // (program, args, entries, net, protected)
+        // what is protected: the listed names, or every entry of the line (`None`)
         type Case<'a> = (
             &'a str,
             &'a [&'a str],
             Vec<(String, bool)>,
             &'a [&'a str],
-            &'a [&'a str],
+            Option<&'a [&'a str]>,
         );
         let cases: Vec<Case> = vec![
             (
@@ -2195,71 +2252,53 @@ mod tests {
                 &["-lc", "cd ci && ./x.sh"],
                 one("ci/x.sh", true),
                 &[],
-                &["ci/x.sh"],
+                Some(&["ci/x.sh"]),
             ),
             (
                 "cmd",
                 &["/c", "cd sub && run.bat"],
                 bare("sub/run.bat"),
                 &[],
-                &[
-                    "sub/run.bat",
-                    "sub/run.bat.bat",
-                    "sub/run.bat.cmd",
-                    "sub/run.bat.com",
-                    "sub/run.bat.exe",
-                ],
+                None,
             ),
             (
                 "pwsh",
                 &["-Command", "& './my scripts/x.ps1'"],
                 one("./my scripts/x.ps1", true),
                 &[],
-                &["my scripts/x.ps1"],
+                Some(&["my scripts/x.ps1"]),
             ),
             (
                 "bash",
                 &["-c", "tsc --outFile build/x.js"],
                 none(),
                 &[],
-                &[],
+                Some(&[]),
             ),
             (
                 "pwsh",
                 &["-Command", "Invoke-Pester tests/New.Tests.ps1"],
                 none(),
                 &["tests/New.Tests.ps1"],
-                &[],
+                Some(&[]),
             ),
             (
                 "bash",
                 &["-c", "./gradlew test"],
                 one("./gradlew", true),
                 &[],
-                &["gradlew"],
+                Some(&["gradlew"]),
             ),
             // not followed: nothing refused, nothing protected
-            ("bash", &["-c", "cd $DIR && ./x.sh"], none(), &[], &[]),
+            ("bash", &["-c", "cd $DIR && ./x.sh"], none(), &[], Some(&[])),
             (
                 "cmd",
                 &["/c", "npm.cmd run build"],
                 bare("npm.cmd"),
                 &[],
-                &[
-                    "npm.cmd",
-                    "npm.cmd.bat",
-                    "npm.cmd.cmd",
-                    "npm.cmd.com",
-                    "npm.cmd.exe",
-                ],
+                None,
             ),
-            (
-                "cmd",
-                &["/c", "build"],
-                bare("build"),
-                &[],
-                &["build", "build.bat", "build.cmd", "build.com", "build.exe"],
-            ),
+            ("cmd", &["/c", "build"], bare("build"), &[], None),
             (
                 "cmd",
                 &["/c", r"scripts\a.cmd && scripts\b.cmd"],
@@ -2268,21 +2307,21 @@ mod tests {
                     (r"scripts\b.cmd".to_string(), true),
                 ],
                 &[],
-                &["scripts/a.cmd", "scripts/b.cmd"],
+                Some(&["scripts/a.cmd", "scripts/b.cmd"]),
             ),
             (
                 "cmd",
                 &["/c", r"call scripts\x.cmd"],
                 one(r"scripts\x.cmd", true),
                 &[],
-                &["scripts/x.cmd"],
+                Some(&["scripts/x.cmd"]),
             ),
             (
                 "pwsh",
                 &["-Command", "& { ./x.ps1 }"],
                 one("./x.ps1", true),
                 &[],
-                &["x.ps1"],
+                Some(&["x.ps1"]),
             ),
             // an argument naming a file of the base commit is protected, never refused
             (
@@ -2290,28 +2329,28 @@ mod tests {
                 &["-Command", "msbuild.exe App.sln"],
                 none(),
                 &[],
-                &["App.sln"],
+                Some(&["App.sln"]),
             ),
             (
                 "make",
                 &["-f", "ci.mk", "test"],
                 one("ci.mk", false),
                 &[],
-                &["ci.mk"],
+                Some(&["ci.mk"]),
             ),
             (
                 "deno",
                 &["run", "scripts/check.ts"],
                 one("scripts/check.ts", true),
                 &[],
-                &["scripts/check.ts"],
+                Some(&["scripts/check.ts"]),
             ),
             (
                 "php",
                 &["artisan", "test"],
                 one("artisan", false),
                 &[],
-                &["artisan"],
+                Some(&["artisan"]),
             ),
             // Do 6, the rest of the table
             (
@@ -2319,24 +2358,24 @@ mod tests {
                 &["run", "scripts/x.ts"],
                 one("scripts/x.ts", true),
                 &[],
-                &["scripts/x.ts"],
+                Some(&["scripts/x.ts"]),
             ),
             (
                 "tsx",
                 &["--tsconfig", "tsconfig.ci.json", "src/main.ts"],
                 one("src/main.ts", true),
                 &[],
-                &["src/main.ts"],
+                Some(&["src/main.ts"]),
             ),
             (
                 "ts-node",
                 &["-P", "tsconfig.json", "tools/gen.ts"],
                 one("tools/gen.ts", true),
                 &[],
-                &["tools/gen.ts"],
+                Some(&["tools/gen.ts"]),
             ),
-            ("deno", &["test", "tests/"], none(), &[], &[]),
-            ("php", &["-r", "echo 1;"], none(), &[], &[]),
+            ("deno", &["test", "tests/"], none(), &[], Some(&[])),
+            ("php", &["-r", "echo 1;"], none(), &[], Some(&[])),
             (
                 "make",
                 &[],
@@ -2346,16 +2385,16 @@ mod tests {
                     ("Makefile".to_string(), false),
                 ],
                 &[],
-                &["GNUmakefile", "Makefile", "makefile"],
+                None,
             ),
             (
                 "make",
                 &["-C", "sub", "--file=build/gen.mk", "all"],
                 one("sub/build/gen.mk", true),
                 &[],
-                &["sub/build/gen.mk"],
+                Some(&["sub/build/gen.mk"]),
             ),
-            ("make", &["-C", "$OUT", "all"], none(), &[], &[]),
+            ("make", &["-C", "$OUT", "all"], none(), &[], Some(&[])),
             // an argument is resolved where the `cd` put it; a quoted path keeps its space
             (
                 "sh",
@@ -2363,7 +2402,100 @@ mod tests {
                 none(),
                 // (`x.sh` is an argument of the inner `sh`: the net sees it, the base commit has it)
                 &["ci/x.sh", "ci/my notes/a.sh"],
-                &["ci/x.sh"],
+                Some(&["ci/x.sh"]),
+            ),
+            // ── R13–R15 review ──
+            // a head without an extension in a `cmd` / PowerShell string runs `<head>.cmd`,
+            // `<head>.ps1`, …: all protected, none refused (round 2 refused none either)
+            (
+                "cmd",
+                &["/c", r"scripts\build"],
+                bare(r"scripts\build"),
+                &[],
+                None,
+            ),
+            (
+                "pwsh",
+                &["-Command", r".\build -Configuration Release"],
+                {
+                    let mut v = bare(r".\build");
+                    v.insert(1, (r".\build.ps1".to_string(), false));
+                    v
+                },
+                &[],
+                None,
+            ),
+            // PowerShell: Push-Location is followed; a quoted string is an expression
+            (
+                "pwsh",
+                &["-Command", "Push-Location ci; ./x.ps1; Pop-Location"],
+                one("ci/x.ps1", true),
+                &[],
+                Some(&["ci/x.ps1"]),
+            ),
+            (
+                "pwsh",
+                &[
+                    "-Command",
+                    "Invoke-Pester -Path @('tests/unit','tests/int')",
+                ],
+                none(),
+                &[],
+                Some(&[]),
+            ),
+            // `-WorkingDirectory`: the script is looked for there; not followed → nothing
+            (
+                "pwsh",
+                &["-WorkingDirectory", "ci", "-Command", "./x.ps1"],
+                one("ci/x.ps1", true),
+                &[],
+                Some(&["ci/x.ps1"]),
+            ),
+            (
+                "pwsh",
+                &["-wd", "ci", "-File", "x.ps1"],
+                one("ci/x.ps1", true),
+                &[],
+                // (the argument `x.ps1` also names a root file of this base commit: protected too)
+                Some(&["ci/x.ps1", "x.ps1"]),
+            ),
+            (
+                "pwsh",
+                &["-WorkingDirectory", "%CI%", "-File", "x.ps1"],
+                none(),
+                &[],
+                // (the bare argument `x.ps1` names a file of the base commit: protected)
+                Some(&["x.ps1"]),
+            ),
+            // a `cd` that is not a head stops the reading; a here-document too
+            (
+                "bash",
+                &["-c", "if [ -d ci ]; then cd ci; fi; ./x.sh"],
+                none(),
+                &[],
+                Some(&[]),
+            ),
+            (
+                "bash",
+                &["-c", "cat > .env <<EOF\n./not/a/command.sh\nEOF\n./x.sh"],
+                none(),
+                &[],
+                Some(&[]),
+            ),
+            // a module specifier is no repository path
+            (
+                "deno",
+                &["run", "-A", "npm:@biomejs/biome", "check"],
+                none(),
+                &[],
+                Some(&[]),
+            ),
+            (
+                "deno",
+                &["run", "-A", "https://deno.land/std/http/file_server.ts"],
+                none(),
+                &[],
+                Some(&[]),
             ),
         ];
         let d = tempfile::tempdir().unwrap();
@@ -2382,7 +2514,15 @@ mod tests {
             assert_eq!(got_net, *net, "net: {program} {args:?}");
             let mut files = verify_files_at_base(&cmd, d.path(), &base);
             files.sort();
-            assert_eq!(files, *protected, "protected: {program} {args:?}");
+            let mut want: Vec<String> = match protected {
+                Some(p) => p.iter().map(|x| x.to_string()).collect(),
+                None => entries
+                    .iter()
+                    .filter_map(|e| repo_relative(d.path(), &e.0))
+                    .collect(),
+            };
+            want.sort();
+            assert_eq!(files, want, "protected: {program} {args:?}");
             // refused-when-missing: exactly the refusable entries
             let refused: Vec<String> = verify_entry_points(&cmd, d.path())
                 .into_iter()

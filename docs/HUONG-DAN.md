@@ -716,14 +716,21 @@ trượt đầu tiên; exit code quyết định; mọi gate có `TORYO_TASK`, `
   Với **chuỗi lệnh** (`pwsh -Command`, `cmd /c`, `-c` của shell, cả `-ec`, `-lc`), Toryo đọc chuỗi đó: tách theo dấu
   nháy thành các lệnh đơn tại `&&`, `||`, `;`, `|`, `&`, xuống dòng và `( ) { }`. Chỉ **từ đầu** của mỗi lệnh đơn (sau
   `call`, `.`, `exec`, `time` hoặc `TÊN=giá_trị` nếu có) mới là script đầu vào, và chỉ khi nó là đường dẫn tương đối có
-  `/` hoặc `\` (`./x.sh`, `scripts\x.cmd`, `./gradlew` không cần đuôi; `& './my scripts/x.ps1'` giữ nguyên dấu cách).
-  `cd` / `chdir` / `pushd` / `Set-Location` / `sl` với thư mục tương đối viết thẳng sẽ đổi chỗ phân giải phần còn lại:
-  `bash -lc "cd ci && ./x.sh"` chạy — và bảo vệ — `ci/x.sh`. Nếu `cd` dùng biến, đường dẫn tuyệt đối, `-` hoặc không có
-  đối số thì Toryo không theo được: phần còn lại của chuỗi **không bị từ chối và không được bảo vệ**. Tên trần đứng đầu
-  lệnh trong chuỗi `cmd` (`cmd /c build`, `cmd /c "npm.cmd run build"`, không phải lệnh nội bộ như `cd`, `echo`, `set`)
-  được **bảo vệ, không bao giờ bị từ chối**, dưới các tên `<tên>`, `<tên>.com`, `.exe`, `.bat`, `.cmd` trong thư mục đó,
-  kể cả khi PATH có chương trình cùng tên: `cmd.exe` tìm trong thư mục làm việc trước PATH, mà thư mục làm việc của
-  gate là checkout (implementer tạo file như vậy → task dừng với `protected_config_changed`).
+  `/` hoặc `\` (`& './my scripts/x.ps1'` giữ nguyên dấu cách). Nó chỉ bị từ chối khi thiếu nếu rõ ràng là script: bắt
+  đầu bằng `./` hoặc `../` (`./gradlew` trong chuỗi shell không cần đuôi) hoặc có đuôi script (`scripts\x.cmd`); các
+  từ đầu khác có dấu phân cách thì được bảo vệ, không bị từ chối. Trong chuỗi `cmd` hoặc PowerShell, từ đầu không có
+  đuôi (`scripts\build`, `.\gradlew`) nghĩa là `scripts\build.cmd`, `.ps1`, …: mọi tên như vậy được bảo vệ, không tên
+  nào bị từ chối. `cd` / `chdir` / `pushd` / `Set-Location` / `sl` / `Push-Location` với thư mục tương đối viết thẳng
+  sẽ đổi chỗ phân giải phần còn lại (`popd` / `Pop-Location` quay lại; `pwsh -WorkingDirectory ci` bắt đầu ở đó):
+  `bash -lc "cd ci && ./x.sh"` chạy — và bảo vệ — `ci/x.sh`. Toryo **dừng đọc** — phần còn lại của chuỗi không bị từ
+  chối và không được bảo vệ — khi không theo được: `cd` dùng biến, đường dẫn tuyệt đối, `-` hoặc không có đối số;
+  `cd` không đứng đầu lệnh (`if [ -d web ]; then cd web; fi`); here-document. Chuỗi trong dấu nháy đứng đầu lệnh của
+  PowerShell là biểu thức, không phải lệnh (`'out/x.txt' | Should -Exist`, `@('a/b','c/d')`), trừ khi có `&` hoặc `.`
+  chạy nó. Tên trần đứng đầu lệnh trong chuỗi `cmd` (`cmd /c build`, `cmd /c "npm.cmd run build"`, không phải lệnh nội
+  bộ như `cd`, `echo`, `set`) được **bảo vệ, không bao giờ bị từ chối**, dưới các tên `<tên>` và `<tên>` + từng đuôi
+  `PATHEXT` mặc định (`.com .exe .bat .cmd .vbs .vbe .js .jse .wsf .wsh .msc`) trong thư mục đó, kể cả khi PATH có
+  chương trình cùng tên: `cmd.exe` tìm trong thư mục làm việc trước PATH, mà thư mục làm việc của gate là checkout
+  (implementer tạo file như vậy → task dừng với `protected_config_changed`).
   Script đầu vào thiếu chỉ bị từ chối khi có `/`/`\` hoặc đuôi script **và** repo không ignore nó; `sh check`,
   `php artisan`, `make -f ci.mk` được bảo vệ, không bị từ chối. Script thiếu **và bị ignore** (`node dist/cli.js` với
   `dist/` bị ignore) là output build: được nhận và ghi vào task (`build_entries` trong `toryo task config <id>`);

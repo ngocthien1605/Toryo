@@ -6,24 +6,32 @@
 //! - The **head** of a simple command is its first word after an optional `call`, `.`, `exec`,
 //!   `time` or leading `NAME=value` assignments (PowerShell's call operator `&` is a separator,
 //!   so the word after it is a head too).
-//! - A `cd` / `chdir` / `pushd` / `Set-Location` / `sl` with one literal relative folder moves
-//!   where the following commands resolve (`popd` goes back; a shell's `( … )` scopes it). With
-//!   any other argument — a variable, an absolute path, `-`, nothing — the string cannot be
-//!   followed: nothing more is found in the rest of it.
-//! - A head that is a relative path with a path separator is an **entry script** (`./x.sh`,
-//!   `scripts\x.cmd`, `./gradlew` — no extension needed): protected whether or not it exists,
-//!   refused at admission when the base commit lacks it and the repository does not ignore it.
+//! - A `cd` / `chdir` / `pushd` / `Set-Location` / `sl` / `Push-Location` with one literal
+//!   relative folder moves where the following commands resolve (`popd` / `Pop-Location` go
+//!   back; a shell's `( … )` scopes it). With any other argument — a variable, an absolute path,
+//!   `-`, nothing — or with a `cd` that is not the head of its command (`if … then cd x`), the
+//!   string cannot be followed: nothing more is found in the rest of it. A here-document stops
+//!   the reading too.
+//! - A head that is a relative path with a path separator is an **entry script**: protected
+//!   whether or not it exists. It is **refusable** (admission refuses it when the base commit
+//!   lacks it and the repository does not ignore it) only when it clearly names a script: it
+//!   starts with `./` or `../` (`.\`, `..\`) or has a script extension. `./gradlew` needs no
+//!   extension in a `sh` string. In a `cmd` or PowerShell string a head without an extension
+//!   (`scripts\build`, `.\gradlew`) runs `<head>.cmd`, `<head>.ps1`, …: every such name is
+//!   protected and none is refused.
 //! - A bare head of a `cmd` string that is not a built-in is **protected, never refused**, as
-//!   `<name>`, `<name>.com`, `<name>.exe`, `<name>.bat`, `<name>.cmd` in the current folder:
-//!   `cmd.exe` looks in the working directory before PATH, and a check gate's working directory
-//!   is the checkout root. PowerShell and the `sh` family never run a bare name from the working
+//!   `<name>` and `<name>` + each default `PATHEXT` extension in the current folder: `cmd.exe`
+//!   looks in the working directory before PATH, and a check gate's working directory is the
+//!   checkout root. PowerShell and the `sh` family never run a bare name from the working
 //!   directory.
+//! - In PowerShell a **quoted** string in head position is an expression, not a command
+//!   (`'out/x.txt' | Should -Exist`, `@('a/b','c/d')`), unless it follows `&` or `.`.
 //! - Every other word is an **argument** ([`Parsed::args`]): never an entry, never refused.
 //!
 //! A word that holds a variable, a glob or an escape is not literal: it is never an entry and
 //! never an argument. When in doubt the reader refuses nothing.
 
-use super::checks::{arg_values, Entry};
+use super::checks::{arg_values, has_script_ext, Entry};
 
 /// Which shell reads the command string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,9 +47,9 @@ pub enum Shell {
 /// What a command string holds.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Parsed {
-    /// The entry scripts (heads with a path separator: refusable) and, for `cmd`, the names a
-    /// bare head can resolve to in the working directory (protected, never refused). Paths are
-    /// as written while no `cd` moved the folder, else repository-relative with `/`.
+    /// The entry scripts (heads with a path separator) and, for `cmd`, the names a bare head
+    /// can resolve to in the working directory (protected, never refused). Paths are as written
+    /// while no `cd` moved the folder, else repository-relative with `/`.
     pub entries: Vec<Entry>,
     /// The other words that are literal relative paths (also the value of `KEY=value`,
     /// `--flag=value`, …), resolved like the entries; the value of an output flag (`-o`,
@@ -49,15 +57,25 @@ pub struct Parsed {
     pub args: Vec<String>,
 }
 
+/// One word: its text without quotes, whether nothing in it expands, and whether it began
+/// with a quote.
+#[derive(Debug, Clone)]
+struct Word {
+    text: String,
+    literal: bool,
+    quoted: bool,
+}
+
 enum Tok {
-    Word {
-        text: String,
-        literal: bool,
-    },
+    Word(Word),
     /// The end of a simple command.
     Sep,
+    /// A single `&`: a separator, and PowerShell's call operator for the next word.
+    Amp,
     Open,
     Close,
+    /// The rest cannot be read (a here-document).
+    Stop,
 }
 
 /// `cmd` built-ins: a bare head that is one of them runs no file.
@@ -114,6 +132,18 @@ const CMD_BUILTINS: &[&str] = &[
     "vol",
 ];
 
+/// The default `PATHEXT` of Windows: what `cmd.exe` appends to a name without an extension,
+/// in the working directory first. The list is fixed (not this machine's `%PATHEXT%`), so a
+/// task's protected set is the same on every machine and every start.
+pub const PATHEXT: [&str; 11] = [
+    ".com", ".exe", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh", ".msc",
+];
+
+/// The words that change the folder (head position).
+const CD: &[&str] = &["cd", "chdir", "set-location", "sl"];
+const PUSHD: &[&str] = &["pushd", "push-location"];
+const POPD: &[&str] = &["popd", "pop-location"];
+
 /// The word in progress and the tokens so far.
 #[derive(Default)]
 struct Lexer {
@@ -121,6 +151,8 @@ struct Lexer {
     text: String,
     /// Nothing in the word expands (a variable, a glob, an escape).
     literal: bool,
+    /// The word began with a quote.
+    quoted: bool,
     /// A word is in progress (also an empty quoted one).
     started: bool,
     /// The next word is a redirection target: dropped.
@@ -128,11 +160,16 @@ struct Lexer {
 }
 
 impl Lexer {
-    fn push(&mut self, c: char, literal: bool) {
+    fn begin(&mut self, quoted: bool) {
         if !self.started {
             self.started = true;
             self.literal = true;
+            self.quoted = quoted;
         }
+    }
+
+    fn push(&mut self, c: char, literal: bool) {
+        self.begin(false);
         self.literal &= literal;
         self.text.push(c);
     }
@@ -144,10 +181,11 @@ impl Lexer {
         }
         let text = std::mem::take(&mut self.text);
         if !std::mem::take(&mut self.drop_next) {
-            self.out.push(Tok::Word {
+            self.out.push(Tok::Word(Word {
                 text,
                 literal: self.literal,
-            });
+                quoted: self.quoted,
+            }));
         }
     }
 
@@ -156,28 +194,58 @@ impl Lexer {
         self.drop_next = false;
         self.out.push(t);
     }
+}
 
-    /// Start a word without a character (an opening quote).
-    fn start(&mut self) {
-        if !self.started {
-            self.started = true;
-            self.literal = true;
+/// The index after the `)` that closes the `(` before `i` (nested parentheses counted), or the
+/// end of the text.
+fn skip_parens(cs: &[char], mut i: usize) -> usize {
+    let mut depth = 1;
+    while i < cs.len() {
+        match cs[i] {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
         }
+        i += 1;
     }
+    i
 }
 
 /// The tokens of `s` as `shell` reads it. Quotes are removed (single and double; `cmd` knows
-/// only double quotes); a redirection (`> out.log`, `2>&1`) is dropped with its target.
+/// only double quotes); a redirection (`> out.log`, `2>&1`) is dropped with its target; a line
+/// continuation joins its lines; a shell's arithmetic (`$(( … ))`, `(( … ))`) and array
+/// (`NAME=( … )`) are skipped — nothing in them is a command.
 fn tokens(s: &str, shell: Shell) -> Vec<Tok> {
     let cs: Vec<char> = s.chars().collect();
     let mut lx = Lexer::default();
     let mut i = 0;
+    // a line break (`\n` or `\r\n`) at `i`: how many characters it takes
+    let newline = |i: usize| match (cs.get(i), cs.get(i + 1)) {
+        (Some('\n'), _) => 1,
+        (Some('\r'), Some('\n')) => 2,
+        _ => 0,
+    };
     while i < cs.len() {
         let c = cs[i];
         i += 1;
+        // a line continuation: `\` (sh), a backtick (PowerShell) or `^` (cmd) before a line break
+        let continues = match shell {
+            Shell::Sh => c == '\\',
+            Shell::Pwsh => c == '`',
+            Shell::Cmd => c == '^',
+        };
+        if continues && newline(i) > 0 {
+            i += newline(i);
+            continue;
+        }
         match c {
             '\'' if shell != Shell::Cmd => {
-                lx.start();
+                lx.begin(true);
                 while i < cs.len() && cs[i] != '\'' {
                     lx.push(cs[i], true);
                     i += 1;
@@ -185,7 +253,7 @@ fn tokens(s: &str, shell: Shell) -> Vec<Tok> {
                 i += 1; // the closing quote
             }
             '"' => {
-                lx.start();
+                lx.begin(true);
                 while i < cs.len() && cs[i] != '"' {
                     let d = cs[i];
                     let expands = match shell {
@@ -206,6 +274,11 @@ fn tokens(s: &str, shell: Shell) -> Vec<Tok> {
                     i += 1;
                 }
             }
+            '<' if shell == Shell::Sh && cs.get(i) == Some(&'<') && cs.get(i + 1) != Some(&'<') => {
+                // a here-document: its body is data, and where it ends is not followed
+                lx.sep(Tok::Stop);
+                break;
+            }
             '>' | '<' => {
                 // an fd number in front (`2>`) belongs to the redirection
                 if lx.started && !lx.text.is_empty() && lx.text.chars().all(|d| d.is_ascii_digit())
@@ -225,6 +298,9 @@ fn tokens(s: &str, shell: Shell) -> Vec<Tok> {
                         i += 1;
                     }
                 } else {
+                    if i < cs.len() && cs[i] == '|' {
+                        i += 1; // `>|`
+                    }
                     lx.drop_next = true;
                 }
             }
@@ -232,8 +308,21 @@ fn tokens(s: &str, shell: Shell) -> Vec<Tok> {
             '&' | '|' => {
                 if i < cs.len() && cs[i] == c {
                     i += 1;
+                    lx.sep(Tok::Sep);
+                } else if c == '&' {
+                    lx.sep(Tok::Amp);
+                } else {
+                    lx.sep(Tok::Sep);
                 }
-                lx.sep(Tok::Sep);
+            }
+            '(' if shell == Shell::Sh
+                && ((lx.started && lx.text.ends_with('$') && cs.get(i) == Some(&'('))
+                    || (lx.started && lx.text.ends_with('='))
+                    || (!lx.started && cs.get(i) == Some(&'('))) =>
+            {
+                // `$(( … ))`, `NAME=( … )`, `(( … ))`: no command inside
+                i = skip_parens(&cs, i);
+                lx.push('(', false);
             }
             '(' => lx.sep(Tok::Open),
             ')' => lx.sep(Tok::Close),
@@ -322,49 +411,116 @@ pub(super) fn output_flag(a: &str) -> bool {
     l == "-o" || l == "-outfile" || l.starts_with("--out")
 }
 
-/// One simple command; `false`: the string cannot be followed any further.
+/// `cd..`, `cd\`, `chdir..` — `cmd` needs no space there: the folder glued to the word.
+fn glued_cd(shell: Shell, w: &str) -> Option<&str> {
+    if shell != Shell::Cmd {
+        return None;
+    }
+    ["chdir", "cd"].iter().find_map(|p| {
+        let (name, rest) = (w.get(..p.len())?, w.get(p.len()..)?);
+        (name.eq_ignore_ascii_case(p) && rest.starts_with(['.', '\\'])).then_some(rest)
+    })
+}
+
+/// A word that changes the folder, wherever it stands.
+fn cd_word(shell: Shell, w: &Word) -> bool {
+    w.literal
+        && (one_of(&w.text, CD)
+            || one_of(&w.text, PUSHD)
+            || one_of(&w.text, POPD)
+            || glued_cd(shell, &w.text).is_some())
+}
+
+/// The file name of `p` has no extension (`scripts\build`, `./gradlew`).
+fn no_extension(p: &str) -> bool {
+    !p.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(p)
+        .trim_start_matches('.')
+        .contains('.')
+}
+
+/// One simple command; `false`: the string cannot be followed any further. `called`: it follows
+/// PowerShell's call operator `&`.
 fn simple(
-    words: &[(String, bool)],
+    words: &[Word],
     shell: Shell,
+    called: bool,
     cur: &mut String,
     dirs: &mut Vec<String>,
     p: &mut Parsed,
 ) -> bool {
     let backslash = shell != Shell::Sh;
-    // `@call x.cmd`, `@echo off`: `cmd` only hides the echo
-    let bare = |w: &'_ str| -> String {
-        if shell == Shell::Cmd {
-            w.trim_start_matches('@').to_string()
-        } else {
-            w.to_string()
+    // `cmd`: `@call x.cmd` only hides the echo; an unquoted head ends at its first `/` (`rd/s/q`,
+    // `cd/d`: the rest is a switch); `for /f` runs a command written in single quotes
+    let mut words: Vec<Word> = words.to_vec();
+    if shell == Shell::Cmd {
+        for w in &mut words {
+            if w.quoted || !w.literal {
+                continue;
+            }
+            let t = w.text.trim_start_matches('@');
+            let t = t
+                .strip_prefix('\'')
+                .and_then(|x| x.strip_suffix('\''))
+                .or_else(|| t.strip_prefix('`').and_then(|x| x.strip_suffix('`')))
+                .unwrap_or(t);
+            w.text = t.to_string();
         }
-    };
+    }
     let mut i = 0;
-    while let Some((w, literal)) = words.get(i) {
-        let w = &bare(w);
-        let prefix = (*literal
-            && (one_of(w, &["call", ".", "exec", "time"])
-                || (shell == Shell::Cmd && one_of(w, &["do", "else"]))))
-            || (shell == Shell::Sh && assignment(w));
+    let mut dotted = false;
+    while let Some(w) = words.get(i) {
+        let dot = w.literal && !w.quoted && w.text == ".";
+        let prefix = (w.literal
+            && !w.quoted
+            && (one_of(&w.text, &["call", "exec", "time"])
+                || dot
+                || (shell == Shell::Cmd && one_of(&w.text, &["do", "else"]))))
+            || (shell == Shell::Sh && assignment(&w.text));
         if !prefix {
             break;
         }
+        dotted |= dot;
         i += 1;
     }
-    let Some((head, literal)) = words.get(i) else {
+    let Some(head) = words.get(i).cloned() else {
         return true;
     };
-    let rest = &words[i + 1..];
-    let head = bare(head);
-    let head = head.as_str();
-    if *literal && one_of(head, &["cd", "chdir", "pushd", "set-location", "sl"]) {
+    let mut rest: Vec<Word> = words[i + 1..].to_vec();
+    let mut head_text = head.text.clone();
+    if shell == Shell::Cmd && head.literal && !head.quoted {
+        if let Some((name, switch)) = head_text.clone().split_once('/') {
+            rest.insert(
+                0,
+                Word {
+                    text: format!("/{switch}"),
+                    literal: true,
+                    quoted: false,
+                },
+            );
+            head_text = name.to_string();
+        }
+    }
+    let head_text = head_text.as_str();
+    // a change of folder
+    let glued = glued_cd(shell, head_text).filter(|_| head.literal && !head.quoted);
+    let is_push = one_of(head_text, PUSHD);
+    if head.literal && !head.quoted && (one_of(head_text, CD) || is_push || glued.is_some()) {
         let flag = |w: &str| match shell {
             Shell::Cmd => w.eq_ignore_ascii_case("/d"),
             Shell::Pwsh => one_of(w, &["-path", "-literalpath"]),
             Shell::Sh => w == "--",
         };
-        let dir: Vec<&(String, bool)> = rest.iter().filter(|w| !(w.1 && flag(&w.0))).collect();
-        let [(dir, true)] = dir[..] else {
+        let mut dir: Vec<(String, bool)> = rest
+            .iter()
+            .filter(|w| !(w.literal && flag(&w.text)))
+            .map(|w| (w.text.clone(), w.literal))
+            .collect();
+        if let Some(g) = glued {
+            dir.insert(0, (g.to_string(), true));
+        }
+        let [(dir, true)] = &dir[..] else {
             return false;
         };
         if !relative(dir) || dir.starts_with('-') {
@@ -373,13 +529,13 @@ fn simple(
         let Some(next) = join(cur, dir, backslash) else {
             return false;
         };
-        if head.eq_ignore_ascii_case("pushd") {
+        if is_push {
             dirs.push(cur.clone());
         }
         *cur = next;
         return true;
     }
-    if *literal && head.eq_ignore_ascii_case("popd") {
+    if head.literal && !head.quoted && one_of(head_text, POPD) {
         return match dirs.pop() {
             Some(d) => {
                 *cur = d;
@@ -388,34 +544,59 @@ fn simple(
             None => false,
         };
     }
+    // a change of folder that is not the head (`if … then cd x`, `command cd x`, `if exist x cd
+    // x`): whether it happens is not known — the rest is not followed
+    if rest.iter().any(|w| cd_word(shell, w)) {
+        return false;
+    }
+    // PowerShell: a quoted string in head position is an expression unless `&` or `.` runs it
+    let expression = shell == Shell::Pwsh && head.quoted && !(called || dotted);
     let mut entry = |path: String, refusable: bool| {
         if !p.entries.iter().any(|e| e.path == path) {
             p.entries.push(Entry { path, refusable });
         }
     };
-    if *literal && !head.is_empty() {
-        if head.contains('/') || (backslash && head.contains('\\')) {
-            if !relative(head) {
+    if head.literal && !head_text.is_empty() && !expression {
+        if head_text.contains('/') || (backslash && head_text.contains('\\')) {
+            // refused when missing only when it clearly names a script
+            let clear = has_script_ext(head_text)
+                || ["./", "../", ".\\", "..\\"]
+                    .iter()
+                    .any(|d| head_text.starts_with(*d) && (backslash || d.ends_with('/')));
+            if !relative(head_text) {
                 // absolute: as written (one outside the repository is dropped by the caller)
-                entry(head.to_string(), true);
-            } else if let Some(path) = resolve(cur, head, backslash) {
-                entry(path, true);
+                entry(head_text.to_string(), has_script_ext(head_text));
+            } else if shell != Shell::Sh && no_extension(head_text) {
+                // `scripts\build`, `.\gradlew`: `cmd` and PowerShell run `<head>.cmd`,
+                // `<head>.ps1`, … — which one is not known: all protected, none refused
+                let ps1 = (shell == Shell::Pwsh).then_some(".ps1");
+                for ext in [""].into_iter().chain(ps1).chain(PATHEXT) {
+                    if let Some(path) = resolve(cur, &format!("{head_text}{ext}"), backslash) {
+                        entry(path, false);
+                    }
+                }
+            } else if let Some(path) = resolve(cur, head_text, backslash) {
+                entry(path, clear);
             }
-        } else if shell == Shell::Cmd && !head.contains(':') && !one_of(head, CMD_BUILTINS) {
-            for ext in ["", ".com", ".exe", ".bat", ".cmd"] {
-                if let Some(path) = resolve(cur, &format!("{head}{ext}"), backslash) {
+        } else if shell == Shell::Cmd
+            && !head_text.contains(':')
+            && !one_of(head_text, CMD_BUILTINS)
+        {
+            for ext in [""].into_iter().chain(PATHEXT) {
+                if let Some(path) = resolve(cur, &format!("{head_text}{ext}"), backslash) {
                     entry(path, false);
                 }
             }
         }
     }
+    let quoted_head = expression.then_some(&head);
     let mut skip = false;
-    for (w, literal) in rest {
-        let skipped = std::mem::replace(&mut skip, *literal && output_flag(w));
-        if skipped || !*literal {
+    for w in quoted_head.into_iter().chain(rest.iter()) {
+        let skipped = std::mem::replace(&mut skip, w.literal && output_flag(&w.text));
+        if skipped || !w.literal {
             continue;
         }
-        for v in arg_values(w) {
+        for v in arg_values(&w.text) {
             if v.starts_with('-') || !relative(&v) {
                 continue;
             }
@@ -431,22 +612,30 @@ fn simple(
 
 /// Read the command string `s` (see the module text).
 pub fn parse(s: &str, shell: Shell) -> Parsed {
+    parse_in(s, shell, "")
+}
+
+/// [`parse`], starting in the folder `start` (repository-relative, `/`; `""` = the root).
+pub fn parse_in(s: &str, shell: Shell, start: &str) -> Parsed {
     let mut p = Parsed::default();
-    let mut cur = String::new();
+    let mut cur = start.trim_matches('/').to_string();
     let mut scopes: Vec<String> = Vec::new();
     let mut dirs: Vec<String> = Vec::new();
-    let mut words: Vec<(String, bool)> = Vec::new();
+    let mut words: Vec<Word> = Vec::new();
+    let mut called = false;
     for t in tokens(s, shell).into_iter().chain([Tok::Sep]) {
-        if let Tok::Word { text, literal } = t {
-            words.push((text, literal));
+        if let Tok::Word(w) = t {
+            words.push(w);
             continue;
         }
         let cmd = std::mem::take(&mut words);
-        if !simple(&cmd, shell, &mut cur, &mut dirs, &mut p) {
+        if !simple(&cmd, shell, called, &mut cur, &mut dirs, &mut p) {
             break;
         }
-        // a shell's `( … )` is a subshell: a `cd` inside does not leave it
+        called = matches!(t, Tok::Amp) && shell == Shell::Pwsh;
         match t {
+            Tok::Stop => break,
+            // a shell's `( … )` is a subshell: a `cd` inside does not leave it
             Tok::Open if shell == Shell::Sh => scopes.push(cur.clone()),
             Tok::Close if shell == Shell::Sh => {
                 if let Some(c) = scopes.pop() {
@@ -471,8 +660,17 @@ mod tests {
             .collect()
     }
 
+    /// Refusable entries.
     fn e(v: &[&str]) -> Vec<(String, bool)> {
         v.iter().map(|p| (p.to_string(), true)).collect()
+    }
+
+    /// `name` and `name` + each `PATHEXT` extension: protected, not refusable.
+    fn names(name: &str) -> Vec<(String, bool)> {
+        [""].into_iter()
+            .chain(PATHEXT)
+            .map(|x| (format!("{name}{x}"), false))
+            .collect()
     }
 
     /// Quotes keep a path with a space in one word; variables, globs and escapes make a word
@@ -492,7 +690,7 @@ mod tests {
         // not literal
         for (s, shell) in [
             ("$HOME/bin/check.sh", Sh),
-            ("\"$PSScriptRoot/x.ps1\"", Pwsh),
+            ("& \"$PSScriptRoot/x.ps1\"", Pwsh),
             ("%~dp0x.cmd", Cmd),
             ("./ci/*.sh", Sh),
             ("ci\\x.sh", Sh),
@@ -507,6 +705,14 @@ mod tests {
         // redirections: no target, no stray `1` or `&` command
         let p = parse("./x.sh > build/out.log 2>&1", Sh);
         assert_eq!((p.entries.len(), p.args.len()), (1, 0), "{p:?}");
+        let p = parse("echo x >| out/log.sh", Sh);
+        assert_eq!(
+            p,
+            Parsed {
+                entries: vec![],
+                args: vec!["x".into()]
+            }
+        );
         let p = parse("scripts\\a.cmd 1>nul 2>&1 & scripts\\b.cmd", Cmd);
         assert_eq!(
             p.entries
@@ -560,6 +766,111 @@ mod tests {
             entries("\"C:\\Program Files\\x\\tool.exe\" a", Cmd),
             e(&["C:\\Program Files\\x\\tool.exe"])
         );
+        // a line continuation joins its lines: the next line is no new command
+        let p = parse("pytest \\\n  --junitxml \\\n  reports/junit.xml", Sh);
+        assert_eq!(
+            (p.entries.len(), p.args),
+            (0, vec!["reports/junit.xml".to_string()])
+        );
+        let p = parse("dotnet test `\r\n  tests/My.Tests.csproj", Pwsh);
+        assert_eq!(
+            (p.entries.len(), p.args),
+            (
+                0,
+                vec!["test".to_string(), "tests/My.Tests.csproj".to_string()]
+            )
+        );
+        let p = parse("msbuild ^\r\n  src\\App.sln", Cmd);
+        assert_eq!(p.args, ["src\\App.sln"]);
+    }
+
+    /// (R13–R15 review) refusable only when the head clearly names a script: `./`, `../` or a
+    /// script extension. Another head with a separator is protected, not refused; in a `cmd` or
+    /// PowerShell string a head without an extension stands for `<head>.cmd`, `<head>.ps1`, ….
+    #[test]
+    fn what_is_refused_when_missing() {
+        use Shell::*;
+        assert_eq!(entries("./gradlew", Sh), e(&["./gradlew"]));
+        assert_eq!(entries("../tools/x", Sh), e(&["../tools/x"]));
+        assert_eq!(entries("ci/run.sh", Sh), e(&["ci/run.sh"]));
+        assert_eq!(entries("ci/run", Sh), [("ci/run".to_string(), false)]);
+        assert_eq!(
+            entries("node_modules/.bin/jest --ci", Sh),
+            [("node_modules/.bin/jest".to_string(), false)]
+        );
+        assert_eq!(entries("scripts\\build", Cmd), names("scripts\\build"));
+        assert_eq!(entries(".\\gradlew build", Cmd), names(".\\gradlew"));
+        let mut ps: Vec<(String, bool)> =
+            vec![(".\\build".into(), false), (".\\build.ps1".into(), false)];
+        ps.extend(names(".\\build").into_iter().skip(1));
+        assert_eq!(entries(".\\build -Configuration Release", Pwsh), ps);
+        assert_eq!(entries("scripts\\x.cmd", Cmd), e(&["scripts\\x.cmd"]));
+        assert_eq!(entries("tools\\gen.py", Pwsh), e(&["tools\\gen.py"]));
+        // `sh`: a backslash is an escape, never a separator
+        assert_eq!(entries(".\\x.sh", Sh), Vec::new());
+    }
+
+    /// (R13–R15 review) what is not a command: a quoted string in head position in PowerShell,
+    /// a shell's arithmetic and arrays, a here-document, a `for /f` or attached-switch form in
+    /// `cmd`.
+    #[test]
+    fn what_is_not_a_command() {
+        use Shell::*;
+        for s in [
+            "Invoke-Pester -Path @('tests/unit','tests/int')",
+            "if ([IO.File]::Exists('build/app.exe')) { exit 0 }",
+            "'out/result.txt' | Should -Exist",
+            "Copy-Item -Path ('build/out' + $x) -Destination dist",
+            "switch ($env:OS) { 'a/b' { exit 0 } }",
+        ] {
+            assert_eq!(entries(s, Pwsh), Vec::new(), "{s}");
+        }
+        // … it is an argument (protected when the base commit has it)
+        assert_eq!(
+            parse("'out/result.txt' | Should -Exist", Pwsh).args,
+            ["out/result.txt"]
+        );
+        // `&` and `.` run a quoted path
+        assert_eq!(entries("& 'ci/x.ps1'", Pwsh), e(&["ci/x.ps1"]));
+        assert_eq!(entries(". 'ci/x.ps1'", Pwsh), e(&["ci/x.ps1"]));
+        assert_eq!(entries("&'ci/x.ps1'", Pwsh), e(&["ci/x.ps1"]));
+        // in `sh` and `cmd` a quoted head is a command
+        assert_eq!(entries("'ci/x.sh' --fast", Sh), e(&["ci/x.sh"]));
+        assert_eq!(
+            entries("\"scripts\\b.bat\" -q", Cmd),
+            e(&["scripts\\b.bat"])
+        );
+        // arithmetic, arrays
+        assert_eq!(entries("sleep $((TIMEOUT/2)); ./x.sh", Sh), e(&["./x.sh"]));
+        assert_eq!(
+            entries("OUT=(build/a.o build/b.o); ./x.sh", Sh),
+            e(&["./x.sh"])
+        );
+        assert_eq!(entries("(( n = a/b )); ./x.sh", Sh), e(&["./x.sh"]));
+        // command substitution still holds commands
+        assert_eq!(entries("echo $(./version.sh)", Sh), e(&["./version.sh"]));
+        // a here-document: what came before stays, the body and the rest are not read
+        assert_eq!(
+            entries(
+                "./a.sh; cat > .env <<EOF\n./not/a/command.sh\nEOF\n./b.sh",
+                Sh
+            ),
+            e(&["./a.sh"])
+        );
+        assert_eq!(
+            entries("python3 - <<'PY'\nopen('build/out.json')\nPY", Sh),
+            Vec::new()
+        );
+        // `cmd`: switches attached to a built-in, `for /f` with a quoted command
+        assert_eq!(
+            entries("rd/s/q build & scripts\\build.cmd", Cmd),
+            e(&["scripts\\build.cmd"])
+        );
+        assert_eq!(entries("dir/b src", Cmd), Vec::new());
+        assert_eq!(
+            entries("for /f %v in ('scripts\\version.cmd') do echo %v", Cmd),
+            e(&["scripts\\version.cmd"])
+        );
     }
 
     /// `cd` moves where the rest resolves; one that cannot be followed stops the reading.
@@ -577,12 +888,21 @@ mod tests {
             e(&["ci/sub/x.ps1"])
         );
         assert_eq!(
+            entries("Push-Location ci; ./x.ps1; Pop-Location; ./y.ps1", Pwsh),
+            e(&["ci/x.ps1", "./y.ps1"])
+        );
+        assert_eq!(
             entries("cd /d sub && call .\\run.bat", Cmd),
             e(&["sub/run.bat"])
         );
+        assert_eq!(entries("cd/d sub && .\\run.bat", Cmd), e(&["sub/run.bat"]));
         assert_eq!(
             entries("pushd sub && .\\a.cmd && popd && .\\b.cmd", Cmd),
             e(&["sub/a.cmd", ".\\b.cmd"])
+        );
+        assert_eq!(
+            entries("cd tools && .\\build.cmd && cd.. && .\\test.cmd", Cmd),
+            e(&["tools/build.cmd", ".\\test.cmd"])
         );
         // a subshell scopes the `cd` (sh); `cmd` parentheses only group
         assert_eq!(
@@ -595,6 +915,14 @@ mod tests {
         );
         // arguments resolve in the folder too
         assert_eq!(parse("cd ci && make -f x.mk", Sh).args, ["ci/x.mk"]);
+        assert_eq!(parse_in("./x.ps1 a.txt", Pwsh, "ci").args, ["ci/a.txt"]);
+        assert_eq!(
+            parse_in("./x.ps1", Pwsh, "ci").entries,
+            [Entry {
+                path: "ci/x.ps1".into(),
+                refusable: true
+            }]
+        );
         // not followed: nothing more is found — what came before stays
         for s in [
             "cd $DIR && ./x.sh",
@@ -604,31 +932,45 @@ mod tests {
             "cd .. && ./x.sh",
             "cd a b && ./x.sh",
             "popd && ./x.sh",
+            "command cd ci && ./x.sh",
         ] {
             assert_eq!(parse(s, Sh), Parsed::default(), "{s}");
         }
+        // a `cd` that is not the head of its command: whether it runs is not known
+        for s in [
+            "if [ -d frontend ]; then cd frontend; fi; ./run-tests.sh",
+            "test -d ci && builtin cd ci; ./x.sh",
+        ] {
+            assert_eq!(entries(s, Sh), Vec::new(), "{s}");
+        }
+        assert_eq!(
+            entries("if (Test-Path ci) { Set-Location ci }; ./x.ps1", Pwsh),
+            e(&["ci/x.ps1"]),
+            "a head `cd` inside a block is followed (the folder exists at the base commit or \
+             the gate fails)"
+        );
         assert_eq!(entries("./a.sh; cd \"$D\"; ./b.sh", Sh), e(&["./a.sh"]));
         assert_eq!(entries("cd C:\\ci && x.cmd", Cmd), Vec::new());
         assert_eq!(entries("cd %CI% && x.cmd", Cmd), Vec::new());
+        assert_eq!(entries("cd\\ && x.cmd", Cmd), Vec::new());
+        assert_eq!(entries("if exist ci cd ci & .\\run.cmd", Cmd), Vec::new());
+        assert_eq!(entries("cd.. && .\\run.cmd", Cmd), Vec::new());
     }
 
-    /// A bare head of a `cmd` string: every name `cmd.exe` would try in the working directory,
-    /// protected and never refused; built-ins are none; other shells run no bare name from it.
+    /// A bare head of a `cmd` string: every name `cmd.exe` would try in the working directory
+    /// (the default `PATHEXT`), protected and never refused; built-ins are none; other shells
+    /// run no bare name from it.
     #[test]
     fn a_bare_cmd_head_is_protected_never_refused() {
         use Shell::*;
-        let bare = |name: &str| -> Vec<(String, bool)> {
-            ["", ".com", ".exe", ".bat", ".cmd"]
-                .iter()
-                .map(|x| (format!("{name}{x}"), false))
-                .collect()
-        };
-        assert_eq!(entries("build", Cmd), bare("build"));
-        assert_eq!(entries("npm.cmd run build", Cmd), bare("npm.cmd"));
-        assert_eq!(entries("cd sub && run.bat", Cmd), bare("sub/run.bat"));
-        assert_eq!(entries("@echo off & call x.cmd arg", Cmd), bare("x.cmd"));
-        let mut two = bare("setup.exe");
-        two.extend(bare("run.cmd"));
+        assert_eq!(names("x").len(), 12);
+        assert_eq!(entries("build", Cmd), names("build"));
+        assert_eq!(entries("npm.cmd run build", Cmd), names("npm.cmd"));
+        assert!(names("npm").contains(&("npm.js".to_string(), false)));
+        assert_eq!(entries("cd sub && run.bat", Cmd), names("sub/run.bat"));
+        assert_eq!(entries("@echo off & call x.cmd arg", Cmd), names("x.cmd"));
+        let mut two = names("setup.exe");
+        two.extend(names("run.cmd"));
         assert_eq!(entries("setup.exe && run.cmd", Cmd), two);
         for s in [
             "echo hi",
@@ -646,5 +988,55 @@ mod tests {
         assert_eq!(entries("npm.cmd run build", Pwsh), Vec::new());
         assert_eq!(entries("msbuild.exe App.sln", Pwsh), Vec::new());
         assert_eq!(parse("msbuild.exe App.sln", Pwsh).args, ["App.sln"]);
+    }
+
+    /// No input makes the reader panic.
+    #[test]
+    fn odd_input_does_not_panic() {
+        for s in [
+            "",
+            "'",
+            "\"",
+            "&",
+            "&&",
+            "(",
+            ")",
+            "((",
+            "$((",
+            "=(",
+            "<<",
+            "<",
+            ">",
+            ">|",
+            "2>&",
+            "cd",
+            "cdé",
+            "chdiré..",
+            "é/ü.sh",
+            "🙂/x.sh",
+            "@",
+            "`",
+            "^",
+            "\\",
+            "a\\\n",
+            "x=(",
+            "' ' ' '",
+            "\"\"",
+            "''",
+            "{",
+            "}",
+            "{}",
+            "a=b=c",
+            "-o",
+            "/",
+            "\\\\",
+            "C:",
+            "é:",
+        ] {
+            for shell in [Shell::Sh, Shell::Pwsh, Shell::Cmd] {
+                let _ = parse(s, shell);
+                let _ = parse_in(s, shell, "a/b");
+            }
+        }
     }
 }

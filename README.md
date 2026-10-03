@@ -302,15 +302,23 @@ from the repository checkout (`project.root`), never from a task worktree, and e
     In a **command string** (`pwsh -Command`, `cmd /c`, a shell's `-c`, also `-ec`, `-lc`) Toryo reads the string:
     it is split, with its quotes, into simple commands at `&&`, `||`, `;`, `|`, `&`, newlines and `( ) { }`. Only the
     **head** of each simple command — its first word after an optional `call`, `.`, `exec`, `time` or `NAME=value` —
-    is an entry script, and only when it is a relative path with a separator (`./x.sh`, `scripts\x.cmd`, `./gradlew`
-    without an extension; `& './my scripts/x.ps1'` keeps its space). A `cd` / `chdir` / `pushd` / `Set-Location` /
-    `sl` with a literal relative folder moves where the rest resolves: `bash -lc "cd ci && ./x.sh"` runs — and
-    protects — `ci/x.sh`. With a variable, an absolute path, `-` or no argument Toryo cannot follow the string and
-    refuses and protects nothing more in it. A bare head of a `cmd` string that is not a built-in (`cmd /c build`,
-    `cmd /c "npm.cmd run build"`) is protected — never refused — as `<name>`, `<name>.com`, `.exe`, `.bat`, `.cmd`
-    in that folder, whether or not a program of that name is on PATH: `cmd.exe` looks in the working directory
-    first, and a gate's working directory is the checkout (an implementer that creates one stops the task with
-    `protected_config_changed`). PowerShell and `sh` never run a bare name from the working directory.
+    is an entry script, and only when it is a relative path with a separator (`& './my scripts/x.ps1'` keeps its
+    space). It is refused when missing only if it clearly names a script: it starts with `./` or `../` (`./gradlew`
+    needs no extension in a shell string) or has a script extension (`scripts\x.cmd`); any other head with a
+    separator is protected, not refused. In a `cmd` or PowerShell string a head without an extension
+    (`scripts\build`, `.\gradlew`) stands for `scripts\build.cmd`, `.ps1`, …: every such name is protected, none is
+    refused. A `cd` / `chdir` / `pushd` / `Set-Location` / `sl` / `Push-Location` with a literal relative folder
+    moves where the rest resolves (`popd` / `Pop-Location` go back; `pwsh -WorkingDirectory ci` starts there):
+    `bash -lc "cd ci && ./x.sh"` runs — and protects — `ci/x.sh`. Toryo stops reading — and refuses and protects
+    nothing more in the string — when it cannot follow it: a `cd` with a variable, an absolute path, `-` or no
+    argument; a `cd` that is not the head of its command (`if [ -d web ]; then cd web; fi`); a here-document. A
+    quoted string in head position of a PowerShell string is an expression, not a command (`'out/x.txt' | Should
+    -Exist`, `@('a/b','c/d')`), unless `&` or `.` runs it. A bare head of a `cmd` string that is not a built-in
+    (`cmd /c build`, `cmd /c "npm.cmd run build"`) is protected — never refused — as `<name>` and `<name>` + each
+    default `PATHEXT` extension (`.com .exe .bat .cmd .vbs .vbe .js .jse .wsf .wsh .msc`) in that folder, whether or
+    not a program of that name is on PATH: `cmd.exe` looks in the working directory first, and a gate's working
+    directory is the checkout (an implementer that creates one stops the task with `protected_config_changed`).
+    PowerShell and `sh` never run a bare name from the working directory.
     A missing entry script is refused only when it has a separator or a script extension (`sh check`, `php artisan`,
     `make -f ci.mk` are protected, not refused) and the repository does not ignore it. One that is missing **and
     ignored** (`node dist/cli.js` with `dist/` ignored) is build output: admitted and recorded with the task

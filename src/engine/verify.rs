@@ -136,6 +136,13 @@ pub fn probe(cfg: &Effective) -> Result<()> {
             let root = verify_root(cfg);
             let scratch = root.join(format!(".label-probe-{}", std::process::id()));
             let r = label(std::slice::from_ref(&scratch));
+            // (R13 review) the control of the write probe below: in a folder that does carry a
+            // Low label the same Low process must succeed — else a "cannot write" answer would
+            // only mean that the probe itself does not work on this machine
+            let control = match &r {
+                Ok(()) => low_can_write(&scratch),
+                Err(_) => Ok(true),
+            };
             let _ = std::fs::remove_dir_all(&scratch);
             r.map_err(|e| {
                 stop(
@@ -146,6 +153,27 @@ pub fn probe(cfg: &Effective) -> Result<()> {
                     ),
                 )
             })?;
+            match control {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(stop(
+                        UNAVAILABLE,
+                        format!(
+                            "{UNAVAILABLE}: verify_root {} — a Low-integrity process could not create a folder inside a Low-labelled folder there, so verify commands could not write their checkout either (M11-R13)",
+                            root.display()
+                        ),
+                    ))
+                }
+                Err(e) => {
+                    return Err(stop(
+                        UNAVAILABLE,
+                        format!(
+                            "{UNAVAILABLE}: could not start a Low-integrity process under verify_root {}: {e:#}",
+                            root.display()
+                        ),
+                    ))
+                }
+            }
             not_low_writable(&root, &root)
         }
     }
@@ -197,7 +225,7 @@ fn low_can_write(dir: &Path) -> Result<bool> {
         stdin: None,
         boundary: Boundary::LowIntegrity,
     };
-    spawn(&spec, &Redactions::empty())?.wait(
+    let exit = spawn(&spec, &Redactions::empty())?.wait(
         WaitOptions {
             max: Some(std::time::Duration::from_secs(30)),
             ..Default::default()
@@ -207,6 +235,13 @@ fn low_can_write(dir: &Path) -> Result<bool> {
     let made = std::fs::symlink_metadata(&target).is_ok();
     if made {
         let _ = std::fs::remove_dir(&target);
+    }
+    // (R13 review) a probe that did not finish proves nothing: never read it as "cannot write"
+    if !made && (exit.timed_out || exit.code.is_none()) {
+        bail!(
+            "the Low-integrity write probe did not finish (timed out: {})",
+            exit.timed_out
+        );
     }
     Ok(made)
 }
