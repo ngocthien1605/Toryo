@@ -571,7 +571,7 @@ fn verify_root_check(r: &mut Report, cfg: &Effective) {
             Level::Ok,
             area,
             format!(
-                "{}: Low integrity label can be set (R36/R45)",
+                "{}: Low integrity label can be set (R36/R45); not writable at Low integrity itself (M11-R13)",
                 root.display()
             ),
         ),

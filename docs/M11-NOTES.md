@@ -774,6 +774,79 @@ The second review of this round found **no must-fix** (the R9 export hardening w
   no-op (the owner would use `--note`). Folding it into the escalation transition would need the class threaded
   through the pure state machine; left as is.
 
+### Round 3
+
+Task list: `M11-review-fixes-3.md` (review of round 2 on 2026-10-03; the reviewer built `df84b02` on Linux with
+Rust 1.99: fmt and both clippy clean, 598 tests passed). M11 is merged (`main` @ `df84b02`, pull request #3); this
+round is the new branch `m11/review-3` from `main`. One commit per task; it ends with a push and a pull request.
+
+#### Progress (round 3)
+
+- [x] R13 — the export proves its bytes; the verify root cannot be Low-writable
+- [ ] R14 — M18: protection comes from the base commit; build output may exist
+- [ ] R15 — command strings and `cmd` bare names
+- [ ] R16 — a gate the machine cannot run is found before the build; the hints tell the whole fix
+- [ ] R17 — Low fixes, missing tests, stale docs
+- [ ] Finish — notes, README, HUONG-DAN
+- [ ] Push and pull request
+- [ ] CI
+
+#### Decisions X9–X12 (binding)
+
+- **X9 — refines X7.** What M18 protects is decided from the **base commit**, never from what happens to exist in
+  the task worktree. An entry script admitted as build output (missing at base, ignored) is barred from being
+  **committed**; it may exist in the worktree (R14).
+- **X10 — replaces rule 1 of X7.** In a command string (`pwsh -Command`, `cmd /c`, `sh -c`) only the **head of each
+  simple command** is an entry script. Other words are arguments and are never refused. A `cd` changes where the rest
+  resolves. When Toryo cannot follow the string, it refuses nothing. A bare head of a `cmd` string is protected,
+  never refused (R15).
+- **X11** Creating a protected entry script that does not exist yet (`sh check`) stops the task with
+  `protected_config_changed` instead of "restored + fix note" (the R10 AC-3 deviation) — accepted: it is the R35
+  rule for every untracked protected file.
+- **X12** What an environment gate needs from the machine is checked **before** the check gates run (R16).
+
+#### R13 — the export proves its bytes; the verify root cannot be Low-writable
+
+- **Content, not stat data.** `deploy_source` no longer passes `-u` to `checkout-index`, so the export's index
+  (`deploy.index`) never holds a size or a timestamp. `verify::export_changed` builds a throw-away index
+  (`deploy.check.index`, `read-tree <tree>` — no stat data either), runs `update-index --refresh` on it — with no
+  stat data Git has to read and **hash every file** — then `diff-files` (what did not hash to its entry) and
+  `ls-files --others` (what was added), and removes the index. The same check runs before the gate (inside
+  `deploy_source`) and after it; neither can be satisfied by size and timestamps. Git does the hashing, so the
+  repository's line-ending and filter settings apply as in a clean checkout (a blob stored with CRLF under
+  `core.autocrlf=true` is clean; test).
+- **What is proven now (the corrected claim).** Round 2 wrote "the files on disk are the commit's"; the code then
+  only proved `write-tree == <head>^{tree}` (true by construction) plus a stat comparison. Now: **each exported
+  file's content hashes to the object id the commit's tree names** — checked by reading the file, not by trusting
+  the object store's bytes or Git's stat data. A blob whose stored bytes do not match its id (the reviewer's
+  120 000-file case) is caught before the gate: the export is refused, `environment_gate_unavailable`.
+- **The verify root cannot be Low-writable.** `verify::not_low_writable`: a Low-integrity process (`cmd /d /c mkdir
+  .toryo-low-probe-<pid>`) tries to create a folder there and must fail. It runs in `verify::prepare` on the task's
+  folder (`<verify_root>/<task>`, with the `low_integrity` boundary, every verify run, before anything is checked
+  out) and in `verify::probe` on the root — so `toryo doctor` (FAIL, area `verify root`) and `task create` say the
+  same. Failure: `verify_boundary_unavailable`, naming `verify_root`, "set `verify.verify_root` to a folder outside
+  Low-writable trees", and for a task "then `toryo task config <id> --reload` and `toryo resume <id>`". Not
+  Windows: no-op.
+- **Decision (not in the list, needed for that hint to work):** `prepare` uses a recorded checkout only while it is
+  under the verify root in force (`c.base == <verify_root>/<task>`). After the owner changes `verify_root` and
+  reloads, a new checkout is made there; the old folder is left alone (not deleted: Low code could write it).
+  Before, the record won and a changed `verify_root` was never used by an existing task.
+- **Tests:** `verify::tests::a_same_length_change_with_restored_timestamps_is_seen` (AC-1, every platform: same
+  length, times put back, the index made to look 10 s newer, `core.trustctime=false` — fails before the fix),
+  `verify::tests::the_content_check_follows_the_line_ending_settings`,
+  `tests/m11_env_gates.rs::a_low_writable_verify_root_is_refused` (AC-2, Windows: the root is given a Low label after
+  admission → `verify_boundary_unavailable` at prepare with nothing checked out, `doctor` FAIL, `task create`
+  refused), `::a_same_length_forgery_in_the_checkout_is_never_deployed` (AC-3, Windows, **rewritten**: the forgery
+  is made on the second verify run, when the file is older than the checkout's index, so Git does not see it; the
+  test now requires `Completed`, "the gate ran" (a hash line per run) and "the deployed SHA-256 is the commit's" —
+  before, it took the escalation branch whenever Git noticed and then checked nothing),
+  `::an_environment_gate_runs_with_a_tracked_checkout` (AC-3: `verify.checkout: tracked`, two verify runs, the gate
+  passes from the export).
+- **Open:** the after-gate check guards the owner's own script — the gate runs with the owner's rights and could
+  rewrite the export and the index alike; it is a contract ("a gate script never writes into
+  `TORYO_VERIFY_CHECKOUT`"), not a boundary. Hashing every file twice per environment gate costs a few seconds on a
+  very large repository.
+
 ## Progress
 
 Branch `m11/orgchart` (from `main` @ `aa0be03`). One commit per task.

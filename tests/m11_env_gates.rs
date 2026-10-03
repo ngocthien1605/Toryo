@@ -1280,32 +1280,53 @@ fn gate_tail(env: &Env, id: &str, name: &str) -> String {
         .unwrap_or_default()
 }
 
-/// M11-R9 AC-3 (Windows): the forgery R9 is about — a check gate overwrites a tracked file with
-/// content of the same length and puts its timestamps back. Whatever `mutated` says, what the
-/// environment gate reads has the committed bytes: either the task escalates before any deploy,
-/// or the deployed file's SHA-256 is the original's, never the forged one's. (Whether Git for
-/// Windows catches this forgery depends on index raciness; the export never carries the
-/// checkout's bytes regardless — the deterministic proof is `the_export_holds_the_commit_not_the
-/// _checkout` and `a_check_gate_that_adds_a_file_is_not_deployed`.)
+/// M11-R9 AC-3 / R13 (Windows): the forgery R9 is about, made the way Git cannot see it. A check
+/// gate overwrites a tracked file with content of the same length and puts its timestamps back —
+/// on the **second** verify run, when the file was written by an earlier checkout and the
+/// checkout's index is newer than it (no "racy" second look: `verify::mutated` says unchanged).
+/// The environment gate therefore **runs**, and the file it reads has the committed SHA-256:
+/// it reads the export, never the Low checkout.
 #[cfg(windows)]
 #[test]
 fn a_same_length_forgery_in_the_checkout_is_never_deployed() {
-    let (env, marker) = probe_then_dbsync(
-        "$f = Join-Path $env:TORYO_VERIFY_CHECKOUT 'src/Calculator.psm1'\n$i = Get-Item $f\n$w = $i.LastWriteTimeUtc\n$c = $i.CreationTimeUtc\n\"orig=$((Get-FileHash $f -Algorithm SHA256).Hash)\"\n$b = [IO.File]::ReadAllBytes($f)\n$b[0] = if ($b[0] -eq 35) { 36 } else { 35 }\n[IO.File]::WriteAllBytes($f, $b)\n$i = Get-Item $f\n$i.LastWriteTimeUtc = $w\n$i.CreationTimeUtc = $c\n\"forged=$((Get-FileHash $f -Algorithm SHA256).Hash)\"\nexit 0\n",
-        "",
+    let (env, marker) = probe_then_dbsync("exit 0\n", "");
+    let flag = fwd(&env.root.join("gates").join("armed"));
+    // run 1: arm, and let more than a second pass; run 2: forge
+    let probe = format!(
+        "if (-not (Test-Path '{flag}')) {{ Set-Content -Path '{flag}' -Value x; Start-Sleep -Milliseconds 2200; 'armed'; exit 0 }}\n$f = Join-Path $env:TORYO_VERIFY_CHECKOUT 'src/Calculator.psm1'\n$i = Get-Item $f\n$w = $i.LastWriteTimeUtc\n$c = $i.CreationTimeUtc\n\"orig=$((Get-FileHash $f -Algorithm SHA256).Hash)\"\n$b = [IO.File]::ReadAllBytes($f)\n$b[0] = if ($b[0] -eq 35) {{ 36 }} else {{ 35 }}\n[IO.File]::WriteAllBytes($f, $b)\n$i = Get-Item $f\n$i.LastWriteTimeUtc = $w\n$i.CreationTimeUtc = $c\n\"forged=$((Get-FileHash $f -Algorithm SHA256).Hash)\"\nexit 0\n"
     );
-    // the environment gate records the hash of the file it would deploy
+    commit_repo(&env, &[("scripts/probe.ps1", &probe)], "the forging probe");
+    // the environment gate records, per run, the hash of the file it would deploy
     let got = env.root.join("gates").join("deployed-hash.txt");
     std::fs::write(
         env.root.join("gates").join("dbsync.ps1"),
         format!(
-            "Set-Content -Path '{}' -Value x\n(Get-FileHash (Join-Path $env:TORYO_VERIFY_CHECKOUT 'src/Calculator.psm1') -Algorithm SHA256).Hash | Set-Content -Path '{}'\nexit 0\n",
+            "Set-Content -Path '{}' -Value x\n(Get-FileHash (Join-Path $env:TORYO_VERIFY_CHECKOUT 'src/Calculator.psm1') -Algorithm SHA256).Hash | Add-Content -Path '{}'\nexit 0\n",
             fwd(&marker),
             fwd(&got)
         ),
     )
     .unwrap();
-    let err = one_turn(&env, "R9-F");
+    create(&env, "R9-F");
+    let s = script(
+        &env,
+        "r9f.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()]),
+                turn(vec![write("src/Notes.txt", "second checkpoint\n"), implementation()]),
+            ],
+            "reviewer": [turn(vec![changes()]), turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R9-F", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R9-F");
+    assert_eq!(
+        t.state,
+        St::Completed,
+        "Git must not see this forgery (else the gate never ran and this test proves nothing): {err}"
+    );
     let tail = gate_tail(&env, "R9-F", "probe");
     let line = |k: &str| {
         tail.lines()
@@ -1315,16 +1336,145 @@ fn a_same_length_forgery_in_the_checkout_is_never_deployed() {
     };
     let (orig, forged) = (line("orig="), line("forged="));
     assert_ne!(orig, forged, "the probe forged the file");
-    let t = task(&env, "R9-F");
-    if t.state == St::Escalated {
-        // Git saw it: no environment gate started
-        assert!(err.contains("verify_mutated_tree"), "{err}");
-        assert!(!marker.exists() && deployments(&env).is_empty());
-    } else {
-        assert_eq!(t.state, St::Completed, "{err}");
-        let deployed = std::fs::read_to_string(&got).unwrap().trim().to_string();
-        assert_eq!(deployed, orig, "the export holds the committed bytes");
-    }
+    // the gate ran on both verify runs, and both times read the committed bytes
+    assert!(marker.exists(), "the environment gate ran");
+    let hashes: Vec<String> = std::fs::read_to_string(&got)
+        .unwrap()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(hashes.len(), 2, "one line per verify run: {hashes:?}");
+    assert_eq!(hashes[1], orig, "the export holds the committed bytes");
+    assert_ne!(hashes[1], forged);
+    let d = deployments(&env);
+    assert_eq!((d.len(), d[0].ok), (1, Some(true)));
+}
+
+/// M11-R13 AC-2 (Windows): a verify root that Low code can write — a folder under a
+/// Low-labelled tree, like `AppData\LocalLow` — would make the export and the `envgate` folder
+/// Low-writable. It is refused: at prepare (`verify_boundary_unavailable`, no gate ran), by
+/// `doctor` (FAIL) and at `task create`.
+#[cfg(windows)]
+#[test]
+fn a_low_writable_verify_root_is_refused() {
+    let (env, marker) = probe_then_dbsync("exit 0\n", "");
+    let cfg = std::fs::read_to_string(&env.config)
+        .unwrap()
+        .replace("boundary: none", "boundary: low_integrity");
+    std::fs::write(&env.config, cfg).unwrap();
+    // admitted while the root is an ordinary folder …
+    create(&env, "R13-L");
+    // … then the root gets a Low label (inherited by everything created under it)
+    toryo::process::label_low(&[env.root.join("verify")]).unwrap();
+    let s = script(
+        &env,
+        "r13l.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R13-L", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R13-L");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("verify_boundary_unavailable")
+    );
+    assert!(
+        err.contains("verify_boundary_unavailable")
+            && err.contains("a Low-integrity process can create files in")
+            && err.contains("verify.verify_root")
+            && err.contains("toryo task config R13-L --reload"),
+        "{err}"
+    );
+    assert!(!marker.exists(), "no gate ran");
+    assert!(deployments(&env).is_empty());
+    let base = env.root.join("verify").join("R13-L");
+    assert!(
+        !base.join("R13-L.verify").exists() && !base.join("deploy").exists(),
+        "nothing was checked out or exported there"
+    );
+    // doctor says the same
+    let o = command(&env, &["doctor"], &[]).output().unwrap();
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    let line = out
+        .lines()
+        .find(|l| l.contains("a Low-integrity process can create files in"))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(
+        line.contains("FAIL") && line.contains("verify root"),
+        "{line}"
+    );
+    // and a new task is not admitted
+    let (code, err) = toryo(
+        &env,
+        &["task", "create", "--file", "TASK.md", "--id", "R13-M"],
+        &[],
+    );
+    assert_ne!(code, 0);
+    assert!(err.contains("verify_boundary_unavailable"), "{err}");
+}
+
+/// M11-R13 AC-3 (R9 AC-7, run): with `verify.checkout: tracked` an environment gate runs and
+/// passes — from the export of the commit, on a second verify run too (the checkout and its
+/// build folder are kept between runs in this mode).
+#[test]
+fn an_environment_gate_runs_with_a_tracked_checkout() {
+    let (env, marker) = probe_then_dbsync(
+        "Set-Content -Path (Join-Path $env:TORYO_VERIFY_BUILD 'built.txt') -Value x\nexit 0\n",
+        "echo x > \"$TORYO_VERIFY_BUILD/built.txt\"\nexit 0\n",
+    );
+    let cfg = std::fs::read_to_string(&env.config)
+        .unwrap()
+        .replace("boundary: none", "boundary: none, checkout: tracked");
+    std::fs::write(&env.config, cfg).unwrap();
+    create(&env, "R13-T");
+    let s = script(
+        &env,
+        "r13t.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()]),
+                turn(vec![write("src/Notes.txt", "second checkpoint\n"), implementation()]),
+            ],
+            "reviewer": [turn(vec![changes()]), turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R13-T", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R13-T");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert!(marker.exists(), "the environment gate ran");
+    let vr = verify_result(&env, "R13-T");
+    assert_eq!(vr["pass"], true);
+    let gate = vr["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["kind"] == "environment")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (gate["exit"].clone(), gate["source"].clone()),
+        (json!(0), json!("export"))
+    );
+    let (co, files) = seen_by_the_gate(&env);
+    assert_eq!(co.file_name().unwrap(), "deploy");
+    assert_eq!(
+        files,
+        checkpoint_files(&env, "R13-T"),
+        "exactly the commit's files"
+    );
+    assert!(
+        files.iter().any(|f| f == "src/Notes.txt"),
+        "the second checkpoint"
+    );
+    let d = deployments(&env);
+    assert_eq!((d.len(), d[0].ok), (1, Some(true)));
+    assert_eq!(d[0].sha, t.machine.checkpoint().unwrap());
 }
 
 /// M11-R9 AC-4 (Windows): a check gate at Low integrity cannot create a file in `deploy` (also

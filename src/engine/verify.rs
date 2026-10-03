@@ -115,9 +115,69 @@ pub fn probe(cfg: &Effective) -> Result<()> {
                     "{UNAVAILABLE}: verify_root {} — {e:#} (R45)",
                     root.display()
                 )
-            })
+            })?;
+            not_low_writable(&root, &root)
         }
     }
+}
+
+/// M11-R13: `dir` (the verify root, or a task's folder under it) must **not** be writable at
+/// Low integrity. Only the checkout and its `build`/`cache`/`tmp`/`home` get a Low label; the
+/// export an environment gate deploys from (`deploy`, `deploy.index`) and its working folder
+/// (`envgate`) are created next to them and are safe only while Low code cannot write there
+/// (X6, X1). A `verify_root` inside a Low-labelled tree (for example under `AppData\LocalLow`)
+/// would hand them to the code under test without a word. The proof is the real thing: a Low
+/// process tries to create a folder in `dir` and must fail. Not Windows: nothing to check.
+fn not_low_writable(dir: &Path, root: &Path) -> Result<()> {
+    let writable = low_can_write(dir).map_err(|e| {
+        anyhow::anyhow!(
+            "{UNAVAILABLE}: could not start a Low-integrity process to check {}: {e:#}",
+            dir.display()
+        )
+    })?;
+    if writable {
+        bail!(
+            "{UNAVAILABLE}: verify_root {} — a Low-integrity process can create files in {}, so the code under test could write what an environment gate deploys (the export of the checkpoint) and the folder the gate runs in. Set `verify.verify_root` to a folder outside Low-writable trees (not under AppData\\LocalLow; the default %LOCALAPPDATA%\\toryo-verify is fine) (M11-R13)",
+            root.display(),
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// Can a Low-integrity process create a folder in `dir`? (It is removed again.)
+#[cfg(windows)]
+fn low_can_write(dir: &Path) -> Result<bool> {
+    use crate::process::{redact::Redactions, spawn, SpawnSpec, WaitOptions};
+    let name = format!(".toryo-low-probe-{}", std::process::id());
+    let target = dir.join(&name);
+    let _ = std::fs::remove_dir(&target);
+    let windows = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let spec = SpawnSpec {
+        program: Path::new(&windows).join("System32").join("cmd.exe"),
+        args: vec!["/d".into(), "/c".into(), "mkdir".into(), name],
+        cwd: dir.to_path_buf(),
+        env: build_env(std::env::vars(), &BTreeMap::new(), &BTreeMap::new()),
+        stdin: None,
+        boundary: Boundary::LowIntegrity,
+    };
+    spawn(&spec, &Redactions::empty())?.wait(
+        WaitOptions {
+            max: Some(std::time::Duration::from_secs(30)),
+            ..Default::default()
+        },
+        |_| {},
+    )?;
+    let made = std::fs::symlink_metadata(&target).is_ok();
+    if made {
+        let _ = std::fs::remove_dir(&target);
+    }
+    Ok(made)
+}
+
+#[cfg(not(windows))]
+fn low_can_write(_dir: &Path) -> Result<bool> {
+    Ok(false)
 }
 
 /// Recorded when the checkout is created (before any verify code ran), in the run store.
@@ -196,10 +256,19 @@ pub fn prepare(
     let rec: Option<Checkout> = std::fs::read(record_path(t))
         .ok()
         .and_then(|x| serde_json::from_slice(&x).ok());
-    let co = match rec.filter(|c| c.dir.exists() && c.admin.exists() && c.low == low) {
+    // (R13) a recorded checkout is used while it is under the verify root in force: after a
+    // `verify_root` change (`task config --reload`) a new one is made there; the old folder is
+    // left alone
+    let base = verify_root(cfg).join(&t.id);
+    if low {
+        std::fs::create_dir_all(&base)?;
+        low_base(&base, cfg, t)?;
+    }
+    let co = match rec
+        .filter(|c| c.dir.exists() && c.admin.exists() && c.low == low && c.base == base)
+    {
         Some(c) => c,
         None => {
-            let base = verify_root(cfg).join(&t.id);
             let dir = base.join(format!("{}.verify", t.id));
             let repo = Loc::Discover(t.repo.clone());
             let fwd = dir.display().to_string().replace('\\', "/");
@@ -274,6 +343,17 @@ pub fn prepare(
         );
     }
     Ok(co)
+}
+
+/// M11-R13: [`not_low_writable`] for a task's folder, with what the owner does next.
+fn low_base(base: &Path, cfg: &Effective, t: &TaskRow) -> Result<()> {
+    not_low_writable(base, &verify_root(cfg)).map_err(|e| {
+        anyhow::anyhow!(
+            "{e:#} — then `toryo task config {} --reload` and `toryo resume {}`",
+            t.id,
+            t.id
+        )
+    })
 }
 
 /// The environment of a verify command: caches and temp in the Low directories.
@@ -458,11 +538,14 @@ pub struct Export {
 /// store** — nothing is copied from the Low checkout, which Low code may have forged (Git's
 /// "unchanged" is a size and timestamp test). The folder is emptied link-safely, then a scratch
 /// index next to it (`deploy.index`, `GIT_INDEX_FILE`) gets `read-tree <head>` and
-/// `checkout-index -a`. Git runs with the admin dir recorded when the checkout was created (R47)
+/// `checkout-index -a` (without `-u`: the index keeps no size or timestamp, M11-R13). Git runs with the admin dir recorded when the checkout was created (R47)
 /// and the hardened prefix of `g` (hooks off, fsmonitor off, the filter plan R37) and reads the
 /// repository's own config, so the bytes are those of a clean checkout. Neither `deploy` nor
-/// the index is Low-labelled. The export is accepted only when `write-tree` of the index equals
-/// `<head>^{tree}`.
+/// the index is Low-labelled, and the task's folder is proven not writable at Low integrity
+/// (`prepare`, M11-R13). The export is accepted only when `write-tree` of the index equals
+/// `<head>^{tree}` and every file on disk **hashes** to its entry ([`export_changed`]): what is
+/// proven is "each file's content has the object id the commit names", by reading the file —
+/// not by trusting the object store's bytes or Git's stat data.
 pub fn deploy_source(g: &GitCmd, co: &Checkout, head: &str) -> Result<Export> {
     let dir = co.base.join("deploy");
     let index = co.base.join("deploy.index");
@@ -500,7 +583,7 @@ pub fn deploy_source(g: &GitCmd, co: &Checkout, head: &str) -> Result<Export> {
         Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
     git(&["read-tree", head])?;
-    git(&["checkout-index", "-a", "-f", "-u"])?;
+    git(&["checkout-index", "-a", "-f"])?;
     let tree = git(&["write-tree"])?;
     let want = git(&["rev-parse", &format!("{head}^{{tree}}")])?;
     if tree != want {
@@ -510,8 +593,8 @@ pub fn deploy_source(g: &GitCmd, co: &Checkout, head: &str) -> Result<Export> {
         );
     }
     let e = Export { dir, index, tree };
-    // (R9 review) the files on disk must be the commit's before any gate reads them, and the
-    // export holds no link
+    // (R9 review, R13) before any gate reads them, every file on disk must hash to the
+    // commit's entry, and the export holds no link
     if let Some(why) = export_changed(g, co, &e)? {
         bail!("the export of {} is not the commit: {why}", short(head));
     }
@@ -542,34 +625,38 @@ fn first_link(dir: &Path) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// M11-R9 (E3 AC-8 against the export): after an environment gate, `Some(reason)` when the
-/// export no longer holds exactly the commit — a tracked file changed (stat refreshed, then
-/// compared by content) or a file added. The gate runs with the owner's rights, so this
-/// catches a script that writes into `TORYO_VERIFY_CHECKOUT`, not a forgery.
+/// M11-R9 / R13 (E3 AC-8 against the export): `Some(reason)` when the export does not hold
+/// exactly the commit — a file whose **content** differs, a file missing or a file added. It
+/// runs before the gate (in [`deploy_source`]) and after it. No stat shortcut: every file is
+/// hashed against a throw-away index read from the export's tree, which holds no size or
+/// timestamp, so Git has to read each file (the index of the export itself is never refreshed
+/// either). A touched timestamp is no change. After the gate this guards the owner's own script
+/// — the gate runs with the owner's rights, so it is a contract, not a boundary.
 pub fn export_changed(g: &GitCmd, co: &Checkout, e: &Export) -> Result<Option<String>> {
     let loc = Loc::Explicit {
         git_dir: co.admin.clone(),
         work_tree: e.dir.clone(),
     };
+    let check = co.base.join("deploy.check.index");
+    let clear = || -> Result<()> {
+        for f in [check.clone(), co.base.join("deploy.check.index.lock")] {
+            if std::fs::symlink_metadata(&f).is_ok() {
+                remove_link(&f).with_context(|| format!("removing {}", f.display()))?;
+            }
+        }
+        Ok(())
+    };
+    clear()?;
     // the settings of the export (`deploy_source`)
     let scratch = [
-        ("GIT_INDEX_FILE", e.index.as_path()),
+        ("GIT_INDEX_FILE", check.as_path()),
         ("GIT_NO_REPLACE_OBJECTS", Path::new("1")),
     ];
     let c = ["-c", "core.symlinks=false"];
-    // a timestamp-only touch is no change: refresh the stat data, then compare by content
-    let _ = g.output_env(
-        &loc,
-        false,
-        &[c[0], c[1], "update-index", "-q", "--refresh"],
-        &scratch,
-    )?;
-    let mut files = Vec::new();
-    for args in [
-        &[c[0], c[1], "diff-files", "--name-only", "-z"][..],
-        &[c[0], c[1], "ls-files", "--others", "-z"][..],
-    ] {
-        let o = g.output_env(&loc, true, args, &scratch)?;
+    let git = |read_only: bool, args: &[&str]| -> Result<Vec<u8>> {
+        let mut full = c.to_vec();
+        full.extend_from_slice(args);
+        let o = g.output_env(&loc, read_only, &full, &scratch)?;
         if !o.status.success() {
             bail!(
                 "git {} failed ({}): {}",
@@ -578,18 +665,40 @@ pub fn export_changed(g: &GitCmd, co: &Checkout, e: &Export) -> Result<Option<St
                 String::from_utf8_lossy(&o.stderr).trim()
             );
         }
-        files.extend(
-            o.stdout
-                .split(|b| *b == 0)
-                .filter(|s| !s.is_empty())
-                .map(|s| String::from_utf8_lossy(s).to_string()),
-        );
-    }
+        Ok(o.stdout)
+    };
+    let mut files = Vec::new();
+    let found = (|| -> Result<()> {
+        git(false, &["read-tree", &e.tree])?;
+        // every entry is without stat data, so this hashes every file; an entry whose content
+        // matches gets its stat data, one that does not stays "changed" (the exit status says
+        // only that there is one)
+        let _ = g.output_env(
+            &loc,
+            false,
+            &[c[0], c[1], "update-index", "-q", "--refresh"],
+            &scratch,
+        )?;
+        for args in [
+            &["diff-files", "--name-only", "-z"][..],
+            &["ls-files", "--others", "-z"][..],
+        ] {
+            files.extend(
+                git(true, args)?
+                    .split(|b| *b == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| String::from_utf8_lossy(s).to_string()),
+            );
+        }
+        Ok(())
+    })();
+    let _ = clear();
+    found?;
     if files.is_empty() {
         return Ok(None);
     }
     Ok(Some(format!(
-        "{MUTATED}: an environment gate changed the export of the checkpoint it deploys from (TORYO_VERIFY_CHECKOUT): {files:?} — a gate script must never write there"
+        "{MUTATED}: the export of the checkpoint an environment gate deploys from (TORYO_VERIFY_CHECKOUT) does not hold the commit's files: {files:?} — a gate script must never write there"
     )))
 }
 
@@ -866,5 +975,80 @@ mod tests {
         );
         assert_eq!(first_link(&e.dir).unwrap(), None);
         assert_eq!(export_changed(&g, &co, &e).unwrap(), None);
+    }
+
+    /// M11-R13 AC-1: the export check compares **content**. A file replaced inside a finished
+    /// export by bytes of the same length, with its timestamps put back — and an index that
+    /// looks newer than every file, as after a long export — is reported: Git's stat data
+    /// (size, times) would call it unchanged.
+    #[test]
+    fn a_same_length_change_with_restored_timestamps_is_seen() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, co, head) = repo_and_checkout(d.path());
+        // Linux: the change time cannot be put back; Git for Windows does not look at it
+        tgit(
+            &d.path().join("repo"),
+            &["config", "core.trustctime", "false"],
+        );
+        let e = deploy_source(&g, &co, &head).unwrap();
+        let f = e.dir.join("app.txt");
+        let m = std::fs::metadata(&f).unwrap();
+        let times = std::fs::FileTimes::new()
+            .set_modified(m.modified().unwrap())
+            .set_accessed(m.accessed().unwrap());
+        assert_eq!(m.len(), "FORGED!!!\n".len() as u64);
+        std::fs::write(&f, "FORGED!!!\n").unwrap();
+        let fh = std::fs::File::options().write(true).open(&f).unwrap();
+        fh.set_times(times).unwrap();
+        drop(fh);
+        // the index is newer than the file by more than a second: no "racy" second look
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(&e.index)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let why = export_changed(&g, &co, &e).unwrap().expect("seen");
+        assert!(why.contains("app.txt"), "{why}");
+        // and a file whose bytes are the commit's again is clean, whatever its times say
+        std::fs::write(&f, "committed\n").unwrap();
+        assert_eq!(export_changed(&g, &co, &e).unwrap(), None);
+    }
+
+    /// M11-R13: hashing every file is not fooled by line-ending conversion — with
+    /// `core.autocrlf=true` (Git for Windows' default) a blob stored with CRLF, one stored with
+    /// LF and an empty file all export clean, and a real change in each is still seen.
+    #[test]
+    fn the_content_check_follows_the_line_ending_settings() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, co, _) = repo_and_checkout(d.path());
+        let repo = d.path().join("repo");
+        std::fs::write(repo.join("crlf.txt"), "a\r\nb\r\n").unwrap();
+        std::fs::write(repo.join("lf.txt"), "a\nb\n").unwrap();
+        std::fs::write(repo.join("empty.txt"), "").unwrap();
+        tgit(&repo, &["add", "crlf.txt", "lf.txt", "empty.txt"]);
+        tgit(&repo, &["commit", "-q", "-m", "two"]);
+        let head = tgit(&repo, &["rev-parse", "HEAD"]);
+        tgit(&repo, &["config", "core.autocrlf", "true"]);
+        let e = deploy_source(&g, &co, &head).unwrap();
+        assert_eq!(
+            std::fs::read(e.dir.join("lf.txt")).unwrap(),
+            b"a\r\nb\r\n",
+            "converted on the way out, like a clean checkout"
+        );
+        assert_eq!(export_changed(&g, &co, &e).unwrap(), None);
+        for (name, text) in [
+            ("crlf.txt", "a\r\nX\r\n"),
+            ("lf.txt", "a\r\nX\r\n"),
+            ("empty.txt", "x"),
+        ] {
+            let before = std::fs::read(e.dir.join(name)).unwrap();
+            std::fs::write(e.dir.join(name), text).unwrap();
+            let why = export_changed(&g, &co, &e).unwrap().expect(name);
+            assert!(why.contains(name), "{why}");
+            std::fs::write(e.dir.join(name), before).unwrap();
+            assert_eq!(export_changed(&g, &co, &e).unwrap(), None, "{name}");
+        }
     }
 }
