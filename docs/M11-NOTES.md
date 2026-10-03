@@ -1365,7 +1365,11 @@ environment's permission layer, so nothing is pushed yet.
 - [x] R21 — Low fixes
 - [x] Review of R18–R21 (independent subagent; 2 Medium, 5 Low — all fixed in one follow-up commit, see below)
 - [x] Finish — notes, README, HUONG-DAN
-- [ ] Push and pull request, CI
+- [~] Push and pull request — `git push -u origin m11/review-3` was denied by the environment's permission layer for
+  the third time (rounds 2, 3, 4). Nothing else was tried: the owner runs that command; the pull request is then
+  opened from https://github.com/ngocthien1605/toryo/compare/main...m11/review-3?expand=1 (base `main`), title
+  `M11 review rounds 3–4: export proof, M18 from the base commit, command strings, gate preflight`.
+- [ ] CI — `test (windows-latest)`, `test (ubuntu-latest)`, then `toryo.exe (release)`.
 
 #### Decisions X13–X15 (binding)
 
