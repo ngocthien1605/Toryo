@@ -90,11 +90,24 @@ fn stat(pid: u32) -> Option<(char, i32, u64)> {
     ))
 }
 
-pub struct Child(std::process::Child);
+/// The root process, and the signal that ended it (once it has ended that way).
+pub struct Child(std::process::Child, Option<i32>);
 
 impl Child {
+    /// The exit code; `-1` when a signal ended the process ([`Child::signal`] says which) — a
+    /// program that cannot be started is an error of `spawn`, never an exit code.
     pub fn try_exit_code(&mut self) -> Result<Option<i32>> {
-        Ok(self.0.try_wait()?.map(|s| s.code().unwrap_or(-1)))
+        use std::os::unix::process::ExitStatusExt;
+        let status = self.0.try_wait()?;
+        if let Some(s) = status {
+            self.1 = s.signal();
+        }
+        Ok(status.map(|s| s.code().unwrap_or(-1)))
+    }
+
+    /// M11-R17: the signal that ended the process, if one did.
+    pub fn signal(&self) -> Option<i32> {
+        self.1
     }
 }
 
@@ -143,7 +156,7 @@ pub fn spawn_in_job(spec: &SpawnSpec) -> Result<Spawned> {
     Ok(Spawned {
         job: Job { pgid: pid as i32 },
         root: ProcId { pid, created },
-        child: Child(child),
+        child: Child(child, None),
         stdin,
         stdout,
         stderr,

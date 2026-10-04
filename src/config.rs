@@ -610,6 +610,18 @@ pub struct Origins {
     pub machine_roles_key: Option<&'static str>,
 }
 
+/// M11-R14 (X9): an entry script of a gate (a verify command) that is build output — missing at
+/// the task's base commit and ignored by the repository's ignore rules, so in the clean verify
+/// checkout only a gate can create it. It may exist in the task worktree (the implementer builds
+/// there); it may never be committed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildEntry {
+    /// The gate (verify command) that runs it.
+    pub gate: String,
+    /// Repository-relative, `/`.
+    pub path: String,
+}
+
 /// Effective configuration = repo config with machine overrides applied.
 #[derive(Debug, Clone, Serialize)]
 pub struct Effective {
@@ -628,6 +640,12 @@ pub struct Effective {
     /// mode, so an M10 configuration keeps its hash.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub team: Option<crate::team::Team>,
+    /// M11-R14 (X9): the entry scripts admitted as build output at `task create` (missing at
+    /// the base commit and ignored by the repository) — set at admission, frozen and hashed
+    /// with the task; left out of the canonical JSON when empty, so every other configuration
+    /// keeps its hash. Never read from a file.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub build_entries: Vec<BuildEntry>,
     #[serde(skip)]
     pub repo_path: PathBuf,
     #[serde(skip)]
@@ -782,6 +800,7 @@ impl Effective {
             toolchains,
             machine_verify,
             team,
+            build_entries: Vec::new(),
             repo_path: repo_path.to_path_buf(),
             machine_path: used_machine,
             origins,
@@ -856,6 +875,8 @@ impl Effective {
             machine_verify: MachineVerify,
             #[serde(default)]
             team: Option<crate::team::Team>,
+            #[serde(default)]
+            build_entries: Vec<BuildEntry>,
         }
         let f: Frozen =
             serde_json::from_str(canonical_json).context("parsing the frozen config.json")?;
@@ -865,6 +886,7 @@ impl Effective {
             toolchains: f.toolchains,
             machine_verify: f.machine_verify,
             team: f.team,
+            build_entries: f.build_entries,
             repo_path: origin.to_path_buf(),
             machine_path: None,
             origins: Origins::default(),
@@ -1329,7 +1351,14 @@ pub fn expand_vars(s: &str) -> Result<String> {
 /// Resolve a `secret_env` reference. Never logs the value.
 pub fn resolve_secret(reference: &str) -> Result<String> {
     if let Some(var) = reference.strip_prefix("env:") {
-        return std::env::var(var).with_context(|| format!("secret env var `{var}` is not set"));
+        // (R16–R17 review) never through `VarError`: its `NotUnicode` form prints the value
+        return match std::env::var(var) {
+            Ok(v) => Ok(v),
+            Err(std::env::VarError::NotPresent) => bail!("secret env var `{var}` is not set"),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                bail!("secret env var `{var}` is not valid Unicode")
+            }
+        };
     }
     if let Some(target) = reference.strip_prefix("credman:") {
         return resolve_credman(target);
@@ -1604,6 +1633,7 @@ policy:
             toolchains: Toolchains::default(),
             machine_verify: MachineVerify::default(),
             team: None,
+            build_entries: Vec::new(),
             repo_path: PathBuf::new(),
             machine_path: None,
             origins: Origins::default(),

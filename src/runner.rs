@@ -40,11 +40,41 @@ pub struct CommandResult {
     pub duration_ms: u128,
     /// stdout + stderr, ANSI-stripped (R50).
     pub output: String,
+    /// M11-R17: the signal that ended the command (Unix; `exit` is then -1). Left out when
+    /// there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
 }
 
 impl CommandResult {
     pub fn ok(&self) -> bool {
         self.exit == Some(0)
+    }
+
+    /// M11-R17: how the command ended, in words — `exit 1`, `exit -1 (killed by signal 9,
+    /// SIGKILL)`, `no exit code (timed out)`. On Unix an exit code of -1 always means a signal
+    /// ended the process: a program that cannot be started is an error, never an exit code.
+    pub fn ended(&self) -> String {
+        let name = |n: i32| match n {
+            1 => ", SIGHUP",
+            2 => ", SIGINT",
+            3 => ", SIGQUIT",
+            4 => ", SIGILL",
+            6 => ", SIGABRT",
+            7 => ", SIGBUS",
+            8 => ", SIGFPE",
+            9 => ", SIGKILL",
+            11 => ", SIGSEGV",
+            13 => ", SIGPIPE",
+            15 => ", SIGTERM",
+            _ => "",
+        };
+        match (self.exit, self.signal) {
+            (Some(c), Some(s)) => format!("exit {c} (killed by signal {s}{})", name(s)),
+            (Some(c), None) => format!("exit {c}"),
+            (None, _) if self.timed_out => "no exit code (timed out)".into(),
+            (None, _) => "no exit code (stopped)".into(),
+        }
     }
 
     /// The last `n` lines of output.
@@ -126,6 +156,7 @@ impl CommandRunner for LocalRunner {
                 output: spec
                     .redact
                     .redact_str(&strip_ansi(&String::from_utf8_lossy(&out))),
+                signal: info.signal,
             })
         })
         .await?

@@ -619,11 +619,24 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     }
     let (old_path, old_text) = task::frozen_config_text(&t)?;
     let old = toryo::config::Effective::from_frozen(&old_text, &old_path)?;
-    let new = load_config(cli)?;
+    let mut new = load_config(cli)?;
     // review H2 (M11-A2): a reload cannot go below the machine floor either
     if let Some(reason) = toryo::engine::verify::below_floor(&new) {
         bail!("{reason}");
     }
+    // M11-R21: a changed `verify_root` is probed as `task create` and `doctor` do — a root
+    // Low-integrity code can write would hand the export and the gate's folder to it
+    if toryo::engine::verify::verify_root(&new) != toryo::engine::verify::verify_root(&old) {
+        toryo::engine::verify::probe(&new)?;
+    }
+    // M11-R14 (X9): the entry scripts that are build output are part of the frozen
+    // configuration — recomputed against the task's own base commit (the refusals follow below)
+    new.build_entries = task::build_entries(
+        &new,
+        &toryo::git::default_gitcmd()?,
+        &t.repo,
+        &t.base_commit,
+    )?;
     let new_text = new.canonical_json();
     let new_sha = sha256_hex(new_text.as_bytes());
     if new_sha == t.config_sha256 {
@@ -963,6 +976,16 @@ fn resume_protected(st: &Store, t: &TaskRow, accept: &[String]) -> Result<bool> 
     Ok(true)
 }
 
+/// M11-R11 (X8): the task is `Escalated` with a machine-caused class, from a running state — a
+/// plain `toryo resume` goes back into the stage (`ResumeStage`).
+fn machine_caused_stop(t: &TaskRow) -> bool {
+    t.state == PipelineState::Escalated
+        && t.machine
+            .reason_class()
+            .is_some_and(toryo::engine::state::is_machine_caused)
+        && t.machine.escalated_from().is_some_and(|s| s.is_running())
+}
+
 fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
     let t = get(st, &lock.task)?;
     let protected = t.state == PipelineState::Escalated
@@ -983,6 +1006,9 @@ fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Res
         "recovery"
     } else if r.note.is_some() {
         "resume_with_note"
+    } else if machine_caused_stop(&t) {
+        // M11-R16: a plain resume after a machine-caused escalation is `ResumeStage`
+        "resume_stage"
     } else {
         "unpause"
     };
@@ -1044,12 +1070,7 @@ fn resume_before_drive(st: &Store, t: &TaskRow, r: &ResumeArgs, protected: bool)
                 t.machine.reason().unwrap_or("")
             ),
         )?;
-    } else if t.state == PipelineState::Escalated
-        && t.machine
-            .reason_class()
-            .is_some_and(toryo::engine::state::is_machine_caused)
-        && t.machine.escalated_from().is_some_and(|s| s.is_running())
-    {
+    } else if machine_caused_stop(t) {
         // M11-R11 (X8): the machine caused this (a missing skill, a context over budget, a gate
         // the machine cannot run) — a plain `toryo resume` goes back into the stage, which
         // checks its precondition again. No fix cycle, no implementer turn for nothing.

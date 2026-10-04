@@ -240,6 +240,38 @@ fn max_fix_cycles_escalates() {
         "no final gate"
     );
     assert_eq!(states(&env, "S-M").last().unwrap(), "Escalated");
+    // M11-R17 (R11 AC-3, at the CLI): the fix-cycle bound is not a machine-caused stop — a
+    // plain `toryo resume` does nothing; the way on is `--note`
+    assert_eq!(t.machine.reason_class(), None);
+    let before = (states(&env, "S-M").len(), attempts(&env, "S-M").len());
+    let (_, err) = toryo(&env, &["resume", "S-M", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "S-M");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(t.fix_cycle, 1);
+    assert_eq!(
+        (states(&env, "S-M").len(), attempts(&env, "S-M").len()),
+        before,
+        "no transition, no turn: {err}"
+    );
+    assert!(
+        err.contains("`toryo resume S-M --note \"…\"` (another fix cycle)"),
+        "{err}"
+    );
+    let (_, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "S-M",
+            "--note",
+            "one more",
+            "--yes",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    let t = task(&env, "S-M");
+    assert_eq!(t.fix_cycle, 2, "the note grants a cycle: {err}");
 }
 
 // ── 3. the automatic re-plan bound (owner decision M2, MAX_PLAN_AUTO_REJECTIONS) ─────

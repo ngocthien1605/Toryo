@@ -34,6 +34,27 @@ use crate::process::Boundary;
 pub const UNAVAILABLE: &str = "verify_boundary_unavailable";
 pub const MUTATED: &str = "verify_mutated_tree";
 
+/// M11-R16 (X8): why the verify stage cannot start — the boundary is unavailable or the checkout
+/// is not the checkpoint. The escalation **class** travels with the error, typed; the engine
+/// never reads it out of the reason text. `reason` begins with the class, as before.
+#[derive(Debug)]
+pub struct Stop {
+    pub class: &'static str,
+    pub reason: String,
+}
+
+impl std::fmt::Display for Stop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for Stop {}
+
+fn stop(class: &'static str, reason: String) -> anyhow::Error {
+    anyhow::Error::new(Stop { class, reason })
+}
+
 /// `verify.verify_root`, expanded (default `%LOCALAPPDATA%\toryo-verify`; `<data>/verify`
 /// where `LOCALAPPDATA` does not exist). The machine's `verify.verify_root` replaces the
 /// repository's (review H2, M11-A2).
@@ -75,7 +96,10 @@ pub fn boundary(cfg: &Effective) -> Result<Boundary> {
     match cfg.repo.verify.boundary.as_str() {
         "none" => Ok(Boundary::None),
         "low_integrity" => Ok(Boundary::LowIntegrity),
-        other => bail!("{UNAVAILABLE}: verify.boundary `{other}` is not available in v0.1 (low_integrity | none)"),
+        other => Err(stop(
+            UNAVAILABLE,
+            format!("{UNAVAILABLE}: verify.boundary `{other}` is not available in v0.1 (low_integrity | none)"),
+        )),
     }
 }
 
@@ -104,20 +128,127 @@ pub fn probe(cfg: &Effective) -> Result<()> {
         Boundary::None => Ok(()),
         Boundary::LowIntegrity => {
             if !cfg!(windows) {
-                bail!("{UNAVAILABLE}: the Low integrity boundary exists only on Windows — set `verify.boundary: none` for trusted-code mode (verification not isolated)");
+                return Err(stop(
+                    UNAVAILABLE,
+                    format!("{UNAVAILABLE}: the Low integrity boundary exists only on Windows — set `verify.boundary: none` for trusted-code mode (verification not isolated)"),
+                ));
             }
             let root = verify_root(cfg);
             let scratch = root.join(format!(".label-probe-{}", std::process::id()));
             let r = label(std::slice::from_ref(&scratch));
+            // (R13 review) the control of the write probe below: in a folder that does carry a
+            // Low label the same Low process must succeed — else a "cannot write" answer would
+            // only mean that the probe itself does not work on this machine
+            let control = match &r {
+                Ok(()) => low_can_write(&scratch),
+                Err(_) => Ok(true),
+            };
             let _ = std::fs::remove_dir_all(&scratch);
             r.map_err(|e| {
-                anyhow::anyhow!(
-                    "{UNAVAILABLE}: verify_root {} — {e:#} (R45)",
-                    root.display()
+                stop(
+                    UNAVAILABLE,
+                    format!(
+                        "{UNAVAILABLE}: verify_root {} — {e:#} (R45)",
+                        root.display()
+                    ),
                 )
-            })
+            })?;
+            match control {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(stop(
+                        UNAVAILABLE,
+                        format!(
+                            "{UNAVAILABLE}: verify_root {} — a Low-integrity process could not create a folder inside a Low-labelled folder there, so verify commands could not write their checkout either (M11-R13)",
+                            root.display()
+                        ),
+                    ))
+                }
+                Err(e) => {
+                    return Err(stop(
+                        UNAVAILABLE,
+                        format!(
+                            "{UNAVAILABLE}: could not start a Low-integrity process under verify_root {}: {e:#}",
+                            root.display()
+                        ),
+                    ))
+                }
+            }
+            not_low_writable(&root, &root)
         }
     }
+}
+
+/// M11-R13: `dir` (the verify root, or a task's folder under it) must **not** be writable at
+/// Low integrity. Only the checkout and its `build`/`cache`/`tmp`/`home` get a Low label; the
+/// export an environment gate deploys from (`deploy`, `deploy.index`) and its working folder
+/// (`envgate`) are created next to them and are safe only while Low code cannot write there
+/// (X6, X1). A `verify_root` inside a Low-labelled tree (for example under `AppData\LocalLow`)
+/// would hand them to the code under test without a word. The proof is the real thing: a Low
+/// process tries to create a folder in `dir` and must fail. Not Windows: nothing to check.
+fn not_low_writable(dir: &Path, root: &Path) -> Result<()> {
+    let writable = low_can_write(dir).map_err(|e| {
+        stop(
+            UNAVAILABLE,
+            format!(
+                "{UNAVAILABLE}: could not start a Low-integrity process to check {}: {e:#}",
+                dir.display()
+            ),
+        )
+    })?;
+    if writable {
+        return Err(stop(
+            UNAVAILABLE,
+            format!(
+                "{UNAVAILABLE}: verify_root {} — a Low-integrity process can create files in {}, so the code under test could write what an environment gate deploys (the export of the checkpoint) and the folder the gate runs in. Set `verify.verify_root` to a folder outside Low-writable trees (not under AppData\\LocalLow; the default %LOCALAPPDATA%\\toryo-verify is fine) (M11-R13)",
+                root.display(),
+                dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Can a Low-integrity process create a folder in `dir`? (It is removed again.)
+#[cfg(windows)]
+fn low_can_write(dir: &Path) -> Result<bool> {
+    use crate::process::{redact::Redactions, spawn, SpawnSpec, WaitOptions};
+    let name = format!(".toryo-low-probe-{}", std::process::id());
+    let target = dir.join(&name);
+    let _ = std::fs::remove_dir(&target);
+    let windows = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let spec = SpawnSpec {
+        program: Path::new(&windows).join("System32").join("cmd.exe"),
+        args: vec!["/d".into(), "/c".into(), "mkdir".into(), name],
+        cwd: dir.to_path_buf(),
+        env: build_env(std::env::vars(), &BTreeMap::new(), &BTreeMap::new()),
+        stdin: None,
+        boundary: Boundary::LowIntegrity,
+    };
+    let exit = spawn(&spec, &Redactions::empty())?.wait(
+        WaitOptions {
+            max: Some(std::time::Duration::from_secs(30)),
+            ..Default::default()
+        },
+        |_| {},
+    )?;
+    let made = std::fs::symlink_metadata(&target).is_ok();
+    if made {
+        let _ = std::fs::remove_dir(&target);
+    }
+    // (R13 review) a probe that did not finish proves nothing: never read it as "cannot write"
+    if !made && (exit.timed_out || exit.code.is_none()) {
+        bail!(
+            "the Low-integrity write probe did not finish (timed out: {})",
+            exit.timed_out
+        );
+    }
+    Ok(made)
+}
+
+#[cfg(not(windows))]
+fn low_can_write(_dir: &Path) -> Result<bool> {
+    Ok(false)
 }
 
 /// Recorded when the checkout is created (before any verify code ran), in the run store.
@@ -184,6 +315,45 @@ fn remove_link(p: &Path) -> std::io::Result<()> {
     std::fs::remove_file(p).or_else(|_| std::fs::remove_dir(p))
 }
 
+/// M11-R21: remove the build-output entry `rel` (a frozen `BuildEntry` path: repository-relative,
+/// as written) from the checkout `root`: a file, or a folder with what is in it. Never through
+/// a link — a link or junction on the way (code under test may have planted one) is removed as a
+/// link, its target is left alone. Missing, absolute or leaving the folder: nothing to do.
+fn remove_entry(root: &Path, rel: &str) -> Result<()> {
+    let rel = rel.replace('\\', "/");
+    let parts: Vec<&str> = rel
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    // (R24) a component with `:` is a drive or a stream name: on Windows `push("C:")` replaces
+    // the path built so far
+    if parts.is_empty()
+        || parts.contains(&"..")
+        || rel.starts_with('/')
+        || (cfg!(windows) && rel.contains(':'))
+    {
+        return Ok(());
+    }
+    let mut p = root.to_path_buf();
+    for (i, c) in parts.iter().enumerate() {
+        p.push(c);
+        let Ok(m) = std::fs::symlink_metadata(&p) else {
+            return Ok(());
+        };
+        let removed = if m.file_type().is_symlink() {
+            remove_link(&p)
+        } else if i + 1 < parts.len() {
+            continue;
+        } else if m.is_dir() {
+            std::fs::remove_dir_all(&p)
+        } else {
+            std::fs::remove_file(&p)
+        };
+        return removed.with_context(|| format!("removing {}", p.display()));
+    }
+    Ok(())
+}
+
 /// Create the checkout once (or again, if it is gone), then reset it to `sha` for this run.
 pub fn prepare(
     g: &GitCmd,
@@ -196,10 +366,19 @@ pub fn prepare(
     let rec: Option<Checkout> = std::fs::read(record_path(t))
         .ok()
         .and_then(|x| serde_json::from_slice(&x).ok());
-    let co = match rec.filter(|c| c.dir.exists() && c.admin.exists() && c.low == low) {
+    // (R13) a recorded checkout is used while it is under the verify root in force: after a
+    // `verify_root` change (`task config --reload`) a new one is made there; the old folder is
+    // left alone
+    let base = verify_root(cfg).join(&t.id);
+    if low {
+        std::fs::create_dir_all(&base)?;
+        not_low_writable(&base, &verify_root(cfg))?;
+    }
+    let co = match rec
+        .filter(|c| c.dir.exists() && c.admin.exists() && c.low == low && c.base == base)
+    {
         Some(c) => c,
         None => {
-            let base = verify_root(cfg).join(&t.id);
             let dir = base.join(format!("{}.verify", t.id));
             let repo = Loc::Discover(t.repo.clone());
             let fwd = dir.display().to_string().replace('\\', "/");
@@ -236,7 +415,7 @@ pub fn prepare(
             }
             if low {
                 label(&[c.dir.clone(), c.build(), c.cache(), c.tmp(), c.home()])
-                    .map_err(|e| anyhow::anyhow!("{UNAVAILABLE}: {e:#} (R45)"))?;
+                    .map_err(|e| stop(UNAVAILABLE, format!("{UNAVAILABLE}: {e:#} (R45)")))?;
             }
             std::fs::write(record_path(t), serde_json::to_vec_pretty(&c)?)?;
             c
@@ -259,6 +438,17 @@ pub fn prepare(
     if clean {
         empty_dir(&co.build())?;
         empty_dir(&co.cache())?;
+    } else {
+        // (R21) `clean -ffd` keeps ignored files, so an entry script built from a checkpoint the
+        // reviewer rejected would be the entry of the next run when no gate builds it again: the
+        // task's build-output entries start every run absent, before any gate
+        for e in &cfg.build_entries {
+            // a locked file is no reason to stop: a stale entry would show in the next run's
+            // own checks
+            if let Err(err) = remove_entry(&co.dir, &e.path) {
+                eprintln!("warning: could not remove the build-output entry `{}` from the verify checkout: {err:#}", e.path);
+            }
+        }
     }
     let head = g.run_str(&loc, true, &["rev-parse", "HEAD"])?;
     let status = g.run(
@@ -267,11 +457,14 @@ pub fn prepare(
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
     )?;
     if head.trim() != sha || !status.is_empty() {
-        bail!(
-            "{MUTATED}: the verify checkout is not a clean checkout of {} before the run (HEAD {})",
-            short(sha),
-            head.trim()
-        );
+        return Err(stop(
+            MUTATED,
+            format!(
+                "{MUTATED}: the verify checkout is not a clean checkout of {} before the run (HEAD {})",
+                short(sha),
+                head.trim()
+            ),
+        ));
     }
     Ok(co)
 }
@@ -446,23 +639,29 @@ pub fn checkout_extra(g: &GitCmd, co: &Checkout) -> Result<Vec<String>> {
 
 /// M11-R9: a fresh export of a checkpoint commit — what the environment gates read as
 /// `TORYO_VERIFY_CHECKOUT`. `dir` has no `.git` entry; `index` is the scratch index it was
-/// checked out from; `tree` the tree id it holds.
+/// checked out from; `tree` the tree id it holds; `manifest` every entry of `dir` as it was
+/// when the export was proven (M11-R20) — what the after-gate check compares with.
 #[derive(Debug, Clone)]
 pub struct Export {
     pub dir: PathBuf,
     pub index: PathBuf,
     pub tree: String,
+    pub manifest: Manifest,
 }
 
 /// M11-R9 (X6): export commit `head` into `<base>/deploy` from the repository's **object
 /// store** — nothing is copied from the Low checkout, which Low code may have forged (Git's
 /// "unchanged" is a size and timestamp test). The folder is emptied link-safely, then a scratch
 /// index next to it (`deploy.index`, `GIT_INDEX_FILE`) gets `read-tree <head>` and
-/// `checkout-index -a`. Git runs with the admin dir recorded when the checkout was created (R47)
+/// `checkout-index -a` (without `-u`: the index keeps no size or timestamp, M11-R13). Git runs with the admin dir recorded when the checkout was created (R47)
 /// and the hardened prefix of `g` (hooks off, fsmonitor off, the filter plan R37) and reads the
 /// repository's own config, so the bytes are those of a clean checkout. Neither `deploy` nor
-/// the index is Low-labelled. The export is accepted only when `write-tree` of the index equals
-/// `<head>^{tree}`.
+/// the index is Low-labelled, and the task's folder is proven not writable at Low integrity
+/// (`prepare`, M11-R13). The export is accepted only when `write-tree` of the index equals
+/// `<head>^{tree}`, a manifest of the folder (every entry, files with the SHA-256 of their bytes)
+/// has exactly the commit's entries, and each file's bytes are the bytes Git must write for the
+/// commit's blob (`git cat-file --filters`, M11-R20, X15) — compared as bytes, not through Git's
+/// view after its clean conversion; no stat data, no timestamp.
 pub fn deploy_source(g: &GitCmd, co: &Checkout, head: &str) -> Result<Export> {
     let dir = co.base.join("deploy");
     let index = co.base.join("deploy.index");
@@ -500,7 +699,7 @@ pub fn deploy_source(g: &GitCmd, co: &Checkout, head: &str) -> Result<Export> {
         Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
     git(&["read-tree", head])?;
-    git(&["checkout-index", "-a", "-f", "-u"])?;
+    git(&["checkout-index", "-a", "-f"])?;
     let tree = git(&["write-tree"])?;
     let want = git(&["rev-parse", &format!("{head}^{{tree}}")])?;
     if tree != want {
@@ -509,17 +708,26 @@ pub fn deploy_source(g: &GitCmd, co: &Checkout, head: &str) -> Result<Export> {
             short(head)
         );
     }
-    let e = Export { dir, index, tree };
-    // (R9 review) the files on disk must be the commit's before any gate reads them, and the
-    // export holds no link
-    if let Some(why) = export_changed(g, co, &e)? {
-        bail!("the export of {} is not the commit: {why}", short(head));
-    }
-    if let Some(l) = first_link(&e.dir)? {
+    if let Some(l) = first_link(&dir)? {
         bail!(
             "the export of {} holds a link ({}) — links are exported as files",
             short(head),
             l.display()
+        );
+    }
+    // (R9 review, R13, R20) before any gate reads them: the folder holds the commit's entries
+    // and no others, and each file holds the bytes Git must write for it
+    let manifest = manifest(&dir).context("reading the export")?;
+    let e = Export {
+        dir,
+        index,
+        tree,
+        manifest,
+    };
+    if let Some(why) = bytes_are_the_commits(g, co, &e, &e.manifest)? {
+        bail!(
+            "the export of {} does not hold the bytes Git writes for the commit: {why}",
+            short(head)
         );
     }
     Ok(e)
@@ -542,11 +750,237 @@ fn first_link(dir: &Path) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// M11-R9 (E3 AC-8 against the export): after an environment gate, `Some(reason)` when the
-/// export no longer holds exactly the commit — a tracked file changed (stat refreshed, then
-/// compared by content) or a file added. The gate runs with the owner's rights, so this
-/// catches a script that writes into `TORYO_VERIFY_CHECKOUT`, not a forgery.
-pub fn export_changed(g: &GitCmd, co: &Checkout, e: &Export) -> Result<Option<String>> {
+/// M11-R20 (X15): one entry of an export as found on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Item {
+    /// A file: its size and the SHA-256 of its bytes.
+    File { size: u64, sha256: String },
+    /// A folder, an empty one too.
+    Dir,
+    /// A symbolic link or junction — never followed: the text of its target.
+    Link(String),
+    /// Anything else (a pipe, a socket, a device): never opened.
+    Other,
+}
+
+/// Every entry under an export folder: its path (relative, `/`) and what it is.
+pub type Manifest = BTreeMap<String, Item>;
+
+/// SHA-256 of a file's bytes, read in pieces; with its size.
+fn hash_file(p: &Path) -> Result<(u64, String)> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let ctx = || format!("reading {}", p.display());
+    let mut f = std::fs::File::open(p).with_context(ctx)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut size = 0u64;
+    loop {
+        let n = f.read(&mut buf).with_context(ctx)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+        size += n as u64;
+    }
+    Ok((size, hex::encode(h.finalize())))
+}
+
+/// M11-R20 (X15): walk `dir` — no link is followed — and record **every** entry: files with the
+/// SHA-256 of their bytes, folders (empty ones too), links, and a `.git` entry like any other.
+/// No timestamp, no Git index, no line-ending conversion is involved: bytes.
+pub fn manifest(dir: &Path) -> Result<Manifest> {
+    fn walk(dir: &Path, rel: &str, out: &mut Manifest) -> Result<()> {
+        for e in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+            let e = e?;
+            let name = e.file_name().to_string_lossy().to_string();
+            let r = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            let ft = e
+                .file_type()
+                .with_context(|| format!("reading {}", e.path().display()))?;
+            if ft.is_symlink() {
+                let target = std::fs::read_link(e.path())
+                    .map(|t| t.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                out.insert(r, Item::Link(target));
+            } else if ft.is_dir() {
+                out.insert(r.clone(), Item::Dir);
+                walk(&e.path(), &r, out)?;
+            } else if ft.is_file() {
+                let (size, sha256) = hash_file(&e.path())?;
+                out.insert(r, Item::File { size, sha256 });
+            } else {
+                out.insert(r, Item::Other);
+            }
+        }
+        Ok(())
+    }
+    let mut out = Manifest::new();
+    walk(dir, "", &mut out)?;
+    Ok(out)
+}
+
+/// The first few names of `v`, and how many more there are.
+fn some(v: &[String]) -> String {
+    const SHOWN: usize = 8;
+    let mut s = v.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+    if v.len() > SHOWN {
+        s.push_str(&format!(", … (+{} more)", v.len() - SHOWN));
+    }
+    s
+}
+
+/// What [`batch_hashes`] read: the SHA-256 of each answer it could frame, and the first item
+/// whose answer could not be framed — its bytes are not the file's — after which nothing is known.
+struct Hashed {
+    sums: Vec<String>,
+    lost: Option<usize>,
+}
+
+/// The SHA-256 of what `git cat-file --batch` prints for each of `items` — `(object, path, size
+/// of the file on disk)`; with `filters` the bytes Git writes to a work tree for that path
+/// (`--filters`: attributes, `core.autocrlf`, filter drivers), else the stored bytes. Streamed:
+/// a blob is hashed as it is read, never held.
+///
+/// With `--filters` the header names the size of the *stored* blob, not of what follows, so the
+/// answers are framed by the size of the file on disk: when the bytes Git writes have another
+/// length the frame does not close (no line break, no header of the next object) and that file
+/// is the one reported as `lost` — a wrong length is a mismatch.
+fn batch_hashes(
+    g: &GitCmd,
+    loc: &Loc,
+    scratch: &[(&str, &Path)],
+    filters: bool,
+    items: &[(&str, &str, u64)],
+) -> Result<Hashed> {
+    use sha2::{Digest, Sha256};
+    use std::io::{BufRead, Read, Write};
+    let mut args = vec!["-c", "core.symlinks=false", "cat-file", "--batch"];
+    if filters {
+        args.push("--filters");
+    }
+    let mut child = g.spawn_piped(loc, true, &args, scratch)?;
+    let (Some(mut stdin), Some(mut stderr), Some(stdout)) =
+        (child.stdin.take(), child.stderr.take(), child.stdout.take())
+    else {
+        bail!("git cat-file has no pipes");
+    };
+    // the requests go out from a thread: git answers while it is still being asked
+    let lines: Vec<String> = items
+        .iter()
+        .map(|(o, p, _)| {
+            if filters {
+                format!("{o} {p}\n")
+            } else {
+                format!("{o}\n")
+            }
+        })
+        .collect();
+    let writer = std::thread::spawn(move || {
+        for l in lines {
+            if stdin.write_all(l.as_bytes()).is_err() {
+                break;
+            }
+        }
+    });
+    let errors = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s);
+        s
+    });
+    let mut out = std::io::BufReader::new(stdout);
+    let mut read = Hashed {
+        sums: Vec::with_capacity(items.len()),
+        lost: None,
+    };
+    let mut buf = vec![0u8; 64 * 1024];
+    // git's output ended by itself (not because we stopped reading): its stderr is then the story
+    let mut ended = false;
+    'items: for (n, (oid, _, size)) in items.iter().enumerate() {
+        // the header of this answer: `<object> blob <size>`
+        let mut line = String::new();
+        let got = out.read_line(&mut line).unwrap_or(0);
+        let mut parts = line.trim_end().split(' ');
+        let framed = got > 0
+            && matches!(
+                (parts.next(), parts.next(), parts.next(), parts.next()),
+                (Some(o), Some("blob"), Some(s), None)
+                    if o == *oid && !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+            );
+        if !framed {
+            ended |= got == 0;
+            // `<object> missing` names this item; else the answer before it was longer or
+            // shorter than the file: it is the one lost
+            let lost = if line.trim_end().ends_with(" missing") {
+                n
+            } else {
+                n.saturating_sub(1)
+            };
+            read.lost = Some(lost);
+            read.sums.truncate(lost);
+            break;
+        }
+        let mut h = Sha256::new();
+        let mut left = *size;
+        while left > 0 {
+            let want = buf.len().min(left as usize);
+            match out.read(&mut buf[..want]) {
+                Ok(k) if k > 0 => {
+                    h.update(&buf[..k]);
+                    left -= k as u64;
+                }
+                _ => {
+                    ended = true;
+                    read.lost = Some(n);
+                    break 'items;
+                }
+            }
+        }
+        let mut nl = [0u8; 1];
+        if out.read_exact(&mut nl).is_err() || nl[0] != b'\n' {
+            ended |= nl[0] == 0;
+            read.lost = Some(n);
+            break;
+        }
+        read.sums.push(hex::encode(h.finalize()));
+    }
+    // nothing may follow the last answer: bytes left over mean its length was not the file's
+    if read.lost.is_none() && !items.is_empty() && out.fill_buf().is_ok_and(|b| !b.is_empty()) {
+        read.lost = Some(items.len() - 1);
+        read.sums.truncate(items.len() - 1);
+    }
+    drop(out); // git stops writing if it has not finished
+    let _ = writer.join();
+    let stderr = errors.join().unwrap_or_default();
+    let status = child.wait()?;
+    // (when we closed the pipe ourselves git ends by SIGPIPE with nothing on stderr)
+    if (read.lost.is_none() && !status.success()) || (ended && !stderr.trim().is_empty()) {
+        // (R24) git stopped — its own words, not "its length differs"
+        bail!(
+            "git cat-file stopped before it answered every request ({status}): {}",
+            stderr.trim()
+        );
+    }
+    Ok(read)
+}
+
+/// M11-R20 (X15), **before the gate**: "the bytes are the commit's". The export folder holds
+/// exactly the entries of the commit's tree — no other file, folder, link or `.git` entry — and
+/// every file hashes to the bytes **Git must write** for its blob: `git cat-file --filters`, the
+/// settings of the export (attributes, `core.autocrlf`, filter drivers), compared as bytes. Git's
+/// own view after its clean conversion is no part of it: a repository whose `.gitattributes` says
+/// `text eol=crlf` over blobs that still hold CRLF is clean. `None` when it holds; else the first
+/// files that do not.
+fn bytes_are_the_commits(
+    g: &GitCmd,
+    co: &Checkout,
+    e: &Export,
+    found: &Manifest,
+) -> Result<Option<String>> {
     let loc = Loc::Explicit {
         git_dir: co.admin.clone(),
         work_tree: e.dir.clone(),
@@ -556,41 +990,163 @@ pub fn export_changed(g: &GitCmd, co: &Checkout, e: &Export) -> Result<Option<St
         ("GIT_INDEX_FILE", e.index.as_path()),
         ("GIT_NO_REPLACE_OBJECTS", Path::new("1")),
     ];
-    let c = ["-c", "core.symlinks=false"];
-    // a timestamp-only touch is no change: refresh the stat data, then compare by content
-    let _ = g.output_env(
+    let o = g.output_env(
         &loc,
-        false,
-        &[c[0], c[1], "update-index", "-q", "--refresh"],
+        true,
+        &[
+            "-c",
+            "core.symlinks=false",
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            &e.tree,
+        ],
         &scratch,
     )?;
-    let mut files = Vec::new();
-    for args in [
-        &[c[0], c[1], "diff-files", "--name-only", "-z"][..],
-        &[c[0], c[1], "ls-files", "--others", "-z"][..],
-    ] {
-        let o = g.output_env(&loc, true, args, &scratch)?;
-        if !o.status.success() {
-            bail!(
-                "git {} failed ({}): {}",
-                args.join(" "),
-                o.status,
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-        }
-        files.extend(
-            o.stdout
-                .split(|b| *b == 0)
-                .filter(|s| !s.is_empty())
-                .map(|s| String::from_utf8_lossy(s).to_string()),
+    if !o.status.success() {
+        bail!(
+            "git ls-tree failed ({}): {}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr).trim()
         );
     }
-    if files.is_empty() {
-        return Ok(None);
+    // (R23, X16) on a file system that does not tell `Src` from `src` (Windows) names are
+    // compared folded, as `checkout_extra` does: a tree that holds `Src/a.txt` and `src/b.txt`
+    // lands in one folder
+    let fold = |p: &str| {
+        if cfg!(windows) {
+            p.to_lowercase()
+        } else {
+            p.to_string()
+        }
+    };
+    // what the commit holds: files (name as in the tree, object id, link?) and folders — the
+    // parents of every entry and a submodule's (checked out as an empty folder, which may be
+    // missing)
+    let mut files: BTreeMap<String, (String, String, bool)> = BTreeMap::new();
+    let mut dirs: std::collections::BTreeSet<String> = Default::default();
+    for ent in o.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+        let ent = String::from_utf8_lossy(ent).to_string();
+        let Some((meta, path)) = ent.split_once('\t') else {
+            bail!("git ls-tree printed `{ent}`");
+        };
+        let m: Vec<&str> = meta.split(' ').collect();
+        let [mode, kind, oid] = m[..] else {
+            bail!("git ls-tree printed `{ent}`");
+        };
+        if kind == "commit" {
+            dirs.insert(fold(path));
+        } else if let Some((other, _, _)) = files.insert(
+            fold(path),
+            (path.to_string(), oid.to_string(), mode == "120000"),
+        ) {
+            bail!(
+                "the commit holds both `{other}` and `{path}`: the names differ only in case, and this file system cannot hold both files in one folder"
+            );
+        }
+        let mut p = path;
+        while let Some((parent, _)) = p.rsplit_once('/') {
+            dirs.insert(fold(parent));
+            p = parent;
+        }
     }
-    Ok(Some(format!(
-        "{MUTATED}: an environment gate changed the export of the checkpoint it deploys from (TORYO_VERIFY_CHECKOUT): {files:?} — a gate script must never write there"
-    )))
+    let found_f: BTreeMap<String, &Item> = found.iter().map(|(p, i)| (fold(p), i)).collect();
+    let mut problems: Vec<String> = Vec::new();
+    for (p, item) in found {
+        let ok = match item {
+            Item::File { .. } => files.contains_key(&fold(p)),
+            Item::Dir => dirs.contains(&fold(p)),
+            Item::Link(_) | Item::Other => false,
+        };
+        if !ok {
+            problems.push(format!("{p} (the commit has no such entry)"));
+        }
+    }
+    type Asked<'a> = Vec<(&'a str, &'a str, u64)>;
+    let (mut plain, mut stored): (Asked, Asked) = (Vec::new(), Vec::new());
+    for (key, (p, oid, link)) in &files {
+        let Some(Item::File { size, .. }) = found_f.get(key).copied() else {
+            problems.push(format!("{p} (missing)"));
+            continue;
+        };
+        if p.contains(['\n', '\r']) {
+            // the request protocol cannot carry the name: its bytes are not compared (it is
+            // present, and the commit's entry — no certainty, no complaint)
+            continue;
+        } else if *link {
+            // a link is exported as a file holding its target text: the stored bytes
+            stored.push((oid, p, *size));
+        } else {
+            plain.push((oid, p, *size));
+        }
+    }
+    for (filters, items) in [(true, plain), (false, stored)] {
+        if items.is_empty() {
+            continue;
+        }
+        let read = batch_hashes(g, &loc, &scratch, filters, &items)?;
+        for ((_, p, _), sha) in items.iter().zip(&read.sums) {
+            if !matches!(found_f.get(&fold(p)).copied(), Some(Item::File { sha256, .. }) if sha256 == sha)
+            {
+                problems.push(format!(
+                    "{p} (not the bytes Git writes for the commit's blob)"
+                ));
+            }
+        }
+        if let Some(n) = read.lost {
+            let (_, p, _) = items[n];
+            problems.push(format!(
+                "{p} (not the bytes Git writes for the commit's blob — its length differs; the files after it were not compared)"
+            ));
+        }
+    }
+    problems.sort();
+    Ok((!problems.is_empty()).then(|| some(&problems)))
+}
+
+/// M11-R20 (X15), **after the gate**: `Some(reason)` when the export is not what it was before
+/// the gate ran — a file whose bytes changed, a file or folder added (an empty one, a `.git`
+/// entry too) or removed. The manifest taken when the export was proven is compared with a new
+/// walk: bytes, no timestamp, no Git. It guards the owner's own script — the gate runs with the
+/// owner's rights, so it is a contract, not a boundary.
+pub fn export_changed(e: &Export) -> Option<String> {
+    let now = match manifest(&e.dir) {
+        Ok(m) => m,
+        Err(err) => {
+            return Some(format!(
+                "{MUTATED}: the export of the checkpoint an environment gate deploys from (TORYO_VERIFY_CHECKOUT) cannot be read after the gate ran: {err:#} — a gate script must never write there"
+            ))
+        }
+    };
+    let (mut changed, mut added, mut removed) = (Vec::new(), Vec::new(), Vec::new());
+    for (p, item) in &now {
+        match e.manifest.get(p) {
+            None => added.push(p.clone()),
+            Some(before) if before != item => changed.push(p.clone()),
+            Some(_) => {}
+        }
+    }
+    for p in e.manifest.keys().filter(|p| !now.contains_key(*p)) {
+        removed.push(p.clone());
+    }
+    if changed.is_empty() && added.is_empty() && removed.is_empty() {
+        return None;
+    }
+    let mut what = Vec::new();
+    for (label, v) in [
+        ("changed", &changed),
+        ("added", &added),
+        ("removed", &removed),
+    ] {
+        if !v.is_empty() {
+            what.push(format!("{label}: {}", some(v)));
+        }
+    }
+    Some(format!(
+        "{MUTATED}: the export of the checkpoint an environment gate deploys from (TORYO_VERIFY_CHECKOUT) is not what it was before the gate ran — {} — a gate script must never write there",
+        what.join("; ")
+    ))
 }
 
 /// M11-R2 (X1): the working directory of an environment gate — `<base>/envgate`, created and
@@ -811,14 +1367,14 @@ mod tests {
             .run_str(&co.loc(), true, &["rev-parse", &format!("{head}^{{tree}}")])
             .unwrap();
         assert_eq!(e.tree, want);
-        assert_eq!(export_changed(&g, &co, &e).unwrap(), None);
+        assert_eq!(export_changed(&e), None);
         // the checkout itself still says what it holds: the forged file is not hidden from
         // `checkout_extra`'s view of added files
         assert_eq!(checkout_extra(&g, &co).unwrap(), ["added.txt"]);
         // a gate that writes into the export: a changed and an added file are seen
         std::fs::write(e.dir.join("app.txt"), "synced\n").unwrap();
         std::fs::write(e.dir.join("new.txt"), "x").unwrap();
-        let why = export_changed(&g, &co, &e).unwrap().expect("changed");
+        let why = export_changed(&e).expect("changed");
         assert!(
             why.starts_with("verify_mutated_tree:")
                 && why.contains("app.txt")
@@ -828,7 +1384,7 @@ mod tests {
         // the next export starts from scratch
         let e = deploy_source(&g, &co, &head).unwrap();
         assert!(!e.dir.join("new.txt").exists());
-        assert_eq!(export_changed(&g, &co, &e).unwrap(), None);
+        assert_eq!(export_changed(&e), None);
     }
 
     /// R9 review: the export holds only the commit's bytes — a link entry of the commit is a
@@ -865,6 +1421,372 @@ mod tests {
             "the commit's blob, not its replacement"
         );
         assert_eq!(first_link(&e.dir).unwrap(), None);
-        assert_eq!(export_changed(&g, &co, &e).unwrap(), None);
+        assert_eq!(export_changed(&e), None);
+    }
+
+    /// M11-R13 AC-1: the export check compares **content**. A file replaced inside a finished
+    /// export by bytes of the same length, with its timestamps put back — and an index that
+    /// looks newer than every file, as after a long export — is reported: Git's stat data
+    /// (size, times) would call it unchanged.
+    #[test]
+    fn a_same_length_change_with_restored_timestamps_is_seen() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, co, head) = repo_and_checkout(d.path());
+        // Linux: the change time cannot be put back; Git for Windows does not look at it
+        tgit(
+            &d.path().join("repo"),
+            &["config", "core.trustctime", "false"],
+        );
+        let e = deploy_source(&g, &co, &head).unwrap();
+        let f = e.dir.join("app.txt");
+        let m = std::fs::metadata(&f).unwrap();
+        let times = std::fs::FileTimes::new()
+            .set_modified(m.modified().unwrap())
+            .set_accessed(m.accessed().unwrap());
+        assert_eq!(m.len(), "FORGED!!!\n".len() as u64);
+        std::fs::write(&f, "FORGED!!!\n").unwrap();
+        let fh = std::fs::File::options().write(true).open(&f).unwrap();
+        fh.set_times(times).unwrap();
+        drop(fh);
+        // the index is newer than the file by more than a second: no "racy" second look
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(&e.index)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let why = export_changed(&e).expect("seen");
+        assert!(why.contains("app.txt"), "{why}");
+        // and a file whose bytes are the commit's again is clean, whatever its times say
+        std::fs::write(&f, "committed\n").unwrap();
+        assert_eq!(export_changed(&e), None);
+    }
+
+    /// M11-R20 AC-1 (X15): `.gitattributes` says `text eol=crlf` and the blob still holds CRLF
+    /// (committed with `core.autocrlf=false`, never renormalised). The bytes on disk are the
+    /// blob's; the export is accepted and the after-gate check finds nothing.
+    #[test]
+    fn crlf_blobs_under_eol_crlf_export_clean() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, co, _) = repo_and_checkout(d.path());
+        let repo = d.path().join("repo");
+        std::fs::write(repo.join(".gitattributes"), "*.xml text eol=crlf\n").unwrap();
+        std::fs::write(d.path().join("model.xml"), "<a>\r\n<b/>\r\n</a>\r\n").unwrap();
+        let blob = tgit(
+            &repo,
+            &[
+                "hash-object",
+                "-w",
+                "--no-filters",
+                &d.path().join("model.xml").display().to_string(),
+            ],
+        );
+        tgit(
+            &repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{blob},model.xml"),
+            ],
+        );
+        tgit(&repo, &["add", ".gitattributes"]);
+        tgit(&repo, &["commit", "-q", "-m", "xml"]);
+        let head = tgit(&repo, &["rev-parse", "HEAD"]);
+        let e = deploy_source(&g, &co, &head).unwrap();
+        assert_eq!(
+            std::fs::read(e.dir.join("model.xml")).unwrap(),
+            b"<a>\r\n<b/>\r\n</a>\r\n"
+        );
+        assert_eq!(export_changed(&e), None);
+        // and a blob with LF only is written with CRLF there, and is just as clean
+        std::fs::write(repo.join("lf.xml"), "<a>\n</a>\n").unwrap();
+        tgit(&repo, &["add", "lf.xml"]);
+        tgit(&repo, &["commit", "-q", "-m", "lf"]);
+        let head = tgit(&repo, &["rev-parse", "HEAD"]);
+        let e = deploy_source(&g, &co, &head).unwrap();
+        assert_eq!(
+            std::fs::read(e.dir.join("lf.xml")).unwrap(),
+            b"<a>\r\n</a>\r\n"
+        );
+        assert_eq!(export_changed(&e), None);
+    }
+
+    /// Commit `files` (path, text) through plumbing with `core.ignorecase=false`, so that names
+    /// differing only in case stay as written; the new head.
+    #[cfg(windows)]
+    fn commit_cased(repo: &Path, files: &[(&str, &str)]) -> String {
+        for (i, (path, text)) in files.iter().enumerate() {
+            let src = repo.join(format!("..\\cased-{i}.txt"));
+            std::fs::write(&src, text).unwrap();
+            let blob = tgit(repo, &["hash-object", "-w", &src.display().to_string()]);
+            tgit(
+                repo,
+                &[
+                    "-c",
+                    "core.ignorecase=false",
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("100644,{blob},{path}"),
+                ],
+            );
+        }
+        tgit(repo, &["commit", "-q", "-m", "cased"]);
+        tgit(repo, &["rev-parse", "HEAD"])
+    }
+
+    /// M11-R23 AC-1 (X16, Windows): a tree that holds `Src/a.txt` and `src/b.txt` lands in one
+    /// folder on NTFS; the export check compares folded names, so it is clean — before and after
+    /// the gate. (Without the fold no environment gate ever started for such a repository.)
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_spelled_two_ways_exports_clean_on_windows() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, co, _) = repo_and_checkout(d.path());
+        let repo = d.path().join("repo");
+        let head = commit_cased(&repo, &[("Src/a.txt", "a\n"), ("src/b.txt", "b\n")]);
+        let e = deploy_source(&g, &co, &head).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(e.dir.join("Src").join("b.txt")).unwrap(),
+            "b\n"
+        );
+        assert_eq!(export_changed(&e), None);
+    }
+
+    /// M11-R23 AC-2 (X16, Windows): `a.txt` and `A.txt` in one folder cannot both exist there:
+    /// the export is refused in plain words, with both names.
+    #[cfg(windows)]
+    #[test]
+    fn two_files_that_differ_only_in_case_are_named_on_windows() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, co, _) = repo_and_checkout(d.path());
+        let repo = d.path().join("repo");
+        let head = commit_cased(&repo, &[("docs/a.txt", "1\n"), ("docs/A.txt", "2\n")]);
+        let err = format!("{:#}", deploy_source(&g, &co, &head).unwrap_err());
+        assert!(
+            err.contains("`docs/a.txt`")
+                && err.contains("`docs/A.txt`")
+                && err.contains("differ only in case")
+                && err.contains("cannot hold both"),
+            "{err}"
+        );
+    }
+
+    /// M11-R24: when Git stops in the middle of the answers (here a required filter that
+    /// fails), the message says that Git stopped and carries its own error text.
+    #[test]
+    fn a_git_that_stops_is_named_with_its_error() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, co, head) = repo_and_checkout(d.path());
+        let e = deploy_source(&g, &co, &head).unwrap();
+        let repo = d.path().join("repo");
+        tgit(&repo, &["config", "filter.boom.smudge", "exit 1"]);
+        tgit(&repo, &["config", "filter.boom.required", "true"]);
+        std::fs::write(e.dir.join(".gitattributes"), "app.txt filter=boom\n").unwrap();
+        let found = manifest(&e.dir).unwrap();
+        let err = format!(
+            "{:#}",
+            bytes_are_the_commits(&g, &co, &e, &found).unwrap_err()
+        );
+        assert!(
+            err.contains("git cat-file stopped") && err.to_lowercase().contains("filter"),
+            "{err}"
+        );
+    }
+
+    /// M11-R20 AC-2 (X15): inside a finished export each of these is reported, on every
+    /// platform — a file whose bytes changed (same length, timestamps put back: the other test),
+    /// an added file, a removed file, an empty folder, a `.git` file — and the export is clean
+    /// again once it is put back.
+    #[test]
+    fn every_change_to_a_finished_export_is_reported() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, co, head) = repo_and_checkout(d.path());
+        let e = deploy_source(&g, &co, &head).unwrap();
+        assert_eq!(export_changed(&e), None);
+        let said = |want: &str, name: &str| {
+            let why = export_changed(&e).expect(name);
+            assert!(
+                why.starts_with("verify_mutated_tree:") && why.contains(want),
+                "{name}: {why}"
+            );
+        };
+        let lib = e.dir.join("src").join("lib.txt");
+        std::fs::write(&lib, "LIBRARY\n").unwrap(); // same length
+        said("changed: src/lib.txt", "same-length change");
+        std::fs::write(&lib, "library\n").unwrap();
+        assert_eq!(export_changed(&e), None);
+        std::fs::write(e.dir.join("new.txt"), "x").unwrap();
+        said("added: new.txt", "added file");
+        std::fs::remove_file(e.dir.join("new.txt")).unwrap();
+        std::fs::remove_file(e.dir.join("app.txt")).unwrap();
+        said("removed: app.txt", "removed file");
+        std::fs::write(e.dir.join("app.txt"), "committed\n").unwrap();
+        assert_eq!(export_changed(&e), None);
+        std::fs::create_dir(e.dir.join("empty")).unwrap();
+        said("added: empty", "empty folder");
+        std::fs::remove_dir(e.dir.join("empty")).unwrap();
+        std::fs::create_dir_all(e.dir.join("src").join("deeper")).unwrap();
+        said("added: src/deeper", "empty folder inside a folder");
+        std::fs::remove_dir(e.dir.join("src").join("deeper")).unwrap();
+        std::fs::write(e.dir.join(".git"), "gitdir: elsewhere\n").unwrap();
+        said("added: .git", ".git file");
+        std::fs::remove_file(e.dir.join(".git")).unwrap();
+        assert_eq!(export_changed(&e), None);
+    }
+
+    /// M11-R20 Do 2: before the gate, the folder holds exactly the commit's entries and each
+    /// file holds the bytes Git writes for its blob — a file of the same length with other
+    /// bytes, one of another length (the answers can no longer be framed by it), an extra and a
+    /// missing file, a `.git` entry and a link are all named.
+    #[test]
+    fn the_bytes_are_the_commits_before_the_gate() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, co, head) = repo_and_checkout(d.path());
+        let e = deploy_source(&g, &co, &head).unwrap();
+        let check = |e: &Export| {
+            let found = manifest(&e.dir).unwrap();
+            bytes_are_the_commits(&g, &co, e, &found).unwrap()
+        };
+        assert_eq!(check(&e), None);
+        let app = e.dir.join("app.txt");
+        std::fs::write(&app, "COMMITTED\n").unwrap();
+        let why = check(&e).expect("same length");
+        assert!(why.contains("app.txt") && !why.contains("lib.txt"), "{why}");
+        std::fs::write(&app, "short\n").unwrap();
+        let why = check(&e).expect("shorter");
+        assert!(why.contains("app.txt"), "{why}");
+        std::fs::write(&app, "committed and longer than the blob\n").unwrap();
+        let why = check(&e).expect("longer");
+        assert!(why.contains("app.txt"), "{why}");
+        std::fs::write(&app, "committed\n").unwrap();
+        assert_eq!(check(&e), None);
+        // (review) the last file, one byte short of what Git writes: bytes are left over
+        let lib = e.dir.join("src").join("lib.txt");
+        std::fs::write(&lib, "library").unwrap();
+        let why = check(&e).expect("a prefix of the last file");
+        assert!(why.contains("src/lib.txt"), "{why}");
+        std::fs::write(&lib, "library\n").unwrap();
+        assert_eq!(check(&e), None);
+        std::fs::write(e.dir.join("extra.txt"), "x").unwrap();
+        std::fs::write(e.dir.join(".git"), "gitdir: x\n").unwrap();
+        std::fs::create_dir(e.dir.join("empty")).unwrap();
+        let why = check(&e).expect("extra");
+        assert!(
+            why.contains("extra.txt") && why.contains(".git") && why.contains("empty"),
+            "{why}"
+        );
+        std::fs::remove_file(e.dir.join("extra.txt")).unwrap();
+        std::fs::remove_file(e.dir.join(".git")).unwrap();
+        std::fs::remove_dir(e.dir.join("empty")).unwrap();
+        std::fs::remove_file(e.dir.join("src").join("lib.txt")).unwrap();
+        let why = check(&e).expect("missing");
+        assert!(why.contains("src/lib.txt (missing)"), "{why}");
+    }
+
+    /// M11-R21: a frozen build-output entry is removed from a `tracked` checkout — a file, a
+    /// folder, one under a folder — and never through a link; what is missing is no error.
+    #[test]
+    fn a_build_output_entry_is_removed_without_following_a_link() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("co");
+        std::fs::create_dir_all(root.join("dist").join("deep")).unwrap();
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::write(root.join("dist").join("cli.js"), "x").unwrap();
+        std::fs::write(root.join("dist").join("deep").join("a.txt"), "x").unwrap();
+        std::fs::write(root.join("build").join("keep.txt"), "x").unwrap();
+        remove_entry(&root, "./dist/cli.js").unwrap();
+        assert!(!root.join("dist").join("cli.js").exists());
+        assert!(root.join("dist").join("deep").exists(), "only the entry");
+        remove_entry(&root, r"dist\deep").unwrap();
+        assert!(!root.join("dist").join("deep").exists(), "a folder entry");
+        remove_entry(&root, "nowhere/at/all.js").unwrap();
+        for bad in [
+            "",
+            "..",
+            "../x",
+            "/etc/passwd",
+            "C:/x",
+            "x/C:/y.ps1",
+            "x/y:stream",
+        ] {
+            remove_entry(&root, bad).unwrap();
+        }
+        assert!(root.join("build").join("keep.txt").exists());
+        // (R24, Windows) `push("C:")` replaces the path built so far: `x/C:/decoy` would reach
+        // `C:decoy` — a file in the current folder of that drive — if the `:` were let through
+        #[cfg(windows)]
+        {
+            let cwd = std::env::current_dir().unwrap();
+            let drive = cwd.display().to_string().chars().next().unwrap();
+            let decoy = cwd.join("toryo-r24-decoy.txt");
+            std::fs::write(&decoy, "keep").unwrap();
+            std::fs::create_dir_all(root.join("x")).unwrap(); // the walk must reach `C:`
+            remove_entry(&root, &format!("x/{drive}:/toryo-r24-decoy.txt")).unwrap();
+            let kept = decoy.exists();
+            let _ = std::fs::remove_file(&decoy);
+            assert!(
+                kept,
+                "an entry with a drive in it stays inside the checkout"
+            );
+        }
+        // a link on the way is removed as a link, whatever it points to
+        let target = d.path().join("precious");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("cli.js"), "keep").unwrap();
+        std::fs::remove_dir_all(root.join("dist")).unwrap();
+        #[cfg(windows)]
+        let linked = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(root.join("dist"))
+            .arg(&target)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, root.join("dist")).is_ok();
+        assert!(linked, "a link could be made");
+        remove_entry(&root, "dist/cli.js").unwrap();
+        assert!(target.join("cli.js").exists(), "the target keeps its file");
+        assert!(std::fs::symlink_metadata(root.join("dist")).is_err());
+    }
+
+    /// M11-R13: hashing every file is not fooled by line-ending conversion — with
+    /// `core.autocrlf=true` (Git for Windows' default) a blob stored with CRLF, one stored with
+    /// LF and an empty file all export clean, and a real change in each is still seen.
+    #[test]
+    fn the_content_check_follows_the_line_ending_settings() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, co, _) = repo_and_checkout(d.path());
+        let repo = d.path().join("repo");
+        std::fs::write(repo.join("crlf.txt"), "a\r\nb\r\n").unwrap();
+        std::fs::write(repo.join("lf.txt"), "a\nb\n").unwrap();
+        std::fs::write(repo.join("empty.txt"), "").unwrap();
+        tgit(&repo, &["add", "crlf.txt", "lf.txt", "empty.txt"]);
+        tgit(&repo, &["commit", "-q", "-m", "two"]);
+        let head = tgit(&repo, &["rev-parse", "HEAD"]);
+        tgit(&repo, &["config", "core.autocrlf", "true"]);
+        let e = deploy_source(&g, &co, &head).unwrap();
+        assert_eq!(
+            std::fs::read(e.dir.join("lf.txt")).unwrap(),
+            b"a\r\nb\r\n",
+            "converted on the way out, like a clean checkout"
+        );
+        assert_eq!(export_changed(&e), None);
+        for (name, text) in [
+            ("crlf.txt", "a\r\nX\r\n"),
+            ("lf.txt", "a\r\nX\r\n"),
+            ("empty.txt", "x"),
+        ] {
+            let before = std::fs::read(e.dir.join(name)).unwrap();
+            std::fs::write(e.dir.join(name), text).unwrap();
+            let why = export_changed(&e).expect(name);
+            assert!(why.contains(name), "{why}");
+            std::fs::write(e.dir.join(name), before).unwrap();
+            assert_eq!(export_changed(&e), None, "{name}");
+        }
     }
 }

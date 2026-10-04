@@ -816,10 +816,20 @@ fn lexical(p: &str) -> String {
     parts.join("/").to_lowercase()
 }
 
-/// `p` is `root` or inside it, compared in [`lexical`] form.
+/// `p` is `root` or inside it, compared in [`lexical`] form — by where it **leads** (its
+/// canonical form), or by where it is **written** (M11-R17): a folder on the way to it is the
+/// root or inside it. `<repo>\link\new.ps1` is inside the repository although `link` is a
+/// junction pointing out of it: agent code can write the repository, and so replace the link.
 fn inside(p: &str, root: &Path) -> bool {
-    let (p, r) = (lexical(p), lexical(&root.display().to_string()));
-    !r.is_empty() && (p == r || p.starts_with(&format!("{r}/")))
+    let r = lexical(&root.display().to_string());
+    if r.is_empty() {
+        return false;
+    }
+    let under = |s: &str| s == r || s.starts_with(&format!("{r}/"));
+    Path::new(p)
+        .ancestors()
+        .filter(|a| !a.as_os_str().is_empty())
+        .any(|a| under(&lexical(&a.display().to_string())))
 }
 
 /// Which agent-reachable folder `p` is inside, if any: the repository (`project.root`), the
@@ -2040,6 +2050,38 @@ mod tests {
             assert!(inside(&p, &root), "{p} in {}", root.display());
         }
         assert!(!inside(&s(alias.join("other/x.ps1")), &repo));
+        // M11-R17: a link **inside** the root that points out of it — what is written under
+        // it is still inside the root (the link itself can be replaced by whoever writes the
+        // root), whether or not the file exists yet
+        let outside = d.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("exists.ps1"), "x").unwrap();
+        let link = repo.join("link");
+        #[cfg(windows)]
+        {
+            let ok = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(&link)
+                .arg(&outside)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "mklink /J {}", link.display());
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        for p in [
+            link.join("new.ps1"),
+            link.join("exists.ps1"),
+            link.join("deeper/skills"),
+            via_alias.join("link/new.ps1"),
+        ] {
+            assert!(inside(&s(p.clone()), &repo), "{}", p.display());
+        }
+        // the folder the link points to is not inside the root by itself
+        assert!(!inside(&s(outside.join("new.ps1")), &repo));
+        assert!(!inside(&s(outside.join("exists.ps1")), &repo));
         #[cfg(windows)]
         {
             // the 8.3 name of the long folder, where the volume keeps them

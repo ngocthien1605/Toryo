@@ -82,6 +82,8 @@ git:
 # skills folder of this UDE machine. The full comments and the script contract are in
 # templates/toryo.local.yaml.example.
 # skills_dir: C:/Temp/AgentShare/skills
+# (After `environment_gate_unavailable`: a secret or program added on the machine → `toryo resume
+# <id>`; this entry changed → `toryo task config <id> --reload`, then `toryo resume <id>`.)
 # environment_gates:
 #   dbsync:
 #     program: powershell

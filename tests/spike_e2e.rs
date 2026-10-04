@@ -559,17 +559,20 @@ fn pipeline_plan_gate_fix_cycle_and_approval() {
     if which_pwsh() {
         assert!(
             has(&|s| s["step"] == "review-0" && s["decision"] == "changes_requested"),
-            "{err}"
+            "{err}\n{}",
+            verify_diag(&env)
         );
         assert!(
             has(&|s| s["step"] == "fix-1" && s["verify"] == true),
-            "{err}"
+            "{err}\n{}",
+            verify_diag(&env)
         );
         assert!(
             has(&|s| s["step"] == "review-1" && s["decision"] == "approved"),
-            "{err}"
+            "{err}\n{}",
+            verify_diag(&env)
         );
-        assert_eq!(code, 0, "{err}");
+        assert_eq!(code, 0, "{err}\n{}", verify_diag(&env));
         assert_eq!(last["pass"], true);
         // checkpoints are on the task branch, with trailers; main is untouched
         let log = Command::new("git")
@@ -707,6 +710,45 @@ fn which_pwsh() -> bool {
     Command::new("pwsh").arg("-v").output().is_ok()
 }
 
+/// M11-R17 (the CI flake of run #20: a `pwsh` verify step ended with `exit Some(-1)` after
+/// about 2 s, and the log did not show why): what the verify commands of the latest run did —
+/// for each command of every `VERIFY_RESULT.json` under the data dir its exit code, the signal
+/// that ended it (on Unix `-1` always means a signal: a program that cannot be started is an
+/// error, not an exit code) and the tail of its output. For the failure messages below.
+fn verify_diag(env: &Env) -> String {
+    let mut files = Vec::new();
+    walk(&env.data.join("runs"), &mut files);
+    let mut out = String::from("── verify commands ──\n");
+    for f in files
+        .iter()
+        .filter(|f| f.file_name().is_some_and(|n| n == "VERIFY_RESULT.json"))
+    {
+        let v: serde_json::Value = std::fs::read(f)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        for c in v["commands"].as_array().into_iter().flatten() {
+            out.push_str(&format!(
+                "{} — exit {}, signal {} (none: it exited by itself), {} ms\n{}\n",
+                c["name"].as_str().unwrap_or("?"),
+                c["exit"],
+                c.get("signal")
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "none".into()),
+                c["ms"],
+                c["output_tail"]
+                    .as_str()
+                    .unwrap_or("")
+                    .lines()
+                    .map(|l| format!("    | {l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+    }
+    out
+}
+
 fn pipeline_env(quota: bool, review_once: bool) -> (Env, PathBuf) {
     let env = setup(false);
     let mut cfg = std::fs::read_to_string(env.root.join("machine.yaml")).unwrap();
@@ -786,8 +828,8 @@ fn pipeline_falls_back_to_claude_when_codex_is_out_of_quota() {
     );
     assert!(p.contains("## TASK.md") && p.contains("NO shell"), "{p}");
     if which_pwsh() {
-        assert_eq!(code, 0, "{err}");
-        assert_eq!(last["pass"], true);
+        assert_eq!(code, 0, "{err}\n{}", verify_diag(&env));
+        assert_eq!(last["pass"], true, "{err}\n{}", verify_diag(&env));
         let by: Vec<&str> = steps
             .iter()
             .filter_map(|s| s["implemented_by"].as_str())

@@ -762,13 +762,29 @@ fn an_environment_gate_that_cannot_run_escalates() {
             err.contains("environment_gate_unavailable: environment gate `dbsync`"),
             "{id}: {err}"
         );
-        // M11-R12 (item 3): the hint names no machine-config file (a frozen config has no path)
+        // M11-R12 (item 3): the hint names no machine-config file (a frozen config has no path).
+        // M11-R16 (changed): it tells both ways out — fixed on the machine: plain resume; fixed
+        // in the machine config: `task config --reload` first (the gate's command is frozen)
         assert!(
             !err.contains("toryo.local.yaml")
-                && err.contains("fix the machine config, then `toryo resume"),
+                && err.contains(&format!(
+                    "fixed on the machine (a value added to Credential Manager, a program installed): `toryo resume {id}`; fixed in a config file (`environment_gates.dbsync` in the machine config — frozen with the task): `toryo task config {id} --reload`, then `toryo resume {id}`"
+                )),
             "{id}: {err}"
         );
         let ev = events(&env, id);
+        // M11-R16 (X12): found before the build — no check gate ran, no result was written
+        assert!(
+            !ev.iter().any(|e| e["type"] == "verify_command"),
+            "{id}: {ev:?}"
+        );
+        assert!(
+            !task(&env, id)
+                .artifacts()
+                .join("VERIFY_RESULT.json")
+                .exists(),
+            "{id}"
+        );
         assert!(
             ev.iter()
                 .any(|e| e["type"] == "escalated"
@@ -1280,32 +1296,53 @@ fn gate_tail(env: &Env, id: &str, name: &str) -> String {
         .unwrap_or_default()
 }
 
-/// M11-R9 AC-3 (Windows): the forgery R9 is about — a check gate overwrites a tracked file with
-/// content of the same length and puts its timestamps back. Whatever `mutated` says, what the
-/// environment gate reads has the committed bytes: either the task escalates before any deploy,
-/// or the deployed file's SHA-256 is the original's, never the forged one's. (Whether Git for
-/// Windows catches this forgery depends on index raciness; the export never carries the
-/// checkout's bytes regardless — the deterministic proof is `the_export_holds_the_commit_not_the
-/// _checkout` and `a_check_gate_that_adds_a_file_is_not_deployed`.)
+/// M11-R9 AC-3 / R13 (Windows): the forgery R9 is about, made the way Git cannot see it. A check
+/// gate overwrites a tracked file with content of the same length and puts its timestamps back —
+/// on the **second** verify run, when the file was written by an earlier checkout and the
+/// checkout's index is newer than it (no "racy" second look: `verify::mutated` says unchanged).
+/// The environment gate therefore **runs**, and the file it reads has the committed SHA-256:
+/// it reads the export, never the Low checkout.
 #[cfg(windows)]
 #[test]
 fn a_same_length_forgery_in_the_checkout_is_never_deployed() {
-    let (env, marker) = probe_then_dbsync(
-        "$f = Join-Path $env:TORYO_VERIFY_CHECKOUT 'src/Calculator.psm1'\n$i = Get-Item $f\n$w = $i.LastWriteTimeUtc\n$c = $i.CreationTimeUtc\n\"orig=$((Get-FileHash $f -Algorithm SHA256).Hash)\"\n$b = [IO.File]::ReadAllBytes($f)\n$b[0] = if ($b[0] -eq 35) { 36 } else { 35 }\n[IO.File]::WriteAllBytes($f, $b)\n$i = Get-Item $f\n$i.LastWriteTimeUtc = $w\n$i.CreationTimeUtc = $c\n\"forged=$((Get-FileHash $f -Algorithm SHA256).Hash)\"\nexit 0\n",
-        "",
+    let (env, marker) = probe_then_dbsync("exit 0\n", "");
+    let flag = fwd(&env.root.join("gates").join("armed"));
+    // run 1: arm, and let more than a second pass; run 2: forge
+    let probe = format!(
+        "if (-not (Test-Path '{flag}')) {{ Set-Content -Path '{flag}' -Value x; Start-Sleep -Milliseconds 2200; 'armed'; exit 0 }}\n$f = Join-Path $env:TORYO_VERIFY_CHECKOUT 'src/Calculator.psm1'\n$i = Get-Item $f\n$w = $i.LastWriteTimeUtc\n$c = $i.CreationTimeUtc\n\"orig=$((Get-FileHash $f -Algorithm SHA256).Hash)\"\n$b = [IO.File]::ReadAllBytes($f)\n$b[0] = if ($b[0] -eq 35) {{ 36 }} else {{ 35 }}\n[IO.File]::WriteAllBytes($f, $b)\n$i = Get-Item $f\n$i.LastWriteTimeUtc = $w\n$i.CreationTimeUtc = $c\n\"forged=$((Get-FileHash $f -Algorithm SHA256).Hash)\"\nexit 0\n"
     );
-    // the environment gate records the hash of the file it would deploy
+    commit_repo(&env, &[("scripts/probe.ps1", &probe)], "the forging probe");
+    // the environment gate records, per run, the hash of the file it would deploy
     let got = env.root.join("gates").join("deployed-hash.txt");
     std::fs::write(
         env.root.join("gates").join("dbsync.ps1"),
         format!(
-            "Set-Content -Path '{}' -Value x\n(Get-FileHash (Join-Path $env:TORYO_VERIFY_CHECKOUT 'src/Calculator.psm1') -Algorithm SHA256).Hash | Set-Content -Path '{}'\nexit 0\n",
+            "Set-Content -Path '{}' -Value x\n(Get-FileHash (Join-Path $env:TORYO_VERIFY_CHECKOUT 'src/Calculator.psm1') -Algorithm SHA256).Hash | Add-Content -Path '{}'\nexit 0\n",
             fwd(&marker),
             fwd(&got)
         ),
     )
     .unwrap();
-    let err = one_turn(&env, "R9-F");
+    create(&env, "R9-F");
+    let s = script(
+        &env,
+        "r9f.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()]),
+                turn(vec![write("src/Notes.txt", "second checkpoint\n"), implementation()]),
+            ],
+            "reviewer": [turn(vec![changes()]), turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R9-F", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R9-F");
+    assert_eq!(
+        t.state,
+        St::Completed,
+        "Git must not see this forgery (else the gate never ran and this test proves nothing): {err}"
+    );
     let tail = gate_tail(&env, "R9-F", "probe");
     let line = |k: &str| {
         tail.lines()
@@ -1315,16 +1352,269 @@ fn a_same_length_forgery_in_the_checkout_is_never_deployed() {
     };
     let (orig, forged) = (line("orig="), line("forged="));
     assert_ne!(orig, forged, "the probe forged the file");
-    let t = task(&env, "R9-F");
-    if t.state == St::Escalated {
-        // Git saw it: no environment gate started
-        assert!(err.contains("verify_mutated_tree"), "{err}");
-        assert!(!marker.exists() && deployments(&env).is_empty());
-    } else {
-        assert_eq!(t.state, St::Completed, "{err}");
-        let deployed = std::fs::read_to_string(&got).unwrap().trim().to_string();
-        assert_eq!(deployed, orig, "the export holds the committed bytes");
-    }
+    // the gate ran on both verify runs, and both times read the committed bytes
+    assert!(marker.exists(), "the environment gate ran");
+    let hashes: Vec<String> = std::fs::read_to_string(&got)
+        .unwrap()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(hashes.len(), 2, "one line per verify run: {hashes:?}");
+    assert_eq!(hashes[1], orig, "the export holds the committed bytes");
+    assert_ne!(hashes[1], forged);
+    let d = deployments(&env);
+    assert_eq!((d.len(), d[0].ok), (1, Some(true)));
+}
+
+/// M11-R13 AC-2 (Windows): a verify root that Low code can write — a folder under a
+/// Low-labelled tree, like `AppData\LocalLow` — would make the export and the `envgate` folder
+/// Low-writable. It is refused: at prepare (`verify_boundary_unavailable`, no gate ran), by
+/// `doctor` (FAIL) and at `task create`.
+#[cfg(windows)]
+#[test]
+fn a_low_writable_verify_root_is_refused() {
+    let (env, marker) = probe_then_dbsync("exit 0\n", "");
+    let cfg = std::fs::read_to_string(&env.config)
+        .unwrap()
+        .replace("boundary: none", "boundary: low_integrity");
+    std::fs::write(&env.config, cfg).unwrap();
+    // admitted while the root is an ordinary folder …
+    create(&env, "R13-L");
+    // … then the root gets a Low label (inherited by everything created under it)
+    toryo::process::label_low(&[env.root.join("verify")]).unwrap();
+    let s = script(
+        &env,
+        "r13l.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R13-L", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R13-L");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("verify_boundary_unavailable")
+    );
+    assert!(
+        err.contains("verify_boundary_unavailable")
+            && err.contains("a Low-integrity process can create files in")
+            && err.contains("verify.verify_root")
+            && err.contains("toryo task config R13-L --reload"),
+        "{err}"
+    );
+    assert!(!marker.exists(), "no gate ran");
+    assert!(deployments(&env).is_empty());
+    let base = env.root.join("verify").join("R13-L");
+    assert!(
+        !base.join("R13-L.verify").exists() && !base.join("deploy").exists(),
+        "nothing was checked out or exported there"
+    );
+    // doctor says the same
+    let o = command(&env, &["doctor"], &[]).output().unwrap();
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    let line = out
+        .lines()
+        .find(|l| l.contains("a Low-integrity process can create files in"))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(
+        line.contains("FAIL") && line.contains("verify root"),
+        "{line}"
+    );
+    // and a new task is not admitted
+    let (code, err) = toryo(
+        &env,
+        &["task", "create", "--file", "TASK.md", "--id", "R13-M"],
+        &[],
+    );
+    assert_ne!(code, 0);
+    assert!(err.contains("verify_boundary_unavailable"), "{err}");
+}
+
+/// M11-R23 AC-1 (X16, Windows): the tree holds `Src/a.txt` next to the fixture's `src/…` — one
+/// folder on NTFS. The export check folds names, so the environment gate runs and the
+/// after-gate check is clean. (Before the fix no gate ever started for such a repository.)
+#[cfg(windows)]
+#[test]
+fn an_environment_gate_runs_when_a_folder_is_spelled_two_ways() {
+    let (env, marker) = probe_then_dbsync("exit 0\n", "exit 0\n");
+    let source = env.root.join("cased-source.txt");
+    std::fs::write(&source, "cased\n").unwrap();
+    let blob = git(
+        &env.repo,
+        &["hash-object", "-w", &source.display().to_string()],
+    );
+    git(
+        &env.repo,
+        &[
+            "-c",
+            "core.ignorecase=false",
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{},Src/Cased.txt", blob.trim()),
+        ],
+    );
+    git(
+        &env.repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "a folder spelled two ways",
+        ],
+    );
+    create(&env, "R23-C");
+    let s = script(
+        &env,
+        "r23c.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R23-C", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R23-C");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert!(marker.exists(), "the environment gate ran");
+    let d = deployments(&env);
+    assert_eq!((d.len(), d[0].ok), (1, Some(true)));
+}
+
+/// M11-R20 AC-1 (X15): `.gitattributes` says `text eol=crlf` and the blobs still hold CRLF (never
+/// renormalised): the export is accepted, the environment gate runs and the after-gate check is
+/// clean. (Round 3 compared Git's view after its clean conversion and blocked every gate.)
+#[test]
+fn an_environment_gate_runs_when_the_blobs_keep_crlf_under_eol_crlf() {
+    let (env, marker) = probe_then_dbsync("exit 0\n", "exit 0\n");
+    // `.gitattributes` says `text eol=crlf`; the blob was committed with CRLF through plumbing
+    // (`core.autocrlf=false`), as a Visual Studio XML file may be in a repository never
+    // renormalised
+    let source = env.root.join("crlf-source.xml");
+    std::fs::write(&source, "<a>\r\n<b/>\r\n</a>\r\n").unwrap();
+    std::fs::write(env.repo.join(".gitattributes"), "*.xml text eol=crlf\n").unwrap();
+    let blob = git(
+        &env.repo,
+        &[
+            "hash-object",
+            "-w",
+            "--no-filters",
+            &source.display().to_string(),
+        ],
+    );
+    let blob = blob.trim();
+    git(
+        &env.repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{blob},data/model.xml"),
+        ],
+    );
+    git(&env.repo, &["add", ".gitattributes"]);
+    git(
+        &env.repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "xml with CRLF blobs",
+        ],
+    );
+    create(&env, "R20-C");
+    let s = script(
+        &env,
+        "r20c.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R20-C", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R20-C");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert!(marker.exists(), "the environment gate ran");
+    // (whether the checkpoint keeps the CRLF blob or Git renormalises it at the first `add`
+    // depends on racy-git timing in a repository this small; the unit test
+    // `verify::tests::crlf_blobs_under_eol_crlf_export_clean` pins the case that blocked every
+    // gate — this one runs the whole chain over such a repository)
+    let (_, files) = seen_by_the_gate(&env);
+    assert!(files.iter().any(|f| f == "data/model.xml"), "{files:?}");
+    let d = deployments(&env);
+    assert_eq!((d.len(), d[0].ok), (1, Some(true)));
+}
+
+/// M11-R13 AC-3 (R9 AC-7, run): with `verify.checkout: tracked` an environment gate runs and
+/// passes — from the export of the commit, on a second verify run too (the checkout and its
+/// build folder are kept between runs in this mode).
+#[test]
+fn an_environment_gate_runs_with_a_tracked_checkout() {
+    let (env, marker) = probe_then_dbsync(
+        "Set-Content -Path (Join-Path $env:TORYO_VERIFY_BUILD 'built.txt') -Value x\nexit 0\n",
+        "echo x > \"$TORYO_VERIFY_BUILD/built.txt\"\nexit 0\n",
+    );
+    let cfg = std::fs::read_to_string(&env.config)
+        .unwrap()
+        .replace("boundary: none", "boundary: none, checkout: tracked");
+    std::fs::write(&env.config, cfg).unwrap();
+    create(&env, "R13-T");
+    let s = script(
+        &env,
+        "r13t.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()]),
+                turn(vec![write("src/Notes.txt", "second checkpoint\n"), implementation()]),
+            ],
+            "reviewer": [turn(vec![changes()]), turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R13-T", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R13-T");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert!(marker.exists(), "the environment gate ran");
+    let vr = verify_result(&env, "R13-T");
+    assert_eq!(vr["pass"], true);
+    let gate = vr["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["kind"] == "environment")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (gate["exit"].clone(), gate["source"].clone()),
+        (json!(0), json!("export"))
+    );
+    let (co, files) = seen_by_the_gate(&env);
+    assert_eq!(co.file_name().unwrap(), "deploy");
+    assert_eq!(
+        files,
+        checkpoint_files(&env, "R13-T"),
+        "exactly the commit's files"
+    );
+    assert!(
+        files.iter().any(|f| f == "src/Notes.txt"),
+        "the second checkpoint"
+    );
+    let d = deployments(&env);
+    assert_eq!((d.len(), d[0].ok), (1, Some(true)));
+    assert_eq!(d[0].sha, t.machine.checkpoint().unwrap());
 }
 
 /// M11-R9 AC-4 (Windows): a check gate at Low integrity cannot create a file in `deploy` (also
@@ -1408,6 +1698,13 @@ fn plain_resume_after_an_unavailable_gate_costs_no_fix_cycle() {
         Some("environment_gate_unavailable")
     );
     assert_eq!(t.fix_cycle, 0);
+    // M11-R16 AC-1 (X12): the gate's needs were checked before the build — no check gate ran
+    let ev = events(&env, "RS-E");
+    assert!(
+        !ev.iter().any(|e| e["type"] == "verify_command"),
+        "no `verify_command` before the escalation: {ev:?}"
+    );
+    assert!(deployments(&env).is_empty());
     // fix the cause (the secret is now resolvable) and plain-resume
     let (code, err) = toryo(
         &env,
@@ -1432,6 +1729,20 @@ fn plain_resume_after_an_unavailable_gate_costs_no_fix_cycle() {
     );
     let vr = verify_result(&env, "RS-E");
     assert_eq!(vr["commands"][0]["name"], "divide-present");
+    // M11-R16 AC-1: after the fix the check gate and the environment gate ran; AC-4: the flight
+    // record calls the plain resume `resume_stage`, not `unpause`
+    let ev = events(&env, "RS-E");
+    let ran: Vec<&str> = ev
+        .iter()
+        .filter(|e| e["type"] == "verify_command")
+        .map(|e| e["name"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(ran, ["divide-present", "dbsync"], "{ev:?}");
+    assert!(
+        ev.iter().any(|e| e["event"] == "resume_stage")
+            && !ev.iter().any(|e| e["event"] == "unpause"),
+        "{ev:?}"
+    );
     assert_eq!(
         deployments(&env)
             .iter()
@@ -1444,4 +1755,310 @@ fn plain_resume_after_an_unavailable_gate_costs_no_fix_cycle() {
         dec.contains("resumed after environment_gate_unavailable"),
         "{dec}"
     );
+}
+
+/// M11-R16 AC-2: a wrong `program` in the machine config. The gate's command is **frozen with
+/// the task**, so correcting the file is not enough: a plain `resume` escalates again — before
+/// any check gate — and its text names `task config --reload`. After the reload, `resume` runs
+/// the gate. No fix cycle and no implementer turn is spent on the way.
+#[test]
+fn a_wrong_gate_program_needs_a_reload_before_resume() {
+    let env = env_gate_setup(
+        "codex-openai",
+        "error",
+        "limits:\n  max_gate_retries: 3\n  max_review_rounds: 3\n",
+    );
+    let base = std::fs::read_to_string(&env.machine).unwrap();
+    let good = machine_gate(&env, "dbsync", "d365-env", "exit 0\n", "exit 0\n", "");
+    let bad = {
+        let program = good.lines().find(|l| l.contains("program:")).unwrap();
+        let args = good.lines().find(|l| l.contains("args:")).unwrap();
+        good.replace(
+            program,
+            if cfg!(windows) {
+                "    program: 'C:/no/such/sync.exe'"
+            } else {
+                "    program: '/no/such/sync'"
+            },
+        )
+        .replace(args, "    args: []")
+    };
+    std::fs::write(&env.machine, format!("{base}environment_gates:\n{bad}")).unwrap();
+    create(&env, "R16-P");
+    let s = script(
+        &env,
+        "r16p.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let counters = |env: &Env| {
+        let t = task(env, "R16-P");
+        let l = t.machine.split_limits().unwrap();
+        (t.fix_cycle, l.gate_retries, l.review_rounds)
+    };
+    let (_, err) = toryo(&env, &["run", "R16-P", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R16-P");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_unavailable")
+    );
+    let before = counters(&env);
+    // the file is corrected — but the task still runs on its frozen configuration
+    std::fs::write(&env.machine, format!("{base}environment_gates:\n{good}")).unwrap();
+    let (_, err) = toryo(
+        &env,
+        &["resume", "R16-P", "--yes", "--fake-agents", &s],
+        &[],
+    );
+    let t = task(&env, "R16-P");
+    assert_eq!(t.state, St::Escalated, "the same escalation: {err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_unavailable")
+    );
+    let why = t.machine.reason().unwrap_or_default().to_string();
+    assert!(
+        why.contains("program `")
+            && why.contains("`toryo task config R16-P --reload`, then `toryo resume R16-P`"),
+        "{why}"
+    );
+    assert!(
+        status_out(&env, "R16-P").contains("`toryo task config R16-P --reload`"),
+        "status says so too"
+    );
+    assert_eq!(counters(&env), before);
+    assert!(
+        !events(&env, "R16-P")
+            .iter()
+            .any(|e| e["type"] == "verify_command"),
+        "still no check gate ran"
+    );
+    // reload, then resume: the gate runs
+    let (code, err) = toryo(&env, &["task", "config", "R16-P", "--reload"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "R16-P").state, St::Escalated);
+    let (code, err) = toryo(
+        &env,
+        &["resume", "R16-P", "--yes", "--fake-agents", &s],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R16-P");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert_eq!(counters(&env), before, "no cycle was spent");
+    let d = deployments(&env);
+    assert_eq!((d.len(), d[0].ok), (1, Some(true)));
+    assert_eq!(
+        calls(&env, "R16-P")
+            .iter()
+            .filter(|c| c["key"]
+                .as_str()
+                .is_some_and(|k| k.starts_with("implementer")))
+            .count(),
+        0,
+        "no implementer turn during the last resume"
+    );
+}
+
+/// M11-R16 AC-3: the escalation and its class are one transaction. A process that dies right
+/// after it has escalated leaves a task whose plain `resume` works — there is no window in
+/// which the reason says `toryo resume` while the class that makes it work is missing.
+#[test]
+fn a_crash_right_after_a_machine_caused_escalation_keeps_its_class() {
+    let env = env_gate_setup("codex-openai", "error", "");
+    define_gates(
+        &env,
+        &machine_gate(
+            &env,
+            "dbsync",
+            "d365-env",
+            "exit 0\n",
+            "exit 0\n",
+            "    secret_env: { K: 'env:TORYO_M11_R16_SECRET' }\n",
+        ),
+    );
+    create(&env, "R16-C");
+    let s = script(
+        &env,
+        "r16c.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["run", "R16-C", "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "escalate:after")],
+    );
+    assert_eq!(code, 86, "crashed at the crash point: {err}");
+    let t = task(&env, "R16-C");
+    assert_eq!(t.state, St::Escalated);
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_unavailable"),
+        "written with the escalation"
+    );
+    let (code, err) = toryo(
+        &env,
+        &["resume", "R16-C", "--yes", "--fake-agents", &s],
+        &[("TORYO_M11_R16_SECRET", "ok")],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R16-C");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert_eq!(t.fix_cycle, 0);
+}
+
+/// M11-R17 (X8): plain resume after `verify_boundary_unavailable` (Windows: the Low label cannot
+/// be set — the injected error of a folder without WRITE_OWNER). Once the cause is gone a plain
+/// `toryo resume` goes back into verify: no fix cycle, no implementer turn.
+#[cfg(windows)]
+#[test]
+fn plain_resume_after_an_unavailable_boundary_costs_no_fix_cycle() {
+    let (env, marker) = probe_then_dbsync("exit 0\n", "");
+    let cfg = std::fs::read_to_string(&env.config)
+        .unwrap()
+        .replace("boundary: none", "boundary: low_integrity");
+    std::fs::write(&env.config, cfg).unwrap();
+    create(&env, "R17-B");
+    let s = script(
+        &env,
+        "r17b.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(
+        &env,
+        &["run", "R17-B", "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_LABEL_ERROR", "5")],
+    );
+    let t = task(&env, "R17-B");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("verify_boundary_unavailable")
+    );
+    let why = t.machine.reason().unwrap_or_default().to_string();
+    assert!(
+        why.starts_with("verify_boundary_unavailable: ")
+            && why.contains("WRITE_OWNER")
+            && why.contains("`toryo resume R17-B`")
+            && why.contains("`toryo task config R17-B --reload`"),
+        "{why}"
+    );
+    assert_eq!(t.fix_cycle, 0);
+    assert!(!marker.exists());
+    let (code, err) = toryo(
+        &env,
+        &["resume", "R17-B", "--yes", "--fake-agents", &s],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R17-B");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert_eq!(t.fix_cycle, 0, "no fix cycle was spent");
+    assert!(t.machine.reason_class().is_none());
+    assert!(marker.exists(), "the gates ran");
+    assert_eq!(
+        calls(&env, "R17-B")
+            .iter()
+            .filter(|c| c["key"]
+                .as_str()
+                .is_some_and(|k| k.starts_with("implementer")))
+            .count(),
+        0
+    );
+}
+
+/// M11-R17 (R12 item 2, end to end): a task frozen before M11-R3 still holds `%X%` in its
+/// environment gate's arguments (they are expanded at load now). The gate does not start —
+/// found before any check gate, no deployment row, no fix cycle — and the reason says to
+/// reload; after `task config --reload` the gate runs.
+#[test]
+fn a_gate_frozen_with_a_variable_does_not_start() {
+    let env = env_gate_setup("codex-openai", "error", "");
+    define_gates(
+        &env,
+        &machine_gate(&env, "dbsync", "d365-env", "exit 0\n", "exit 0\n", ""),
+    );
+    create(&env, "R17-V");
+    // forge what an older binary froze: the script path written with a variable. The frozen
+    // configuration is the version whose SHA-256 the task row names; a run store from before
+    // the immutable versions has only the view, which is used when its hash matches
+    let t = task(&env, "R17-V");
+    let (_, text) = toryo::engine::task::frozen_config_text(&t).unwrap();
+    let gates = fwd(&env.root.join("gates"));
+    assert!(text.contains(&gates), "{text}");
+    let old = text.replace(&gates, "%TORYO_R17_GATES%");
+    std::fs::write(t.artifacts().join("config.json"), &old).unwrap();
+    let sha = toryo::engine::task::sha256_hex(old.as_bytes());
+    let (i, p, im, rv, idx) = (
+        t.id.clone(),
+        t.planner.clone(),
+        t.implementers.clone(),
+        t.reviewer.clone(),
+        t.implementer_index,
+    );
+    db(&env)
+        .call(move |tx| store::set_config(tx, &i, &sha, &p, &im, &rv, idx))
+        .unwrap();
+    let s = script(
+        &env,
+        "r17v.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    // the variable is even set: the frozen text is never expanded at run time
+    let gates_var = [("TORYO_R17_GATES", gates.as_str())];
+    let (_, err) = toryo(
+        &env,
+        &["run", "R17-V", "--yes", "--fake-agents", &s],
+        &gates_var,
+    );
+    let t = task(&env, "R17-V");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_unavailable")
+    );
+    let why = t.machine.reason().unwrap_or_default().to_string();
+    assert!(
+        why.contains("environment gate `dbsync`: the command still contains `%TORYO_R17_GATES%`")
+            && why.contains("run `toryo task config R17-V --reload`, then `toryo resume R17-V`"),
+        "{why}"
+    );
+    assert_eq!(t.fix_cycle, 0);
+    assert!(deployments(&env).is_empty(), "no deployment row");
+    assert!(
+        !events(&env, "R17-V")
+            .iter()
+            .any(|e| e["type"] == "verify_command"),
+        "no gate ran"
+    );
+    // the way out the reason names
+    let (code, err) = toryo(&env, &["task", "config", "R17-V", "--reload"], &[]);
+    assert_eq!(code, 0, "{err}");
+    let (code, err) = toryo(
+        &env,
+        &["resume", "R17-V", "--yes", "--fake-agents", &s],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R17-V");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert_eq!(t.fix_cycle, 0);
+    let d = deployments(&env);
+    assert_eq!((d.len(), d[0].ok), (1, Some(true)));
 }

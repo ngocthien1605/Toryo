@@ -11,7 +11,7 @@ use super::checks::{parse_acceptance_ids, task_id};
 use super::state::Machine;
 use super::store::{self, NewTask, Store, TaskRow};
 use super::worktree::Worktree;
-use crate::config::{data_dir, expand_vars, Effective};
+use crate::config::{data_dir, expand_vars, BuildEntry, Effective};
 use crate::git::{default_gitcmd, GitCmd, Loc};
 
 pub struct CreateArgs {
@@ -82,43 +82,127 @@ pub fn new_machine(cfg: &Effective, cli_max: Option<u32>) -> Result<Machine> {
 /// [`super::checks::verify_entry_points`]) is in the commit `base` — one the task created could
 /// be written by the implementer before verify runs it. At `task create` and at `task config
 /// --reload` (group E review).
-pub fn check_entry_points(cfg: &Effective, g: &GitCmd, repo: &Path, base: &str) -> Result<()> {
-    for n in entry_point_notes(cfg, g, repo, base)? {
+/// Returns the entry scripts admitted as build output (M11-R14, X9), to freeze with the task.
+pub fn check_entry_points(
+    cfg: &Effective,
+    g: &GitCmd,
+    repo: &Path,
+    base: &str,
+) -> Result<Vec<BuildEntry>> {
+    let a = admission(cfg, g, repo, base)?;
+    if let Some(refusal) = a.refused.into_iter().next() {
+        bail!("{refusal}");
+    }
+    for n in a.notes {
         eprintln!("note: {n}");
     }
-    Ok(())
+    Ok(a.build)
 }
 
-/// [`check_entry_points`]: refuses a refusable entry script missing at `base` (M11-R10, X7:
-/// only when the repository does not ignore it — an ignored one is build output a gate creates
-/// in the clean verify checkout, never the implementer's); returns the notes for the other
-/// arguments the base commit lacks (the net: never a refusal). Also used by `doctor`.
+/// [`check_entry_points`]'s notes for the other arguments the base commit lacks (the net:
+/// never a refusal); a refusal is the error. Used by `doctor`.
 pub fn entry_point_notes(
     cfg: &Effective,
     g: &GitCmd,
     repo: &Path,
     base: &str,
 ) -> Result<Vec<String>> {
-    let cmds = super::checks::verify_commands(cfg, repo).unwrap_or_default();
-    let entry = super::checks::verify_entry_points(&cmds, repo);
-    let net: Vec<(String, String)> = super::checks::script_like_args(&cmds, repo)
-        .into_iter()
-        .filter(|e| !entry.contains(e))
-        .collect();
-    if entry.is_empty() && net.is_empty() {
-        return Ok(Vec::new());
+    let a = admission(cfg, g, repo, base)?;
+    if let Some(refusal) = a.refused.into_iter().next() {
+        bail!("{refusal}");
     }
-    let repol = Loc::Discover(repo.to_path_buf());
-    let listing = g.run(
-        &repol,
-        true,
-        &["ls-tree", "-r", "-t", "-z", "--name-only", base],
-    )?;
-    let tree: std::collections::HashSet<String> = listing
+    Ok(a.notes)
+}
+
+/// M11-R14 (X9): the entry scripts of `cfg`'s verify commands that are build output at `base`
+/// (missing there, ignored by the repository) — what `task create` freezes with the task and
+/// `task config --reload` recomputes against the same base commit. Never a refusal.
+pub fn build_entries(
+    cfg: &Effective,
+    g: &GitCmd,
+    repo: &Path,
+    base: &str,
+) -> Result<Vec<BuildEntry>> {
+    Ok(admission(cfg, g, repo, base)?.build)
+}
+
+/// The files of commit `base` in `repo` (M11-R14): repository-relative, `/`, lower-case.
+/// What protects arguments: never a folder.
+pub fn base_files(
+    g: &GitCmd,
+    repo: &Path,
+    base: &str,
+) -> Result<std::collections::HashSet<String>> {
+    ls_base(g, repo, base, false)
+}
+
+/// The files **and folders** of commit `base` (M11-R18, X14): what admission asks "is it in the
+/// base commit" of — an entry that is a folder (`node --test tests/unit`) is there.
+pub fn base_paths(
+    g: &GitCmd,
+    repo: &Path,
+    base: &str,
+) -> Result<std::collections::HashSet<String>> {
+    ls_base(g, repo, base, true)
+}
+
+fn ls_base(
+    g: &GitCmd,
+    repo: &Path,
+    base: &str,
+    folders: bool,
+) -> Result<std::collections::HashSet<String>> {
+    let mut args = vec!["ls-tree", "-r", "-z", "--name-only"];
+    if folders {
+        args.push("-t");
+    }
+    args.push(base);
+    let listing = g
+        .run(&Loc::Discover(repo.to_path_buf()), true, &args)
+        .with_context(|| {
+            format!(
+                "listing the files of the base commit {}",
+                crate::git::short(base)
+            )
+        })?;
+    Ok(listing
         .split(|b| *b == 0)
         .filter(|f| !f.is_empty())
         .map(|f| String::from_utf8_lossy(f).to_lowercase())
+        .collect())
+}
+
+/// What M18 admission finds for a configuration at a base commit.
+struct Admission {
+    /// `verify_script_missing: …` for each refusable entry script the base commit lacks and
+    /// the repository does not ignore.
+    refused: Vec<String>,
+    /// Entry scripts the base commit lacks and the repository ignores: build output (X9).
+    build: Vec<BuildEntry>,
+    /// The net: other arguments the base commit lacks (never a refusal).
+    notes: Vec<String>,
+}
+
+/// M18 admission (M11-R10, X7; R14, X9): a refusable entry script missing at `base` is refused
+/// only when the repository does not ignore it — an ignored one is build output a gate creates
+/// in the clean verify checkout, never the implementer's: it is admitted and recorded.
+fn admission(cfg: &Effective, g: &GitCmd, repo: &Path, base: &str) -> Result<Admission> {
+    let mut found = Admission {
+        refused: Vec::new(),
+        build: Vec::new(),
+        notes: Vec::new(),
+    };
+    let cmds = super::checks::verify_commands(cfg, repo).unwrap_or_default();
+    let entries = super::checks::verify_entries(&cmds, repo);
+    let net: Vec<(String, String)> = super::checks::script_like_args(&cmds, repo)
+        .into_iter()
+        .filter(|e| !entries.iter().any(|x| x.0 == e.0 && x.1 == e.1))
         .collect();
+    if entries.is_empty() && net.is_empty() {
+        return Ok(found);
+    }
+    let repol = Loc::Discover(repo.to_path_buf());
+    let tree = base_paths(g, repo, base)?;
     let what = if cfg.team.is_some() {
         "gate"
     } else {
@@ -133,22 +217,36 @@ pub fn entry_point_notes(
         .map(|o| o.status.success())
         .unwrap_or(false)
     };
-    for (name, path) in entry {
-        if !tree.contains(&path.to_lowercase()) && !ignored(&path) {
-            bail!(
+    for (name, path, refusable) in entries {
+        if tree.contains(&path.to_lowercase()) {
+            continue;
+        }
+        if ignored(&path) {
+            let e = BuildEntry { gate: name, path };
+            if !found.build.contains(&e) {
+                found.build.push(e);
+            }
+        } else if refusable {
+            found.refused.push(format!(
                 "verify_script_missing: {what} `{name}` runs `{path}`, which is not in the base commit {} of {} — commit it before creating the task (M18: a verify script the task itself creates could be written by the implementer)",
                 crate::git::short(base),
                 repo.display()
-            );
+            ));
         }
     }
-    Ok(net
+    // (R21 review) a data or configuration file (`ci/settings.json`) that the repository ignores
+    // is build output: no note. A script-like path keeps its note, ignored or not (M11-R10).
+    found.notes = net
         .into_iter()
-        .filter(|(_, path)| !tree.contains(&path.to_lowercase()))
+        .filter(|(_, path)| {
+            !tree.contains(&path.to_lowercase())
+                && (super::checks::has_script_ext(path) || !ignored(path))
+        })
         .map(|(name, path)| {
             format!("{what} `{name}` passes `{path}`, which is not in the base commit — fine for build output; if the {what} runs it as its script, commit it first")
         })
-        .collect())
+        .collect();
+    Ok(found)
 }
 
 /// Git for this task's repository, with the R37 filter plan admitted.
@@ -229,7 +327,12 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         true,
         &["rev-parse", &format!("{base_ref}^{{commit}}")],
     )?;
-    check_entry_points(cfg, &g, &repo, &base)?;
+    // M11-R14 (X9): the entry scripts admitted as build output are frozen with the task
+    let admitted = Effective {
+        build_entries: check_entry_points(cfg, &g, &repo, &base)?,
+        ..cfg.clone()
+    };
+    let cfg = &admitted;
     // R59 admission: its metadata folder and (protected) build projects are in the base commit
     if super::xpp::compile_only(cfg) {
         let listing = g.run(&repol, true, &["ls-tree", "-r", "-z", "--name-only", &base])?;

@@ -494,6 +494,7 @@ pub fn not_started(name: &str) -> CommandResult {
         cancelled: false,
         duration_ms: 0,
         output: "not started: the earlier projects of this command used up its timeout_min".into(),
+        signal: None,
     }
 }
 

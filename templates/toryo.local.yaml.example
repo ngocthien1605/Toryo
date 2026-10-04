@@ -101,6 +101,13 @@ git:
 # all tasks; `toryo status` shows which task and commit each lock's environment last received.
 # Lock names ignore case (D365-Env is d365-env); Windows device names (con, nul, com1, …) are
 # refused. A gate killed by its timeout or a stop is recorded as interrupted (a partial deploy).
+# What a gate needs from this machine — every `secret_env` value, its program, a valid lock name —
+# is checked BEFORE the check gates run: a gate that cannot start stops the task at once
+# (environment_gate_unavailable), not after a long build. The way on depends on the fix:
+#   - a value added to Credential Manager, a program installed: `toryo resume <id>` (no fix cycle);
+#   - this entry changed (program, args, env, a secret_env reference): a task that already exists
+#     does not see it — its gate command is frozen with the task. `toryo task config <id> --reload`,
+#     then `toryo resume <id>`.
 # environment_gates:
 #   dbsync:
 #     program: powershell                 # Windows PowerShell 5.1; pwsh for 7

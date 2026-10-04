@@ -612,11 +612,15 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
                 let (code, out, ms) = (res.exit, res.output.clone(), res.duration_ms);
                 let ok = code == Some(0);
                 pass &= ok;
+                // M11-R17: a signal that ended the command is named (Unix: `exit Some(-1)`)
                 eprintln!(
-                    "  {} {} (exit {:?}, {:.1}s)",
+                    "  {} {} (exit {:?}{}, {:.1}s)",
                     if ok { "✔" } else { "✘" },
                     cmd.name,
                     code,
+                    res.signal
+                        .map(|_| format!(" — {}", res.ended()))
+                        .unwrap_or_default(),
                     ms as f64 / 1000.0
                 );
                 let tail: String = out
@@ -628,7 +632,17 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
                     .rev()
                     .collect::<Vec<_>>()
                     .join("\n");
-                results.push(json!({"name": cmd.name, "argv": std::iter::once(cmd.program.clone().unwrap_or_default()).chain(cmd.args.clone()).collect::<Vec<_>>(), "exit": code, "ms": ms, "output_tail": tail}));
+                // M11-R17: what a failing command printed, so a log shows why it failed
+                if !ok {
+                    for l in tail.lines() {
+                        eprintln!("      | {l}");
+                    }
+                }
+                let mut entry = json!({"name": cmd.name, "argv": std::iter::once(cmd.program.clone().unwrap_or_default()).chain(cmd.args.clone()).collect::<Vec<_>>(), "exit": code, "ms": ms, "output_tail": tail});
+                if let Some(s) = res.signal {
+                    entry["signal"] = json!(s);
+                }
+                results.push(entry);
                 if !ok {
                     break; // stop at first failure (§5.2)
                 }

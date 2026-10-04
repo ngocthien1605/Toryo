@@ -86,6 +86,10 @@ pub struct ExitInfo {
     /// The root exited but descendants were still in the Job (holding the pipes or not):
     /// they were terminated with the Job at the end of the stage.
     pub lingering_killed: bool,
+    /// M11-R17: the signal that ended the root process (Unix; `code` is then -1). Left out
+    /// when there is none, so the records keep their shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
 }
 
 #[cfg(unix)]
@@ -270,6 +274,7 @@ impl Running {
             duration_ms: self.started.elapsed().as_millis(),
             tree_gone,
             lingering_killed,
+            signal: self.child.signal(),
         })
     }
 }
@@ -350,6 +355,31 @@ pub fn quote_windows_arg(arg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M11-R17: on Unix a process ended by a signal has the exit code -1 and its signal is
+    /// kept; one that exits by itself has none.
+    #[cfg(unix)]
+    #[test]
+    fn the_signal_that_ended_a_process_is_kept() {
+        let run = |script: &str| {
+            let spec = SpawnSpec {
+                program: PathBuf::from("/bin/sh"),
+                args: vec!["-c".to_string(), script.to_string()],
+                cwd: std::env::temp_dir(),
+                env: std::env::vars().collect(),
+                stdin: None,
+                boundary: Boundary::None,
+            };
+            spawn(&spec, &Redactions::empty())
+                .unwrap()
+                .wait(WaitOptions::default(), |_| {})
+                .unwrap()
+        };
+        let killed = run("kill -TERM $$");
+        assert_eq!((killed.code, killed.signal), (Some(-1), Some(15)));
+        let exited = run("exit 3");
+        assert_eq!((exited.code, exited.signal), (Some(3), None));
+    }
 
     #[test]
     fn strip_ansi_removes_colour_codes() {

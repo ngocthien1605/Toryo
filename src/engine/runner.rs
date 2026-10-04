@@ -31,7 +31,7 @@ use serde_json::{json, Value};
 
 use super::checks::{
     parse_allow_protected, resolve_program, review_violations, verify_commands, verify_files,
-    verify_globs, Protected,
+    verify_files_at_base, verify_globs, Protected,
 };
 use super::context;
 use super::contracts;
@@ -102,10 +102,17 @@ pub fn crash_point(name: &str) {
 }
 
 /// Git (with the admitted filter plan), protected paths and verify commands of a task.
+///
+/// M11-R14 (X9): which arguments of a verify command name a repository file — and so are
+/// protected — is decided from the task's **base commit**, not from the worktree as it is now,
+/// so every engine start gives the same set (build output left by an earlier run is not
+/// suddenly protected). The entry scripts frozen as build output (`cfg.build_entries`) are
+/// outside the R35 snapshot and barred from a change list instead.
 pub fn task_policy(t: &TaskRow, cfg: &Effective) -> Result<(GitCmd, Protected, Vec<CommandSpec>)> {
     let g = task_git(cfg, &t.repo)?;
     let cmds = verify_commands(cfg, &t.worktree)?;
-    let mut exact = verify_files(&cmds, &t.worktree);
+    let base = super::task::base_files(&g, &t.repo, &t.base_commit)?;
+    let mut exact = verify_files_at_base(&cmds, &t.worktree, &base);
     if let Ok(r) = rel(&t.repo, &t.task_file) {
         exact.push(r); // the task is the contract: agents may not edit it
     }
@@ -126,10 +133,12 @@ pub fn task_policy(t: &TaskRow, cfg: &Effective) -> Result<(GitCmd, Protected, V
     // R59: `tool: xpp` adds `**/Directory.Build.*` — MSBuild reads them from parent folders
     let mut globs = cfg.repo.policy.protected_paths.clone();
     globs.extend(verify_globs(&cmds));
-    let p = Protected::new(exact, &globs).with_policy(
-        &parse_allow_protected(&task_md),
-        &cfg.repo.policy.deny_paths,
-    );
+    let p = Protected::new(exact, &globs)
+        .with_build_entries(&cfg.build_entries)
+        .with_policy(
+            &parse_allow_protected(&task_md),
+            &cfg.repo.policy.deny_paths,
+        );
     // M11-C2: the implementer's write fence (org chart mode)
     let p = match cfg.team.as_ref().and_then(|t| t.role("implementer")) {
         Some(r) => p.with_fence(&r.writes, &r.never),
@@ -236,19 +245,23 @@ impl<'a> Engine<'a> {
         self.apply_with(e, false, None)
     }
 
-    /// Escalate with `reason`, printed as `!! reason` before the `[state]` line.
+    /// Escalate with `reason`, printed as `!! reason` before the `[state]` line. M11-R11/R16:
+    /// the typed `class` is stored on the machine **in the same transaction** as the
+    /// escalation, so a plain `toryo resume` can tell a machine-caused escalation from one a
+    /// fix cycle should repair — also after a crash right behind it.
     fn escalate(&self, class: &str, reason: String) -> Result<St> {
-        let st = self.apply_with(Ev::Escalate { reason }, true, Some(class))?;
-        self.record_reason_class(class)?;
-        Ok(st)
-    }
-
-    /// M11-R11: store the escalation class on the machine, so a plain `toryo resume` can tell a
-    /// machine-caused escalation from one a fix cycle should repair.
-    fn record_reason_class(&self, class: &str) -> Result<()> {
-        let (i, c) = (self.id.clone(), class.to_string());
-        self.store
-            .call(move |tx| store::set_reason_class(tx, &i, &c))
+        let i = self.id.clone();
+        let from = self.task()?.state;
+        let e = Ev::Escalate { reason };
+        let name = e.name();
+        let c = class.to_string();
+        let m = self
+            .store
+            .call(move |tx| store::transition_classed(tx, &i, e, Some(&c)))?;
+        crash_point("escalate:after");
+        self.rec
+            .transition_classed(from, name, &m, true, true, Some(class));
+        Ok(m.state())
     }
 
     /// M11-R5: before a turn of `stage` starts (no attempt, no tokens) — every skill it needs
@@ -276,7 +289,8 @@ impl<'a> Engine<'a> {
             ))
         } else {
             let c = context::assemble(&req)?;
-            context::over_budget(&c).map(|r| (context::CONTEXT_OVER_BUDGET, r))
+            context::over_budget(&c)
+                .map(|r| (context::CONTEXT_OVER_BUDGET, over_budget_reason(t, r)))
         };
         match blocked {
             Some((class, reason)) => {
@@ -1032,17 +1046,33 @@ impl<'a> Engine<'a> {
                 Ok(Flow::Next)
             }
             ImplementOutcome::PathPolicy { paths } => {
-                let fb = match change_fence_feedback(&paths, &self.protect) {
-                    // M11-C2: the fix note names the fence rule each path breaks
-                    Some(fb) => {
-                        eprintln!("!! paths the implementer may not change were changed: {paths:?} — restored, nothing committed; sent back to the implementer (write fence)");
-                        fb
-                    }
-                    None => {
-                        eprintln!("!! protected or denied paths changed: {paths:?} — restored, nothing committed; sent back to the implementer");
-                        format!("- POLICY: you changed protected or denied paths {paths:?}. They were restored. Do not modify them; achieve the task another way.")
-                    }
-                };
+                // M11-R14: a build-output entry script that reached the change list gets its
+                // own note, naming the gate
+                let (built, others): (Vec<String>, Vec<String>) = paths
+                    .iter()
+                    .cloned()
+                    .partition(|p| self.protect.build_entry(p).is_some());
+                let mut notes: Vec<String> = Vec::new();
+                if !others.is_empty() {
+                    notes.push(match change_fence_feedback(&others, &self.protect) {
+                        // M11-C2: the fix note names the fence rule each path breaks
+                        Some(fb) => {
+                            eprintln!("!! paths the implementer may not change were changed: {others:?} — restored, nothing committed; sent back to the implementer (write fence)");
+                            fb
+                        }
+                        None => {
+                            eprintln!("!! protected or denied paths changed: {others:?} — restored, nothing committed; sent back to the implementer");
+                            format!("- POLICY: you changed protected or denied paths {others:?}. They were restored. Do not modify them; achieve the task another way.")
+                        }
+                    });
+                }
+                if let Some(fb) =
+                    build_output_feedback(&built, &self.protect, self.cfg.team.is_some())
+                {
+                    eprintln!("!! build output that a gate runs as its script reached the change list: {built:?} — removed, nothing committed; sent back to the implementer");
+                    notes.push(fb);
+                }
+                let fb = notes.join("\n");
                 wt.restore(&paths)?;
                 self.end_and(
                     a,
@@ -1412,11 +1442,25 @@ impl<'a> Engine<'a> {
         let xpp = match xpp::for_config(&self.cfg) {
             Ok(x) => x,
             Err(e) => {
-                let reason = format!("{e:#}");
+                let reason = format!(
+                    "{e:#} — {}",
+                    machine_fix_hint(
+                        &t.id,
+                        "a NuGet folder or MSBuild put back",
+                        "`toolchains.xpp` in the machine config"
+                    )
+                );
                 self.escalate_attempt(&a, xpp::UNAVAILABLE.into(), reason)?;
                 return Ok(Flow::Next);
             }
         };
+        // M11-R16 (X12): what the environment gates of this run need from the machine is
+        // checked before any check gate runs — a build of tens of minutes is not spent on a
+        // gate that cannot start. (Checked again when each gate starts: things can change.)
+        if let Some(reason) = self.environment_gates_preflight(t) {
+            self.escalate_attempt(&a, ENV_UNAVAILABLE.into(), reason)?;
+            return Ok(Flow::Next);
+        }
         let Some((b, co)) = self.verify_checkout(t, &a, &head)? else {
             return Ok(Flow::Next);
         };
@@ -1543,16 +1587,92 @@ impl<'a> Engine<'a> {
             .and_then(|b| verify::prepare(&self.g, t, &self.cfg, head, b).map(|c| (b, c)));
         match prepared {
             Ok(x) => Ok(Some(x)),
-            Err(e)
-                if format!("{e:#}").starts_with(verify::UNAVAILABLE)
-                    || format!("{e:#}").starts_with(verify::MUTATED) =>
-            {
-                let reason = format!("{e:#}");
-                self.escalate_attempt(a, reason_class(&reason, verify::UNAVAILABLE), reason)?;
-                Ok(None)
-            }
-            Err(e) => Err(e),
+            // M11-R16 (X8): the class comes typed with the error, never from its text
+            Err(e) => match e.downcast_ref::<verify::Stop>().map(|s| s.class) {
+                Some(class) => {
+                    let mut reason = format!("{e:#}");
+                    if class == verify::UNAVAILABLE {
+                        reason = format!(
+                            "{reason} — {}",
+                            machine_fix_hint(
+                                &t.id,
+                                "the rights on the verify root",
+                                "`verify.verify_root` or `verify.boundary`"
+                            )
+                        );
+                    }
+                    self.escalate_attempt(a, class.to_string(), reason)?;
+                    Ok(None)
+                }
+                None => Err(e),
+            },
         }
+    }
+
+    /// M11-R16 (X12): the reason the first environment gate of this run that the machine
+    /// defines cannot start here ([`Self::gate_ready`]), or `None`. Nothing is run, locked or
+    /// recorded; a resolved secret is dropped at once.
+    fn environment_gates_preflight(&self, t: &TaskRow) -> Option<String> {
+        let team = self.cfg.team.as_ref()?;
+        team.handoff_gates()
+            .into_iter()
+            .filter(|(_, g)| g.decl.kind == crate::team::GateType::Environment)
+            .find_map(|(name, g)| {
+                g.machine
+                    .as_ref()
+                    .and_then(|m| self.gate_ready(t, name, m).err())
+            })
+    }
+
+    /// M11-R16: what the environment gate `name` needs from this machine before it can start —
+    /// no `%NAME%` left in its command (a task frozen before M11-R3), a valid lock name, every
+    /// `secret_env` reference resolved, the program found and outside the roots agent code can
+    /// write. `Ok`: the program to start and the resolved secrets; `Err`: the
+    /// `environment_gate_unavailable` reason, with the way out.
+    fn gate_ready(
+        &self,
+        t: &TaskRow,
+        name: &str,
+        m: &crate::config::EnvGate,
+    ) -> std::result::Result<(PathBuf, BTreeMap<String, String>), String> {
+        // M11-R12 (item 3): a frozen config has no machine path, so the hint names no file
+        let unavailable = |what: String| {
+            format!(
+                "{ENV_UNAVAILABLE}: environment gate `{name}`: {what} — {}",
+                machine_fix_hint(
+                    &t.id,
+                    "a value added to Credential Manager, a program installed",
+                    &format!("`environment_gates.{name}` in the machine config")
+                )
+            )
+        };
+        // M11-R12 (item 2): a task frozen before R3 may still hold `%VAR%` in program/args
+        // (they are expanded at load now, not at run time) — do not run it half-expanded
+        if let Some(var) = gate_residual_var(&m.program, &m.args) {
+            return Err(format!(
+                "{ENV_UNAVAILABLE}: environment gate `{name}`: the command still contains `%{var}%` (a task created before M11 expanded gate variables at load) — run `toryo task config {} --reload`, then `toryo resume {}`",
+                t.id, t.id
+            ));
+        }
+        // (only a change of the config helps here: no "fixed on the machine" half)
+        if let Some(problem) = super::lock::lock_name_problem(&super::lock::lock_key(&m.lock)) {
+            return Err(format!(
+                "{ENV_UNAVAILABLE}: environment gate `{name}`: lock `{}`: {problem} — change `environment_gates.{name}.lock` in the machine config, then `toryo task config {} --reload` and `toryo resume {}`",
+                m.lock, t.id, t.id
+            ));
+        }
+        let mut secrets = BTreeMap::new();
+        for (k, r) in &m.secret_env {
+            match crate::config::resolve_secret(r) {
+                Ok(v) => {
+                    secrets.insert(k.clone(), v);
+                }
+                Err(e) => return Err(unavailable(format!("secret_env.{k}: {e:#}"))),
+            }
+        }
+        let program = env_gate_program(&self.cfg, &m.program, std::env::var_os("PATH").as_deref())
+            .map_err(unavailable)?;
+        Ok((program, secrets))
     }
 
     /// Run the verify commands in the checkout, inside the boundary, and stop at the first
@@ -1723,37 +1843,10 @@ impl<'a> Engine<'a> {
             };
             // M11-R8: one lock and one deployment row whatever the case it is written in
             let lock_name = super::lock::lock_key(&m.lock);
-            // M11-R12 (item 3): a frozen config has no machine path, so the hint names no file
-            let unavailable = |what: String| {
-                Ok(EnvGates::Unavailable(format!(
-                    "{ENV_UNAVAILABLE}: environment gate `{name}`: {what} — fix the machine config, then `toryo resume {}`",
-                    t.id
-                )))
-            };
-            // M11-R12 (item 2): a task frozen before R3 may still hold `%VAR%` in program/args
-            // (they are expanded at load now, not at run time) — do not run it half-expanded
-            if let Some(var) = gate_residual_var(&m.program, &m.args) {
-                return Ok(EnvGates::Unavailable(format!(
-                    "{ENV_UNAVAILABLE}: environment gate `{name}`: the command still contains `%{var}%` (a task created before M11 expanded gate variables at load) — run `toryo task config {} --reload`, then `toryo resume {}`",
-                    t.id, t.id
-                )));
-            }
-            let mut secrets = BTreeMap::new();
-            for (k, r) in &m.secret_env {
-                match crate::config::resolve_secret(r) {
-                    Ok(v) => {
-                        secrets.insert(k.clone(), v);
-                    }
-                    Err(e) => return unavailable(format!("secret_env.{k}: {e:#}")),
-                }
-            }
-            let program = match env_gate_program(
-                &self.cfg,
-                &m.program,
-                std::env::var_os("PATH").as_deref(),
-            ) {
-                Ok(p) => p,
-                Err(e) => return unavailable(e),
+            // M11-R16: the checks of the preflight again — the build may have taken long
+            let (program, secrets) = match self.gate_ready(t, name, m) {
+                Ok(x) => x,
+                Err(reason) => return Ok(EnvGates::Unavailable(reason)),
             };
             let Some(lock) = self.env_lock(t, &lock_name, stop)? else {
                 return Ok(EnvGates::Stopped);
@@ -1853,7 +1946,7 @@ impl<'a> Engine<'a> {
                 .collect();
             results.push(json!({"name": name, "kind": "environment", "lock": lock_name, "machine": machine, "argv": argv, "exit": res.exit, "timed_out": res.timed_out, "ms": res.duration_ms, "output_tail": res.tail(40), "source": "export", "source_tree": export.tree}));
             // M11-R9: the gate must not have written into what it deploys from (E3 AC-8)
-            if let Some(reason) = verify::export_changed(&self.g, co, &export)? {
+            if let Some(reason) = verify::export_changed(&export) {
                 return Ok(EnvGates::Mutated(reason));
             }
             if !res.ok() {
@@ -2431,6 +2524,7 @@ impl<'a> Engine<'a> {
             return Ok(None);
         }
         if let Some(reason) = context::over_budget(&c) {
+            let reason = over_budget_reason(t, reason);
             self.escalate_attempt(a, context::CONTEXT_OVER_BUDGET.into(), reason)?;
             return Ok(None);
         }
@@ -2667,6 +2761,20 @@ impl<'a> Engine<'a> {
         feedback: Option<Option<String>>,
         e: Option<Ev>,
     ) -> Result<()> {
+        self.finish_classed(a, status, end, feedback, e, None)
+    }
+
+    /// [`Self::finish_and`]; `escalation`: the typed class of an escalation, stored on the
+    /// machine in the same transaction (M11-R16).
+    fn finish_classed(
+        &self,
+        a: &AttemptRow,
+        status: AttemptStatus,
+        end: AttemptEnd,
+        feedback: Option<Option<String>>,
+        e: Option<Ev>,
+        escalation: Option<String>,
+    ) -> Result<()> {
         let (i, aid) = (self.id.clone(), a.id.clone());
         let from = self.task()?.state;
         let name = e.as_ref().map(|e| e.name());
@@ -2677,7 +2785,12 @@ impl<'a> Engine<'a> {
                 store::set_feedback(tx, &i, f.as_deref())?;
             }
             match e {
-                Some(e) => Ok(Some(store::transition(tx, &i, e)?)),
+                Some(e) => Ok(Some(store::transition_classed(
+                    tx,
+                    &i,
+                    e,
+                    escalation.as_deref(),
+                )?)),
                 None => Ok(None),
             }
         })?;
@@ -2689,10 +2802,11 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    /// Fail the attempt with `class` and escalate the task with `reason` (one transaction;
-    /// its reason is printed with the escalation, R5).
+    /// Fail the attempt with `class` and escalate the task with `reason` — one transaction,
+    /// the typed class on the machine included (M11-R16); its reason is printed with the
+    /// escalation (R5).
     fn escalate_attempt(&self, a: &AttemptRow, class: String, reason: String) -> Result<()> {
-        self.finish_and(
+        self.finish_classed(
             a,
             AttemptStatus::Failed,
             AttemptEnd {
@@ -2701,8 +2815,10 @@ impl<'a> Engine<'a> {
             },
             None,
             Some(Ev::Escalate { reason }),
+            Some(class),
         )?;
-        self.record_reason_class(&class)
+        crash_point("escalate:after");
+        Ok(())
     }
 }
 
@@ -2799,6 +2915,29 @@ fn change_fence_feedback(paths: &[String], protect: &Protected) -> Option<String
         .collect();
     Some(format!(
         "- POLICY: you changed paths you may not change: {}. They were restored. Do not modify them; achieve the task another way.",
+        list.join("; ")
+    ))
+}
+
+/// M11-R14 (X9): the fix note when a build-output entry script reached the change list — the
+/// gate builds that file itself, in the clean verify checkout; the implementer's copy stays
+/// ignored and is never committed. `None` when `paths` is empty.
+fn build_output_feedback(paths: &[String], protect: &Protected, team: bool) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+    let what = if team { "gate" } else { "verify command" };
+    let list: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            format!(
+                "`{p}` (the script {what} `{}` runs)",
+                protect.build_entry(p).unwrap_or_default()
+            )
+        })
+        .collect();
+    Some(format!(
+        "- POLICY: build output must not be committed: {}. The {what} builds it itself in a clean checkout, so Git has to keep ignoring it. It was removed from your changes. Leave the ignore rules as they are and do not add it.",
         list.join("; ")
     ))
 }
@@ -3819,7 +3958,12 @@ fn command_result(c: &CommandSpec, res: &CommandResult) -> Value {
             .collect(),
         CommandKind::Xpp { .. } => Vec::new(),
     };
-    json!({"name": c.name, "argv": argv, "exit": res.exit, "ms": res.duration_ms, "output_tail": res.tail(40)})
+    let mut v = json!({"name": c.name, "argv": argv, "exit": res.exit, "ms": res.duration_ms, "output_tail": res.tail(40)});
+    // M11-R17: the signal that ended it (Unix), only when there is one
+    if let Some(s) = res.signal {
+        v["signal"] = json!(s);
+    }
+    v
 }
 
 /// The feedback of a failed verify for the implementer: the failing command, how it ended,
@@ -3839,6 +3983,11 @@ fn ended(res: &CommandResult) -> String {
     match (res.timed_out, res.cancelled, res.exit) {
         (true, _, _) => "timed out".into(),
         (_, true, _) => "was cancelled".into(),
+        // M11-R17: on Unix -1 means a signal ended it — say which
+        (_, _, Some(code)) if res.signal.is_some() => format!(
+            "exited {code} (killed by signal {})",
+            res.signal.unwrap_or_default()
+        ),
         (_, _, Some(code)) => format!("exited {code}"),
         (_, _, None) => "ended without an exit code (killed)".into(),
     }
@@ -3903,14 +4052,41 @@ fn deployment_ok(res: &CommandResult) -> Option<bool> {
     (!res.timed_out && !res.cancelled).then(|| res.ok())
 }
 
+/// M11-R16 (X12): the way out of a machine-caused escalation, in two steps — a fix on the
+/// machine itself needs only `toryo resume <id>`; a fix in a config file needs `toryo task config
+/// <id> --reload` first, because the task runs on its frozen configuration (the gate's command,
+/// the budget, the toolchain paths, the profiles).
+pub fn machine_fix_hint(id: &str, on_machine: &str, in_config: &str) -> String {
+    format!(
+        "fixed on the machine ({on_machine}): `toryo resume {id}`; fixed in a config file ({in_config} — frozen with the task): `toryo task config {id} --reload`, then `toryo resume {id}`"
+    )
+}
+
 /// M11-R5: the `skill_unavailable` reason — the skills that do not resolve, with both lookup
 /// paths, and the way out.
 fn skill_unavailable_reason(t: &TaskRow, stage: &str, profile: &str, missing: &[String]) -> String {
     format!(
-        "{}: the {stage} turn ({profile}) was not started — {}; put the skill back, then `toryo resume {}`",
+        "{}: the {stage} turn ({profile}) was not started — {}; {}",
         context::SKILL_UNAVAILABLE,
         missing.join("; "),
-        t.id
+        machine_fix_hint(
+            &t.id,
+            "the skill folder put back",
+            "`skills_dir` in the machine config, a role file's `skills`"
+        )
+    )
+}
+
+/// M11-R16: the `context_over_budget` reason with the way out — the budget is frozen with the
+/// task.
+fn over_budget_reason(t: &TaskRow, reason: String) -> String {
+    format!(
+        "{reason} — {}",
+        machine_fix_hint(
+            &t.id,
+            "a skill file made smaller",
+            "`context.budget_kb` in toryo.yaml"
+        )
     )
 }
 
@@ -4447,8 +4623,9 @@ pub fn next_action(t: &TaskRow) -> String {
                 .reason_class()
                 .is_some_and(crate::engine::state::is_machine_caused)
             {
-                // M11-R11 (X8): the machine caused it — plain resume goes back into the stage
-                format!("{why}\n  → fix the cause, then `toryo resume {id}` (no fix cycle; the stage is checked again)")
+                // M11-R11 (X8): the machine caused it — plain resume goes back into the stage.
+                // M11-R16: a fix in a config file is not used until the task is reloaded
+                format!("{why}\n  → fix the cause, then `toryo resume {id}` (no fix cycle; the stage is checked again). A fix in a config file (the machine config, toryo.yaml, a profile) is used only after `toryo task config {id} --reload` — the task runs on its frozen configuration")
             } else if why.starts_with(protect::REASON) {
                 format!("{why}\n  → restore the file(s) and `toryo resume {id}`, or `toryo resume {id} --accept-protected-change <path>` (recorded in DECISIONS.md)")
             } else if why.starts_with("recovery_policy_violation") {
@@ -5493,7 +5670,33 @@ mod tests {
             cancelled: false,
             duration_ms: 1500,
             output,
+            signal: None,
         };
+        // M11-R17: how a command ended, in words
+        assert_eq!(res.ended(), "exit 1");
+        let killed = CommandResult {
+            exit: Some(-1),
+            signal: Some(9),
+            ..res.clone()
+        };
+        assert_eq!(killed.ended(), "exit -1 (killed by signal 9, SIGKILL)");
+        assert_eq!(
+            serde_json::to_value(&killed).unwrap()["signal"],
+            json!(9),
+            "recorded when there is one"
+        );
+        assert_eq!(command_result(&c, &killed)["signal"], json!(9));
+        assert_eq!(ended(&killed), "exited -1 (killed by signal 9)");
+        assert!(
+            serde_json::to_value(&res).unwrap().get("signal").is_none(),
+            "left out otherwise"
+        );
+        let timed_out = CommandResult {
+            exit: None,
+            timed_out: true,
+            ..res.clone()
+        };
+        assert_eq!(timed_out.ended(), "no exit code (timed out)");
         let tail: Vec<String> = (6..=45).map(|i| format!("line {i}")).collect();
         assert_eq!(
             command_result(&c, &res),
@@ -5518,6 +5721,7 @@ mod tests {
                 cancelled,
                 duration_ms: 10,
                 output: output.into(),
+                signal: None,
             };
         let many: String = (1..=45).map(|i| format!("line {i}\n")).collect();
         let tail: Vec<String> = (6..=45).map(|i| format!("line {i}")).collect();
@@ -5584,6 +5788,55 @@ mod tests {
     fn gate_names_match_the_approval_rows() {
         assert_eq!(gate_name(GateKind::Plan), "plan");
         assert_eq!(gate_name(GateKind::Final), "final");
+    }
+
+    /// M11-R16 / R17: after each of the five machine-caused escalations `status` names both
+    /// ways out — plain `toryo resume`, and `task config --reload` first for a fix in a config
+    /// file — and never `--note`; the reasons the engine writes say which fix needs which step.
+    #[test]
+    fn next_action_of_the_five_machine_caused_classes() {
+        for class in crate::engine::state::MACHINE_CAUSED {
+            let mut t = task_in(&[
+                Ev::Start,
+                Ev::Escalate {
+                    reason: format!("{class}: x"),
+                },
+            ]);
+            t.machine.set_reason_class(class);
+            assert_eq!(
+                next_action(&t),
+                format!("{class}: x\n  → fix the cause, then `toryo resume T-1` (no fix cycle; the stage is checked again). A fix in a config file (the machine config, toryo.yaml, a profile) is used only after `toryo task config T-1 --reload` — the task runs on its frozen configuration"),
+                "{class}"
+            );
+        }
+        // the same reason without the typed class is an ordinary escalation: the text is never
+        // parsed for it
+        let t = task_in(&[
+            Ev::Start,
+            Ev::Escalate {
+                reason: "skill_unavailable: x".into(),
+            },
+        ]);
+        assert!(next_action(&t).contains("--note"), "{}", next_action(&t));
+        // the reasons
+        let t = task_in(&[]);
+        let hint = machine_fix_hint("T-1", "a program installed", "`environment_gates.g`");
+        assert_eq!(
+            hint,
+            "fixed on the machine (a program installed): `toryo resume T-1`; fixed in a config file (`environment_gates.g` — frozen with the task): `toryo task config T-1 --reload`, then `toryo resume T-1`"
+        );
+        let skill = skill_unavailable_reason(&t, "implement", "codex", &["`a` not found".into()]);
+        assert!(
+            skill.starts_with("skill_unavailable: the implement turn (codex) was not started — `a` not found; fixed on the machine (the skill folder put back): `toryo resume T-1`;")
+                && skill.contains("`toryo task config T-1 --reload`"),
+            "{skill}"
+        );
+        let budget = over_budget_reason(&t, "context_over_budget: too big".into());
+        assert!(
+            budget.starts_with("context_over_budget: too big — fixed on the machine")
+                && budget.contains("(`context.budget_kb` in toryo.yaml — frozen with the task): `toryo task config T-1 --reload`, then `toryo resume T-1`"),
+            "{budget}"
+        );
     }
 
     #[test]
@@ -5723,6 +5976,7 @@ mod tests {
             cancelled,
             duration_ms: 1,
             output: String::new(),
+            signal: None,
         };
         // finished: its own result — also when a stop came afterwards (the stop flag is not
         // an input)

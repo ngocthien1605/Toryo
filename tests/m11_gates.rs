@@ -513,6 +513,217 @@ fn admission_refuses_only_entry_scripts_the_implementer_could_write() {
     );
 }
 
+/// M11-R18 AC-1/AC-3 (X14, applies to everyone): an entry that is a **folder** of the base
+/// commit (`node --test tests/unit`, `node packages/cli`, `python tools/gen`) is admitted — at
+/// `task create`, in `doctor` and at `task config --reload` — and refused again when the folder
+/// is not there and not ignored. (Round 3 listed files only and refused them all.)
+#[test]
+fn an_entry_that_is_a_folder_of_the_base_commit_is_admitted() {
+    for (i, (program, args, folder)) in [
+        ("node", r#""--test", "tests/unit""#, "tests/unit"),
+        ("node", r#""packages/cli""#, "packages/cli"),
+        ("python", r#""tools/gen""#, "tools/gen"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let line = format!(r#"    - {{ name: dir, program: {program}, args: [{args}] }}"#);
+        let env = setup("codex-openai");
+        commit_repo(&env, &[(&format!("{folder}/a.txt"), "x\n")], "a folder");
+        with_verify_command(&env, &line);
+        let id = format!("R18-{i}");
+        let (code, err) = create_as(&env, &id);
+        assert_eq!(code, 0, "{folder} is in the base commit: {err}");
+        let o = command(&env, &["doctor"], &[]).output().unwrap();
+        let out = format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        assert!(!out.contains("verify_script_missing"), "doctor: {out}");
+        let s = script(
+            &env,
+            &format!("r18-{i}.json"),
+            json!({ "planner": [turn(vec![plan()])] }),
+        );
+        let (_, err) = toryo(&env, &["run", &id, "--fake-agents", &s], &[]);
+        assert_eq!(task(&env, &id).state, St::WaitingPlanApproval, "{err}");
+        let (code, err) = toryo(&env, &["task", "config", &id, "--reload"], &[]);
+        assert_eq!(code, 0, "--reload: {err}");
+        let y = std::fs::read_to_string(&env.config).unwrap();
+        std::fs::write(&env.config, y.replace(folder, "nowhere/at/all")).unwrap();
+        let (code, err) = toryo(&env, &["task", "config", &id, "--reload"], &[]);
+        assert_ne!(code, 0, "--reload of a folder the base commit lacks");
+        assert!(err.contains("verify_script_missing"), "{err}");
+        std::fs::write(&env.config, y).unwrap();
+        // admitted as that exact name only: nothing inside the folder is protected because of it
+        let t = task(&env, &id);
+        let cfgv = toryo::engine::task::frozen_config(&t).unwrap();
+        let (_, prot, _) = toryo::engine::runner::task_policy(&t, &cfgv).unwrap();
+        // AC-2: the set that protects arguments lists files only; admission's lists folders too
+        let g = toryo::git::default_gitcmd().unwrap();
+        let files = toryo::engine::task::base_files(&g, &t.repo, &t.base_commit).unwrap();
+        let paths = toryo::engine::task::base_paths(&g, &t.repo, &t.base_commit).unwrap();
+        assert!(
+            !files.contains(folder) && paths.contains(folder),
+            "{folder}"
+        );
+        assert!(files.contains(&format!("{folder}/a.txt")));
+        assert!(prot.violates(folder), "{folder} itself");
+        assert!(
+            !prot.violates(&format!("{folder}/a.txt")),
+            "nothing inside {folder} is protected because of the entry"
+        );
+
+        // the same line without the folder: refused (not ignored), at create and in doctor
+        let env = setup("codex-openai");
+        with_verify_command(&env, &line);
+        let (code, err) = create_as(&env, &id);
+        assert_ne!(code, 0);
+        assert!(
+            err.contains(&format!(
+                "verify_script_missing: verify command `dir` runs `{folder}`, which is not in the base commit"
+            )),
+            "{err}"
+        );
+    }
+}
+
+/// M11-R21: with `verify.checkout: tracked` `clean -ffd` keeps ignored files between verify
+/// runs; the task's frozen build-output entries are removed before each run — an entry script
+/// built from a checkpoint the reviewer rejected must not be what a later run starts — and
+/// other ignored files stay (that is what `tracked` is for).
+#[test]
+fn a_tracked_checkout_starts_every_run_without_the_build_output_entries() {
+    let (env, entry) = build_output_repo();
+    let y = std::fs::read_to_string(&env.config).unwrap();
+    assert!(y.contains("boundary: none"), "{y}");
+    std::fs::write(
+        &env.config,
+        y.replace("boundary: none", "boundary: none, checkout: tracked"),
+    )
+    .unwrap();
+    let (code, err) = create_as(&env, "R21-T");
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R21-T");
+    let cfg = toryo::engine::task::frozen_config(&t).unwrap();
+    assert_eq!(cfg.build_entries.len(), 1, "{:?}", cfg.build_entries);
+    let g = toryo::engine::task::task_git(&cfg, &t.repo).unwrap();
+    let prepare = || {
+        toryo::engine::verify::prepare(&g, &t, &cfg, &t.base_commit, toryo::process::Boundary::None)
+            .unwrap()
+    };
+    let co = prepare();
+    // a gate of an earlier run built the entry; another ignored file is there too
+    let built = co.dir.join(entry);
+    std::fs::create_dir_all(built.parent().unwrap()).unwrap();
+    std::fs::write(&built, "stale\n").unwrap();
+    let other = co.dir.join("build").join("cache.txt");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    std::fs::write(&other, "kept\n").unwrap();
+    prepare();
+    assert!(!built.exists(), "the entry starts every run absent");
+    assert!(other.exists(), "`tracked` keeps the other ignored files");
+}
+
+/// M11-R21: an argument that is clearly a path — a separator and a file extension — and is not
+/// in the base commit gets the `note:` at `task create` and in `doctor`, as a script-like one
+/// does (`-Config ci/settings.json`); one the base commit has gets none, and is protected.
+#[test]
+fn a_missing_path_argument_with_a_file_extension_gets_a_note() {
+    let line = r#"    - { name: smoke, program: pwsh, args: ["-File", "scripts/smoke.ps1", "-Config", "ci/settings.json"] }"#;
+    let note =
+        "note: verify command `smoke` passes `ci/settings.json`, which is not in the base commit";
+    let env = setup("codex-openai");
+    commit_repo(&env, &[("scripts/smoke.ps1", "exit 0\n")], "a smoke script");
+    with_verify_command(&env, line);
+    let (code, err) = create_as(&env, "R21-N");
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains(note), "{err}");
+    let o = command(&env, &["doctor"], &[]).output().unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains(note), "{out}");
+    // in the base commit: no note, and protected
+    let env = setup("codex-openai");
+    commit_repo(
+        &env,
+        &[
+            ("scripts/smoke.ps1", "exit 0\n"),
+            ("ci/settings.json", "{}\n"),
+        ],
+        "a smoke script and its settings",
+    );
+    with_verify_command(&env, line);
+    let (code, err) = create_as(&env, "R21-M");
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("ci/settings.json"), "{err}");
+    let t = task(&env, "R21-M");
+    let cfgv = toryo::engine::task::frozen_config(&t).unwrap();
+    let (_, prot, _) = toryo::engine::runner::task_policy(&t, &cfgv).unwrap();
+    assert!(prot.violates("ci/settings.json"));
+    // ignored by the repository: build output, no note (review)
+    let env = setup("codex-openai");
+    commit_repo(
+        &env,
+        &[("scripts/smoke.ps1", "exit 0\n"), (".gitignore", "ci/\n")],
+        "a smoke script; ci/ is ignored",
+    );
+    with_verify_command(&env, line);
+    let (code, err) = create_as(&env, "R21-I");
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("ci/settings.json"), "{err}");
+}
+
+/// M11-R21: `task config --reload` probes a changed `verify_root` as `task create` and `doctor`
+/// do: one a Low-integrity process can write is refused, nothing is changed; an ordinary one
+/// is accepted. (Windows: the boundary is the Low integrity level.)
+#[cfg(windows)]
+#[test]
+fn a_reload_probes_a_changed_verify_root() {
+    let env = setup("codex-openai");
+    let y = std::fs::read_to_string(&env.config).unwrap();
+    assert!(
+        y.contains("boundary: none") && y.contains("/verify\""),
+        "{y}"
+    );
+    std::fs::write(
+        &env.config,
+        y.replace("boundary: none", "boundary: low_integrity"),
+    )
+    .unwrap();
+    let (code, err) = create_as(&env, "R21-P");
+    assert_eq!(code, 0, "{err}");
+    let s = script(
+        &env,
+        "r21p.json",
+        json!({ "planner": [turn(vec![plan()])] }),
+    );
+    // to the plan gate: a waiting state, where a reload is allowed
+    let (_, err) = toryo(&env, &["run", "R21-P", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "R21-P").state, St::WaitingPlanApproval, "{err}");
+    let digest = task(&env, "R21-P").config_sha256;
+    // the new root carries a Low label (inherited by everything created under it)
+    let low = env.root.join("verify-low");
+    std::fs::create_dir_all(&low).unwrap();
+    toryo::process::label_low(std::slice::from_ref(&low)).unwrap();
+    let y = std::fs::read_to_string(&env.config).unwrap();
+    std::fs::write(&env.config, y.replace("/verify\"", "/verify-low\"")).unwrap();
+    let (code, err) = toryo(&env, &["task", "config", "R21-P", "--reload"], &[]);
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains("verify_boundary_unavailable")
+            && err.contains("a Low-integrity process can create files in"),
+        "{err}"
+    );
+    assert_eq!(task(&env, "R21-P").config_sha256, digest, "nothing changed");
+    // an ordinary folder is accepted
+    let y = std::fs::read_to_string(&env.config).unwrap();
+    std::fs::write(&env.config, y.replace("/verify-low\"", "/verify-ok\"")).unwrap();
+    let (code, err) = toryo(&env, &["task", "config", "R21-P", "--reload"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_ne!(task(&env, "R21-P").config_sha256, digest);
+}
+
 /// M11-R10 AC-3: `sh check` (no separator, no extension) missing at the base commit is
 /// admitted — and protected: a fake implementer that creates `check` cannot pass its own gate.
 /// (Deviation, recorded: a new untracked protected file is caught by the R35 protected-state
@@ -552,4 +763,718 @@ fn an_extensionless_entry_script_is_admitted_and_protected() {
         "never committed: {files}"
     );
     // without the protection the same run would commit `check` and pass its own gate
+}
+
+/// M11-R14: a toryo.yaml-only repository whose second verify command `smoke` runs a script that
+/// is **build output** — `dist/check.ps1` (`.sh`), missing at the base commit, `dist/` ignored
+/// — which the first command `build` creates in the verify checkout. The built script passes
+/// when the checkout has `Divide-Numbers`.
+fn build_output_repo() -> (Env, &'static str) {
+    let env = setup("codex-openai");
+    let (mk, body, entry, lines) = if cfg!(windows) {
+        (
+            "scripts/mk.ps1",
+            "New-Item -ItemType Directory -Force -Path dist | Out-Null\nSet-Content -Path dist/check.ps1 -Value 'git grep -q Divide-Numbers -- src; exit $LASTEXITCODE'\nexit 0\n",
+            "dist/check.ps1",
+            "    - { name: build, program: pwsh, args: [\"-NoProfile\", \"-File\", \"scripts/mk.ps1\"] }\n    - { name: smoke, program: pwsh, args: [\"-NoProfile\", \"-File\", \"dist/check.ps1\"] }",
+        )
+    } else {
+        (
+            "scripts/mk.sh",
+            "mkdir -p dist\nprintf 'git grep -q Divide-Numbers -- src\\n' > dist/check.sh\nexit 0\n",
+            "dist/check.sh",
+            "    - { name: build, program: sh, args: [\"scripts/mk.sh\"] }\n    - { name: smoke, program: sh, args: [\"dist/check.sh\"] }",
+        )
+    };
+    commit_repo(
+        &env,
+        &[(mk, body), (".gitignore", "dist/\nbuild/\n")],
+        "a build step; build output is ignored",
+    );
+    with_verify_command(&env, lines);
+    (env, entry)
+}
+
+/// M11-R14 AC-1 (X9, applies to everyone): a gate whose entry script is ignored build output is
+/// admitted, and the pipeline runs — the fake implementer writes source **and** its own
+/// `dist/check.*` (ignored), with no `protected_config_changed`; the checkpoint does not hold
+/// it; verify builds it in the clean checkout and runs it. The entry is frozen with the task
+/// (`build_entries`), outside the R35 snapshot and still barred from a change list.
+#[test]
+fn a_build_output_entry_script_may_exist_in_the_worktree() {
+    let (env, entry) = build_output_repo();
+    let (code, err) = create_as(&env, "R14-1");
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R14-1");
+    let cfgv = toryo::engine::task::frozen_config(&t).unwrap();
+    assert_eq!(
+        cfgv.build_entries
+            .iter()
+            .map(|e| (e.gate.as_str(), e.path.as_str()))
+            .collect::<Vec<_>>(),
+        [("smoke", entry)]
+    );
+    let (_, prot, _) = toryo::engine::runner::task_policy(&t, &cfgv).unwrap();
+    assert!(!prot.matches(entry), "not in the R35 snapshot");
+    assert!(
+        prot.violates(entry) && prot.build_entry(entry) == Some("smoke"),
+        "barred from a change list"
+    );
+    let s = script(
+        &env,
+        "r14a.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![
+                write("src/Calculator.psm1", DIVIDE),
+                write(entry, "exit 0\n"),
+                implementation(),
+            ])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R14-1", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R14-1");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert!(!err.contains("protected_config_changed"), "{err}");
+    assert_eq!(t.fix_cycle, 0);
+    let vr: Value =
+        serde_json::from_slice(&std::fs::read(t.artifacts().join("VERIFY_RESULT.json")).unwrap())
+            .unwrap();
+    assert_eq!(vr["pass"], true, "{vr}");
+    let names: Vec<&str> = vr["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["build", "smoke"]);
+    assert!(
+        wt(&env, "R14-1").join(entry).exists(),
+        "left in the worktree"
+    );
+    let files = git(&wt(&env, "R14-1"), &["diff", "--name-only", "main..HEAD"]);
+    assert!(
+        !files.lines().any(|f| f.starts_with("dist/")),
+        "never committed: {files}"
+    );
+    // a repository without such an entry freezes no `build_entries` (its hash is unchanged)
+    let env = setup("codex-openai");
+    create(&env, "R14-0");
+    let t = task(&env, "R14-0");
+    let (_, text) = toryo::engine::task::frozen_config_text(&t).unwrap();
+    assert!(!text.contains("build_entries"), "{text}");
+}
+
+/// M11-R14 AC-2: the implementer un-ignores `dist/`, so its copy of the entry script reaches
+/// the change list → a path-policy violation: the file is removed, nothing is committed, and
+/// the fix note names the verify command; the next turn goes on.
+#[test]
+fn an_unignored_build_output_entry_is_a_path_policy_violation() {
+    let (env, entry) = build_output_repo();
+    let (code, err) = create_as(&env, "R14-2");
+    assert_eq!(code, 0, "{err}");
+    let s = script(
+        &env,
+        "r14b.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![
+                    // overwritten (the `write` helper appends): `dist/` is no longer ignored
+                    json!({"kind": "write_file", "path": ".gitignore", "content": "build/\n", "append": false}),
+                    write(entry, "exit 0\n"),
+                    write("src/Calculator.psm1", DIVIDE),
+                    implementation(),
+                ]),
+                turn(vec![implementation()]),
+            ],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R14-2", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R14-2");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert!(
+        err.contains("build output that a gate runs as its script reached the change list")
+            && !err.contains("protected_config_changed"),
+        "{err}"
+    );
+    assert_eq!(t.fix_cycle, 1, "one fix cycle: the violation");
+    assert!(!wt(&env, "R14-2").join(entry).exists(), "removed");
+    let files = git(&wt(&env, "R14-2"), &["diff", "--name-only", "main..HEAD"]);
+    assert!(
+        !files.lines().any(|f| f.starts_with("dist/")) && files.contains("src/Calculator.psm1"),
+        "{files}"
+    );
+    let fix = calls(&env, "R14-2")
+        .into_iter()
+        .rev()
+        .find(|c| {
+            c["key"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("implementer")
+        })
+        .unwrap();
+    let prompt = fix["prompt"].as_str().unwrap();
+    assert!(
+        prompt.contains("build output must not be committed")
+            && prompt.contains(&format!(
+                "`{entry}` (the script verify command `smoke` runs)"
+            )),
+        "{prompt}"
+    );
+}
+
+/// M11-R14 AC-3 + AC-4 (X9): what is protected comes from the base commit. A first run leaves
+/// an ignored `build/app.exe` — an argument of a verify command — in the worktree; the task's
+/// protected set is the same before and after, `task config --reload` finds nothing changed,
+/// and `toryo resume` goes on: no `protected_config_changed`.
+#[test]
+fn build_output_left_in_the_worktree_is_not_protected_on_resume() {
+    let env = setup("codex-openai");
+    let (smoke, body, line) = if cfg!(windows) {
+        (
+            "scripts/smoke.ps1",
+            "if (Test-Path 'src/Fixed.txt') { exit 0 }\n'not fixed yet'\nexit 1\n",
+            "    - { name: smoke, program: pwsh, args: [\"-NoProfile\", \"-File\", \"scripts/smoke.ps1\", \"-Exe\", \"build/app.exe\"] }",
+        )
+    } else {
+        (
+            "scripts/smoke.sh",
+            "[ -f src/Fixed.txt ] && exit 0\necho 'not fixed yet'\nexit 1\n",
+            "    - { name: smoke, program: sh, args: [\"scripts/smoke.sh\", \"build/app.exe\"] }",
+        )
+    };
+    commit_repo(
+        &env,
+        &[(smoke, body), (".gitignore", "build/\n")],
+        "a smoke script; build output is ignored",
+    );
+    with_verify_command(&env, line);
+    let (code, err) = toryo(
+        &env,
+        &[
+            "task",
+            "create",
+            "--file",
+            "TASK.md",
+            "--id",
+            "R14-3",
+            "--max-fix-cycles",
+            "1",
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let protected = |env: &Env| {
+        let t = task(env, "R14-3");
+        let cfgv = toryo::engine::task::frozen_config(&t).unwrap();
+        let (_, prot, _) = toryo::engine::runner::task_policy(&t, &cfgv).unwrap();
+        (prot.exact_paths(), prot.matches("build/app.exe"))
+    };
+    let before = protected(&env);
+    assert!(
+        before.0.contains(&smoke.to_string()) && !before.1,
+        "{before:?}"
+    );
+    // the first run: the implementer builds `build/app.exe`; verify fails twice → Escalated
+    let s = script(
+        &env,
+        "r14c.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![
+                    write("src/Calculator.psm1", DIVIDE),
+                    write("build/app.exe", "MZ\n"),
+                    implementation(),
+                ]),
+                turn(vec![implementation()]),
+            ],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R14-3", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R14-3");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert!(
+        t.machine
+            .reason()
+            .unwrap_or_default()
+            .contains("not accepted after 1 fix cycle(s)"),
+        "{:?}",
+        t.machine.reason()
+    );
+    assert!(wt(&env, "R14-3").join("build").join("app.exe").exists());
+    // AC-4: the same protected set, although the file exists now
+    assert_eq!(protected(&env), before);
+    // Do 3: a reload recomputes against the same base commit — nothing changed
+    let (code, err) = toryo(&env, &["task", "config", "R14-3", "--reload"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("the effective configuration is unchanged"),
+        "{err}"
+    );
+    // AC-3: resume → the fix turn runs, verify passes
+    let s = script(
+        &env,
+        "r14d.json",
+        json!({
+            "implementer": [turn(vec![write("src/Fixed.txt", "x\n"), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "R14-3",
+            "--note",
+            "add src/Fixed.txt",
+            "--yes",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    let t = task(&env, "R14-3");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert!(!err.contains("protected_config_changed"), "{err}");
+}
+
+/// M11-R15 AC-2 (X10, applies to everyone): a `cd` in a command string is followed. The two
+/// lines of the list are accepted with the script at the base commit — round 2 looked for
+/// `x.sh` / `run.bat` in the repository root and refused them — and the script is protected
+/// where the `cd` put it. A head that is missing there is refused by its resolved path; a `cd`
+/// that cannot be followed refuses nothing.
+#[test]
+fn a_cd_in_a_command_string_is_followed_at_admission() {
+    let env = setup("codex-openai");
+    commit_repo(
+        &env,
+        &[("ci/x.sh", "exit 0\n"), ("sub/run.bat", "exit /b 0\n")],
+        "scripts in sub-folders",
+    );
+    with_verify_command(
+        &env,
+        "    - { name: ci, program: bash, args: [\"-lc\", \"cd ci && ./x.sh\"] }\n    - { name: sub, program: cmd, args: [\"/c\", \"cd sub && run.bat\"] }",
+    );
+    let (code, err) = create_as(&env, "R15-1");
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R15-1");
+    let cfgv = toryo::engine::task::frozen_config(&t).unwrap();
+    let (_, prot, _) = toryo::engine::runner::task_policy(&t, &cfgv).unwrap();
+    for p in [
+        "ci/x.sh",
+        "sub/run.bat",
+        "sub/run.bat.cmd",
+        "sub/run.bat.exe",
+    ] {
+        assert!(prot.violates(p), "{p} is protected");
+    }
+    for p in ["x.sh", "run.bat", "ci/other.sh"] {
+        assert!(!prot.violates(p), "{p} is not");
+    }
+
+    let env = setup("codex-openai");
+    with_verify_command(
+        &env,
+        r#"    - { name: ci, program: bash, args: ["-lc", "cd ci && ./new.sh"] }"#,
+    );
+    let (code, err) = create_as(&env, "R15-2");
+    assert_ne!(code, 0);
+    assert!(
+        err.contains(
+            "verify_script_missing: verify command `ci` runs `ci/new.sh`, which is not in the base commit"
+        ),
+        "{err}"
+    );
+
+    // not followed (a variable): nothing is refused; an argument is never refused either
+    let env = setup("codex-openai");
+    with_verify_command(
+        &env,
+        "    - { name: var, program: bash, args: [\"-c\", \"cd $DIR && ./x.sh\"] }\n    - { name: out, program: bash, args: [\"-c\", \"tsc --outFile build/x.js\"] }\n    - { name: pester, program: pwsh, args: [\"-Command\", \"Invoke-Pester tests/New.Tests.ps1\"] }",
+    );
+    let (code, err) = create_as(&env, "R15-3");
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("note: verify command `pester` passes `tests/New.Tests.ps1`, which is not in the base commit"),
+        "the direct form's note: {err}"
+    );
+    assert!(!err.contains("build/x.js"), "an output file: {err}");
+}
+
+/// M11-R15 AC-2, end to end: the gate `cd`s into `ci/` and runs its script there. The
+/// implementer edits that script → a path-policy violation: restored, nothing committed, a fix
+/// note; then the gate runs the committed script and passes.
+#[test]
+fn a_script_behind_a_cd_is_protected_from_the_implementer() {
+    let env = setup("codex-openai");
+    let (file, line) = if cfg!(windows) {
+        (
+            "ci/x.ps1",
+            r#"    - { name: ci, program: pwsh, args: ["-NoProfile", "-Command", "cd ci; ./x.ps1"] }"#,
+        )
+    } else {
+        (
+            "ci/x.sh",
+            // sourced (`.`): the file needs no executable bit
+            r#"    - { name: ci, program: sh, args: ["-c", "cd ci && . ./x.sh"] }"#,
+        )
+    };
+    commit_repo(&env, &[(file, "exit 0\n")], "a gate script in ci/");
+    with_verify_command(&env, line);
+    let (code, err) = create_as(&env, "R15-E");
+    assert_eq!(code, 0, "{err}");
+    let s = script(
+        &env,
+        "r15e.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write(file, "# always green\n"), write("src/Calculator.psm1", DIVIDE), implementation()]),
+                turn(vec![implementation()]),
+            ],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R15-E", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R15-E");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert!(
+        err.contains("protected or denied paths changed") && err.contains(file),
+        "{err}"
+    );
+    assert_eq!(t.fix_cycle, 1);
+    let files = git(&wt(&env, "R15-E"), &["diff", "--name-only", "main..HEAD"]);
+    assert!(
+        !files.lines().any(|f| f == file) && files.contains("src/Calculator.psm1"),
+        "{files}"
+    );
+}
+
+/// M11-R19 AC-2 (X13, applies to everyone): a gate script behind a command line the reader
+/// cannot use as a head — here a PowerShell expression, a nested `sh` — is protected all the
+/// same: a fake implementer that edits it gets a path-policy violation (restored, fix note).
+/// Nothing is refused and nothing noted when it is missing at the base commit.
+#[test]
+fn a_script_behind_a_wrapper_is_protected_from_the_implementer() {
+    let env = setup("codex-openai");
+    let (file, line) = if cfg!(windows) {
+        (
+            "ci/x.ps1",
+            // a command line inside a PowerShell expression: no head the reader could use
+            r#"    - { name: ci, program: pwsh, args: ["-NoProfile", "-Command", "Invoke-Expression './ci/x.ps1 -a'"] }"#,
+        )
+    } else {
+        (
+            "ci/x.sh",
+            // a nested shell
+            r#"    - { name: ci, program: sh, args: ["-c", "sh -c '. ./ci/x.sh'"] }"#,
+        )
+    };
+    commit_repo(&env, &[(file, "exit 0\n")], "a gate script in ci/");
+    with_verify_command(&env, line);
+    let (code, err) = create_as(&env, "R19-E");
+    assert_eq!(code, 0, "{err}");
+    let s = script(
+        &env,
+        "r19e.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write(file, "# always green\n"), write("src/Calculator.psm1", DIVIDE), implementation()]),
+                turn(vec![implementation()]),
+            ],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R19-E", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R19-E");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert!(
+        err.contains("protected or denied paths changed") && err.contains(file),
+        "{err}"
+    );
+    assert_eq!(t.fix_cycle, 1);
+    let files = git(&wt(&env, "R19-E"), &["diff", "--name-only", "main..HEAD"]);
+    assert!(
+        !files.lines().any(|f| f == file) && files.contains("src/Calculator.psm1"),
+        "{files}"
+    );
+    // X13 refuses nothing: the same line with the script missing at the base commit is
+    // admitted (the quoted word of the Unix line, `. ./ci/x.sh`, may get the older net note
+    // for arguments — a note, never a refusal)
+    let env = setup("codex-openai");
+    with_verify_command(&env, line);
+    let (code, err) = create_as(&env, "R19-N");
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("verify_script_missing"), "{err}");
+    // … and X13 says nothing: a wrapper line whose words are no script path (no separator, no
+    // script extension) is admitted without a single note
+    let env = setup("codex-openai");
+    with_verify_command(
+        &env,
+        r#"    - { name: wrap, program: docker, args: ["run", "img", "sh", "-c", "run-checks --fast"] }"#,
+    );
+    let (code, err) = create_as(&env, "R19-Q");
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("note:"), "{err}");
+}
+
+/// M11-R22 AC-2 (applies to everyone): a script fed through standard input is an entry, as on
+/// `main` — `bash -c "sh < scripts/missing.sh"` is refused like `./scripts/missing.sh`, with the
+/// script at the base commit it is protected; an input file that is no script (`sort <
+/// data/input.txt`) is admitted.
+#[test]
+fn a_script_fed_through_standard_input_is_an_entry() {
+    let line = r#"    - { name: feed, program: bash, args: ["-c", "sh < scripts/feed.sh"] }"#;
+    let env = setup("codex-openai");
+    with_verify_command(&env, line);
+    let (code, err) = create_as(&env, "R22-M");
+    assert_ne!(code, 0);
+    assert!(
+        err.contains(
+            "verify_script_missing: verify command `feed` runs `scripts/feed.sh`, which is not in the base commit"
+        ),
+        "{err}"
+    );
+    let env = setup("codex-openai");
+    commit_repo(&env, &[("scripts/feed.sh", "exit 0\n")], "a script");
+    with_verify_command(&env, line);
+    let (code, err) = create_as(&env, "R22-P");
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R22-P");
+    let cfgv = toryo::engine::task::frozen_config(&t).unwrap();
+    let (_, prot, _) = toryo::engine::runner::task_policy(&t, &cfgv).unwrap();
+    assert!(prot.violates("scripts/feed.sh"), "protected");
+    let env = setup("codex-openai");
+    with_verify_command(
+        &env,
+        r#"    - { name: sorted, program: bash, args: ["-c", "sort < data/input.txt"] }"#,
+    );
+    let (code, err) = create_as(&env, "R22-S");
+    assert_eq!(code, 0, "{err}");
+}
+
+/// M11-R15 AC-3 (X10, X11): `cmd.exe` looks in the working directory before PATH, and a check
+/// gate's working directory is the checkout root — so a bare head of a `cmd` string is
+/// protected under every name `cmd` would try, whether or not a program of that name is on
+/// PATH. A fake implementer that adds `npm.cmd` for `cmd /c "npm.cmd run build"`, or
+/// `build.cmd` for `cmd /c build`, is stopped: `protected_config_changed`, nothing committed.
+/// (The configuration is admitted: a bare head is never refused.)
+#[test]
+fn a_bare_cmd_name_cannot_be_planted_by_the_implementer() {
+    for (id, line, planted) in [
+        (
+            "R15-N",
+            r#"    - { name: build, program: cmd, args: ["/c", "npm.cmd run build"] }"#,
+            "npm.cmd",
+        ),
+        (
+            "R15-B",
+            r#"    - { name: build, program: cmd, args: ["/c", "build"] }"#,
+            "build.cmd",
+        ),
+    ] {
+        let env = setup("codex-openai");
+        with_verify_command(&env, line);
+        let (code, err) = create_as(&env, id);
+        assert_eq!(code, 0, "{id}: {err}");
+        let s = script(
+            &env,
+            "r15c.json",
+            json!({
+                "planner": [turn(vec![plan()])],
+                "implementer": [
+                    turn(vec![write("src/Calculator.psm1", DIVIDE), write(planted, "@exit /b 0\n"), implementation()]),
+                    turn(vec![implementation()]),
+                ],
+                "reviewer": [turn(vec![approved()])],
+            }),
+        );
+        let (_, err) = toryo(&env, &["run", id, "--yes", "--fake-agents", &s], &[]);
+        let t = task(&env, id);
+        assert_eq!(t.state, St::Escalated, "{id}: {err}");
+        let why = t.machine.reason().unwrap_or_default().to_string();
+        assert!(
+            why.starts_with(&format!("protected_config_changed: added {planted}")),
+            "{id}: {why}"
+        );
+        let files = git(&wt(&env, id), &["diff", "--name-only", "main..HEAD"]);
+        assert!(
+            !files.lines().any(|f| f == planted),
+            "{id}: never committed: {files}"
+        );
+    }
+}
+
+/// M11-R14 Do 3 (R13–R15 review): `task config --reload` recomputes the build-output entries
+/// against the task's base commit. With nothing changed the digest is the same — it would
+/// differ if the reload left them out; after the gate's script is renamed in the configuration
+/// the frozen list follows.
+#[test]
+fn a_reload_recomputes_the_build_output_entries() {
+    let (env, entry) = build_output_repo();
+    let (code, err) = create_as(&env, "R14-R");
+    assert_eq!(code, 0, "{err}");
+    let s = script(
+        &env,
+        "r14r.json",
+        json!({ "planner": [turn(vec![plan()])] }),
+    );
+    // to the plan gate: a waiting state, where a reload is allowed
+    let (_, err) = toryo(&env, &["run", "R14-R", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "R14-R").state, St::WaitingPlanApproval, "{err}");
+    let (code, err) = toryo(&env, &["task", "config", "R14-R", "--reload"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("the effective configuration is unchanged"),
+        "{err}"
+    );
+    let other = entry.replace("check", "other");
+    let y = std::fs::read_to_string(&env.config).unwrap();
+    std::fs::write(&env.config, y.replace(entry, &other)).unwrap();
+    let (code, err) = toryo(&env, &["task", "config", "R14-R", "--reload"], &[]);
+    assert_eq!(code, 0, "{err}");
+    let cfgv = toryo::engine::task::frozen_config(&task(&env, "R14-R")).unwrap();
+    assert_eq!(
+        cfgv.build_entries
+            .iter()
+            .map(|e| (e.gate.as_str(), e.path.as_str()))
+            .collect::<Vec<_>>(),
+        [("smoke", other.as_str())]
+    );
+}
+
+/// M11-R13 (R13–R15 review): a task that already has a verify checkout follows a changed
+/// `verify.verify_root` after `task config --reload` — a new checkout is made under the new
+/// root; the old folder is left alone.
+#[test]
+fn a_changed_verify_root_is_used_after_a_reload() {
+    let env = setup("codex-openai");
+    let (code, err) = toryo(
+        &env,
+        &[
+            "task",
+            "create",
+            "--file",
+            "TASK.md",
+            "--id",
+            "R13-V",
+            "--max-fix-cycles",
+            "1",
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    // two verify runs fail (no `Divide-Numbers` yet) → Escalated, with a checkout under `verify`
+    let s = script(
+        &env,
+        "r13v.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![implementation()]), turn(vec![implementation()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "R13-V", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "R13-V");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    let checkout = |env: &Env| -> std::path::PathBuf {
+        let vr: Value = serde_json::from_slice(
+            &std::fs::read(task(env, "R13-V").artifacts().join("VERIFY_RESULT.json")).unwrap(),
+        )
+        .unwrap();
+        std::path::PathBuf::from(vr["verify_checkout"].as_str().unwrap())
+    };
+    let old = checkout(&env);
+    assert!(
+        old.starts_with(env.root.join("verify")),
+        "{}",
+        old.display()
+    );
+    // the owner moves the verify root
+    let y = std::fs::read_to_string(&env.config).unwrap();
+    assert!(y.contains("/verify\""), "{y}");
+    std::fs::write(&env.config, y.replace("/verify\"", "/verify2\"")).unwrap();
+    let (code, err) = toryo(&env, &["task", "config", "R13-V", "--reload"], &[]);
+    assert_eq!(code, 0, "{err}");
+    let s = script(
+        &env,
+        "r13v2.json",
+        json!({
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "R13-V",
+            "--note",
+            "add Divide-Numbers",
+            "--yes",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(task(&env, "R13-V").state, St::Completed, "{err}");
+    let new = checkout(&env);
+    assert!(
+        new.starts_with(env.root.join("verify2")),
+        "{}",
+        new.display()
+    );
+    assert!(old.exists(), "the old checkout is left alone");
+}
+
+/// M11-R15 (R13–R15 review): command lines the first version of the reader refused although
+/// their script is in the base commit — a head without an extension in a `cmd` string
+/// (`scripts\build` runs `scripts\build.cmd`), a `Push-Location`, a quoted string that is an
+/// expression, a `cd` that is not the head of its command. All are admitted; what the gate
+/// clearly runs is protected.
+#[test]
+fn lines_the_reader_must_not_refuse() {
+    let env = setup("codex-openai");
+    commit_repo(
+        &env,
+        &[
+            ("scripts/build.cmd", "@exit /b 0\n"),
+            ("ci/x.ps1", "exit 0\n"),
+            ("run-tests.sh", "exit 0\n"),
+        ],
+        "gate scripts",
+    );
+    with_verify_command(
+        &env,
+        concat!(
+            "    - { name: build, program: cmd, args: ['/c', 'scripts\\build'] }\n",
+            "    - { name: ci, program: pwsh, args: ['-Command', 'Push-Location ci; ./x.ps1; Pop-Location'] }\n",
+            "    - { name: pester, program: pwsh, args: ['-Command', \"Invoke-Pester -Path @('tests/unit','tests/int')\"] }\n",
+            "    - { name: maybe, program: bash, args: ['-c', 'if [ -d frontend ]; then cd frontend; fi; ./run-tests.sh'] }\n",
+            "    - { name: deno, program: deno, args: ['run', '-A', 'npm:@biomejs/biome', 'check'] }"
+        ),
+    );
+    let (code, err) = create_as(&env, "R15-V");
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "R15-V");
+    let cfgv = toryo::engine::task::frozen_config(&t).unwrap();
+    let (_, prot, _) = toryo::engine::runner::task_policy(&t, &cfgv).unwrap();
+    // (R16–R17 review) `run-tests.sh` comes after a `cd` that may not run: Toryo stops reading
+    // there, refuses nothing, and still protects the script the base commit has
+    for p in [
+        "scripts/build.cmd",
+        "scripts/build.bat",
+        "ci/x.ps1",
+        "run-tests.sh",
+    ] {
+        assert!(prot.violates(p), "{p} is protected");
+    }
+    for p in ["x.ps1", "tests/unit", "frontend/run-tests.sh"] {
+        assert!(!prot.violates(p), "{p} is not");
+    }
 }

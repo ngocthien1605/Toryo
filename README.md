@@ -268,7 +268,12 @@ from the repository checkout (`project.root`), never from a task worktree, and e
   lookup paths; no turn, no tokens) — put it back and `toryo resume <id>`. A context with skills that is still over
   budget escalates with `context_over_budget`. These, and a gate/toolchain/boundary the machine cannot provide, are
   **machine-caused** (M11-R11, X8): a plain `toryo resume <id>` goes back into the stage once the cause is fixed — no
-  fix cycle, no implementer turn; `--note` is only for giving the implementer another cycle.
+  fix cycle, no implementer turn; `--note` is only for giving the implementer another cycle. **Which fix needs which
+  step (M11-R16):** fixed on the machine itself — a value added to Credential Manager, a program installed, a skill
+  folder put back — `toryo resume <id>`. Fixed in a config file — `environment_gates.<name>` in the machine config,
+  `context.budget_kb` in `toryo.yaml`, a profile, `verify.verify_root` — `toryo task config <id> --reload`, then
+  `toryo resume <id>`: a task runs on the configuration frozen at `task create`, so a corrected file alone changes
+  nothing (the reason and `status` say so).
 - **The write fence.** The implementer's `writes:` (globs; when set, the only files it may change — `writes: []` or no
   `writes` means no allowlist: only `never` applies) and `never:`
   (never, even inside `writes`) — case-insensitive, `/` and `\` alike. A planned file outside the fence sends the
@@ -277,8 +282,12 @@ from the repository checkout (`project.root`), never from a task worktree, and e
   entry like a protected path. Patterns are normalised at load (`./src/**`, `src/` and `src` all mean `src/**`: the
   path and everything under it; a last segment without a wildcard covers what is under it too, `**/secrets` is
   `**/secrets/**`; a wildcard pattern without a `/` matches at any depth, `*.pfx` is `**/*.pfx`); an absolute pattern, `..`, an empty one or syntax the matcher lacks (`{ } [ ] !`;
-  it has `*`, `**`, `?`) is a load error. (`policy.deny_paths` / `protected_paths` keep their M10 behaviour;
-  `toryo doctor` warns about a pattern there that can never match.)
+  it has `*`, `**`, `?`) is a load error; so is a variable or the home shortcut, which a fence never expands — a
+  `%NAME%` anywhere, `~` or `$NAME` / `${NAME}` / `$env:NAME` as the whole first segment (`~/x`, `$HOME/x`). Elsewhere `%`, `~`
+  and `$` are ordinary characters of a file name (`routes/$id.tsx`, `~$draft.docx`, `50%.txt`).
+  (`policy.deny_paths` / `protected_paths` keep their M10 behaviour; `toryo doctor` warns about a pattern there
+  that can never match, and about one with `{ } [ ] !` — there those characters are matched literally: Toryo
+  patterns have no braces, classes or negation.)
 - **The culture file is protected** (org chart mode) like the verify files: an agent's change is restored, unless
   TASK.md lists it under `## Allow protected`.
 - **Gates.** The implementer's `before_handoff` lists gates by name, every `check` gate before every `environment`
@@ -287,20 +296,62 @@ from the repository checkout (`project.root`), never from a task worktree, and e
   (legacy verify commands too).
   - `kind: check` — defined in the repository (`program`/`args` or `tool: xpp` + `metadata`/`projects`, `timeout:
     30s | 20m | 1h`), runs exactly like a verify command: clean checkout, Low integrity, no secrets, its script
-    protected. (M18, for everyone; M11-R10, X7) a gate's **entry script** — the file that decides pass or fail — is
-    protected before it exists, and `task create` refuses a configuration whose base commit lacks it, because the
-    implementer could write it: the program when it is a repository path; `-File x` of PowerShell, else every literal
-    path with a separator and a script extension in a `-Command` line (`& { ./x.ps1 }`), else the first positional
-    `.ps1`; the same in a `cmd /c` line (`call scripts\x.cmd`), where a bare command name (the head of any `&&` / `&`
-    / `|` / `;` segment) with a script extension counts too unless a program of that name is on PATH; in a shell's `-c` line (also `-ec`, `-euxc`); the first argument of
-    `sh`/`bash`/`python`/`node`/`ruby`/`perl` that is not a flag or a flag's value (`-o`, `-W`, `-r`, `-I`,
-    `--env-file`, `--rcfile`, …). A missing entry script is refused only when it has a separator or a script extension
-    (`sh check` is protected, not refused) and the repository does not ignore it (`node dist/cli.js` with `dist/`
-    ignored is build output: admitted, still protected). **Every other argument** — also the value of `KEY=value`,
-    `--flag=value`, `-Flag:value`, `/p:Name=value` — is protected when it names a file of the base commit and never
-    refused; a missing one with a script or program extension gets a `note:` at `task create` and in `doctor`.
+    protected. (M18, for everyone; M11-R10/R14/R15: X7, X9, X10) a gate's **entry script** — the file that decides
+    pass or fail — is protected before it exists, and `task create` refuses a configuration whose base commit lacks
+    it, because the implementer could write it. Entry scripts are: the program when it is a repository path;
+    `-File x` of PowerShell, else the first positional `.ps1`; the makefile of `make -f x` / `--file=x` (plain `make`
+    protects `GNUmakefile`, `makefile` and `Makefile`, never refused); the first argument of `sh`/`bash`/`python`/
+    `node`/`ruby`/`perl`/`php`/`bun`/`tsx`/`ts-node` that is not a flag or a flag's value (`-o`, `-W`, `-r`, `-I`,
+    `--env-file`, `--rcfile`, …), and of `deno run`.
+    In a **command string** (`pwsh -Command`, `cmd /c`, a shell's `-c`, also `-ec`, `-lc`) Toryo reads the string:
+    it is split, with its quotes, into simple commands at `&&`, `||`, `;`, `|`, `&`, newlines and `( ) { }` (in a
+    `cmd` string `;` separates arguments, not commands, and `rem` comments out its line). Only the
+    **head** of each simple command — its first word after an optional `call`, `.`, `exec`, `time` or `NAME=value` —
+    is an entry script, and only when it is a relative path with a separator (`& './my scripts/x.ps1'` keeps its
+    space). It is refused when missing only if it clearly names a script: it starts with `./` or `../` (`./gradlew`
+    needs no extension in a shell string) or has a script extension (`scripts\x.cmd`); any other head with a
+    separator is protected, not refused. In a `cmd` or PowerShell string a head without an extension
+    (`scripts\build`, `.\gradlew`) stands for `scripts\build.cmd`, `.ps1`, …: every such name is protected, none is
+    refused. A `cd` / `chdir` / `pushd` / `Set-Location` / `sl` / `Push-Location` with a literal relative folder
+    moves where the rest resolves (`popd` / `Pop-Location` go back):
+    `bash -lc "cd ci && ./x.sh"` runs — and protects — `ci/x.sh`. `pwsh -WorkingDirectory ci -File x.ps1` runs the
+    root `x.ps1` (PowerShell finds a `-File` script from the folder it was started in, then changes folder), but
+    `-Command ./x.ps1` runs under `ci` in PowerShell 7 and under the root in Windows PowerShell 5.1, which ignores
+    the flag: that form is read both ways and nothing in it is refused. Toryo **stops reading** when it cannot follow the
+    string: a `cd` with a variable, an absolute path, `-` or no argument; a `cd` that runs only sometimes — after
+    `&&` / `||` (`[ -d ci ] && cd ci`), in a pipeline, inside a block or a function body (`if (…) { cd build }`), or
+    not as the head of its command (`if [ -d web ]; then cd web; fi`); a here-document (its body is skipped).
+    From there on nothing is an entry script and nothing is refused. **Refusing needs certainty; protecting does
+    not:** for every verify command and gate, next to what Toryo finds, every word of every argument that names a
+    file of the base commit is protected — also inside an argument that is itself a command line (`docker run img sh
+    -c "…"`, `wsl bash -lc "…"`, `bash -c "bash -c '…'"`, `Invoke-Expression '…'`), after a here-document and after
+    any point where reading stopped — looked up from the checkout root **and** from every folder the command names
+    as a change of folder anywhere (`cd`, `pushd`, `Set-Location`, `-C`, `-WorkingDirectory`), followed or not.
+    This never refuses and never prints a note; when it protects a file the task must edit, list that file under
+    `## Allow protected` in TASK.md. A
+    quoted string in head position of a PowerShell string is an expression, not a command (`'out/x.txt' | Should
+    -Exist`, `@('a/b','c/d')`), unless `&` or `.` runs it. A bare head of a `cmd` string that is not a built-in
+    (`cmd /c build`, `cmd /c "npm.cmd run build"`) is protected — never refused — as `<name>` and `<name>` + each
+    default `PATHEXT` extension (`.com .exe .bat .cmd .vbs .vbe .js .jse .wsf .wsh .msc`) in that folder, whether or
+    not a program of that name is on PATH: `cmd.exe` looks in the working directory first, and a gate's working
+    directory is the checkout (an implementer that creates one stops the task with `protected_config_changed`).
+    PowerShell and `sh` never run a bare name from the working directory.
+    An entry that is a **folder** of the base commit (`node --test tests/unit`, `node packages/cli`) is admitted, as
+    before round 3 (M11-R18): it is protected as that name, and nothing inside it is protected because of it.
+    A missing entry script is refused only when it has a separator or a script extension (`sh check`, `php artisan`,
+    `make -f ci.mk` are protected, not refused) and the repository does not ignore it. One that is missing **and
+    ignored** (`node dist/cli.js` with `dist/` ignored) is build output: admitted and recorded with the task
+    (`build_entries` in `toryo task config <id>`); the implementer may build it in its worktree, but it is never
+    committed — un-ignoring it is a path-policy violation with a fix note naming the gate.
+    **Every other word** — also the value of `KEY=value`, `--flag=value`, `-Flag:value`, `/p:Name=value`, and every
+    argument inside a command string — is protected when it names a file of the task's **base commit** (not of the
+    worktree: build output that appears later, `build/app.exe`, is not suddenly protected after a `resume`) and
+    never refused; a missing one with a separator and a script or program extension gets a `note:` at `task create`
+    and in `doctor`.
     Remaining limits: a file a gate script itself loads (dot-sourced, imported) is not seen; a script without an
-    extension, in the repository root, run by a program outside this table.
+    extension, in the repository root, run by a program outside this table; a shell keyword in front of a command
+    (`if ./x.sh; then …`) makes it an argument (protected when it exists, not refused); `source x.sh` is read like
+    any command (`x.sh` is an argument), `. x.sh` as a head.
   - `kind: environment` — the repository only declares it (`timeout`, `if_missing: error | skip`); the command is
     `environment_gates.<name>` in the machine config (`program`, `args`, `lock`, `env`, `secret_env`), frozen with the
     task. It runs only after every check gate passed (a check gate that changed a tracked file of the verify checkout
@@ -308,7 +359,22 @@ from the repository checkout (`project.root`), never from a task worktree, and e
     **never reads the checkout the check gates used** (M11 review X6): once it holds its lock, Toryo exports the
     checkpoint commit afresh from the repository's object store into `<verify_root>\<task>\deploy`, a folder no agent
     code can write — that export is its `TORYO_VERIFY_CHECKOUT` (no `.git`; its tree id is in `VERIFY_RESULT.json`,
-    `source: "export"`). What a check gate left in the checkout is listed (`checkout_extra`, one warning), never
+    `source: "export"`). (M11-R13, R20) The check is **byte-exact**: right after the export Toryo walks the folder
+    (no link followed) and records every entry — path, kind, size, SHA-256. Before the gate starts, the folder must
+    hold exactly the entries of the commit's tree, and every file the bytes Git writes for its blob (`git cat-file
+    --filters`: `.gitattributes`, `core.autocrlf`, filter drivers) — compared as bytes, never through Git's own view
+    after its line-ending conversion, so a repository with `*.xml text eol=crlf` over CRLF blobs is fine; a
+    difference stops the gate (`environment_gate_unavailable`, naming the first files). After the gate, a new walk
+    must match the record: a changed, added or removed file or folder (an empty one, a `.git` entry too) is
+    `verify_mutated_tree` — a gate script never writes there (this guards your own script: a contract, not a
+    boundary). (In a repository whose `.gitattributes` says `text` / `eol=crlf` over blobs that still hold CRLF, Git
+    itself reports the files of the verify *checkout* as modified right after checkout, so verify can stop with
+    `verify_mutated_tree` before any gate — also before this change: run `git add --renormalize .` once and commit.)
+    With the `low_integrity` boundary Toryo also proves, before each verify run, that the task's folder
+    under `verify_root` is **not writable at Low integrity** (a Low process tries to create a folder there and must
+    fail): a `verify_root` inside a Low-writable tree such as `AppData\LocalLow` would hand the export and the
+    gate's working folder to the code under test — `verify_boundary_unavailable`, and `toryo doctor` / `task
+    create` say the same. What a check gate left in the checkout is listed (`checkout_extra`, one warning), never
     deployed; `verify.checkout: tracked` works with environment gates too. It runs in an **empty working directory**
     that agent code cannot write (`<verify_root>\<task>\envgate`), inside a Job Object, with an
     environment from scratch + the gate variables + `env` + the resolved
@@ -317,7 +383,10 @@ from the repository checkout (`project.root`), never from a task worktree, and e
     variable is a load error) — the expanded text is what is checked, frozen and run (`config show` prints it), and a
     PATH name that resolves inside those folders is refused at run time. One gate per `lock` runs at a time across all tasks;
     a second waits (`status`: `waiting for lock d365-env (held by T-12)`), `toryo stop` ends the wait. A failure
-    goes back to the implementer as data and counts against `max_gate_retries`. A machine without the gate:
+    goes back to the implementer as data and counts against `max_gate_retries`. What a gate needs from the machine —
+    every `secret_env` value, its program, a valid lock name — is checked **before the check gates run** (M11-R16,
+    X12) and again when the gate starts: a gate that cannot start stops the task with `environment_gate_unavailable`
+    at once, not after a build of tens of minutes. A machine without the gate:
     `if_missing: error` refuses the task, `skip` runs without it and says so at the final gate.
   - **The script contract** (`templates/toryo.local.yaml.example`): exit code decides (PowerShell: `$ErrorActionPreference
     = 'Stop'` and `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }` after every native call); deploy only
@@ -365,7 +434,7 @@ came from. Sources: `repo`, `machine`, `repo_overridden_by_machine` (a machine s
 
 ```jsonc
 { "schema": 1, "mode": "org chart",                 // or "toryo.yaml only"
-  "config_sha256": "…",                             // what `task create` records as tasks.config_sha256
+  "config_sha256": "…",                             // what `task create` records as tasks.config_sha256 — plus the build-output entry scripts of the task's base commit, if any (then the task's digest differs)
   "team": "d365fo-dev",                             // null in toryo.yaml-only mode
   "files": [ { "what": "toryo.yaml", "path": "…", "sha256": "…" } ],   // + machine config, org chart, role <seat>
   "seats": [ { "seat": "implementer", "profile": "codex-openai", "model": null, "fallback": ["claude-max"], "source": "repo" } ],
@@ -416,7 +485,7 @@ cargo test --release
 | `tests/m11_trust.rs` | Windows + Linux | M11-A: the machine floor for `verify.boundary`, the machine `verify_root` and its origin in `doctor` |
 | `tests/m11_orgchart.rs` | Windows + Linux | M11-B/C1: `config show` (text, `--json`), a task frozen and reloaded with the same digest, a fake run to the final gate in org chart mode, layered role instructions in `context show` |
 | `tests/m11_roles.rs` | Windows + Linux | M11-C: the write fence at plan time and after a build turn (`## Allow protected`), `reviewer-differs-from-builder` off/warn/error after a fallback, split limits end to end |
-| `tests/m11_gates.rs` | Windows + Linux | M11-E1/E2: the gate variables, M18 admission, verify output redacted with the task's secrets, stdout/stderr order kept |
+| `tests/m11_gates.rs` | Windows + Linux | M11-E1/E2: the gate variables, M18 admission, verify output redacted with the task's secrets, stdout/stderr order kept; round 3: build-output entry scripts (R14), a `cd` in a command string and `cmd` bare names (R15), a reload after a changed `verify_root` |
 | `tests/m11_env_gates.rs` | Windows + Linux (normal-token vs Low-IL test Windows only) | M11-E3: environment gates after the checks, the deployment record in every view, the shared lock with `stop`, secrets, `if_missing: skip`, a mutated checkout, an unavailable gate, a crash during the gate |
 | `tests/m11_skills.rs` | Windows + Linux | M11-D: the planner's menu, the plan's `skills` (off the menu, over the budget, none), skills per role in `context show`, a changed SKILL.md, the Claude implementer's context file |
 

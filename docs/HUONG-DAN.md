@@ -250,7 +250,8 @@ NuGet) và `scope: compile`. Các property `/p:…` được truyền qua một 
 và metadata phải có sẵn trong repo khi `task create` (nếu thiếu: `xpp_project_missing`). Project build và mọi `Directory.Build.*` được bảo vệ: agent sửa project →
 bị trả lại (fix cycle); agent thêm `Directory.Build.props` → Escalated (`protected_config_changed`).
 Thiếu MSBuild hay thiếu gói NuGet: `task create` từ chối; nếu hỏng sau đó thì verify dừng ở Escalated
-(`xpp_toolchain_unavailable`) — sửa toolchain rồi `toryo resume ID`.
+(`xpp_toolchain_unavailable`) — đặt lại toolchain rồi `toryo resume ID`; nếu phải sửa đường dẫn `toolchains.xpp`
+trong machine config thì `toryo task config ID --reload` trước (cấu hình của task đã đóng băng).
 
 Lỗi compile được tách khỏi output MSBuild (có thể dài hàng nghìn dòng): mỗi mục `xpp` trong
 `VERIFY_RESULT.json` có `diagnostics` (50 lỗi đầu, mỗi lỗi một lần, đường dẫn tương đối với checkout),
@@ -676,14 +677,23 @@ Bộ mẫu: `templates\d365fo\.toryo\`, `templates\d365fo\CULTURE.md`, `template
   dẫn đã tìm; chưa chạy lượt nào, không tốn token) — đặt skill lại rồi `toryo resume <id>`. Ngữ cảnh có skill mà vẫn
   quá ngân sách → escalate `context_over_budget`. Các lỗi này, cùng gate/toolchain/boundary máy không cung cấp được,
   là **do máy** (M11-R11, X8): `toryo resume <id>` (không `--note`) quay lại stage sau khi sửa nguyên nhân — không
-  tốn vòng sửa, không chạy implementer; `--note` chỉ để cấp thêm một vòng cho implementer.
+  tốn vòng sửa, không chạy implementer; `--note` chỉ để cấp thêm một vòng cho implementer. **Sửa ở đâu thì làm bước
+  nào (M11-R16):** sửa trên máy (thêm giá trị vào Credential Manager, cài chương trình, đặt lại thư mục skill) →
+  `toryo resume <id>`. Sửa trong file config (`environment_gates.<tên>` trong machine config, `context.budget_kb` trong
+  `toryo.yaml`, một profile, `verify.verify_root`) → `toryo task config <id> --reload`, rồi `toryo resume <id>`: task
+  chạy theo cấu hình đã **đóng băng** lúc `task create`, nên chỉ sửa file thì chưa có gì thay đổi (lý do escalate và
+  `status` đều ghi rõ).
 - **Hàng rào ghi (write fence)** của implementer: `writes:` = chỉ được sửa các file này (`writes: []` hoặc không ghi = không giới hạn, chỉ áp `never`); `never:` = không bao giờ,
   kể cả trong `writes`. Kế hoạch đụng file ngoài hàng rào → lập lại kế hoạch; implementer sửa file ngoài hàng rào →
   khôi phục và trả lại, nêu rõ luật. `## Allow protected` trong TASK.md mở được một mục, như file được bảo vệ.
   Mẫu được chuẩn hoá lúc nạp: `./src/**`, `src/` và `src` đều là `src/**` (thư mục và mọi thứ bên trong; `**/secrets` là `**/secrets/**`; mẫu có ký tự đại
   diện mà không có `/` khớp ở mọi cấp: `*.pfx` là `**/*.pfx`); mẫu tuyệt
-  đối, có `..`, rỗng, hoặc dùng cú pháp không hỗ trợ (`{ } [ ] !` — chỉ có `*`, `**`, `?`) → lỗi nạp. (`policy.deny_paths`
-  / `protected_paths` giữ hành vi M10; `toryo doctor` cảnh báo mẫu không bao giờ khớp.)
+  đối, có `..`, rỗng, hoặc dùng cú pháp không hỗ trợ (`{ } [ ] !` — chỉ có `*`, `**`, `?`) → lỗi nạp; biến hoặc lối tắt
+  thư mục home cũng vậy (hàng rào không bao giờ thay biến): `%TÊN%` ở bất kỳ đâu, `~` hoặc `$TÊN` / `${TÊN}` / `$env:TÊN` là cả
+  đoạn đầu (`~/x`, `$HOME/x`). Ở chỗ khác `%`, `~`, `$` là ký tự thường của tên file (`routes/$id.tsx`,
+  `~$draft.docx`, `50%.txt`). (`policy.deny_paths` / `protected_paths` giữ hành vi M10; `toryo doctor` cảnh báo mẫu
+  không bao giờ khớp, và mẫu có `{ } [ ] !` — ở đó các ký tự này được so khớp nguyên văn: mẫu của Toryo không có ngoặc
+  nhọn, lớp ký tự hay phủ định.)
 - **File `culture` được bảo vệ** (chế độ org chart) như script của gate: agent sửa → khôi phục, trừ khi TASK.md
   liệt kê nó dưới `## Allow protected`.
 - **Giới hạn**: `limits: { max_gate_retries, max_review_rounds }` — gate trượt tính vào cái đầu, review bị từ chối
@@ -701,22 +711,72 @@ trượt đầu tiên; exit code quyết định; mọi gate có `TORYO_TASK`, `
 `TORYO_VERIFY_BUILD`):
 - `kind: check` — khai báo đầy đủ trong repo, chạy trong checkout sạch với quyền **Low integrity**, không có secret.
   Script của gate được bảo vệ kể cả khi chưa tồn tại (M18), và `task create` từ chối nếu commit gốc chưa có nó.
-  (M11-R10, X7, áp dụng cho mọi repo) Chỉ **script đầu vào** của gate (file quyết định đạt/không đạt) mới bị từ chối khi
-  commit gốc chưa có, vì implementer có thể tự viết nó: `-File x` của PowerShell, các đường dẫn có `/` hoặc `\` và đuôi
-  script trong dòng `-Command` (`& { ./x.ps1 }`), dòng `cmd /c` (`call scripts\x.cmd`; tên trần có đuôi script cũng tính,
-  trừ khi PATH có chương trình cùng tên), dòng `-c` của shell (cả `-ec`, `-euxc`), và đối số đầu tiên không phải cờ của
-  `sh`/`bash`/`python`/`node`/… (bỏ qua giá trị của `-o`, `-W`, `-r`, `--env-file`, `--rcfile`…). Script đầu vào thiếu
-  chỉ bị từ chối khi có `/`/`\` hoặc đuôi script **và** repo không ignore nó (`node dist/cli.js` với `dist/` bị ignore là
-  output build: cho qua, vẫn được bảo vệ); `sh check` được bảo vệ, không bị từ chối. **Mọi đối số khác** (cả giá trị của
-  `KEY=value`, `--flag=value`, `/p:Name=value`) được bảo vệ nếu có trong commit gốc và không bao giờ bị từ chối; thiếu thì
-  chỉ in một dòng `note:` khi `task create` và trong `doctor`. Giới hạn còn lại: file mà script tự nạp (dot-source,
-  import) không được nhìn thấy; script không có đuôi, ở gốc repo, chạy bằng chương trình ngoài bảng.
+  (M11-R10/R14/R15: X7, X9, X10 — áp dụng cho mọi repo) Chỉ **script đầu vào** của gate (file quyết định đạt/không
+  đạt) mới bị từ chối khi commit gốc chưa có, vì implementer có thể tự viết nó: chương trình nếu là đường dẫn trong
+  repo; `-File x` của PowerShell (hoặc `.ps1` đứng một mình); makefile của `make -f x` (`make` trần thì bảo vệ
+  `GNUmakefile`, `makefile`, `Makefile`, không từ chối); đối số đầu tiên không phải cờ của `sh`/`bash`/`python`/`node`/
+  `ruby`/`perl`/`php`/`bun`/`tsx`/`ts-node` (bỏ qua giá trị của `-o`, `-W`, `-r`, `--env-file`, `--rcfile`…) và của
+  `deno run`.
+  Với **chuỗi lệnh** (`pwsh -Command`, `cmd /c`, `-c` của shell, cả `-ec`, `-lc`), Toryo đọc chuỗi đó: tách theo dấu
+  nháy thành các lệnh đơn tại `&&`, `||`, `;`, `|`, `&`, xuống dòng và `( ) { }` (trong chuỗi `cmd`, `;` ngăn cách đối
+  số chứ không ngăn cách lệnh, và `rem` biến cả dòng thành chú thích). Chỉ **từ đầu** của mỗi lệnh đơn (sau
+  `call`, `.`, `exec`, `time` hoặc `TÊN=giá_trị` nếu có) mới là script đầu vào, và chỉ khi nó là đường dẫn tương đối có
+  `/` hoặc `\` (`& './my scripts/x.ps1'` giữ nguyên dấu cách). Nó chỉ bị từ chối khi thiếu nếu rõ ràng là script: bắt
+  đầu bằng `./` hoặc `../` (`./gradlew` trong chuỗi shell không cần đuôi) hoặc có đuôi script (`scripts\x.cmd`); các
+  từ đầu khác có dấu phân cách thì được bảo vệ, không bị từ chối. Trong chuỗi `cmd` hoặc PowerShell, từ đầu không có
+  đuôi (`scripts\build`, `.\gradlew`) nghĩa là `scripts\build.cmd`, `.ps1`, …: mọi tên như vậy được bảo vệ, không tên
+  nào bị từ chối. `cd` / `chdir` / `pushd` / `Set-Location` / `sl` / `Push-Location` với thư mục tương đối viết thẳng
+  sẽ đổi chỗ phân giải phần còn lại (`popd` / `Pop-Location` quay lại):
+  `bash -lc "cd ci && ./x.sh"` chạy — và bảo vệ — `ci/x.sh`. `pwsh -WorkingDirectory ci -File x.ps1` chạy `x.ps1` ở
+  **gốc** (PowerShell tìm script của `-File` từ thư mục nó được khởi động, rồi mới đổi thư mục), còn
+  `-Command ./x.ps1` chạy trong `ci` ở PowerShell 7 nhưng ở gốc ở Windows PowerShell 5.1 (bỏ qua cờ này): dạng đó
+  được đọc theo cả hai cách và không có gì bị từ chối (đã đo, R19). Toryo **dừng đọc** khi không theo được: `cd` dùng biến,
+  đường dẫn tuyệt đối, `-` hoặc không có đối số; `cd` chỉ chạy trong một số trường hợp — sau `&&` / `||`
+  (`[ -d ci ] && cd ci`), trong pipeline, trong khối lệnh hay thân hàm (`if (…) { cd build }`), hoặc không đứng đầu
+  lệnh (`if [ -d web ]; then cd web; fi`); here-document (thân của nó được bỏ qua). Từ chỗ đó trở đi không có gì là
+  script đầu vào và không có gì bị từ chối. **Từ chối cần chắc chắn; bảo vệ thì không (X13):** với mọi lệnh verify và
+  gate, bên cạnh những gì Toryo tìm thấy, **mọi từ của mọi đối số** là tên file có trong commit gốc đều được bảo vệ —
+  kể cả bên trong một đối số mà tự nó là một dòng lệnh (`docker run img sh -c "…"`, `wsl bash -lc "…"`,
+  `bash -c "bash -c '…'"`, `Invoke-Expression '…'`), sau here-document và sau mọi chỗ việc đọc dừng lại — tra từ thư
+  mục checkout **và** từ mọi thư mục mà lệnh nêu như một lần đổi thư mục ở bất kỳ đâu (`cd`, `pushd`, `Set-Location`,
+  `-C`, `-WorkingDirectory`), dù có theo được hay không. Quy tắc này không bao giờ từ chối và không in `note:`. Chuỗi
+  trong dấu nháy đứng đầu lệnh của
+  PowerShell là biểu thức, không phải lệnh (`'out/x.txt' | Should -Exist`, `@('a/b','c/d')`), trừ khi có `&` hoặc `.`
+  chạy nó. Tên trần đứng đầu lệnh trong chuỗi `cmd` (`cmd /c build`, `cmd /c "npm.cmd run build"`, không phải lệnh nội
+  bộ như `cd`, `echo`, `set`) được **bảo vệ, không bao giờ bị từ chối**, dưới các tên `<tên>` và `<tên>` + từng đuôi
+  `PATHEXT` mặc định (`.com .exe .bat .cmd .vbs .vbe .js .jse .wsf .wsh .msc`) trong thư mục đó, kể cả khi PATH có
+  chương trình cùng tên: `cmd.exe` tìm trong thư mục làm việc trước PATH, mà thư mục làm việc của gate là checkout
+  (implementer tạo file như vậy → task dừng với `protected_config_changed`).
+  Mục vào là **thư mục** của commit gốc (`node --test tests/unit`, `node packages/cli`) được chấp nhận như trước vòng 3
+  (R18): nó được bảo vệ với đúng tên đó, không có gì bên trong bị bảo vệ vì nó.
+  Script đầu vào thiếu chỉ bị từ chối khi có `/`/`\` hoặc đuôi script **và** repo không ignore nó; `sh check`,
+  `php artisan`, `make -f ci.mk` được bảo vệ, không bị từ chối. Script thiếu **và bị ignore** (`node dist/cli.js` với
+  `dist/` bị ignore) là output build: được nhận và ghi vào task (`build_entries` trong `toryo task config <id>`);
+  implementer được build nó trong worktree của mình, nhưng nó không bao giờ được commit — bỏ ignore nó là vi phạm
+  path policy, kèm ghi chú sửa nêu tên gate. **Mọi từ khác** (cả giá trị của `KEY=value`, `--flag=value`,
+  `/p:Name=value`, và mọi đối số trong chuỗi lệnh) được bảo vệ nếu có trong **commit gốc** của task (không phải trong
+  worktree: output build xuất hiện sau, như `build/app.exe`, không tự nhiên bị bảo vệ sau `resume`) và không bao giờ bị
+  từ chối; thiếu thì chỉ in một dòng `note:` khi `task create` và trong `doctor`. Giới hạn còn lại: file mà script tự
+  nạp (dot-source, import) không được nhìn thấy; script không có đuôi, ở gốc repo, chạy bằng chương trình ngoài bảng;
+  từ khóa shell đứng trước lệnh (`if ./x.sh; then …`) biến lệnh đó thành đối số (được bảo vệ nếu có, không bị từ chối).
 - `kind: environment` — **thay đổi môi trường D365FO** của máy này (deploy, DB sync), chạy bằng **quyền bình thường
   của anh**, nên lệnh chỉ nằm trong machine config (`environment_gates`), ngoài tầm với của mọi agent. Chỉ chạy
   sau khi **mọi** check gate cùng lượt đã qua (check gate sửa file đã track trong checkout → không gate môi trường
   nào chạy, `verify_mutated_tree`), và **không bao giờ đọc bản checkout mà check gate đã dùng** (X6): khi đã giữ lock,
   Toryo xuất lại commit checkpoint từ kho object của repo vào `<verify_root>\<task>\deploy`, thư mục mà code agent không
   ghi được — bản xuất đó là `TORYO_VERIFY_CHECKOUT` của gate (không có `.git`; tree id ghi trong `VERIFY_RESULT.json`).
+  (M11-R13, R20) Việc kiểm tra là **từng byte**: ngay sau khi xuất, Toryo duyệt thư mục (không đi theo link) và ghi lại
+  mọi mục — đường dẫn, loại, kích thước, SHA-256. Trước khi gate chạy, thư mục phải có đúng các mục của tree commit,
+  và mỗi file đúng các byte mà Git sẽ ghi cho blob của nó (`git cat-file --filters`: `.gitattributes`,
+  `core.autocrlf`, filter driver) — so từng byte, không qua cách Git nhìn sau khi đổi kết thúc dòng, nên repo có
+  `*.xml text eol=crlf` với blob CRLF vẫn ổn; khác → gate không chạy (`environment_gate_unavailable`, nêu tên các file
+  đầu tiên). Sau khi gate chạy, một lần duyệt mới phải khớp bản ghi: file hoặc thư mục bị đổi, thêm, xoá (kể cả thư
+  mục rỗng, mục `.git`) → `verify_mutated_tree` — script gate không bao giờ được ghi vào đó (việc này canh script của
+  chính bạn: một cam kết, không phải ranh giới). Với boundary
+  `low_integrity`, trước mỗi lần verify Toryo còn kiểm tra thư mục của task dưới `verify_root` **không ghi được ở mức
+  Low integrity** (cho một tiến trình Low thử tạo thư mục ở đó — phải thất bại): `verify_root` nằm trong cây thư mục
+  Low ghi được (như `AppData\LocalLow`) sẽ trao bản xuất và thư mục làm việc của gate cho code đang được kiểm tra →
+  `verify_boundary_unavailable`; `toryo doctor` và `task create` báo cùng lỗi.
   File check gate để lại trong checkout chỉ được liệt kê (`checkout_extra`, một dòng cảnh báo), không bao giờ được
   deploy; `verify.checkout: tracked` dùng được cùng gate môi trường. Gate chạy trong một **thư mục làm việc trống** mà code của
   agent không ghi được (`envgate`). `%VAR%` trong `program`/`args` được thay **một lần, lúc nạp config** (`task create`;
@@ -1012,11 +1072,11 @@ CI chạy: `cargo fmt --check`, `clippy -D warnings` (có và không có M0 kit)
 | Muốn xem AI "nghĩ" gì | `runs\<ID>\captures\*.stdout.jsonl` (stream đầy đủ), `*.prompt.md`, và `toryo context show` |
 | Ký tự lạ kiểu `ΓòÉΓòÉ`, `ΓåÆ` khi **pipe** output của toryo (`toryo … \| Tee-Object`, `\| Select-String`) | toryo in UTF-8, còn PowerShell giải mã output qua pipe bằng code page OEM 437. Thêm vào `$PROFILE`: `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)` (các script trong `scripts\` đã tự đặt). Chạy trực tiếp không pipe thì luôn hiển thị đúng |
 | `protected_config_changed` | Mở file diff được nêu trong lý do; khôi phục rồi `toryo resume ID`, hoặc `--accept-protected-change <path>` |
-| `verify_boundary_unavailable` | `verify_root` không gán được Low label (thiếu WRITE_OWNER) → để mặc định `%LOCALAPPDATA%\toryo-verify`; `toryo doctor` nêu nguyên nhân |
+| `verify_boundary_unavailable` | `verify_root` không gán được Low label (thiếu WRITE_OWNER), hoặc (M11-R13) `verify_root` nằm trong cây thư mục mà tiến trình Low ghi được (ví dụ dưới `AppData\LocalLow`) → để mặc định `%LOCALAPPDATA%\toryo-verify`; `toryo doctor` nêu nguyên nhân. Đổi `verify.verify_root` cho task đang có: `toryo task config ID --reload`, rồi `toryo resume ID` |
 | `verify_mutated_tree` | Script verify đã sửa file đã track / `.git` của bản checkout → sửa script (hoặc code agent viết), rồi `toryo resume ID --note "…"` |
 | `!! a check gate left files in the verify checkout — they are not deployed` (M11) | Chỉ là cảnh báo: gate môi trường deploy từ bản xuất mới của commit, không từ checkout. Nên cho check gate ghi output vào `TORYO_VERIFY_BUILD`; danh sách nằm ở `checkout_extra` trong `VERIFY_RESULT.json` |
-| `environment_gate_unavailable` (M11) | Máy không chạy được gate môi trường: secret chưa có, chương trình không tìm thấy hoặc nằm trong repo/worktrees/verify root → sửa machine config, rồi `toryo resume ID` (do máy; không tốn vòng sửa); task tạo trước bản này mà có `%VAR%` trong `program`/`args` → `toryo task config ID --reload` |
-| `skill_unavailable` / `context_over_budget` (M11) | Skill cần cho lượt này không tìm thấy (lý do nêu cả hai đường dẫn) → đặt lại rồi `toryo resume ID` (do máy; không tốn vòng sửa); ngữ cảnh có skill vẫn quá ngân sách → tăng `context.budget_kb.<role>` hoặc chọn ít skill hơn |
+| `environment_gate_unavailable` (M11) | Máy không chạy được gate môi trường: secret chưa có, chương trình không tìm thấy hoặc nằm trong repo/worktrees/verify root. Được kiểm tra **trước khi chạy các check gate** (M11-R16), nên không tốn một lần build. Sửa trên máy (thêm secret vào Credential Manager, cài chương trình) → `toryo resume ID`; sửa `environment_gates.<tên>` trong machine config → `toryo task config ID --reload`, rồi `toryo resume ID` (lệnh của gate đã đóng băng theo task). Do máy: không tốn vòng sửa. Task tạo trước bản này mà có `%VAR%` trong `program`/`args` → `toryo task config ID --reload` |
+| `skill_unavailable` / `context_over_budget` (M11) | Skill cần cho lượt này không tìm thấy (lý do nêu cả hai đường dẫn) → đặt lại rồi `toryo resume ID` (do máy; không tốn vòng sửa); ngữ cảnh có skill vẫn quá ngân sách → tăng `context.budget_kb.<role>` trong `toryo.yaml` (hoặc chọn ít skill hơn), `toryo task config ID --reload`, rồi `toryo resume ID` — ngân sách đã đóng băng theo task |
 | `artifact_tampered` / `artifact_missing` | Có người sửa/xoá file trong `runstore\artifacts\` → khôi phục file, hoặc `toryo task cleanup ID` |
 | `Paused` — `admission cap reached` | `toryo budget set ID --tokens N` rồi `toryo resume ID` |
 | `unverified profiles (R51)` nhắc `claude-implementer-isolation` | `toryo spike claude-implementer-isolation --profile claude-max` (hoặc `doctor --canaries`) |

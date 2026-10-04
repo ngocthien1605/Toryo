@@ -69,6 +69,11 @@ fn a_fake_run_in_org_chart_mode_reaches_the_final_gate() {
     );
     assert!(text.contains("implementer  codex-openai — repo"), "{text}");
     assert!(text.contains("before_handoff: divide-present"), "{text}");
+    // (M11-R21) a task's digest can differ from the printed one: said next to it
+    assert!(
+        text.contains("a task's digest also covers its build-output entry scripts"),
+        "{text}"
+    );
 
     create(&env, "OC-1");
     let t = task(&env, "OC-1");
