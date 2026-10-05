@@ -239,3 +239,110 @@ fn m12_09_the_local_config_comes_before_the_variable() {
     let (used, _) = config_in_use(&env, &here, None);
     assert!(norm(&used).ends_with("toryo.yaml"), "{used}");
 }
+
+// ── M12-10 (X22): text files are UTF-8, a byte-order mark is ignored ──────────────────────
+
+/// The fixture TASK.md with its heading replaced by `# BOM-7 …` and `lead` bytes in front.
+fn task_file_with(env: &Env, name: &str, lead: &[u8]) -> std::path::PathBuf {
+    let text = std::fs::read_to_string(env.repo.join("TASK.md")).unwrap();
+    let body: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.starts_with("# "))
+        .collect::<Vec<_>>();
+    let mut bytes = lead.to_vec();
+    bytes.extend(format!("# BOM-7 a title\n{}\n", body.join("\n")).bytes());
+    let p = env.root.join(name);
+    std::fs::write(&p, bytes).unwrap();
+    p
+}
+
+/// AC-2 and AC-3: a `TASK.md` with a byte-order mark gives the id from its heading (was: the
+/// file name, because `^#` did not match behind the mark); a UTF-16 one is refused with its
+/// name.
+#[test]
+fn m12_10_task_md_with_a_bom_has_the_right_id_and_utf16_is_refused() {
+    let env = setup("codex-openai");
+    let p = task_file_with(&env, "with-bom.md", &[0xEF, 0xBB, 0xBF]);
+    let (code, err) = toryo(
+        &env,
+        &["task", "create", "--file", &p.display().to_string()],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "BOM-7").id, "BOM-7");
+    // UTF-16 with a mark
+    let text = std::fs::read_to_string(&p).unwrap();
+    let mut b = vec![0xFF, 0xFE];
+    for u in text.trim_start_matches('\u{feff}').encode_utf16() {
+        b.extend(u.to_le_bytes());
+    }
+    let u16p = env.root.join("utf16.md");
+    std::fs::write(&u16p, b).unwrap();
+    let (code, err) = toryo(
+        &env,
+        &["task", "create", "--file", &u16p.display().to_string()],
+        &[],
+    );
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("utf16.md") && err.contains("is not UTF-8") && err.contains("UTF-16"),
+        "{err}"
+    );
+}
+
+/// AC-3 at turn time: a Shift-JIS `AGENTS.md` is a machine stop (`context_unreadable`) before
+/// the turn — no tokens, no fix cycle; saved as UTF-8, a plain `resume` goes on.
+#[test]
+fn m12_10_a_context_file_that_is_not_utf8_stops_the_turn_by_name() {
+    let env = setup("codex-openai");
+    let agents = env.repo.join("AGENTS.md");
+    let good = std::fs::read(&agents).ok();
+    std::fs::write(&agents, [0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA, b'\n']).unwrap();
+    create(&env, "E-1");
+    let s = script(
+        &env,
+        "e1.json",
+        serde_json::json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "E-1", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "E-1");
+    assert_eq!(t.state, toryo::engine::PipelineState::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("context_unreadable"),
+        "{err}"
+    );
+    let why = t.machine.reason().unwrap().to_string();
+    assert!(
+        why.starts_with("context_unreadable:")
+            && why.contains("AGENTS.md")
+            && why.contains("is not UTF-8")
+            && why.contains("`toryo resume E-1`"),
+        "{why}"
+    );
+    assert_eq!(t.fix_cycle, 0);
+    let at = attempts(&env, "E-1");
+    assert!(
+        at.len() == 1
+            && at[0].error_class.as_deref() == Some("context_unreadable")
+            && at[0].context_sha256.is_none(),
+        "no turn was spent: {at:?}"
+    );
+    // the way out: the file saved as UTF-8; a plain resume goes on
+    match good {
+        Some(g) => std::fs::write(&agents, g).unwrap(),
+        None => std::fs::remove_file(&agents).unwrap(),
+    }
+    let (_, err) = toryo(&env, &["resume", "E-1", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "E-1");
+    assert_ne!(
+        t.machine.reason_class(),
+        Some("context_unreadable"),
+        "{err}"
+    );
+    assert_eq!(t.fix_cycle, 0, "a machine stop costs no fix cycle");
+}

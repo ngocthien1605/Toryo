@@ -130,7 +130,7 @@ pub fn task_policy(t: &TaskRow, cfg: &Effective) -> Result<(GitCmd, Protected, V
             t.id
         );
     }
-    let task_md = String::from_utf8_lossy(&task_md).to_string();
+    let task_md = crate::textfile::decode(&t.artifacts().join("TASK.md"), &task_md)?;
     // R59: `tool: xpp` adds `**/Directory.Build.*` — MSBuild reads them from parent folders
     let mut globs = cfg.repo.policy.protected_paths.clone();
     globs.extend(verify_globs(&cmds));
@@ -290,8 +290,15 @@ impl<'a> Engine<'a> {
             ))
         } else {
             let c = context::assemble(&req)?;
-            context::over_budget(&c)
-                .map(|r| (context::CONTEXT_OVER_BUDGET, over_budget_reason(t, r)))
+            if !c.unreadable.is_empty() {
+                Some((
+                    context::CONTEXT_UNREADABLE,
+                    context_unreadable_reason(t, stage, profile, &c.unreadable),
+                ))
+            } else {
+                context::over_budget(&c)
+                    .map(|r| (context::CONTEXT_OVER_BUDGET, over_budget_reason(t, r)))
+            }
         };
         match blocked {
             Some((class, reason)) => {
@@ -2770,6 +2777,12 @@ impl<'a> Engine<'a> {
             self.escalate_attempt(a, context::SKILL_UNAVAILABLE.into(), reason)?;
             return Ok(None);
         }
+        // M12-10 (X22): a context file that is not UTF-8 — no turn, no fix cycle
+        if !c.unreadable.is_empty() {
+            let reason = context_unreadable_reason(t, &a.stage, profile, &c.unreadable);
+            self.escalate_attempt(a, context::CONTEXT_UNREADABLE.into(), reason)?;
+            return Ok(None);
+        }
         if let Some(reason) = context::over_budget(&c) {
             let reason = over_budget_reason(t, reason);
             self.escalate_attempt(a, context::CONTEXT_OVER_BUDGET.into(), reason)?;
@@ -4346,6 +4359,17 @@ fn skill_unavailable_reason(t: &TaskRow, stage: &str, profile: &str, missing: &[
             "the skill folder put back",
             "`skills_dir` in the machine config, a role file's `skills`"
         )
+    )
+}
+
+/// M12-10: the `context_unreadable` reason — each file that is not UTF-8, by name, and the way
+/// out (the file is read from the repository checkout, so nothing is frozen with the task).
+fn context_unreadable_reason(t: &TaskRow, stage: &str, profile: &str, files: &[String]) -> String {
+    format!(
+        "{}: the {stage} turn ({profile}) was not started — {}; saved as UTF-8 on the machine: `toryo resume {}`",
+        context::CONTEXT_UNREADABLE,
+        files.join("; "),
+        t.id
     )
 }
 

@@ -17,7 +17,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] Review of M12-05…07 (subagent, in place)
 - [x] M12-08 `base_branch` is honoured; keys without effect say so (X19, X20)
 - [x] M12-09 `./toryo.yaml` before `$TORYO_CONFIG` (X21)
-- [ ] M12-10 Text files: BOM ignored, non-UTF-8 refused by name (X22)
+- [x] M12-10 Text files: BOM ignored, non-UTF-8 refused by name (X22)
 - [ ] M12-11 Acceptance criteria are never dropped silently
 - [ ] M12-12 Three CLI traps
 - [ ] M12-13 Long paths on Windows
@@ -256,6 +256,33 @@ No Critical or High; three Medium, fixed here.
 - **Scripts:** `scripts/m3-stop-test.ps1`, `m4-m7-check.ps1`, `m8-check.ps1` set `$env:TORYO_CONFIG` and relied on the
   old order when run from a folder that has its own `toryo.yaml` — see Open. No test relied on the old order (all use
   `--config` or the environment without a local file).
+
+
+### M12-10 — Text files: BOM ignored, non-UTF-8 refused by name (X22)
+
+- **New `src/textfile.rs`:** `decode(path, bytes)` / `read_text(path)` — strips a leading U+FEFF; a UTF-16 mark or NUL
+  bytes → "`<file>` is not UTF-8 (it looks like UTF-16): save it as UTF-8"; other invalid UTF-8 → "… (it looks like a
+  code-page file, such as Shift-JIS or Windows-1252): save it as UTF-8". Unit test `a_utf8_mark_is_ignored_and_…`.
+- **Used for:** `toryo.yaml` and the machine config (`config.rs`), the org chart and every role file (`team.rs`; a role
+  file that is not UTF-8 is one of the load problems, named), `SKILL.md` (`resolve_skill` → `Err` naming the file), `TASK.md`
+  at `task create` (the id and title come from the decoded text) and its snapshot at turn time (`runner.rs`), and every
+  context file (`context::read`: global, `CLAUDE.md`, `AGENTS.md`, `.toryo/context/*.md`, culture, role instructions,
+  the task pack). The raw bytes still feed the SHA-256 of `config show`'s file list; the frozen configuration and its digest
+  do not change (test: the digest of the draft set with a mark on four files equals the one without).
+- **New escalation class `context_unreadable`** (the ninth in `MACHINE_CAUSED`, as the list says): a context file that
+  exists and is not UTF-8 stops the turn before it starts (`turn_blocked` in org chart mode, the attempt-time check in all
+  modes) with the file's name; no turn, no fix cycle; a plain `resume` after the file is saved as UTF-8. For the
+  M12-19 table: reason `context_unreadable: the <stage> turn (<profile>) was not started — <file> is not UTF-8 …`,
+  way out: save the file as UTF-8 (the file is read from the repository checkout — nothing is frozen), `toryo resume <id>`.
+- **Deviation:** a `SKILL.md` that is not UTF-8 stops a turn as `skill_unavailable` (the reason names the file), not as
+  `context_unreadable`: skills are resolved before the context is assembled and `resolve_skill` reports every problem as a
+  missing skill. At `task create`, `doctor` and `config show` it is a refusal, as the list asks.
+- **Not done here:** `doctor`'s per-file encoding check of everything under `.toryo/` is M12-17.
+- **Tests:** `team::tests::a_byte_order_mark_is_ignored_and_other_encodings_are_refused_by_name` (AC-1, AC-3: the four
+  YAML kinds with a mark load with the same digest; Shift-JIS `SKILL.md` and a UTF-16 org chart are refused by name),
+  `m12_10_task_md_with_a_bom_has_the_right_id_and_utf16_is_refused` (AC-2, AC-3),
+  `m12_10_a_context_file_that_is_not_utf8_stops_the_turn_by_name` (the stop, no turn, no cycle, resume). AC-4: no
+  `from_utf8_lossy` is left on these paths (checked with grep).
 
 
 ## Open

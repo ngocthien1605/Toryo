@@ -582,8 +582,7 @@ pub struct Notify {
 impl MachineConfig {
     /// Read and parse a machine config file.
     pub fn load(path: &Path) -> Result<Self> {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let text = crate::textfile::read_text(path)?;
         // M11-B3: an unknown key gets the friendly form with a "did you mean" hint
         let mut m: Self =
             serde_yaml::from_str(&text).map_err(|e| {
@@ -703,8 +702,7 @@ impl Effective {
     pub fn load(repo_path: &Path, machine_path: Option<&Path>) -> Result<Self> {
         let bytes =
             std::fs::read(repo_path).with_context(|| format!("reading {}", repo_path.display()))?;
-        let text = String::from_utf8(bytes.clone())
-            .with_context(|| format!("reading {}", repo_path.display()))?;
+        let text = crate::textfile::decode(repo_path, &bytes)?;
         // R60 (ARCH-05): the repository file never defines an agent's program, environment
         // or secrets — checked on the raw text, before anything is merged
         if let Some(part) =

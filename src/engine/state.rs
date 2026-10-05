@@ -42,7 +42,7 @@ pub const MAX_PLAN_AUTO_REJECTIONS: u32 = 2;
 /// over budget, or a gate/toolchain/boundary the machine cannot provide. Leaving one costs no
 /// fix cycle: a plain `toryo resume <id>` goes back into the stage, which checks its
 /// precondition again (a cause still there escalates again, no turn and no cycle).
-pub const MACHINE_CAUSED: [&str; 8] = [
+pub const MACHINE_CAUSED: [&str; 9] = [
     "gate_unavailable",
     "environment_gate_timeout",
     "environment_gate_confirm",
@@ -51,6 +51,7 @@ pub const MACHINE_CAUSED: [&str; 8] = [
     "environment_gate_unavailable",
     "xpp_toolchain_unavailable",
     "verify_boundary_unavailable",
+    "context_unreadable",
 ];
 
 /// M11-R11: whether `class` is [`MACHINE_CAUSED`].

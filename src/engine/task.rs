@@ -283,8 +283,7 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         repo.join(&a.file)
     };
     let file = std::path::absolute(&file)?;
-    let text =
-        std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+    let text = crate::textfile::read_text(&file)?;
     let ac = parse_acceptance_ids(&text)?;
     let id = task_id(&text, &file, a.id.as_deref());
     if !id

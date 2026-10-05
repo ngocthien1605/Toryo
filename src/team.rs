@@ -445,7 +445,7 @@ pub fn load(
     let bytes =
         std::fs::read(&org_path).with_context(|| format!("reading {}", org_path.display()))?;
     let org: OrgChart = parse_repo_file(
-        &String::from_utf8_lossy(&bytes),
+        &crate::textfile::decode(&org_path, &bytes)?,
         &org_path,
         FileKind::OrgChart,
     )?;
@@ -509,7 +509,9 @@ pub fn load(
             continue;
         };
         files.push(FileRead::of(&format!("role {seat}"), &p, &bytes));
-        match parse_repo_file::<RoleFile>(&String::from_utf8_lossy(&bytes), &p, FileKind::Role) {
+        let parsed = crate::textfile::decode(&p, &bytes)
+            .and_then(|text| parse_repo_file::<RoleFile>(&text, &p, FileKind::Role));
+        match parsed {
             Ok(r) => {
                 if r.toryo != 1 {
                     problems.push(format!(
@@ -1288,7 +1290,10 @@ pub fn resolve_skill(
     let places = skill_candidates(name, repo, machine);
     for (origin, path) in &places {
         if let Ok(bytes) = std::fs::read(path) {
-            let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
+            // M12-10: a SKILL.md that is not UTF-8 is refused by name, not sent as `�`
+            let text = crate::textfile::decode(path, &bytes)
+                .map_err(|e| format!("{e:#}"))?
+                .replace("\r\n", "\n");
             return Ok(Skill {
                 name: name.to_string(),
                 origin: *origin,
@@ -1554,6 +1559,53 @@ mod tests {
             "{:#}",
             crate::config::Effective::load(y, Some(m)).expect_err("must be refused")
         )
+    }
+
+    /// Put a UTF-8 byte-order mark in front of the file.
+    fn add_bom(p: &Path) {
+        let mut b = vec![0xEF, 0xBB, 0xBF];
+        b.extend(std::fs::read(p).unwrap());
+        std::fs::write(p, b).unwrap();
+    }
+
+    /// M12-10 AC-1: a byte-order mark on `toryo.yaml`, the machine config, the org chart and a
+    /// role file changes nothing — the set loads and the digest stays. AC-3: a Shift-JIS
+    /// SKILL.md and a UTF-16 org chart are refused with the file's name.
+    #[test]
+    fn a_byte_order_mark_is_ignored_and_other_encodings_are_refused_by_name() {
+        use crate::config::Effective;
+        let (d, y, m) = draft_repo(&[]);
+        let plain = Effective::load(&y, Some(&m)).unwrap().sha256();
+        let repo = d.path().join("repo");
+        let org = repo.join(".toryo/toryo-orgchart.yaml");
+        let role = repo.join(".toryo/roles/implementer/toryo-role.yaml");
+        for f in [&y, &m, &org, &role] {
+            add_bom(f);
+        }
+        let with_bom = Effective::load(&y, Some(&m)).unwrap();
+        assert_eq!(with_bom.sha256(), plain, "the digest ignores the mark");
+        assert!(with_bom.team.is_some());
+        // Shift-JIS "日本語" in the repository skill
+        let skill = repo.join(".toryo/skills/xpp-axclass/SKILL.md");
+        std::fs::write(&skill, [0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA]).unwrap();
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains("SKILL.md") && e.contains("is not UTF-8") && e.contains("save it as UTF-8"),
+            "{e}"
+        );
+        // a UTF-16 org chart
+        std::fs::write(&skill, "---\ndescription: x\n---\n").unwrap();
+        let text = std::fs::read_to_string(&org).unwrap();
+        let mut b = vec![0xFF, 0xFE];
+        for u in text.encode_utf16() {
+            b.extend(u.to_le_bytes());
+        }
+        std::fs::write(&org, b).unwrap();
+        let e = load_err(&y, &m);
+        assert!(
+            e.contains("toryo-orgchart.yaml") && e.contains("UTF-16"),
+            "{e}"
+        );
     }
 
     /// M11-B2 AC-1: the fixture set loads in org chart mode; every origin is known; the
