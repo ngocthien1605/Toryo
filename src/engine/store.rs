@@ -195,6 +195,21 @@ pub fn deploy_confirmed_under_another_config(
     Ok(n > 0)
 }
 
+/// M13-11 (X28): take back a task that `task create` could not finish — its row and what the
+/// creation had written for it (the first artifacts, their events). Only for a task that
+/// never ran: nothing else refers to it yet.
+pub fn remove_created_task(tx: &Transaction, id: &str) -> Result<()> {
+    for sql in [
+        "DELETE FROM artifact_heads WHERE task_id = ?1",
+        "DELETE FROM artifacts WHERE task_id = ?1",
+        "DELETE FROM events WHERE task_id = ?1",
+        "DELETE FROM tasks WHERE id = ?1",
+    ] {
+        tx.execute(sql, [id])?;
+    }
+    Ok(())
+}
+
 /// M13-05: the stop asks about `asks` (what an earlier stop asked and got no yes for is dropped).
 pub fn ask_deploys(
     tx: &Transaction,
@@ -1782,6 +1797,37 @@ mod tests {
             !changed("new"),
             "the last yes was under this configuration: the next commit is asked for, but not because the configuration changed"
         );
+    }
+
+    /// M13-11 (X28): a task `task create` could not finish is taken back — its row and its
+    /// events — and the id is free again.
+    #[test]
+    fn a_task_that_was_never_finished_is_taken_back() {
+        let d = tempfile::tempdir().unwrap();
+        let st = Store::open(&d.path().join("toryo.db")).unwrap();
+        st.call(|tx| {
+            insert_task(tx, &new_task("N-1"))?;
+            event(tx, Some("N-1"), None, "note", &serde_json::json!({})).map(|_| ())
+        })
+        .unwrap();
+        st.call(|tx| insert_task(tx, &new_task("N-2"))).unwrap();
+        st.call(|tx| remove_created_task(tx, "N-1")).unwrap();
+        let left = st
+            .call(|tx| {
+                let events: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM events WHERE task_id = 'N-1'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok((
+                    get_task(tx, "N-1").is_ok(),
+                    get_task(tx, "N-2").is_ok(),
+                    events,
+                ))
+            })
+            .unwrap();
+        assert_eq!(left, (false, true, 0), "only N-1 is gone");
+        st.call(|tx| insert_task(tx, &new_task("N-1"))).unwrap();
     }
 
     /// M11-R16 AC-3: an escalation and its typed class are written in one transaction — both

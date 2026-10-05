@@ -169,3 +169,83 @@ fn m13_07_cleanup_that_cannot_look_refuses_without_force() {
     let listed = git(&env.repo, &["worktree", "list"]);
     assert!(!listed.contains("C-7"), "{listed}");
 }
+
+// ── M13-11 (X28): `task create` is all or nothing ─────────────────────────────────────────
+
+/// Nothing of the task `id` is left: no row, no run store, no worktree, no branch.
+fn assert_nothing_left(env: &Env, id: &str, err: &str) {
+    let i = id.to_string();
+    let row = db(env).call(move |tx| Ok(toryo::engine::store::get_task(tx, &i).is_ok()));
+    assert!(!row.unwrap(), "a row is left: {err}");
+    assert!(
+        !env.data.join("runs").join(id).exists(),
+        "the run store is left: {err}"
+    );
+    assert!(!wt(env, id).exists(), "the worktree is left: {err}");
+    let branches = git(&env.repo, &["branch", "--list", &format!("toryo/{id}")]);
+    assert!(
+        branches.trim().is_empty(),
+        "the branch is left: {branches}\n{err}"
+    );
+    let listed = git(&env.repo, &["worktree", "list"]);
+    assert!(!listed.contains(id), "{listed}");
+}
+
+/// AC-1: `task create` fails after the run store exists — a **file** where the worktrees
+/// folder should be. Was: the run store stayed, and the retry was refused ("run store …
+/// already exists"). Now what was made is removed, the error is the original one, and the same
+/// `TASK.md` creates once the cause is gone.
+#[test]
+fn m13_11_a_create_that_fails_at_the_worktree_leaves_nothing() {
+    let env = setup("codex-openai");
+    let wts = env.root.join("wts");
+    assert!(!wts.exists(), "the fixture does not make it");
+    std::fs::write(&wts, "a file, not a folder\n").unwrap();
+    let (code, err) = toryo(
+        &env,
+        &["task", "create", "--file", "TASK.md", "--id", "N-1"],
+        &[],
+    );
+    assert_ne!(code, 0, "{err}");
+    assert!(err.contains("removed: the run store"), "{err}");
+    assert!(
+        err.contains("error: creating project.worktrees_root"),
+        "the error that ended the creation is the one reported: {err}"
+    );
+    assert_nothing_left(&env, "N-1", &err);
+    // the cause is gone: the same TASK.md creates
+    std::fs::remove_file(&wts).unwrap();
+    create(&env, "N-1");
+    assert!(wt(&env, "N-1").join("TASK.md").exists());
+}
+
+/// The same after the **branch and the worktree** exist: the step after `git worktree add`
+/// fails (Git's `info/exclude` cannot be written — here it is a folder). Was: branch, worktree
+/// and run store stayed; the retry was refused. Now all three are removed, one line each.
+#[test]
+fn m13_11_a_create_that_fails_after_the_worktree_removes_branch_and_worktree() {
+    let env = setup("codex-openai");
+    let exclude = env.repo.join(".git").join("info").join("exclude");
+    let _ = std::fs::remove_file(&exclude);
+    std::fs::create_dir_all(&exclude).unwrap();
+    let (code, err) = toryo(
+        &env,
+        &["task", "create", "--file", "TASK.md", "--id", "N-2"],
+        &[],
+    );
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains("removed: the worktree")
+            && err.contains("removed: the branch toryo/N-2")
+            && err.contains("removed: the run store"),
+        "{err}"
+    );
+    assert!(
+        err.contains("exclude"),
+        "the original error is the one reported: {err}"
+    );
+    assert_nothing_left(&env, "N-2", &err);
+    std::fs::remove_dir(&exclude).unwrap();
+    create(&env, "N-2");
+    assert_eq!(task(&env, "N-2").state, St::New);
+}

@@ -17,7 +17,7 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
 - [x] M13-08 The gate resolver is one resolver; the timeout stop names every gate that re-runs
 - [x] M13-09 `environment_gate_confirm` says what to type, and how to say no
 - [x] M13-10 `doctor` looks at long paths where the first run will hit them
-- [ ] M13-11 `task create` is all or nothing (X28)
+- [x] M13-11 `task create` is all or nothing (X28)
 - [ ] M13-12 Ctrl+C on `toryo run` is a stop request (X29)
 - [ ] M13-13 A launch error before the agent starts does not reserve a budget
 - [ ] M13-14 Tests the review asked for
@@ -274,6 +274,31 @@ failed first; the rest is under "Open".
 - **A mistake of mine while checking this task, for the owner to know:** I ran the built `toryo doctor` once from the repository folder without
   `--config`; it used `$TORYO_CONFIG` (`C:\.thien\m0\toryo.yaml`) and so probed the owner's data folder and verify root (a probe file and a probe
   folder, created and removed — `doctor` does that on every run; `toryo.db` was not opened or changed). Nothing else was touched.
+
+
+### M13-11 — `task create` is all or nothing (X28)
+
+- **Failing tests first** (`tests/m12_cli.rs`): `m13_11_a_create_that_fails_at_the_worktree_leaves_nothing` (AC-1 — a **file** where
+  `project.worktrees_root` should be: before, the run store stayed and the retry was refused) and
+  `m13_11_a_create_that_fails_after_the_worktree_removes_branch_and_worktree` (the step after `git worktree add` fails — Git's `info/exclude` is a
+  folder: before, branch, worktree and run store stayed). Both then create the same `TASK.md` again.
+  **AC-1 as the list writes it** ("a file where the worktree folder should be", that is `<worktrees_root>\<id>`) is refused before anything is made
+  ("worktree … already exists"), today and before: the test puts the file one level up, where the failure comes after the run store exists.
+- **How:** `task::Made` — what the creation has made so far (run store, worktree, branch, database row). It is dropped at every early return; unless
+  `keep()` was called (the last line of `create`), its `Drop` removes them in reverse order, best effort, one `removed: …` line each (a `WARNING:`
+  line for what could not be removed). The error that ended the creation is the one printed. This shape leaves the body of `create` where it is.
+  - the row: `store::remove_created_task` (the task's row, its first artifacts and its events — nothing else refers to a task that never ran);
+  - the worktree: `git worktree remove --force`, else the folder itself, then `git worktree prune`;
+  - the branch `toryo/<id>`: it did not exist before this `task create` (that is checked first), so it is this creation's, at the base commit;
+  - the run store: the folder.
+  The line `/.toryo-tmp/` in Git's `info/exclude` and an empty `worktrees_root` are left (shared, harmless).
+- **The order of the refusals** was checked, nothing had to move: `TASK.md` (encoding, acceptance ids, the id), roles, the verify floor and probe, the
+  environment gates, the X++ toolchain, the base branch, the entry scripts, "already exists" (row, run store, worktree, branch) all come before the
+  first thing is made.
+- **Two errors got their place named** (they were bare OS errors): "creating project.worktrees_root <path>" and "writing <…/info/exclude>".
+- **Not tested end to end:** a failure after the row exists (the first artifacts, the protected baseline) — nothing cheap makes those fail. The
+  removal of the row has the unit test `store::tests::a_task_that_was_never_finished_is_taken_back`.
+- **AC-2:** every existing create test passes unchanged (full run).
 
 
 ## Open

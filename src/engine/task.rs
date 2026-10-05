@@ -293,6 +293,105 @@ pub fn cleanup_git(repo: &Path) -> Result<GitCmd> {
     Ok(g)
 }
 
+/// M13-11 (X28): what `task create` has made so far. Dropped without [`Made::keep`] — any error
+/// after the first of them — it removes them again in reverse order, best effort, one line
+/// each: the same `TASK.md` can then be created again. The error that ended the creation is
+/// the one reported.
+struct Made<'a> {
+    g: &'a GitCmd,
+    store: &'a Store,
+    repo: PathBuf,
+    id: String,
+    run_store: Option<PathBuf>,
+    worktree: Option<PathBuf>,
+    branch: Option<String>,
+    row: bool,
+    kept: bool,
+}
+
+impl Made<'_> {
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for Made<'_> {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        let repo = Loc::Discover(self.repo.clone());
+        if self.row {
+            let id = self.id.clone();
+            match self
+                .store
+                .call(move |tx| store::remove_created_task(tx, &id))
+            {
+                Ok(()) => eprintln!("removed: the database row of {}", self.id),
+                Err(e) => eprintln!(
+                    "WARNING: could not remove the database row of {}: {e:#}",
+                    self.id
+                ),
+            }
+        }
+        if let Some(wt) = &self.worktree {
+            let existed = wt.exists();
+            let w = wt.display().to_string().replace('\\', "/");
+            if existed
+                && self
+                    .g
+                    .run(&repo, false, &["worktree", "remove", "--force", &w])
+                    .is_err()
+            {
+                let _ = std::fs::remove_dir_all(wt);
+            }
+            // (also an entry Git made for a worktree whose folder it never finished)
+            let _ = self.g.run(&repo, false, &["worktree", "prune"]);
+            match (existed, wt.exists()) {
+                (true, false) => eprintln!("removed: the worktree {}", wt.display()),
+                (_, true) => eprintln!(
+                    "WARNING: could not remove the worktree {} — delete it by hand",
+                    wt.display()
+                ),
+                (false, false) => {}
+            }
+        }
+        if let Some(b) = &self.branch {
+            // it did not exist before this `task create` (checked there): it is ours, at the base
+            let there = self
+                .g
+                .output(
+                    &repo,
+                    true,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        &format!("refs/heads/{b}"),
+                    ],
+                )
+                .is_ok_and(|o| o.status.success());
+            if there {
+                match self.g.run(&repo, false, &["branch", "-D", b]) {
+                    Ok(_) => eprintln!("removed: the branch {b}"),
+                    Err(e) => eprintln!("WARNING: could not remove the branch {b}: {e:#}"),
+                }
+            }
+        }
+        if let Some(rs) = &self.run_store {
+            if rs.exists() {
+                match std::fs::remove_dir_all(rs) {
+                    Ok(()) => eprintln!("removed: the run store {}", rs.display()),
+                    Err(e) => eprintln!(
+                        "WARNING: could not remove the run store {}: {e} — delete it by hand",
+                        rs.display()
+                    ),
+                }
+            }
+        }
+    }
+}
+
 pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> {
     let repo = std::path::absolute(&a.repo)?;
     let file = if a.file.is_absolute() || a.file.exists() {
@@ -446,6 +545,19 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         bail!("branch {branch} already exists in {}", repo.display());
     }
 
+    // M13-11 (X28): every refusal is above this line — nothing has been made yet. From here
+    // on, whatever fails, what was made is removed again (`Made`).
+    let mut made = Made {
+        g: &g,
+        store,
+        repo: repo.clone(),
+        id: id.clone(),
+        run_store: Some(rs.clone()),
+        worktree: None,
+        branch: None,
+        row: false,
+        kept: false,
+    };
     // run store: TASK.md snapshot (R27) + frozen config (R35)
     let art = rs.join("runstore");
     std::fs::create_dir_all(&art)?;
@@ -454,8 +566,10 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     let frozen = cfg.canonical_json();
     std::fs::write(art.join("config.json"), &frozen)?;
 
-    std::fs::create_dir_all(&wt_root)?;
+    std::fs::create_dir_all(&wt_root)
+        .with_context(|| format!("creating project.worktrees_root {}", wt_root.display()))?;
     let fwd = |p: &Path| p.display().to_string().replace('\\', "/");
+    (made.worktree, made.branch) = (Some(wt.clone()), Some(branch.clone()));
     g.run(
         &repol,
         false,
@@ -477,7 +591,8 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         } else {
             "\n"
         };
-        std::fs::write(&excl, format!("{cur}{sep}/.toryo-tmp/\n"))?;
+        std::fs::write(&excl, format!("{cur}{sep}/.toryo-tmp/\n"))
+            .with_context(|| format!("writing {}", excl.display()))?;
     }
 
     let nt = NewTask {
@@ -498,18 +613,11 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         reviewer,
         budget_tokens: cfg.repo.pipeline.budget_tokens.map(|b| b as i64),
     };
-    let res = store.call(move |tx| {
+    let t = store.call(move |tx| {
         store::insert_task(tx, &nt)?;
         store::get_task(tx, &nt.id)
-    });
-    if res.is_err() {
-        let _ = g.output(
-            &Loc::Discover(wt.clone()),
-            false,
-            &["worktree", "remove", "--force", &fwd(&wt)],
-        );
-    }
-    let t = res?;
+    })?;
+    made.row = true;
     // R34: the task snapshot and the frozen configuration are the first immutable versions
     super::artifacts::put(
         store,
@@ -534,6 +642,7 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     // R35: protected baseline v1 — after the info/exclude line (R46), before any agent runs
     let (_, protect, _) = super::runner::task_policy(&t, cfg)?;
     super::protect::take_baseline(store, &t, &g, &protect, "v1 (task created)")?;
+    made.keep();
     Ok(t)
 }
 
