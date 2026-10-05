@@ -33,6 +33,8 @@ pub fn lock_path(task: &str) -> PathBuf {
 }
 
 fn open_lock_file(task: &str) -> Result<File> {
+    // M12-12 (c): `toryo run ../../repo/.git/index` made `index.lock` there
+    super::task::valid_task_id(task)?;
     let p = lock_path(task);
     std::fs::create_dir_all(p.parent().expect("parent"))?;
     OpenOptions::new()

@@ -170,6 +170,7 @@ fn store() -> Result<Store> {
 }
 
 fn get(store: &Store, id: &str) -> Result<TaskRow> {
+    task::valid_task_id(id)?;
     let i = id.to_string();
     store.call(move |tx| store::get_task(tx, &i))
 }
@@ -177,6 +178,7 @@ fn get(store: &Store, id: &str) -> Result<TaskRow> {
 /// [`get`] in a read-only transaction (R6): for the commands that only look (`status`, `task
 /// show`, `usage`, `watch`).
 fn read_task(store: &Store, id: &str) -> Result<TaskRow> {
+    task::valid_task_id(id)?;
     let i = id.to_string();
     store.read(move |tx| store::get_task(tx, &i))
 }
@@ -557,10 +559,6 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
                     t.state
                 );
             }
-            if !t.state.is_terminal() {
-                let i = id.clone();
-                st.call(move |tx| store::transition(tx, &i, PipelineEvent::Cancel).map(|_| ()))?;
-            }
             // EC-12: a task whose frozen configuration cannot be read can still be removed
             let cfg = match frozen_config(&t) {
                 Ok(c) => Some(c),
@@ -573,6 +571,21 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
                 Some(c) => task::task_git(c, &t.repo)?,
                 None => task::cleanup_git(&t.repo)?,
             };
+            // M12-12 (a): what cleanup deletes cannot be had back — say what, and ask for --force
+            if !*force {
+                let lost = cleanup_would_lose(&g, &t);
+                if !lost.is_empty() {
+                    bail!(
+                        "{id}: `task cleanup` would delete {} — look at it first (`git -C {} status`); `toryo task cleanup {id} --force` deletes it anyway",
+                        lost.join(" and "),
+                        t.worktree.display()
+                    );
+                }
+            }
+            if !t.state.is_terminal() {
+                let i = id.clone();
+                st.call(move |tx| store::transition(tx, &i, PipelineEvent::Cancel).map(|_| ()))?;
+            }
             toryo::engine::verify::cleanup(&g, &t, cfg.as_ref())?;
             if t.worktree.exists() {
                 let w = t.worktree.display().to_string().replace('\\', "/");
@@ -595,6 +608,34 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+/// M12-12 (a): what `task cleanup` would delete that exists nowhere else — uncommitted changes
+/// in the worktree and the partial snapshots of the run store (the branch is kept). Empty: a
+/// clean worktree and no snapshot.
+fn cleanup_would_lose(g: &toryo::git::GitCmd, t: &TaskRow) -> Vec<String> {
+    let mut lost = Vec::new();
+    if t.worktree.exists() {
+        let n = toryo::engine::worktree::Worktree::new(g, &t.worktree)
+            .changed()
+            .map(|c| c.len())
+            .unwrap_or(0);
+        if n > 0 {
+            lost.push(format!(
+                "{n} uncommitted change(s) in the worktree {}",
+                t.worktree.display()
+            ));
+        }
+    }
+    let partial = t.run_store.join("artifacts").join("partial");
+    let n = std::fs::read_dir(&partial).map_or(0, |d| d.flatten().count());
+    if n > 0 {
+        lost.push(format!(
+            "the partial snapshot(s) of {n} attempt(s) in {}",
+            partial.display()
+        ));
+    }
+    lost
 }
 
 fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Result<i32> {
@@ -1143,6 +1184,19 @@ fn resume_before_drive(st: &Store, t: &TaskRow, r: &ResumeArgs, protected: bool)
 }
 
 pub fn resume(id: Option<&str>, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
+    // M12-12 (b): these flags belong to one task — `resume --note "x"` used to be accepted
+    // and then ignored
+    if id.is_none() {
+        let one = [
+            ("--note", r.note.is_some()),
+            ("--discard-partial", r.discard_partial),
+            ("--keep-partial", r.keep_partial),
+            ("--accept-protected-change", !r.accept_protected.is_empty()),
+        ];
+        if let Some((flag, _)) = one.iter().find(|(_, set)| *set) {
+            bail!("{flag} belongs to one task — `toryo resume <id> {flag} …`; without an id `toryo resume` takes every waiting task as it is");
+        }
+    }
     let st = store()?;
     match id {
         Some(id) => {
@@ -1156,6 +1210,11 @@ pub fn resume(id: Option<&str>, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
             let tasks = st.call(store::list_tasks)?;
             let mut code = 0;
             for t in tasks.into_iter().filter(|t| !t.state.is_terminal()) {
+                // M12-12 (b): a task that was never started is `run`, not `resume`
+                if t.state == PipelineState::New {
+                    eprintln!("\n{}: not started — `toryo run {}`", t.id, t.id);
+                    continue;
+                }
                 // M12-07 (review): a stop that asks before a deploy is answered by `resume <id>`
                 // — never by a resume of everything
                 if waits_for_a_deploy_yes(&t) {
@@ -1169,8 +1228,15 @@ pub fn resume(id: Option<&str>, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
                 match TaskLock::acquire(&st, &t.id) {
                     Ok(lock) => {
                         eprintln!("\n▶ resume {}", t.id);
-                        let c = resume_one(&st, &lock, &ResumeArgs::default(), d)?;
-                        code = code.max(c);
+                        // M12-12 (b): one failing task does not stop the others; the exit
+                        // code says that one failed
+                        match resume_one(&st, &lock, &ResumeArgs::default(), d) {
+                            Ok(c) => code = code.max(c),
+                            Err(e) => {
+                                eprintln!("{}: error: {e:#}", t.id);
+                                code = code.max(2);
+                            }
+                        }
                         lock.release();
                     }
                     Err(e) => match e.downcast_ref::<lock::TaskActive>() {

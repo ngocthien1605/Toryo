@@ -216,8 +216,9 @@ fn an_escalation_carries_its_typed_reason_class() {
     assert_eq!(ev[fin]["status"], "failed");
     assert_eq!(ev[fin]["error_class"], "protected_config_changed");
     assert_eq!(ev.last().unwrap()["type"], "run_ended");
-    // `task cleanup` removes it with the run store
-    let (code, err) = toryo(&env, &["task", "cleanup", "EV-3"], &[]);
+    // `task cleanup` removes it with the run store (`--force` since M12-12: the worktree holds
+    // the uncommitted protected file the escalation is about)
+    let (code, err) = toryo(&env, &["task", "cleanup", "EV-3", "--force"], &[]);
     assert_eq!(code, 0, "{err}");
     assert!(!task(&env, "EV-3").run_store.join("events.jsonl").exists());
 }

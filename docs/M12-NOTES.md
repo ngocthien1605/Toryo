@@ -19,7 +19,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] M12-09 `./toryo.yaml` before `$TORYO_CONFIG` (X21)
 - [x] M12-10 Text files: BOM ignored, non-UTF-8 refused by name (X22)
 - [x] M12-11 Acceptance criteria are never dropped silently
-- [ ] M12-12 Three CLI traps
+- [x] M12-12 Three CLI traps
 - [ ] M12-13 Long paths on Windows
 - [ ] M12-14 An agent CLI that dies without a result shows its error text
 - [ ] M12-15 Gate output: OEM code page; one UI language for every gate (X23)
@@ -299,6 +299,33 @@ No Critical or High; three Medium, fixed here.
   are unchanged); `m12_11_an_acceptance_line_that_would_be_dropped_is_refused` (AC-1: the review's six lines through the
   binary, 1–4 accepted, 5 and 6 refused with their line numbers). AC-2: every existing TASK fixture loads unchanged (the
   whole suite, including the template `TASK.example.md` test). HUONG-DAN troubleshooting row updated.
+
+
+### M12-12 — Three CLI traps (review M11, M8, L1)
+
+- **(a) `task cleanup`** (`src/engine_cli.rs`): the frozen configuration and Git are opened first; unless `--force`,
+  `cleanup_would_lose` lists the uncommitted changes of the worktree (`Worktree::changed`, untracked included, ignored not)
+  and the partial snapshots under `<run store>/artifacts/partial` — "…would delete 1 uncommitted change(s) in the worktree …
+  and the partial snapshot(s) of 1 attempt(s) in … — look at it first (`git -C … status`); `toryo task cleanup <id> --force`
+  deletes it anyway" — and nothing is cancelled or deleted. **Applies to every state**, not only `Escalated` (a completed
+  task whose run store still holds a recovery snapshot also asks). A clean worktree and no snapshot: as before, an
+  `Escalated` task needs no `--force`.
+- **(b) `resume` without an id:** `--note`, `--discard-partial`, `--keep-partial`, `--accept-protected-change` are refused
+  ("--note belongs to one task — `toryo resume <id> --note …`"; before, the all-tasks branch took them and dropped them
+  silently); tasks in `New` are listed as "not started — `toryo run <id>`" and skipped; one task whose resume fails
+  prints "<id>: error: …" and the loop goes on; the exit code is 2 if any failed (else the largest code, as before).
+- **(c) task ids:** `engine::task::valid_task_id` (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, never `..`) is checked in
+  `open_lock_file` (so in every `TaskLock::acquire`), in `engine_cli::get` / `read_task` (every command that takes an
+  id) and in `task create` for `--id` and for the id of a `TASK.md` title (`create` keeps its older rule too: no `.`).
+  The title regex of `task_id` can only produce valid ids; `--id` is where a path can come from.
+- **Two earlier assertions changed (the milestone text contradicts them):** `engine_e2e::lock_first_recovery` expected
+  `resume` without an id to plan the `New` task B-1 — now it expects "B-1: not started", B-1 still `New`, and then starts
+  B-1 with `run`; `m10_events::an_escalation_carries_its_typed_reason_class` ran `task cleanup EV-3` on an escalated task
+  whose worktree holds the uncommitted protected file — now `--force`.
+- **Tests (`tests/m12_cli.rs`):** `m12_12_cleanup_asks_for_force_when_it_would_delete_unsaved_work`,
+  `m12_12_cleanup_of_a_clean_escalated_task_needs_no_force`, `m12_12_resume_without_an_id` (the failing task is one whose
+  worktree was deleted), `m12_12_a_task_id_is_never_a_path` (`../victim-x`, `a/b`, `..`, `a..b`, `_x`, `x y`; no lock file
+  outside `locks/`).
 
 
 ## Open

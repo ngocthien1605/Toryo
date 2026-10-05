@@ -22,6 +22,24 @@ pub struct CreateArgs {
     pub max_fix_cycles: Option<u32>,
 }
 
+/// M12-12 (c): a task id is a file name (the lock file, the run store): `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`
+/// and never `..` — checked before any file is touched, on every command that takes an id.
+pub fn valid_task_id(id: &str) -> Result<()> {
+    let mut chars = id.chars();
+    let ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && !id.contains("..");
+    if !ok {
+        bail!(
+            "`{id}` is not a task id — letters, digits, `.`, `_` and `-`, starting with a letter or digit, at most 64 characters, never `..`"
+        );
+    }
+    Ok(())
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -286,6 +304,7 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     let text = crate::textfile::read_text(&file)?;
     let ac = parse_acceptance_ids(&text)?;
     let id = task_id(&text, &file, a.id.as_deref());
+    valid_task_id(&id)?;
     if !id
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
