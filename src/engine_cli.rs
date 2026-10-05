@@ -624,6 +624,10 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     if let Some(reason) = toryo::engine::verify::below_floor(&new) {
         bail!("{reason}");
     }
+    // M12-05: an environment gate this machine cannot start is refused here too
+    if let Some(reason) = toryo::engine::gates::env_gates_refusal(&new) {
+        bail!("{reason}");
+    }
     // M11-R21: a changed `verify_root` is probed as `task create` and `doctor` do — a root
     // Low-integrity code can write would hand the export and the gate's folder to it
     if toryo::engine::verify::verify_root(&new) != toryo::engine::verify::verify_root(&old) {

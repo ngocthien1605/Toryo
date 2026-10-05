@@ -165,6 +165,76 @@ pub fn policy_checks(cfg: &Effective) -> Vec<Check> {
     .collect()
 }
 
+/// M12-05: one line per gate — can it start on this machine? A check gate's program (a bare
+/// name on the PATH, an absolute path that exists) and an environment gate's program and
+/// script (`-File`, an absolute script path). FAIL with the way out; a gate that can start is
+/// an OK line. A repository path is not asked here (the M18 rules).
+pub fn gate_checks(cfg: &Effective) -> Vec<Check> {
+    use crate::engine::gates;
+    let path = std::env::var_os("PATH");
+    let root = expand_vars(&cfg.repo.project.root).map(PathBuf::from).ok();
+    let mut out = Vec::new();
+    let mut add = |level: Level, message: String| {
+        out.push(Check {
+            level,
+            area: "gates".into(),
+            message,
+            source: None,
+        })
+    };
+    let cmds = root
+        .as_deref()
+        .and_then(|r| crate::engine::checks::verify_commands(cfg, r).ok())
+        .unwrap_or_else(|| cfg.repo.commands.verify.clone());
+    for c in &cmds {
+        if !matches!(c.kind(), crate::config::CommandKind::Program { .. }) {
+            continue;
+        }
+        match gates::check_gate_problem(c, path.as_deref()) {
+            Some(why) => add(
+                Level::Fail,
+                format!(
+                    "check gate `{}`: {why} — install it or put it on the PATH, or change `commands.verify` / the gate in the org chart; a run would stop with `{}` before any gate ran",
+                    c.name,
+                    gates::GATE_UNAVAILABLE
+                ),
+            ),
+            None => add(Level::Ok, format!("check gate `{}` can start here", c.name)),
+        }
+    }
+    if let Some(team) = &cfg.team {
+        for (name, g) in team.handoff_gates() {
+            if g.decl.kind != crate::team::GateType::Environment {
+                continue;
+            }
+            let Some(m) = &g.machine else { continue };
+            let mut problems: Vec<String> = Vec::new();
+            if let Err(e) =
+                crate::engine::runner::env_gate_program(cfg, &m.program, path.as_deref())
+            {
+                problems.push(e);
+            }
+            problems.extend(gates::script_problems(&m.args));
+            if problems.is_empty() {
+                add(
+                    Level::Ok,
+                    format!("environment gate `{name}` can start here"),
+                );
+            } else {
+                add(
+                    Level::Fail,
+                    format!(
+                        "environment gate `{name}`: {} — fix `environment_gates.{name}` in the machine config; `task create` refuses it and a run would stop with `{}` before any gate ran",
+                        problems.join("; "),
+                        crate::engine::runner::ENV_UNAVAILABLE
+                    ),
+                );
+            }
+        }
+    }
+    out
+}
+
 /// M11-R8: the machine's `skills_dir` (org chart mode) — a WARN when the folder does not
 /// exist: a skill only there resolves nowhere, and the turn that needs it escalates
 /// (`skill_unavailable`).
@@ -308,6 +378,7 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
     verify_root_check(&mut r, cfg);
     r.0.extend(origin_checks(cfg));
     r.0.extend(policy_checks(cfg));
+    r.0.extend(gate_checks(cfg));
     r.0.extend(skills_dir_checks(cfg));
 
     // Profiles

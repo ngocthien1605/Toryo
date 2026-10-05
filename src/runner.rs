@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -29,6 +29,29 @@ pub struct RunSpec {
     /// Set to `true` to terminate the command's Job.
     pub cancel: Option<Arc<AtomicBool>>,
 }
+
+/// M12-05: the command could not be started at all (no such program, not an executable) — a
+/// problem of the machine, never a failing gate. Carried typed, so the engine never reads it
+/// out of the message.
+#[derive(Debug)]
+pub struct StartFailed {
+    pub name: String,
+    pub program: String,
+    /// The OS error, with its context.
+    pub error: String,
+}
+
+impl std::fmt::Display for StartFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "starting `{}` ({}): {}",
+            self.name, self.program, self.error
+        )
+    }
+}
+
+impl std::error::Error for StartFailed {}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CommandResult {
@@ -116,8 +139,12 @@ impl CommandRunner for LocalRunner {
             // the raw streams, interleaved as they arrive; the whole output is redacted at the
             // end (M11-E2): a per-stream redactor holds back bytes and would reorder stdout and
             // stderr when any secret is configured (group E review)
-            let running = spawn(&s, &Redactions::empty()).with_context(|| {
-                format!("starting `{}` ({})", spec.name, spec.program.display())
+            let running = spawn(&s, &Redactions::empty()).map_err(|e| {
+                anyhow::Error::new(StartFailed {
+                    name: spec.name.clone(),
+                    program: spec.program.display().to_string(),
+                    error: format!("{e:#}"),
+                })
             })?;
             let cancel_flag = spec.cancel.clone();
             let mut out = Vec::new();

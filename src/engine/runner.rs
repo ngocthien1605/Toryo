@@ -36,6 +36,7 @@ use super::checks::{
 use super::context;
 use super::contracts;
 use super::flight::{EngineEvent, Recorder, TurnUsage};
+use super::gates::GATE_UNAVAILABLE;
 use super::lock::{EnvLock, StopWatch, TaskLock};
 use super::protect;
 use super::state::{GateKind, Machine, PipelineEvent as Ev, PipelineState as St};
@@ -1486,6 +1487,12 @@ impl<'a> Engine<'a> {
             self.escalate_attempt(&a, ENV_UNAVAILABLE.into(), reason)?;
             return Ok(Flow::Next);
         }
+        // M12-05: the same for the check gates — a program that is not on this machine is a
+        // machine stop before any gate runs, not a failing gate and not a plain error
+        if let Some(reason) = self.check_gates_preflight(t) {
+            self.escalate_attempt(&a, GATE_UNAVAILABLE.into(), reason)?;
+            return Ok(Flow::Next);
+        }
         let Some((b, co)) = self.verify_checkout(t, &a, &head)? else {
             return Ok(Flow::Next);
         };
@@ -1504,9 +1511,13 @@ impl<'a> Engine<'a> {
             )?;
             e.stopped()
         };
-        let Some((mut results, mut failure)) =
-            self.run_verify_commands(b, &co, &head, &stop, xpp.as_ref())?
-        else {
+        let ran = match self.run_verify_commands(b, &co, &head, &stop, xpp.as_ref()) {
+            Ok(r) => r,
+            // M12-05: the program disappeared between the preflight and the start (or is no
+            // executable): the same class, with the OS error
+            Err(e) => return self.gate_start_failed(t, &a, e),
+        };
+        let Some((mut results, mut failure)) = ran else {
             return interrupted(self);
         };
         // M11-R9 (X6, replaces X2): the environment gates read a fresh export of the commit,
@@ -1649,6 +1660,48 @@ impl<'a> Engine<'a> {
             })
     }
 
+    /// M12-05: the reason the first check gate of this run cannot start here — its program is
+    /// not on the PATH the gate gets, or an absolute path does not exist
+    /// ([`super::gates::check_gate_problem`]) — or `None`. Nothing is run.
+    fn check_gates_preflight(&self, t: &TaskRow) -> Option<String> {
+        let path = std::env::var_os("PATH");
+        self.cmds.iter().find_map(|c| {
+            super::gates::check_gate_problem(c, path.as_deref()).map(|why| {
+                format!(
+                    "{GATE_UNAVAILABLE}: check gate `{}` cannot start — {why} — {}",
+                    c.name,
+                    machine_fix_hint(
+                        &t.id,
+                        "the program installed or put on the PATH",
+                        "`commands.verify` in toryo.yaml (or the gate in the org chart)"
+                    )
+                )
+            })
+        })
+    }
+
+    /// M12-05: a verify run ended in an error — when that is a command that could not be
+    /// started ([`crate::runner::StartFailed`]), the attempt ends `gate_unavailable` (machine-
+    /// caused: plain `resume` goes back into the stage); any other error stays an error.
+    fn gate_start_failed(&self, t: &TaskRow, a: &AttemptRow, e: anyhow::Error) -> Result<Flow> {
+        let Some(s) = e.downcast_ref::<crate::runner::StartFailed>() else {
+            return Err(e);
+        };
+        let reason = format!(
+            "{GATE_UNAVAILABLE}: check gate `{}` could not be started ({}): {} — {}",
+            s.name,
+            s.program,
+            s.error,
+            machine_fix_hint(
+                &t.id,
+                "the program installed or put on the PATH",
+                "`commands.verify` in toryo.yaml (or the gate in the org chart)"
+            )
+        );
+        self.escalate_attempt(a, GATE_UNAVAILABLE.into(), reason)?;
+        Ok(Flow::Next)
+    }
+
     /// M11-R16: what the environment gate `name` needs from this machine before it can start —
     /// no `%NAME%` left in its command (a task frozen before M11-R3), a valid lock name, every
     /// `secret_env` reference resolved, the program found and outside the roots agent code can
@@ -1697,6 +1750,11 @@ impl<'a> Engine<'a> {
         }
         let program = env_gate_program(&self.cfg, &m.program, std::env::var_os("PATH").as_deref())
             .map_err(unavailable)?;
+        // M12-05: the script it is handed (`-File`, an absolute script path) is there — a typo
+        // in the machine config is not a failing gate
+        if let Some(why) = super::gates::script_problems(&m.args).into_iter().next() {
+            return Err(unavailable(why));
+        }
         Ok((program, secrets))
     }
 
@@ -1936,6 +1994,20 @@ impl<'a> Engine<'a> {
                     let _ = self
                         .store
                         .call(move |tx| store::deployment_end(tx, &l, &i, Some(false)));
+                    drop(lock);
+                    // M12-05: a program that cannot be started is a machine stop
+                    if let Some(s) = e.downcast_ref::<crate::runner::StartFailed>() {
+                        return Ok(EnvGates::Unavailable(format!(
+                            "{ENV_UNAVAILABLE}: environment gate `{name}` could not be started ({}): {} — {}",
+                            s.program,
+                            s.error,
+                            machine_fix_hint(
+                                &t.id,
+                                "a program installed",
+                                &format!("`environment_gates.{name}` in the machine config")
+                            )
+                        )));
+                    }
                     return Err(e);
                 }
             };

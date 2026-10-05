@@ -11,7 +11,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] M12-03 Read-only role checks run on every way a turn ends (H6)
 - [x] M12-04 The redactor releases complete lines (H5)
 - [ ] Review of M12-01…04 (subagent, in place)
-- [ ] M12-05 A gate that cannot start is a machine stop, and `doctor` finds it first
+- [x] M12-05 A gate that cannot start is a machine stop, and `doctor` finds it first
 - [ ] M12-06 An environment gate that times out stops for the owner (X18)
 - [ ] M12-07 Confirm before deploy (X17)
 - [ ] Review of M12-05…07 (subagent, in place)
@@ -126,6 +126,33 @@ One High, four Medium, four Low; the High and the Mediums fixed here.
   fence (same `Protected::violates`); the Unix AC-3 test sets a process-wide variable (unique name); an error from
   `hub.turn_with` skips the read-only checks as before; after a stop that came with a write, the loop prints "stopped
   at a stage boundary" although the task escalated.
+
+### M12-05 — a gate that cannot start is a machine stop, and `doctor` finds it first
+
+- **New class `gate_unavailable`** (`engine::gates::GATE_UNAVAILABLE`), added to `MACHINE_CAUSED` (now six): plain
+  `resume` costs no fix cycle, `task config --reload` works (the task is `Escalated`, a waiting state). The
+  `next:` text is the generic machine-caused one (both ways out).
+- **One resolver** (`src/engine/gates.rs`, new): `program_problem` (a bare name on the PATH the gate gets — `PATHEXT`
+  on Windows; an absolute path exists; a repository path is **never** asked: M18's business), `script_problems` (the
+  argument after `-File` / `-f`, and every absolute argument with a script extension; a relative `-File` is the
+  repository's), `check_gate_problem`, `env_gate_problems`.
+- **Where it is asked.** *Verify*, before any gate (`check_gates_preflight`, right after X12's environment preflight,
+  one attempt end `gate_unavailable`); the environment gate preflight (`gate_ready`) now also asks the script.
+  *Spawn error path*: `LocalRunner` returns a typed `StartFailed` (name, program, OS error) instead of a plain
+  context; `verify()` turns it into `gate_unavailable` (`gate_start_failed`), the environment gate runner into
+  `environment_gate_unavailable` (the deployment row says "did not start"). *`doctor`*: area `gates`, one line per
+  check gate and environment gate (OK, or FAIL with the way out; `gate_checks`).
+- **Deviation from the list (needed for AC-4):** `task create` / `task config --reload` refuse an environment gate
+  only for a missing **script** (new), **not** for a missing program: two M11 tests
+  (`a_wrong_gate_program_needs_a_reload_before_resume`, `an_environment_gate_that_cannot_run_escalates`) create a
+  task with a program that does not exist and expect the Verify stop — "no existing test changes". A missing program
+  is therefore admitted as before, `doctor` FAILs it and Verify stops with `environment_gate_unavailable`. A check
+  gate is never refused or noted at create (AC-1/AC-4).
+- **Tests:** `tests/m12_gates.rs` — `m12_05_a_check_gate_that_cannot_start_is_a_machine_stop` (AC-1: no refusal, no
+  note, `doctor` FAIL, `gate_unavailable` before any gate and before another implementer turn, reload allowed, plain
+  resume completes, no fix cycle), `m12_05_a_program_that_exists_but_cannot_start_is_the_same_stop` (AC-2: a text
+  file as program — the spawn error), `m11_env_gates::m12_05_an_environment_gate_with_a_missing_script_is_a_
+  machine_stop` (AC-3), and the unit tests of `gates.rs`. The M18 tables are untouched.
 
 ## Open
 

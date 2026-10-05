@@ -2062,3 +2062,79 @@ fn a_gate_frozen_with_a_variable_does_not_start() {
     let d = deployments(&env);
     assert_eq!((d.len(), d[0].ok), (1, Some(true)));
 }
+
+/// M12-05 AC-3: an environment gate whose `-File` script is not there. `doctor` FAILs and
+/// `task create` refuses it (like a gate the machine does not define); when the script
+/// disappears after `task create`, Verify stops with `environment_gate_unavailable` — no
+/// implementer turn, no gate retry used, no deployment. (Was: PowerShell starts, exits 2, and
+/// that counts as a failing gate: a typo in the machine config cost two implementer turns.)
+#[test]
+fn m12_05_an_environment_gate_with_a_missing_script_is_a_machine_stop() {
+    let env = env_gate_setup("codex-openai", "error", "");
+    let g = machine_gate(&env, "dbsync", "d365-env", "exit 0\n", "exit 0\n", "");
+    define_gates(&env, &g);
+    let script_file = env.root.join("gates").join(if cfg!(windows) {
+        "dbsync.ps1"
+    } else {
+        "dbsync.sh"
+    });
+    assert!(script_file.is_file());
+    // the script is there: doctor is quiet, `task create` accepts
+    let o = command(&env, &["doctor"], &[]).output().unwrap();
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    assert!(
+        out.lines()
+            .any(|l| l.contains("environment gate `dbsync` can start here")),
+        "{out}"
+    );
+    create(&env, "MS-1");
+    // … and gone: doctor FAILs, a new task is refused
+    std::fs::remove_file(&script_file).unwrap();
+    let o = command(&env, &["doctor"], &[]).output().unwrap();
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    let line = out
+        .lines()
+        .find(|l| l.contains("environment gate `dbsync`") && l.contains("FAIL"))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(line.contains("does not exist"), "{line}");
+    let (code, err) = toryo(
+        &env,
+        &["task", "create", "--file", "TASK.md", "--id", "MS-2"],
+        &[],
+    );
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("environment_gate_unavailable: environment gate `dbsync` cannot start")
+            && err.contains("does not exist"),
+        "{err}"
+    );
+    // the task made before: Verify stops, nothing was spent on it
+    let s = script(
+        &env,
+        "ms1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "MS-1", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "MS-1");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_unavailable"),
+        "{err}"
+    );
+    let why = t.machine.reason().unwrap().to_string();
+    assert!(why.contains("does not exist"), "{why}");
+    assert_eq!(
+        attempts(&env, "MS-1")
+            .iter()
+            .filter(|a| a.stage == "implement")
+            .count(),
+        1,
+        "no implementer turn"
+    );
+    assert_eq!(t.fix_cycle, 0, "no gate retry used");
+    assert!(deployments(&env).is_empty());
+}

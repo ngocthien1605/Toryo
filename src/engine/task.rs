@@ -308,6 +308,10 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     let g = task_git(cfg, &repo)?;
     // R36/R45 admission: the verify boundary must be available before anything is created
     super::verify::probe(cfg)?;
+    // M12-05: an environment gate this machine cannot start is refused, like one it does not define
+    if let Some(reason) = super::gates::env_gates_refusal(cfg) {
+        bail!("{reason}");
+    }
     // R59 admission: a `tool: xpp` command needs MSBuild and the five CI/CD packages here
     super::xpp::for_config(cfg)?;
     let repol = Loc::Discover(repo.clone());
