@@ -385,3 +385,158 @@ fn m12_11_an_acceptance_line_that_would_be_dropped_is_refused() {
         "{err}"
     );
 }
+
+// ── M12-17: `doctor` checks what a first run needs ───────────────────────────────────────
+
+fn doctor_lines(env: &Env, cwd: Option<&std::path::Path>) -> Vec<String> {
+    let mut c = command(env, &["doctor"], &[]);
+    if let Some(d) = cwd {
+        c.current_dir(d);
+    }
+    let o = c.output().unwrap();
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn line_with<'a>(lines: &'a [String], needle: &str) -> &'a str {
+    lines
+        .iter()
+        .find(|l| l.contains(needle))
+        .unwrap_or_else(|| panic!("no line with `{needle}` in:\n{}", lines.join("\n")))
+}
+
+/// The base branch line (M12-08): the key set and the branch there — OK; the key set and no
+/// such branch — FAIL with the way out; no key — INFO naming the checked-out branch.
+#[test]
+fn m12_17_doctor_checks_the_base_branch() {
+    let env = setup("codex-openai");
+    let lines = doctor_lines(&env, None);
+    let l = line_with(&lines, "no project.base_branch");
+    assert!(l.contains("checked-out branch (`main`)"), "{l}");
+    set_project_key(&env, "base_branch: main");
+    let lines = doctor_lines(&env, None);
+    let l = line_with(&lines, "project.base_branch `main` exists");
+    assert!(l.contains("OK"), "{l}");
+    let y = std::fs::read_to_string(&env.config).unwrap();
+    std::fs::write(
+        &env.config,
+        y.replace("base_branch: main\n", "base_branch: nope\n"),
+    )
+    .unwrap();
+    let lines = doctor_lines(&env, None);
+    let l = line_with(&lines, "the branch `nope` does not exist");
+    assert!(l.contains("FAIL") && l.contains("task create"), "{l}");
+}
+
+/// The encoding line: every text file under `.toryo/` and the machine config are UTF-8 (a
+/// byte-order mark passes); a Shift-JIS file is a FAIL naming it.
+#[test]
+fn m12_17_doctor_checks_the_encoding_of_the_toryo_folder() {
+    let env = setup("codex-openai");
+    let ctx = env.repo.join(".toryo").join("context");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::write(ctx.join("10-ok.md"), b"\xEF\xBB\xBFplain text\n").unwrap();
+    let lines = doctor_lines(&env, None);
+    let l = line_with(&lines, "text file(s) under .toryo/ are UTF-8");
+    assert!(l.contains("OK") && l.contains("1 text file(s)"), "{l}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("machine config") && l.contains("is UTF-8")),
+        "{lines:?}"
+    );
+    std::fs::write(ctx.join("20-bad.md"), [0x93, 0xFA, 0x96, 0x7B]).unwrap();
+    let lines = doctor_lines(&env, None);
+    let l = line_with(&lines, "20-bad.md is not UTF-8");
+    assert!(
+        l.contains("FAIL") && l.contains("context_unreadable"),
+        "{l}"
+    );
+}
+
+/// The config-file line (M12-09): which file and why; and a WARN when `$TORYO_CONFIG` names
+/// another file that is ignored in this folder.
+#[test]
+fn m12_17_doctor_says_which_config_is_used_and_why() {
+    let env = setup("codex-openai");
+    let here = env.root.join("here");
+    std::fs::create_dir_all(&here).unwrap();
+    std::fs::copy(&env.config, here.join("toryo.yaml")).unwrap();
+    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_toryo"));
+    c.arg("--machine-config")
+        .arg(&env.machine)
+        .arg("doctor")
+        .env("TORYO_DATA_DIR", &env.data)
+        .env("TORYO_CONFIG", &env.config)
+        .current_dir(&here)
+        .stdin(std::process::Stdio::null());
+    let o = c.output().unwrap();
+    let lines: Vec<String> = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let l = line_with(&lines, "is in use — chosen by");
+    assert!(l.contains("the toryo.yaml of the folder you are in"), "{l}");
+    let l = line_with(&lines, "$TORYO_CONFIG names");
+    assert!(l.contains("WARN") && l.contains("is ignored here"), "{l}");
+    // `--config` is named as the reason when it is given
+    let lines = doctor_lines(&env, None);
+    let l = line_with(&lines, "is in use — chosen by");
+    assert!(l.contains("`--config`"), "{l}");
+    assert!(!lines.iter().any(|l| l.contains("$TORYO_CONFIG names")));
+}
+
+/// A profile `env:` value with `%NAME%` is a WARN: it is passed as written.
+#[test]
+fn m12_17_doctor_warns_about_a_percent_variable_in_a_profile_env() {
+    let env = setup("codex-openai");
+    let m = std::fs::read_to_string(&env.machine).unwrap();
+    assert!(m.contains("exe: codex-not-installed }"), "{m}");
+    std::fs::write(
+        &env.machine,
+        m.replace(
+            "exe: codex-not-installed }",
+            "exe: codex-not-installed, env: { CODEX_HOME: '%USERPROFILE%/codex', PLAIN: 'a%b' } }",
+        ),
+    )
+    .unwrap();
+    let lines = doctor_lines(&env, None);
+    let l = line_with(&lines, "env CODEX_HOME contains %USERPROFILE%");
+    assert!(
+        l.contains("WARN") && l.contains("profile codex-openai") && l.contains("not expanded here"),
+        "{l}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("env PLAIN")),
+        "a lone % is no variable"
+    );
+}
+
+/// The elevation line: WARN when elevated (the way out in it), OK when not — and on Windows
+/// `doctor` prints one of the two.
+#[test]
+fn m12_17_doctor_says_whether_toryo_runs_elevated() {
+    use toryo::doctor::{elevation_check, Level};
+    let w = elevation_check(true);
+    assert!(matches!(w.level, Level::Warn));
+    assert!(
+        w.message.contains("administrator token")
+            && w.message
+                .contains("elevate inside the environment gate script"),
+        "{}",
+        w.message
+    );
+    assert!(matches!(elevation_check(false).level, Level::Ok));
+    if cfg!(windows) {
+        let env = setup("codex-openai");
+        let lines = doctor_lines(&env, None);
+        let l = line_with(&lines, "Toryo runs");
+        assert_eq!(
+            l.contains("WARN"),
+            toryo::doctor::is_elevated(),
+            "doctor and the token agree: {l}"
+        );
+    }
+}

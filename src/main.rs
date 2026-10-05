@@ -244,6 +244,19 @@ pub(crate) fn config_path(cli: &Cli) -> PathBuf {
     var.unwrap_or(local)
 }
 
+/// Why [`config_path`] chose its file, in words (M12-17: `doctor` says it).
+fn config_source(cli: &Cli) -> String {
+    if cli.config.is_some() {
+        "`--config`".into()
+    } else if PathBuf::from("toryo.yaml").is_file() {
+        "the toryo.yaml of the folder you are in".into()
+    } else if std::env::var_os("TORYO_CONFIG").is_some() {
+        "$TORYO_CONFIG (there is no toryo.yaml in this folder)".into()
+    } else {
+        "the default `./toryo.yaml`".into()
+    }
+}
+
 pub(crate) fn load_config(cli: &Cli) -> Result<Effective> {
     let path = config_path(cli);
     let machine = cli
@@ -288,7 +301,17 @@ fn run(cli: Cli) -> Result<i32> {
                 Ok(c) => (Some(c), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             };
-            let code = toryo::doctor::run(cfg.as_ref(), err, *json)?;
+            // `$TORYO_CONFIG` is only worth a word when it could have been the choice
+            let variable = std::env::var_os("TORYO_CONFIG")
+                .map(PathBuf::from)
+                .filter(|_| cli.config.is_none());
+            let code = toryo::doctor::run(
+                cfg.as_ref(),
+                err,
+                *json,
+                &config_source(&cli),
+                variable.as_deref(),
+            )?;
             if !failed.is_empty() {
                 eprintln!("canaries that did not pass: {}", failed.join(", "));
                 return Ok(code.max(1));

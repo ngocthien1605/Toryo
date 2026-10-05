@@ -24,7 +24,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] M12-14 An agent CLI that dies without a result shows its error text
 - [x] M12-15 Gate output: OEM code page; one UI language for every gate (X23)
 - [x] M12-16 Gate output for the owner: full log, heartbeat, bounded memory
-- [ ] M12-17 `doctor` checks what a first run needs
+- [x] M12-17 `doctor` checks what a first run needs
 - [ ] M12-18 The D365FO template loads as shipped; example gate scripts
 - [ ] M12-19 Guide: "First real task on D365FO", one escalation table, stale lines
 - [ ] M12-20 Notes: `STATUS.md`, `DECISIONS.md`, archive, the review in the repo
@@ -415,6 +415,27 @@ No Critical or High; three Medium, fixed here.
   in the log; the check gate has a log too). `an_environment_gate_secret_is_redacted_everywhere` (EG-5) already walks the
   whole run store for the secret and still passes with the logs in it.
 - **Not done:** live streaming of the output (the list says it is not part of this task).
+
+
+### M12-17 — `doctor` checks what a first run needs
+
+`doctor::run` gained two parameters (`config_source`, `config_variable`; its one caller is `main.rs`). Each line below is a
+function of `src/doctor.rs` with its own test in `tests/m12_config.rs` (`m12_17_*`):
+
+| line (area) | level | what | test |
+|---|---|---|---|
+| gates | OK / FAIL | check gate / environment gate can start (M12-05) and `(confirm: <mode>)` of each environment gate (M12-07) | M12-05 / M12-07 tests (earlier commits) |
+| config | INFO + WARN | "`<file>` is in use — chosen by `--config` / the toryo.yaml of the folder you are in / $TORYO_CONFIG / the default"; WARN when `$TORYO_CONFIG` names another existing file that this folder's file shadows (not when `--config` was given) | `m12_17_doctor_says_which_config_is_used_and_why` |
+| base branch | OK / FAIL / INFO | `project.base_branch` exists / does not (names the key, the way out, "task create refuses it") / unset: "starts from the checked-out branch (`main`)" | `m12_17_doctor_checks_the_base_branch` |
+| encoding | OK / FAIL | every `.md .yaml .yml .txt .json .toml` under `<root>/.toryo/` is UTF-8 (a mark passes) — FAIL names each file that is not and says `context_unreadable`; the machine config too | `m12_17_doctor_checks_the_encoding_of_the_toryo_folder` |
+| paths | INFO / WARN | the lengths of `worktrees_root` / `verify_root` (M12-13) | `m12_13_doctor_prints_the_root_lengths` |
+| token | OK / WARN | Windows only: WARN when the token is elevated ("agents and the Low-integrity gates get an administrator token: start Toryo from a normal shell and elevate inside the environment gate script"); OK otherwise. `is_elevated()` reads `TokenElevation` | `m12_17_doctor_says_whether_toryo_runs_elevated` (the texts on every platform; on Windows that `doctor`'s line agrees with the token — the elevated branch itself cannot be run from a test) |
+| profile `<name>` | WARN | a profile `env:` value with `%NAME%` — "not expanded here: the value is passed as written; write the absolute path in the machine config"; a lone `%` is not a variable | `m12_17_doctor_warns_about_a_percent_variable_in_a_profile_env` |
+
+- Only `env:` is looked at: `exe` is expanded by Toryo and `secret_env` values are references, not paths.
+- The doctor's own tests ran with the owner's real `$TORYO_CONFIG` set in the shell (`C:\.thien\m0\toryo.yaml`): the new
+  WARN looked at it (`is_file`, `canonicalize`; the file is never read). That is why the variable is not reported when
+  `--config` is given.
 
 
 ## Open
