@@ -2277,7 +2277,11 @@ commands:
             (
                 t.join("d365fo").join("toryo.yaml.example"),
                 t.join("d365fo").join("toryo.local.yaml.example"),
-                "fd5f27ff14d049d67848df01c4054a141ca02c0fb36b3ed1cf0e0dec0792bd91",
+                // M12-18: the d365fo machine example itself changed (the `codex-openai` profile
+                // the org chart seats, `seats`, `verify`, the `dbsync` environment gate with
+                // `confirm: first`); it was `fd5f27ff…` (M10). The loader-neutrality this test
+                // pins is still held by the two templates beside it, whose files did not change.
+                "919cfa7aec8e707d98772fb5be7eed6ce7abd5924f4db5ba2635778704e0deb4",
             ),
             (
                 t.join("dogfood").join("toryo.yaml.example"),
@@ -2471,7 +2475,9 @@ commands:
         .unwrap();
         assert!(cfg.repo.commands.verify[0].is_xpp());
         assert!(cfg.toolchains.xpp.is_some());
-        assert_eq!(cfg.origins.profiles.len(), 3);
+        // (4 since M12-18: the machine example also defines `codex-openai`, the org chart's
+        // implementer; it was 3)
+        assert_eq!(cfg.origins.profiles.len(), 4);
         assert!(cfg.repo.policy.deny_paths.iter().any(|d| d == "**/ZZZ/**"));
         assert_eq!(cfg.repo.verify.checkout, "clean");
         let mut files = vec![

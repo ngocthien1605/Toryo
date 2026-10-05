@@ -1,17 +1,26 @@
-# D365FO machine config (M9-C1) — %USERPROFILE%\.toryo\toryo.local.yaml on the UDE machine,
-# outside every repository. The ONLY place for agent profiles and the X++ toolchain (R59/R60).
-# Merge it with what the file already holds (one `profiles:`, one `roles:`, one `git:`).
+# D365FO machine config (M9-C1, M12-18) — %USERPROFILE%\.toryo\toryo.local.yaml on the UDE machine,
+# outside every repository. The ONLY place for agent profiles, the X++ toolchain and the commands of
+# environment gates (R59/R60). It loads together with toryo.orgchart.yaml.example and the
+# .toryo/ folder of this template.
+# Merge it with what the file already holds (one `profiles:`, one `seats:`, one `git:`).
 #
 # TODO(owner):
 #   1. profiles.*.exe — where claude.exe and codex.exe are installed on this machine.
-#   2. claude-foundry / codex-foundry — the Foundry resource, the deployment names, the base_url.
+#   2. claude-foundry / codex-foundry — only on a machine that uses Foundry: the Foundry resource,
+#      the deployment names, the base_url. Delete the two profiles on a machine that does not.
 #   3. secret_env — the Credential Manager targets (`toryo secrets set toryo/<name>`).
-#   4. codex-foundry.env.CODEX_HOME — a folder of its own (auth and sessions only).
+#   4. codex-foundry.env.CODEX_HOME — a folder of its own (auth and sessions only), written out in
+#      full: a `%NAME%` in an `env:` value is NOT expanded (`toryo doctor` warns).
 #   5. toolchains.xpp.msbuild — `toryo doctor` proposes the path vswhere finds.
 #   6. toolchains.xpp.nugets — the five CI/CD NuGets for the release the UDE runs, extracted.
 #   7. toolchains.xpp.ude_metadata — the UDE's PackagesLocalDirectory (version check only).
-#   8. roles — which Claude profile plans and reviews on this machine.
+#   8. seats — which Claude profile plans and reviews on this machine (the org chart seats
+#      claude-max for both, codex-openai for the implementer).
 #   9. git.trusted_filters — only if the repository uses Git LFS (Open decision 14).
+#  10. environment_gates.dbsync — copy templates/d365fo/machine/dbsync.ps1.example OUTSIDE every
+#      repository and point `args` at it; put your real deploy and sync into it.
+#  11. verify.verify_root — a SHORT folder on a drive with room (Windows tools stop at 260
+#      characters; `toryo doctor` prints the length). It replaces the repository's.
 profiles:
   claude-max:                               # personal machine: Claude Max subscription
     kind: claude
@@ -20,6 +29,14 @@ profiles:
     version: "2.1.x"
     env:
       CLAUDE_CODE_GIT_BASH_PATH: C:\Program Files\Git\bin\bash.exe
+
+  codex-openai:                             # personal machine: ChatGPT login (the org chart's implementer)
+    kind: codex
+    billing: subscription
+    exe: C:\tools\codex\codex.exe                        # TODO(owner) 1
+    codex:
+      sandbox_mode: workspace-write
+      windows_sandbox: unelevated                        # R18: without it the Windows sandbox is OFF
 
   claude-foundry:                           # company laptop: approved Foundry models
     kind: claude
@@ -36,7 +53,7 @@ profiles:
     secret_env:
       ANTHROPIC_FOUNDRY_API_KEY: credman:toryo/foundry-claude   # TODO(owner) 3
 
-  codex-foundry:
+  codex-foundry:                            # company laptop: the implementer on Foundry
     kind: codex
     billing: foundry
     exe: C:\tools\codex\codex.exe                        # TODO(owner) 1
@@ -63,9 +80,11 @@ toolchains:
     bp_check: false                                      # xppbp.exe: not supported yet (V08-VERIFY 4)
     ude_metadata: '%LOCALAPPDATA%\Microsoft\Dynamics365\10.0.2345.12\PackagesLocalDirectory'   # TODO(owner) 7
 
-roles:                                      # TODO(owner) 8 — override the repository's roles on this machine
+seats:                                      # TODO(owner) 8 — override the org chart's seats on this machine
   planner:  { profile: claude-max, model: opus }
   reviewer: { profile: claude-max, model: opus }
+  # company laptop: the implementer on Foundry
+  # implementer: { profile: codex-foundry }
 
 git:
   trusted_filters: {}                       # TODO(owner) 9 — with Git LFS:
@@ -73,19 +92,34 @@ git:
   #     process: '"C:\Program Files\Git LFS\git-lfs.exe" filter-process'
   #     required: true
 
+# This machine's floor for the repositories' verify sandbox, and its verify root (M11, review H2).
+# `min_boundary: low_integrity` refuses a repository that asks for `boundary: none`.
+verify:
+  min_boundary: low_integrity
+  verify_root: 'D:\toryo-verify'            # TODO(owner) 11
+
+# The environment gate the org chart's `dbsync` gate runs on this machine (M11-E3). Without this
+# entry `task create` refuses the org chart (`if_missing: error`); a machine without a D365FO
+# environment sets `if_missing: skip` on the gate in toryo-orgchart.yaml instead.
+# (After `environment_gate_unavailable`: a secret or program added on the machine → `toryo resume
+# <id>`; this entry changed → `toryo task config <id> --reload`, then `toryo resume <id>`.)
+environment_gates:
+  dbsync:
+    program: powershell                     # Windows PowerShell 5.1; pwsh for 7
+    args: [-NoProfile, -NonInteractive, -File, 'C:\toryo-gates\dbsync.ps1']   # TODO(owner) 10 — outside every repository
+    lock: d365-env
+    confirm: first                          # stop and ask before the first deploy of each task
+    # env:    { D365_PACKAGES: 'K:\AosService\PackagesLocalDirectory' }
+    # secret_env: { D365_SYNC_SECRET: 'credman:toryo/d365-sync' }
+
 # M10: a Windows toast when a task needs you (a gate, an escalation, a pause, the end of a run).
 # Off by default; `toryo notify-test` shows a sample.
 # notify:
 #   toast: true
 
-# M11 — org chart mode (templates/d365fo/.toryo/): the DB-sync environment gate and the shared
-# skills folder of this UDE machine. The full comments and the script contract are in
-# templates/toryo.local.yaml.example.
+# M11: the shared skills folder of this machine (org chart skills are looked up in the repository
+# first, then here).
 # skills_dir: C:/Temp/AgentShare/skills
-# (After `environment_gate_unavailable`: a secret or program added on the machine → `toryo resume
-# <id>`; this entry changed → `toryo task config <id> --reload`, then `toryo resume <id>`.)
-# environment_gates:
-#   dbsync:
-#     program: powershell
-#     args: [-NoProfile, -NonInteractive, -File, 'C:\toryo-gates\dbsync.ps1']   # outside every repository
-#     lock: d365-env
+
+# The full comments and the contract of a gate script are in templates/toryo.local.yaml.example and
+# in the header of templates/d365fo/machine/dbsync.ps1.example.

@@ -25,7 +25,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] M12-15 Gate output: OEM code page; one UI language for every gate (X23)
 - [x] M12-16 Gate output for the owner: full log, heartbeat, bounded memory
 - [x] M12-17 `doctor` checks what a first run needs
-- [ ] M12-18 The D365FO template loads as shipped; example gate scripts
+- [x] M12-18 The D365FO template loads as shipped; example gate scripts
 - [ ] M12-19 Guide: "First real task on D365FO", one escalation table, stale lines
 - [ ] M12-20 Notes: `STATUS.md`, `DECISIONS.md`, archive, the review in the repo
 - [ ] M12-21 Housekeeping
@@ -436,6 +436,42 @@ function of `src/doctor.rs` with its own test in `tests/m12_config.rs` (`m12_17_
 - The doctor's own tests ran with the owner's real `$TORYO_CONFIG` set in the shell (`C:\.thien\m0\toryo.yaml`): the new
   WARN looked at it (`is_file`, `canonicalize`; the file is never read). That is why the variable is not reported when
   `--config` is given.
+
+
+### M12-18 — The D365FO template loads as shipped; example gate scripts
+
+- **Reproduced:** the org chart seats `codex-openai`, the machine example defined only `codex-foundry` (and had no
+  `dbsync` entry, so `task create` of the org chart refused it). Fixed by making the pair agree, not by adding keys.
+- **Machine example** (`templates/d365fo/toryo.local.yaml.example`): a `codex-openai` profile (ChatGPT login, the org chart's
+  implementer); `seats:` instead of the old `roles:` (org chart mode); `verify: { min_boundary: low_integrity, verify_root }`
+  pinned; `environment_gates.dbsync` active with `confirm: first`, its script path a `TODO(owner)` outside every repository;
+  header items 10 and 11; the `%NAME%` warning from M12-17 mentioned at the `CODEX_HOME` item.
+- **Org chart / role / context / task texts:** the stale "Toryo today has ONE counter" comment is replaced (two counters are
+  implemented); a paragraph "tool: xpp or a script?" at `gates.build` and a note at `gates.dbsync` (deploys before review;
+  `confirm: first`); `40-build.md` and `50-xpp-roles.md` no longer say "`tool: xpp` only, no DB sync" next to an org chart
+  that declares a script build and `dbsync` (they say what the gates are and that the agent never builds or deploys);
+  `TASK.example.md` says the `build` gate proves AC-5 and has a `## Allow protected` example (one HTML comment line each:
+  a line starting with `- ` inside the section would be read as a real path); the implementer role: `writes:
+  [Metadata/ContosoCore/**]` with a `TODO(owner)` and a commented `never:` block of the files a build loads or runs.
+  The 12 patterns are accepted by the fence (the loader normalises `*.dll` to `**/*.dll`); none uses `{}`, `[]` or `!`.
+- **Example scripts (print-only, `TODO(owner)` blocks, no D365FO command invented):**
+  `templates/d365fo/scripts/build-model.ps1.example` and `templates/d365fo/machine/dbsync.ps1.example`: UTF-8 console output,
+  `$ErrorActionPreference = 'Stop'`, print the `TORYO_*` variables and the working directory, `exit 0`. Each header states the
+  contract (working directory, variables, exit codes, timeout, what may and must not be written; "build again from
+  `TORYO_VERIFY_CHECKOUT`; `TORYO_VERIFY_BUILD` is written at Low integrity — never deploy from it"; "the last 40 lines of
+  your output go to the AI vendor: print no connection string"), and `dbsync` adds elevation inside the script.
+- **The guide's paragraph** on `tool: xpp` versus a script gate goes into the new HUONG-DAN section of M12-19 (same text as the
+  org chart comment).
+- **Two earlier assertions changed (commit body):** `config::tests::templates_keep_their_m10_hash` — the pinned hash of the
+  d365fo pair (`fd5f27ff…` → `919cfa7a…`) because the machine example itself is the thing M12-18 changes; the loader-neutrality
+  the test pins is still held by the two other templates, whose files did not change. `config::tests::d365fo_templates_load` —
+  `origins.profiles.len()` 3 → 4 (the new `codex-openai`).
+- **Tests (`tests/m12_template.rs`):** `m12_18_the_d365fo_template_loads_as_shipped` (AC-1: the template with test values, the
+  seats' profiles exist, the `dbsync` entry has `confirm: first`, the pinned verify root is the machine's, no key without
+  effect; and the commented `never:` block loads once uncommented) and
+  `m12_18_the_template_reaches_the_final_gate_with_the_example_scripts` (AC-2: `task create`, a `--fake-agents` run — the build
+  script gate passes, the machine's `confirm: first` stops before the deploy, a plain `resume` runs the example `dbsync` and the
+  task waits at the final gate; skipped with a message where there is no `pwsh`).
 
 
 ## Open

@@ -2,6 +2,9 @@
 # as `toryo.yaml`, together with templates/d365fo/.toryo/ (the org chart, the role files, the
 # skills) and templates/d365fo/CULTURE.md. This pair loads together; toryo.yaml.example is the
 # toryo.yaml-only layout of M9/M10 and does NOT load next to an org chart.
+# The gate scripts: templates/d365fo/scripts/build-model.ps1.example (the repository's `build`
+# gate: copy to scripts/build-model.ps1 and COMMIT it) and templates/d365fo/machine/dbsync.ps1.example
+# (the machine's `dbsync` gate: outside every repository). Both are print-only until you fill them.
 #
 # With .toryo/toryo-orgchart.yaml present, `roles:`, `commands:` and `pipeline.max_fix_cycles`
 # live there (seats, gates + the implementer's before_handoff, limits) — setting them here too

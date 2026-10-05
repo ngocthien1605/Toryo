@@ -19,5 +19,9 @@ order header.
 - Existing holds (no data migration); security changes beyond the privilege of a new menu item.
 
 ## Verification
-- Toryo Verify proves AC-5 (compile only). AC-2 and AC-3 need DB sync and a manual test in the
-  cloud tier, by the owner after the final gate.
+- The `build` gate proves AC-5. AC-2 and AC-3 need the database and a manual test in the
+  environment, by the owner after the `dbsync` gate and the final approval.
+
+## Allow protected
+<!-- Only when THIS task must change a protected file (a build project, a descriptor, AGENTS.md…): one path per line, "- " first, e.g. the next line without its comment marks. Without such a line an agent's change to a protected file is restored. -->
+<!-- - Metadata/ContosoCore/ContosoCore/Descriptor/ContosoCore.xml -->
