@@ -71,6 +71,8 @@ pub fn json(cfg: &Effective) -> Value {
                         std::iter::once(&m.program).chain(&m.args).collect::<Vec<_>>()
                     }),
                     "if_missing": g.decl.if_missing,
+                    // M12-07: does it ask before it deploys (`never`, `first`, `always`)
+                    "confirm": g.machine.as_ref().map(|m| m.confirm.as_str()),
                     "defined_on_this_machine": g.decl.kind == GateType::Check || !skipped,
                     "source": source(cfg.origins.gates.get(name).copied()),
                 })
@@ -89,6 +91,7 @@ pub fn json(cfg: &Effective) -> Value {
                     "lock": null,
                     "command": null,
                     "if_missing": null,
+                    "confirm": null,
                     "defined_on_this_machine": true,
                     "source": source((!cfg.origins.roles.is_empty()).then_some(Origin::Repo)),
                 })
@@ -248,6 +251,16 @@ pub fn text(cfg: &Effective) -> String {
                 .map(shown_arg)
                 .collect();
             s.push_str(&format!("      runs: {}\n", argv.join(" ")));
+        }
+        if let Some(c) = x["confirm"].as_str() {
+            s.push_str(&format!(
+                "      confirm: {c}{}\n",
+                match c {
+                    "never" => " (deploys without asking)",
+                    "first" => " (asks once per task before it deploys)",
+                    _ => " (asks for every new checkpoint before it deploys)",
+                }
+            ));
         }
     }
     if let Some(order) = v["before_handoff"].as_array() {

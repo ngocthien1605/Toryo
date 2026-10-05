@@ -489,6 +489,33 @@ pub struct MachineConfig {
     pub verify: MachineVerify,
 }
 
+/// `environment_gates.<name>.confirm` (M12-07, X17): does the gate ask the owner before it
+/// deploys? `never` (the default, as before), `first` (once per task) or `always` (once per
+/// checkpoint commit). The question is a machine stop before any gate runs; a plain `toryo
+/// resume` is the "yes".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Confirm {
+    #[default]
+    Never,
+    First,
+    Always,
+}
+
+impl Confirm {
+    pub fn is_never(&self) -> bool {
+        *self == Confirm::Never
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Confirm::Never => "never",
+            Confirm::First => "first",
+            Confirm::Always => "always",
+        }
+    }
+}
+
 /// `environment_gates.<name>` in the machine config (M11-E3): the command an org chart's
 /// `kind: environment` gate runs, with the owner's normal token, in an empty working directory
 /// (M11-R2); it deploys from a fresh export of the checkpoint commit (M11-R9, X6).
@@ -509,6 +536,10 @@ pub struct EnvGate {
     /// `credman:<target>` or `env:<VAR>` references, resolved when the gate runs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub secret_env: BTreeMap<String, String>,
+    /// M12-07 (X17): ask the owner before it deploys. Left out of the frozen configuration when
+    /// `never`, so an existing configuration keeps its hash.
+    #[serde(default, skip_serializing_if = "Confirm::is_never")]
+    pub confirm: Confirm,
 }
 
 /// `verify:` in the machine config (review H2, M11-A2): the repository chooses the sandbox its
@@ -2284,6 +2315,42 @@ commands:
         );
         assert!(g.secret_env.contains_key("D365_SYNC_SECRET"));
         assert_eq!(m.verify.min_boundary.as_deref(), Some("low_integrity"));
+    }
+
+    /// M12-07 (X17): `confirm` is `never`, `first` or `always`; `never` is the default and is
+    /// left out of the frozen configuration, so an existing configuration keeps its hash.
+    #[test]
+    fn the_confirm_key_of_an_environment_gate() {
+        let gate = |extra: &str| {
+            format!("environment_gates:\n  dbsync:\n    program: powershell\n    lock: d365-env\n{extra}")
+        };
+        let d = tempfile::tempdir().unwrap();
+        let load = |text: &str| {
+            let p = d.path().join("m.yaml");
+            std::fs::write(&p, text).unwrap();
+            MachineConfig::load(&p)
+        };
+        for (word, want) in [
+            ("first", Confirm::First),
+            ("always", Confirm::Always),
+            ("never", Confirm::Never),
+        ] {
+            let m = load(&gate(&format!("    confirm: {word}\n"))).unwrap();
+            assert_eq!(m.environment_gates["dbsync"].confirm, want);
+        }
+        let none = load(&gate("")).unwrap();
+        let g = &none.environment_gates["dbsync"];
+        assert_eq!(g.confirm, Confirm::Never);
+        assert!(
+            !serde_json::to_string(g).unwrap().contains("confirm"),
+            "never is not frozen: the digest of an existing configuration stays"
+        );
+        let first = load(&gate("    confirm: first\n")).unwrap();
+        assert!(serde_json::to_string(&first.environment_gates["dbsync"])
+            .unwrap()
+            .contains("\"confirm\":\"first\""));
+        let err = format!("{:#}", load(&gate("    confirm: sometimes\n")).unwrap_err());
+        assert!(err.contains("sometimes") && err.contains("first"), "{err}");
     }
 
     /// The shipped templates keep loading under the checks.

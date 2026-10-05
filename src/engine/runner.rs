@@ -1493,6 +1493,12 @@ impl<'a> Engine<'a> {
             self.escalate_attempt(&a, GATE_UNAVAILABLE.into(), reason)?;
             return Ok(Flow::Next);
         }
+        // M12-07 (X17): a gate that asks before it deploys — before any gate runs, so nothing
+        // was built or deployed. A plain `resume` is the "yes".
+        if let Some(reason) = self.confirm_preflight(t, &head)? {
+            self.escalate_attempt(&a, super::gates::ENV_CONFIRM.into(), reason)?;
+            return Ok(Flow::Next);
+        }
         let Some((b, co)) = self.verify_checkout(t, &a, &head)? else {
             return Ok(Flow::Next);
         };
@@ -1683,6 +1689,78 @@ impl<'a> Engine<'a> {
                 )
             })
         })
+    }
+
+    /// M12-07 (X17): the reason this verify run must wait for the owner — an environment gate of
+    /// the run whose `confirm` is `first` (once per task) or `always` (once per checkpoint
+    /// commit) and that was not confirmed yet — or `None`. Writes what a plain `resume` will
+    /// confirm. Nothing is run.
+    fn confirm_preflight(&self, t: &TaskRow, head: &str) -> Result<Option<String>> {
+        use super::gates::{is_confirmed, set_pending, Asked};
+        let Some(team) = self.cfg.team.as_ref() else {
+            return Ok(None);
+        };
+        let done = super::gates::confirmations(&t.run_store);
+        let asked: Vec<(&str, &crate::config::EnvGate)> = team
+            .handoff_gates()
+            .into_iter()
+            .filter(|(_, g)| g.decl.kind == crate::team::GateType::Environment)
+            .filter_map(|(name, g)| g.machine.as_ref().map(|m| (name, m)))
+            .filter(|(name, m)| !is_confirmed(&done, m.confirm, name, head))
+            .collect();
+        if asked.is_empty() {
+            return Ok(None);
+        }
+        set_pending(
+            &t.run_store,
+            asked
+                .iter()
+                .map(|(name, _)| Asked {
+                    gate: name.to_string(),
+                    commit: head.to_string(),
+                })
+                .collect(),
+        )?;
+        let wt = Worktree::new(&self.g, &t.worktree);
+        let stat = self
+            .g
+            .run_str(
+                &wt.loc,
+                true,
+                &["diff", "--stat", &format!("{}..{head}", t.base_commit)],
+            )
+            .unwrap_or_default();
+        let stat: Vec<&str> = stat.lines().take(20).collect();
+        let mut s = format!(
+            "{}: the checkpoint {} would be deployed to the environment before the review and before any human has read it.\n",
+            super::gates::ENV_CONFIRM,
+            short(head)
+        );
+        for (name, m) in &asked {
+            let argv: Vec<&str> = std::iter::once(m.program.as_str())
+                .chain(m.args.iter().map(String::as_str))
+                .collect();
+            s.push_str(&format!(
+                "  gate `{name}` (lock {}, confirm: {}) runs: {}\n",
+                super::lock::lock_key(&m.lock),
+                m.confirm.as_str(),
+                argv.join(" ")
+            ));
+        }
+        s.push_str(&format!(
+            "  changes since the base commit (git diff --stat, first 20 lines):\n{}\n",
+            stat.iter()
+                .map(|l| format!("    {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+        s.push_str(&format!(
+            "  look at it (`git -C {} show --stat {}`), then `toryo resume {}` allows the deploy",
+            t.worktree.display(),
+            short(head),
+            t.id
+        ));
+        Ok(Some(s))
     }
 
     /// M12-05: a verify run ended in an error — when that is a command that could not be

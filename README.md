@@ -388,6 +388,12 @@ from the repository checkout (`project.root`), never from a task worktree, and e
     X12) and again when the gate starts: a gate that cannot start stops the task with `environment_gate_unavailable`
     at once, not after a build of tens of minutes. A machine without the gate:
     `if_missing: error` refuses the task, `skip` runs without it and says so at the final gate.
+    **Confirm before deploy (M12-07, X17).** An environment gate deploys the agent's commit **before the review and
+    before any human has read it**. Ask first with the machine key `environment_gates.<name>.confirm: never | first |
+    always` (default `never`: as before): `first` once per task, `always` once per checkpoint commit. The question is
+    a machine stop **before any gate runs** (`environment_gate_confirm`): the reason shows the gate, the lock, the
+    commit, the first 20 lines of `git diff --stat <base>..<commit>` and the command; a plain `toryo resume <id>`
+    is the "yes" (no fix cycle); `--yes` never confirms a deploy. `config show` and `doctor` print the setting.
   - **The script contract** (`templates/toryo.local.yaml.example`): exit code decides (PowerShell: `$ErrorActionPreference
     = 'Stop'` and `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }` after every native call); deploy only
     `$env:TORYO_VERIFY_CHECKOUT` / `$env:TORYO_VERIFY_BUILD`, never your main repository folder; idempotent; print

@@ -787,6 +787,12 @@ trượt đầu tiên; exit code quyết định; mọi gate có `TORYO_TASK`, `
   commit mà môi trường sắp nhận; `toryo status` luôn cho biết môi trường đang chạy code nào:
   `environment    d365-env holds BR-001 @ 1a2b3c4d5e6f (not approved yet)`. Huỷ task hay `task cleanup` **không**
   xoá dòng này (môi trường vẫn đang chạy code đó).
+  **Hỏi trước khi deploy (M12-07, X17).** Gate môi trường deploy commit của agent **trước khi reviewer và trước khi
+  có người đọc nó**. Muốn được hỏi trước: khoá machine config `environment_gates.<tên>.confirm: never | first |
+  always` (mặc định `never`: như cũ) — `first` một lần cho mỗi task, `always` một lần cho mỗi commit checkpoint. Câu
+  hỏi là một lần dừng do máy **trước khi bất kỳ gate nào chạy** (`environment_gate_confirm`): lý do ghi gate, lock,
+  commit, 20 dòng đầu của `git diff --stat <base>..<commit>` và lệnh; `toryo resume ID` thường là "đồng ý" (không tốn
+  vòng sửa); `--yes` không bao giờ xác nhận một lần deploy. `config show` và `doctor` in cài đặt này.
 
 **Ví dụ D365FO**: build kiểm tra (check) rồi DB sync (environment).
 

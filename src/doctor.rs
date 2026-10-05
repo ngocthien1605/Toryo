@@ -218,7 +218,10 @@ pub fn gate_checks(cfg: &Effective) -> Vec<Check> {
             if problems.is_empty() {
                 add(
                     Level::Ok,
-                    format!("environment gate `{name}` can start here"),
+                    format!(
+                        "environment gate `{name}` can start here (confirm: {})",
+                        m.confirm.as_str()
+                    ),
                 );
             } else {
                 add(

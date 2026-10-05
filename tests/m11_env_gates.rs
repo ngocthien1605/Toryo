@@ -2279,3 +2279,181 @@ fn m12_06_a_check_gate_timeout_is_still_a_gate_failure_and_says_so() {
         "a check gate is not the owner's problem"
     );
 }
+
+// ── M12-07: confirm before deploy (X17) ──────────────────────────────────────────────────
+
+/// The `probe_then_dbsync` fixture with `confirm: <mode>` on the machine's `dbsync`. The check
+/// gate `probe` logs each run to the returned file, so a test can tell that none ran.
+fn confirm_fixture(mode: &str) -> (Env, PathBuf, PathBuf) {
+    let log_name = "probe-runs";
+    let (env, marker) = {
+        // the probe script needs the log path, which needs the env: write it afterwards
+        let (env, marker) = probe_then_dbsync("exit 0\n", "exit 0\n");
+        (env, marker)
+    };
+    let log = env.root.join("gates").join(log_name);
+    let l = fwd(&log);
+    // the probe script is committed in the repository: add the log line and commit it
+    let (file, body) = if cfg!(windows) {
+        (
+            "scripts/probe.ps1",
+            format!("Add-Content -Path '{l}' -Value x\nexit 0\n"),
+        )
+    } else {
+        ("scripts/probe.sh", format!("echo x >> '{l}'\nexit 0\n"))
+    };
+    commit_repo(&env, &[(file, &body)], "the probe logs its runs");
+    let m = std::fs::read_to_string(&env.machine).unwrap();
+    assert!(m.contains("    lock: d365-env\n"), "{m}");
+    std::fs::write(
+        &env.machine,
+        m.replace(
+            "    lock: d365-env\n",
+            &format!("    lock: d365-env\n    confirm: {mode}\n"),
+        ),
+    )
+    .unwrap();
+    (env, marker, log)
+}
+
+fn confirm_stops(env: &Env, id: &str) -> usize {
+    events(env, id)
+        .iter()
+        .filter(|e| e["type"] == "escalated" && e["reason_class"] == "environment_gate_confirm")
+        .count()
+}
+
+/// AC-1/AC-2/AC-4, `first`: the first Verify stops **before any gate ran** (no check gate, no
+/// deploy); the reason has the gate, the lock, the commit, the `git diff --stat` lines, the
+/// command and "then `toryo resume`"; `run --yes` does not skip the stop; a plain `resume`
+/// confirms, costs no fix cycle, and the gates run.
+#[test]
+fn m12_07_confirm_first_stops_before_any_gate_and_resume_is_the_yes() {
+    let (env, marker, probe) = confirm_fixture("first");
+    create(&env, "CF-1");
+    let s = script(
+        &env,
+        "cf1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "CF-1", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "CF-1");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_confirm"),
+        "{err}"
+    );
+    let why = t.machine.reason().unwrap().to_string();
+    let head = t.machine.checkpoint().map(str::to_string);
+    assert!(
+        why.contains("gate `dbsync` (lock d365-env, confirm: first)")
+            && why.contains("src/Calculator.psm1")
+            && why.contains("`toryo resume CF-1` allows the deploy")
+            && why.contains("show --stat"),
+        "{why}"
+    );
+    let _ = head;
+    assert!(!probe.exists(), "no check gate ran");
+    assert!(
+        !marker.exists() && deployments(&env).is_empty(),
+        "nothing deployed"
+    );
+    assert_eq!(
+        attempts(&env, "CF-1")
+            .iter()
+            .filter(|a| a.stage == "implement")
+            .count(),
+        1
+    );
+    // `--yes` is no confirmation: `run --yes` finds the task still waiting
+    let (_, err) = toryo(&env, &["run", "CF-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "CF-1").state, St::Escalated, "{err}");
+    assert!(!probe.exists() && !marker.exists());
+    // the plain resume is the yes
+    let s2 = script(
+        &env,
+        "cf1b.json",
+        json!({ "reviewer": [turn(vec![approved()])] }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["resume", "CF-1", "--yes", "--fake-agents", &s2],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("deploy confirmed (dbsync"), "{err}");
+    let t = task(&env, "CF-1");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert_eq!(t.fix_cycle, 0, "no fix cycle for the question");
+    assert!(
+        probe.exists() && marker.exists(),
+        "the gates ran after the yes"
+    );
+    assert_eq!(confirm_stops(&env, "CF-1"), 1);
+}
+
+/// AC-2 (the second half): with `first` a later checkpoint of the same task does not stop;
+/// AC-3: with `always` every new checkpoint stops once.
+#[test]
+fn m12_07_first_asks_once_per_task_and_always_once_per_checkpoint() {
+    for (mode, stops) in [("first", 1), ("always", 2)] {
+        let (env, _marker, probe) = confirm_fixture(mode);
+        let id = format!("CM-{mode}");
+        create(&env, &id);
+        // the reviewer asks for changes once: a second checkpoint
+        let s = script(
+            &env,
+            &format!("{id}.json"),
+            json!({
+                "planner": [turn(vec![plan()])],
+                "implementer": [
+                    turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()]),
+                    turn(vec![write("src/Notes.txt", "second checkpoint\n"), implementation()]),
+                ],
+                "reviewer": [turn(vec![changes()]), turn(vec![approved()])],
+            }),
+        );
+        let (_, err) = toryo(&env, &["run", &id, "--yes", "--fake-agents", &s], &[]);
+        assert_eq!(task(&env, &id).state, St::Escalated, "{mode}: {err}");
+        // each process starts its script from the top: what the rest of the run needs
+        let s1 = script(
+            &env,
+            &format!("{id}-1.json"),
+            json!({
+                "implementer": [turn(vec![write("src/Notes.txt", "second checkpoint\n"), implementation()])],
+                "reviewer": [turn(vec![changes()]), turn(vec![approved()])],
+            }),
+        );
+        let s2 = script(
+            &env,
+            &format!("{id}-2.json"),
+            json!({ "reviewer": [turn(vec![approved()])] }),
+        );
+        let (code, err) = toryo(&env, &["resume", &id, "--yes", "--fake-agents", &s1], &[]);
+        let mut err = err;
+        if mode == "always" {
+            // the second checkpoint stops again; one more yes
+            assert_eq!(code, 1, "{mode}: {err}");
+            assert_eq!(task(&env, &id).state, St::Escalated, "{mode}: {err}");
+            let (code, e2) = toryo(&env, &["resume", &id, "--yes", "--fake-agents", &s2], &[]);
+            assert_eq!(code, 0, "{mode}: {e2}");
+            err = e2;
+        } else {
+            assert_eq!(code, 0, "{mode}: {err}");
+        }
+        let t = task(&env, &id);
+        assert_eq!(t.state, St::Completed, "{mode}: {err}");
+        assert_eq!(confirm_stops(&env, &id), stops, "{mode}");
+        let runs = std::fs::read_to_string(&probe).unwrap();
+        assert_eq!(
+            runs.lines().count(),
+            2,
+            "{mode}: both checkpoints were verified"
+        );
+    }
+}

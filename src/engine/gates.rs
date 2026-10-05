@@ -138,6 +138,86 @@ pub fn env_gates_refusal(cfg: &crate::config::Effective) -> Option<String> {
     })
 }
 
+/// The escalation class of an environment gate that waits for the owner's "yes" (M12-07, X17).
+pub const ENV_CONFIRM: &str = "environment_gate_confirm";
+
+/// What the owner has confirmed so far, in the task's run store (`confirmations.json`): one
+/// entry per gate and checkpoint commit. A small file, not a database column: no migration.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Confirmations {
+    #[serde(default)]
+    pub confirmed: Vec<Asked>,
+    /// What the last stop asked and a plain `resume` will confirm.
+    #[serde(default)]
+    pub pending: Vec<Asked>,
+}
+
+/// A deploy the owner is asked about: the gate and the checkpoint commit.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Asked {
+    pub gate: String,
+    pub commit: String,
+}
+
+fn confirmations_path(run_store: &Path) -> PathBuf {
+    run_store.join("confirmations.json")
+}
+
+/// The confirmations of a task (none when the file is not there or unreadable).
+pub fn confirmations(run_store: &Path) -> Confirmations {
+    std::fs::read(confirmations_path(run_store))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn save(run_store: &Path, c: &Confirmations) -> std::io::Result<()> {
+    std::fs::write(
+        confirmations_path(run_store),
+        serde_json::to_vec_pretty(c).unwrap_or_default(),
+    )
+}
+
+/// Has the owner confirmed the deploy of `commit` by `gate`? `first`: any confirmation of the
+/// gate in this task; `always`: this commit. `never` needs none.
+pub fn is_confirmed(
+    c: &Confirmations,
+    mode: crate::config::Confirm,
+    gate: &str,
+    commit: &str,
+) -> bool {
+    use crate::config::Confirm;
+    match mode {
+        Confirm::Never => true,
+        Confirm::First => c.confirmed.iter().any(|a| a.gate == gate),
+        Confirm::Always => c
+            .confirmed
+            .iter()
+            .any(|a| a.gate == gate && a.commit == commit),
+    }
+}
+
+/// The stop asks about these deploys: a plain `resume` confirms them ([`record_confirmation`]).
+pub fn set_pending(run_store: &Path, asked: Vec<Asked>) -> std::io::Result<()> {
+    let mut c = confirmations(run_store);
+    c.pending = asked;
+    save(run_store, &c)
+}
+
+/// A plain `toryo resume` after the stop: what it asked about is now confirmed. Returns the
+/// confirmed deploys.
+pub fn record_confirmation(run_store: &Path) -> std::io::Result<Vec<Asked>> {
+    let mut c = confirmations(run_store);
+    let asked = std::mem::take(&mut c.pending);
+    for a in &asked {
+        if !c.confirmed.contains(a) {
+            c.confirmed.push(a.clone());
+        }
+    }
+    save(run_store, &c)?;
+    Ok(asked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

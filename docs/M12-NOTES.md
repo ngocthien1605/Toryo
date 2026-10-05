@@ -13,7 +13,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] Review of M12-01…04 (subagent, in place)
 - [x] M12-05 A gate that cannot start is a machine stop, and `doctor` finds it first
 - [x] M12-06 An environment gate that times out stops for the owner (X18)
-- [ ] M12-07 Confirm before deploy (X17)
+- [x] M12-07 Confirm before deploy (X17)
 - [ ] Review of M12-05…07 (subagent, in place)
 - [ ] M12-08 `base_branch` is honoured; keys without effect say so (X19, X20)
 - [ ] M12-09 `./toryo.yaml` before `$TORYO_CONFIG` (X21)
@@ -169,6 +169,32 @@ One High, four Medium, four Low; the High and the Mediums fixed here.
   limit, the script sleeps the first time only; the deployment row — one per lock — ends `Some(true)` after the
   resume), `m12_06_a_check_gate_timeout_is_still_a_gate_failure_and_says_so` (AC-3). Two helper variants take a
   timeout (`env_gate_setup_timeout`, `probe_then_dbsync_timed`); the originals delegate with `2m`.
+
+### M12-07 — confirm before deploy (X17)
+
+- **Key:** machine config `environment_gates.<name>.confirm: never | first | always` (`config::Confirm`, default `never`).
+  `skip_serializing_if = Confirm::is_never` — **an existing configuration keeps its frozen digest**; a gate with
+  `first`/`always` has `"confirm"` in its frozen part (unit test `config::tests::the_confirm_key_of_an_environment_gate`,
+  also: an unknown word is a load error naming the allowed ones). `config show` (text and `--json`: `"confirm"`) and
+  `doctor` (`environment gate … can start here (confirm: first)`) print it.
+- **The stop** (`Runner::confirm_preflight`, in `verify()` right after the gate preflights, before the checkout and any
+  gate): for each environment gate of the implementer's `before_handoff` that this machine defines and whose
+  `confirm` is not satisfied — `first`: any confirmation of the gate in this task; `always`: this checkpoint commit —
+  the attempt ends `environment_gate_confirm` (new, **machine-caused**, now eight classes). The reason has the commit,
+  each gate with lock, mode and command, the first 20 lines of `git diff --stat <base>..<commit>`, and "look at it
+  (`git -C <worktree> show --stat <commit>`), then `toryo resume <id>` allows the deploy". All unconfirmed gates are
+  asked at once. `next:` uses the generic machine-caused text (its existing unit test enumerates `MACHINE_CAUSED`, so
+  a special text would change an earlier assertion; the reason itself says what to do).
+- **The yes:** a plain `resume` from this class (`engine_cli`, the `machine_caused_stop` branch) calls
+  `gates::record_confirmation` — it moves what the stop asked (`pending`) into `confirmed`, prints "deploy confirmed
+  (<gate> @ <commit>)", then `ResumeStage`. `--yes` confirms nothing (`run --yes` finds the task still waiting).
+  **Storage choice (no migration):** `<run store>/confirmations.json` (`{confirmed, pending}`), not a database column.
+- **Tests** (`m11_env_gates`): `m12_07_confirm_first_stops_before_any_gate_and_resume_is_the_yes` (AC-2, AC-4: no check
+  gate ran — the probe gate logs its runs —, nothing deployed, one implement attempt, `run --yes` does not skip, resume
+  confirms, `fix_cycle == 0`), `m12_07_first_asks_once_per_task_and_always_once_per_checkpoint` (AC-2 second half, AC-3:
+  `first` stops once over two checkpoints, `always` twice). AC-1: the whole existing suite passes unchanged with the
+  default. AC-5: README and HUONG-DAN gate paragraphs; M12-18 puts `confirm: first` into the machine example, M12-19
+  the class into the escalation table.
 
 ## Open
 
