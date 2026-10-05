@@ -28,7 +28,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] M12-18 The D365FO template loads as shipped; example gate scripts
 - [x] M12-19 Guide: "First real task on D365FO", one escalation table, stale lines
 - [x] M12-20 Notes: `STATUS.md`, `DECISIONS.md`, archive, the review in the repo
-- [ ] M12-21 Housekeeping
+- [x] M12-21 Housekeeping
 - [ ] Finish, push, pull request, CI
 
 ## Tasks
@@ -532,6 +532,22 @@ function of `src/doctor.rs` with its own test in `tests/m12_config.rs` (`m12_17_
   audit with the status of every item, updated — H1, H4, H5, H6, M1, M8, M11, M12, M13, L1 are FIXED with their task and commit
   (counts: 14 fixed, 2 partial, 46 open of 62). Rows keep the old evidence after "Was:".
 - Also: the sentence in the M12-19 paragraph that guessed which 14 classes the reviewer found undocumented was removed.
+
+
+### M12-21 — Housekeeping
+
+- `.gitignore`: `/target-*/`, `/.claude/`. `Cargo.toml`: description "… through a gated, verified workflow (plan v0.8; M0–M12)", `version =
+  "0.12.0"` (`Cargo.lock` follows: one line). `.github/workflows/ci.yml`: `timeout-minutes: 45` on both jobs.
+- **`toryo --version`** prints `toryo 0.12.0 (<12-hex commit>)`: a new `build.rs` asks `git rev-parse --short=12 HEAD` (and re-runs when `HEAD`
+  or the branch it names moves); "unknown" where there is no Git or no repository. `doctor`'s first line shows it too. Test:
+  `m12_cli::m12_21_version_names_the_commit`.
+- **R51 evidence stays valid:** `Record.toryo_version` (still `CARGO_PKG_VERSION`) is only written, never read back — `evidence_status` decides on
+  the spike, the profile, the pass flag and the recorded CLI versions. A record written by `0.0.1` is exactly as valid as before; the new test
+  `evidence::tests::a_record_of_an_older_toryo_stays_valid` says so. The commit is deliberately **not** put into `toryo_version`.
+- **Leftover reviewer worktrees** (the owner's permission, in the list): looked at first — each held only the untracked `target-review/` and the
+  ignored `.claude/settings.local.json`; `git worktree remove --force` on the three paths under `.claude/worktrees/` (3.9 + 2.0 + 1.8 GB), then
+  `git branch -d` on `worktree-agent-a7ca9a0a604a0d54e`, `…ac1999026e124d50b`, `…ace35f955409e603a` (all three were at `df84b02`, merged) and
+  `m11/review-3` (merged as #4). Never `-D`. No new worktree was created in this milestone. `git worktree list` shows only the main one.
 
 
 ## Open

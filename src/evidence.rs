@@ -397,6 +397,18 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// M12-21: the version of Toryo that wrote a record is information, not a key — a record of an
+    /// older Toryo (`0.0.1`, before the version moved to 0.12.0) is as valid as it was: only the
+    /// spike, the profile, the pass flag and the CLI versions decide.
+    #[test]
+    fn a_record_of_an_older_toryo_stays_valid() {
+        let rec = json!({"spike": "codex-canary", "profile": "cx", "pass": true, "ts": "t1",
+            "summary": "ok", "toryo_version": "0.0.1", "cli_versions": { "cx": "1.0.0" }});
+        assert!(evidence_status(&[rec], "codex-canary", "cx", "cx", Some("1.0.0")).is_verified());
+        let now = Record::new("codex-canary", Some("cx"), &[]);
+        assert_ne!(now.toryo_version, "0.0.1");
+    }
+
     #[test]
     fn evidence_is_bound_to_the_cli_version() {
         let pass = |v: Option<&str>| {

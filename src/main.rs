@@ -23,7 +23,7 @@ use spike_cli::{run_canaries, spike, SpikeCmd};
 #[derive(Parser)]
 #[command(
     name = "toryo",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("TORYO_COMMIT"), ")"),
     about = "Toryo (棟梁) — orchestrates Claude Code and Codex through a gated, verified workflow"
 )]
 pub(crate) struct Cli {

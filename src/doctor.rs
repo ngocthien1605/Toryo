@@ -559,8 +559,9 @@ pub fn run(
         Level::Info,
         "toryo",
         format!(
-            "version {} on {}",
+            "version {} ({}) on {}",
             env!("CARGO_PKG_VERSION"),
+            env!("TORYO_COMMIT"),
             std::env::consts::OS
         ),
     );

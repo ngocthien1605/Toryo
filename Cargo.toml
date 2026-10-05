@@ -1,9 +1,9 @@
 [package]
 name = "toryo"
-version = "0.0.1"
+version = "0.12.0"
 edition = "2021"
 rust-version = "1.89"
-description = "Toryo (棟梁) — orchestrates Claude Code and Codex through a bounded, verified workflow (M1 adapter layer + M0 kit, plan v0.7)"
+description = "Toryo (棟梁) — orchestrates Claude Code and Codex through a gated, verified workflow (plan v0.8; M0–M12)"
 license = "UNLICENSED"
 publish = false
 

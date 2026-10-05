@@ -128,3 +128,17 @@ fn m12_12_a_task_id_is_never_a_path() {
     assert_ne!(code, 0);
     assert!(err.contains("is not a task id"), "{err}");
 }
+
+/// M12-21: `toryo --version` prints the version and the commit it was built from (`unknown` where
+/// there was no Git).
+#[test]
+fn m12_21_version_names_the_commit() {
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_toryo"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    let re = regex::Regex::new(r"^toryo \d+\.\d+\.\d+ \(([0-9a-f]{7,40}|unknown)\)$").unwrap();
+    assert!(re.is_match(&out), "{out}");
+    assert!(out.contains(env!("CARGO_PKG_VERSION")), "{out}");
+}
