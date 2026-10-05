@@ -2323,10 +2323,16 @@ impl<'a> Engine<'a> {
         )?;
         let model = self.role_model(role.as_str());
         self.usage(a, profile, &r, model.as_deref())?;
+        // M12-03 (H6): the protected-state and "a read-only role wrote" checks come first, on
+        // every way the turn ended — a stop, the live budget and a quota pause must not hide a
+        // write (it would stay in the tree and go on under the implementer's name)
+        if let Some(flow) = self.read_only_checks(t, a, &r, &before)? {
+            return Ok(Err(flow));
+        }
         if let Some(flow) = self.cut_short(a, &r, budget_hit.load(Ordering::SeqCst))? {
             return Ok(Err(flow));
         }
-        if let Some(flow) = self.after_read_only_turn(t, a, &r, role.as_str(), &before)? {
+        if let Some(flow) = self.read_only_quota(t, a, &r, role.as_str())? {
             return Ok(Err(flow));
         }
         Ok(Ok(r))
@@ -2417,18 +2423,14 @@ impl<'a> Engine<'a> {
         )))
     }
 
-    /// After a Planner/Reviewer turn: quota → `Paused` (no Planner/Reviewer fallback in
-    /// v0.1, R49); a changed protected state → `Escalated`; a worktree that changed during the
-    /// turn (from `before`) or a moved HEAD → `Escalated` as a policy violation (EC-31:
-    /// read-only roles write nothing, and what one wrote must never reach the next checkpoint
-    /// under the implementer's name).
-    fn after_read_only_turn(
+    /// A Planner/Reviewer turn that ended by quota or rate limit → `Paused` (no Planner/Reviewer
+    /// fallback in v0.1, R49). Runs after [`Self::read_only_checks`].
+    fn read_only_quota(
         &self,
         t: &TaskRow,
         a: &AttemptRow,
         r: &StageOutcome,
         role: &str,
-        before: &TreeState,
     ) -> Result<Option<Flow>> {
         if let Some(
             c @ (ErrorClass::QuotaExceeded | ErrorClass::RateLimited | ErrorClass::Overloaded),
@@ -2445,6 +2447,20 @@ impl<'a> Engine<'a> {
             )?;
             return Ok(Some(Flow::Next));
         }
+        Ok(None)
+    }
+
+    /// After a Planner/Reviewer turn, however it ended (M12-03): a changed protected state →
+    /// `Escalated`; a worktree that changed during the turn (from `before`) or a moved HEAD →
+    /// `Escalated` as a policy violation (EC-31: read-only roles write nothing, and what one
+    /// wrote must never reach the next checkpoint under the implementer's name).
+    fn read_only_checks(
+        &self,
+        t: &TaskRow,
+        a: &AttemptRow,
+        r: &StageOutcome,
+        before: &TreeState,
+    ) -> Result<Option<Flow>> {
         if let Some(reason) = self.protected_violation(t, false)? {
             self.end_and(
                 a,

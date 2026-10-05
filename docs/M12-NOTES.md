@@ -8,7 +8,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 
 - [x] M12-01 Recovery never accepts a commit Toryo did not make (H1)
 - [x] M12-02 The protected scan fails closed (H4)
-- [ ] M12-03 Read-only role checks run on every way a turn ends (H6)
+- [x] M12-03 Read-only role checks run on every way a turn ends (H6)
 - [ ] M12-04 The redactor releases complete lines (H5)
 - [ ] Review of M12-01…04 (subagent, in place)
 - [ ] M12-05 A gate that cannot start is a machine stop, and `doctor` finds it first
@@ -69,6 +69,18 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
   Windows: `icacls /deny <user>:(RD)` works in a test — run here, fails before; the ACL is removed before the
   temporary folder drops; the test says why and returns where listing cannot be taken away, e.g. root).
   `m12_02_a_missing_protected_folder_is_still_fine` (AC-3).
+
+### M12-03 — read-only role checks run on every way a turn ends (H6)
+
+- `read_only_turn` ran `cut_short` (live budget, stop) and then `after_read_only_turn`, whose quota branch returned
+  before `protected_violation` and the "read-only role wrote" check. Now `read_only_checks` (protected state, then
+  "the worktree changed during a read-only stage / HEAD moved") runs **first**, on every exit; then `cut_short`;
+  then `read_only_quota` (the pause). The write is handled exactly as on the normal path: the attempt ends `Failed`
+  with class `policy_violation`, the task `Escalated`; only when nothing was written do the stop, the budget pause and
+  the quota pause happen as before. A stop request that arrives together with a write now escalates.
+- **Tests** (new file `tests/m12_safety.rs`, all four fail before): reviewer + quota (AC-1), reviewer + live budget and
+  reviewer + `toryo stop` (AC-2), planner + quota (AC-3); each asserts the state, the reason prefix
+  `policy_violation: the worktree changed during a read-only stage` and that the file is in no checkpoint.
 
 ## Open
 
