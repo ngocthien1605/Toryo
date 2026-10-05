@@ -2656,6 +2656,19 @@ impl<'a> Engine<'a> {
         // EC-31 (F5): the worktree as the turn finds it — only what changes during the turn
         // is the read-only role's write, never what a human left there before
         let before = TreeState::read(&Worktree::new(&self.g, &t.worktree))?;
+        // M13-06: kept in the run store (hashed like every artifact) — when the engine dies
+        // after the turn, recovery still knows what was there before it, and escalates and
+        // puts back only what the role changed
+        super::artifacts::put(
+            self.store,
+            t,
+            Some(&a.id),
+            &tree_before_name(a),
+            "json",
+            "tree_before",
+            &serde_json::to_vec(&before)?,
+            None,
+        )?;
         let r = self.hub.turn_with(
             OpenSession {
                 profile: profile.clone(),
@@ -2676,9 +2689,43 @@ impl<'a> Engine<'a> {
             },
             self.limits(),
             hooks,
-        )?;
+        );
+        crash_point("read_only:after_turn");
+        // M13-06: an error after the agent ran (an I/O error, the session's close) must not
+        // skip the checks either — what the role wrote is undone before the error goes up
+        let r = match r {
+            Ok(r) => r,
+            Err(e) => {
+                let wt = Worktree::new(&self.g, &t.worktree);
+                if let Some(reason) = undo_read_only_write(&wt, t, &a.id, &before)? {
+                    let (i, aid) = (self.id.clone(), a.id.clone());
+                    let detail = format!("{reason} (the turn itself ended in an error: {e:#})");
+                    self.store.call(move |tx| {
+                        store::finish_attempt(
+                            tx,
+                            &aid,
+                            AttemptStatus::Failed,
+                            &AttemptEnd {
+                                error_class: Some("policy_violation".into()),
+                                error_detail: Some(detail),
+                                ..Default::default()
+                            },
+                        )?;
+                        store::transition(tx, &i, Ev::Escalate { reason }).map(|_| ())
+                    })?;
+                }
+                return Err(e);
+            }
+        };
         let model = self.role_model(role.as_str());
-        self.usage(a, profile, &r, model.as_deref())?;
+        if let Err(e) = self.usage(a, profile, &r, model.as_deref()) {
+            // the same for an error while the usage is recorded: checks first
+            if let Some(flow) = self.read_only_checks(t, a, &r, &before)? {
+                eprintln!("!! the turn's usage could not be recorded: {e:#}");
+                return Ok(Err(flow));
+            }
+            return Err(e);
+        }
         // M12-03 (H6): the protected-state and "a read-only role wrote" checks come first, on
         // every way the turn ended — a stop, the live budget and a quota pause must not hide a
         // write (it would stay in the tree and go on under the implementer's name)
@@ -2832,57 +2879,7 @@ impl<'a> Engine<'a> {
             return Ok(Some(Flow::Next));
         }
         let wt = Worktree::new(&self.g, &t.worktree);
-        let after = TreeState::read(&wt)?;
-        if let Some(reason) = read_only_write(before, &after) {
-            // M12-03 review: what the role wrote must not wait in the tree for the next
-            // checkpoint — `git add -A` of a fix cycle would commit it under the implementer's
-            // name. Paths that were clean or absent before the turn are put back (tracked →
-            // HEAD, new → removed); what a human had changed before stays.
-            // M13-01 (X24): a commit the role made on the task branch is undone first (soft
-            // reset to where the turn began), so that what it committed is put back like what
-            // it only wrote — it must not wait at the branch tip for the next fix cycle.
-            let mut after = after;
-            if let (Some(began), true) = (&before.head, before.head != after.head) {
-                let on_branch =
-                    wt.head_ref().ok().flatten() == Some(format!("refs/heads/{}", t.branch));
-                if on_branch && wt.unfinished_operation()?.is_none() {
-                    wt.soft_reset(began)?;
-                    eprintln!(
-                        "   the read-only role had moved HEAD — soft reset to {}",
-                        short(began)
-                    );
-                    after = TreeState::read(&wt)?;
-                }
-            }
-            if before.head == after.head {
-                let written: Vec<String> = after
-                    .changed_since(before)
-                    .into_iter()
-                    .filter(|p| !ide_state(p) && !before.entries.contains_key(p))
-                    .collect();
-                if !written.is_empty() {
-                    // a copy first (best effort): the human may want to see what it wrote
-                    let keep = t
-                        .run_store
-                        .join("read-only-writes")
-                        .join(a.id.replace('/', "-"));
-                    for p in &written {
-                        let from = t.worktree.join(p);
-                        let to = keep.join(p);
-                        if from.is_file() {
-                            if let Some(dir) = to.parent() {
-                                let _ = std::fs::create_dir_all(dir);
-                            }
-                            let _ = std::fs::copy(&from, &to);
-                        }
-                    }
-                    wt.restore(&written)?;
-                    eprintln!(
-                        "   put back (written by the read-only role): {written:?} — a copy is in {}",
-                        keep.display()
-                    );
-                }
-            }
+        if let Some(reason) = undo_read_only_write(&wt, t, &a.id, before)? {
             self.end_and(
                 a,
                 AttemptStatus::Failed,
@@ -4190,17 +4187,215 @@ fn read_only_failure(role: &str, class: ErrorClass, detail: Option<&str>, retrie
 }
 
 /// The task worktree around a read-only turn (EC-31, F5): HEAD, and every changed path —
-/// tracked or untracked, not ignored — with its status and a hash of its content.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct TreeState {
+/// tracked or untracked, not ignored — with its status and a hash of its content. Saved in the
+/// run store before every read-only turn (M13-06) so that recovery has it too.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct TreeState {
     /// `None`: HEAD does not resolve.
     head: Option<String>,
     /// path → (`git status` code, content hash).
     entries: BTreeMap<String, (String, String)>,
 }
 
+/// M13-06: the artifact that holds the [`TreeState`] before the latest turn of the read-only
+/// attempt `a`.
+fn tree_before_name(a: &AttemptRow) -> String {
+    format!("tree-before/{}-{}", a.stage, a.attempt)
+}
+
+/// M13-06: the worktree as the latest turn of the read-only attempt `a` found it — `None` for
+/// an attempt from before M13, or one that died before its first turn.
+pub(super) fn tree_before(store: &Store, t: &TaskRow, a: &AttemptRow) -> Result<Option<TreeState>> {
+    Ok(
+        match super::artifacts::read_head(store, t, &tree_before_name(a))? {
+            Some((_, bytes)) => serde_json::from_slice(&bytes).ok(),
+            None => None,
+        },
+    )
+}
+
+/// The largest file a copy of a read-only role's write keeps (M13-06).
+const READ_ONLY_COPY_MAX: u64 = 8 * 1024 * 1024;
+
+/// A copy of what a read-only role wrote at `from`, for the human to look at (M13-06): never
+/// through a link (the link itself is neither copied nor followed), never more than
+/// [`READ_ONLY_COPY_MAX`]. `Some(why)`: not copied.
+fn keep_copy(from: &Path, to: &Path) -> Option<String> {
+    let md = std::fs::symlink_metadata(from).ok()?; // gone: nothing to copy
+    if md.file_type().is_symlink() {
+        return Some("a link: not followed".into());
+    }
+    if !md.is_file() {
+        return Some("not a regular file".into());
+    }
+    if md.len() > READ_ONLY_COPY_MAX {
+        return Some(format!("{} bytes, over the 8 MB a copy keeps", md.len()));
+    }
+    if let Some(dir) = to.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::copy(from, to)
+        .err()
+        .map(|e| format!("the copy failed: {e}"))
+}
+
+/// The first folder on the way to `rel` (below `root`) that is a link or a junction, as a
+/// `/`-separated relative path — the path itself is not asked (`git status` lists a link as a
+/// path of its own, and `restore` removes that as a link).
+fn link_on_the_way(root: &Path, rel: &str) -> Option<String> {
+    let parts: Vec<&str> = rel.split('/').collect();
+    let mut at = root.to_path_buf();
+    for (i, part) in parts.iter().enumerate().take(parts.len().saturating_sub(1)) {
+        at.push(part);
+        if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Some(parts[..=i].join("/"));
+        }
+    }
+    None
+}
+
+/// What a read-only role (Planner, Reviewer) did to the task worktree since `before`, undone —
+/// after its turn, however that ended, and in recovery when the engine died after it (M12-03,
+/// M13-01, M13-06). `None`: it changed nothing. Otherwise the escalation reason, after:
+/// - a commit it made on the task branch is undone (soft reset to where the turn began, X24);
+/// - every path that was clean or absent before the turn is put back (tracked → HEAD, new →
+///   removed; a link is removed as a link), after a copy for the human;
+/// - a path that was **already changed before** the turn and changed again is copied and left
+///   as it is — Toryo cannot tell the owner's edit from the role's — and the reason says so.
+///
+/// What the owner had in the tree before the turn and the role did not touch is not looked at.
+pub(super) fn undo_read_only_write(
+    wt: &Worktree,
+    t: &TaskRow,
+    attempt: &str,
+    before: &TreeState,
+) -> Result<Option<String>> {
+    let mut after = TreeState::read(wt)?;
+    let Some(mut reason) = read_only_write(before, &after) else {
+        return Ok(None);
+    };
+    if let (Some(began), true) = (&before.head, before.head != after.head) {
+        let on_branch = wt.head_ref().ok().flatten() == Some(format!("refs/heads/{}", t.branch));
+        if on_branch && wt.unfinished_operation()?.is_none() {
+            wt.soft_reset(began)?;
+            eprintln!(
+                "   the read-only role had moved HEAD — soft reset to {}",
+                short(began)
+            );
+            after = TreeState::read(wt)?;
+        }
+    }
+    if before.head != after.head {
+        return Ok(Some(reason));
+    }
+    // (again, written): changed before the turn and changed again / clean or absent before it
+    let split = |after: &TreeState| -> (Vec<String>, Vec<String>) {
+        after
+            .changed_since(before)
+            .into_iter()
+            .filter(|p| !ide_state(p))
+            .partition(|p| before.entries.contains_key(p))
+    };
+    let (again, written) = split(&after);
+    if written.is_empty() && again.is_empty() {
+        return Ok(Some(reason));
+    }
+    // AC-3: nothing is copied, put back or deleted through a link or junction — Git lists the
+    // files behind a junction like any folder's. A link the role made is removed as a link; one
+    // that was there before the turn (a path below it was already changed then) is left alone,
+    // and the reason says so.
+    let mut links: std::collections::BTreeSet<String> = Default::default();
+    for p in written.iter().chain(&again) {
+        if let Some(link) = link_on_the_way(&t.worktree, p) {
+            let under = format!("{link}/");
+            if !before.entries.keys().any(|k| k.starts_with(&under)) {
+                links.insert(link);
+            }
+        }
+    }
+    for link in &links {
+        let p = t.worktree.join(link);
+        if std::fs::remove_file(&p).is_err() {
+            let _ = std::fs::remove_dir(&p); // a directory link or junction: the link only
+        }
+    }
+    // what a removed link stood in place of — a tracked folder the role deleted first — shows
+    // only now: read the tree again
+    let (again, written) = if links.is_empty() {
+        (again, written)
+    } else {
+        split(&TreeState::read(wt)?)
+    };
+    let mut behind: Vec<String> = Vec::new();
+    let mut direct = |paths: Vec<String>| -> Vec<String> {
+        paths
+            .into_iter()
+            .filter(|p| {
+                let link = link_on_the_way(&t.worktree, p).is_some();
+                if link {
+                    behind.push(p.clone());
+                }
+                !link
+            })
+            .collect()
+    };
+    let (written, again) = (direct(written), direct(again));
+    if !links.is_empty() {
+        reason.push_str(&format!(
+            "; removed as links, not followed: {:?}",
+            links.iter().collect::<Vec<_>>()
+        ));
+    }
+    if !behind.is_empty() {
+        reason.push_str(&format!(
+            "; not touched (behind a link Toryo left in place: it was there before the turn, or could not be removed): {behind:?}"
+        ));
+    }
+    // a copy first: the human may want to see what it wrote
+    let keep = t
+        .run_store
+        .join("read-only-writes")
+        .join(attempt.replace('/', "-"));
+    let not_copied: Vec<String> = written
+        .iter()
+        .chain(&again)
+        .filter_map(|p| {
+            keep_copy(&t.worktree.join(p), &keep.join(p)).map(|why| format!("{p} ({why})"))
+        })
+        .collect();
+    if !written.is_empty() {
+        wt.restore(&written)?;
+        // `restore` does not say when Git refused (a stale `index.lock`, a file in use): look
+        let now = split(&TreeState::read(wt)?).1;
+        let (left, back): (Vec<String>, Vec<String>) =
+            written.into_iter().partition(|p| now.contains(p));
+        if !back.is_empty() {
+            eprintln!(
+                "   put back (written by the read-only role): {back:?} — a copy is in {}",
+                keep.display()
+            );
+        }
+        if !left.is_empty() {
+            reason.push_str(&format!(
+                "; could NOT be put back: {left:?} — Git refused (look at `git -C \"{}\" status`); put them back by hand, or they go into the next checkpoint",
+                t.worktree.display()
+            ));
+        }
+    }
+    if !again.is_empty() {
+        reason.push_str(&format!(
+            "; not put back: {again:?} — changed already before the turn, so Toryo cannot tell your edit from the role's (what is there now is copied to {})",
+            keep.display()
+        ));
+    }
+    if !not_copied.is_empty() {
+        reason.push_str(&format!("; no copy kept of: {}", not_copied.join(", ")));
+    }
+    Ok(Some(reason))
+}
+
 impl TreeState {
-    fn read(wt: &Worktree) -> Result<Self> {
+    pub(super) fn read(wt: &Worktree) -> Result<Self> {
         let entries = wt
             .changed()?
             .into_iter()

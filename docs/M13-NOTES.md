@@ -11,7 +11,7 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
 - [x] M13-03 The redactor: a line break may only be the last byte of a secret
 - [x] M13-04 Gate output is cut on line boundaries; the log path the vendor sees is relative (X27)
 - [x] M13-05 The deploy confirmation is a database row bound to gate, commit and digest (X26)
-- [ ] M13-06 Read-only turns: the checks also run when the turn errors; the copy is safe
+- [x] M13-06 Read-only turns: the checks also run when the turn errors; the copy is safe
 - [ ] Review of M13-01…06 (acceptance criteria against code and tests)
 - [ ] M13-07 `task cleanup` that cannot look fails closed; `doctor` never loops on a link
 - [ ] M13-08 The gate resolver is one resolver; the timeout stop names every gate that re-runs
@@ -127,6 +127,45 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
 - **Unit test (AC-4):** `store::tests::an_older_database_opens_and_is_raised` (version 1 → 2 with its task kept; the functions above; version 3 refused).
 - **Threat model (goes to STATUS N-11):** an agent started with the owner's token can write the database as well as the run store; the row is the same
   trust level as every other record there, not a new boundary.
+
+
+### M13-06 — Read-only turns: the checks also run when the turn errors; the copy is safe
+
+- **Failing tests first** (`tests/regress_engine.rs`; the new crash point `read_only:after_turn` lets the engine die right after a Planner/Reviewer turn; both
+  tests were also run against the old `recovery.rs` and failed there): `m13_06_recovery_puts_back_only_what_the_read_only_role_wrote` (AC-1, audit O-11 —
+  before: the reason named the owner's `owner-notes.txt` next to the reviewer's file and nothing was put back) and
+  `m13_06_a_link_left_by_the_read_only_role_is_removed_not_followed` (AC-3 — before: Git listed `peek/precious.txt` behind the junction as a changed path).
+- **The `before` state is kept:** `read_only_turn` stores the `TreeState` it read before the turn as an artifact of the attempt (`tree-before/<stage>-<attempt>`,
+  kind `tree_before`, hashed and registered like the context file; one version per turn). `TreeState` is `Serialize`/`Deserialize` and `pub(super)`.
+- **One function for both ways:** `runner::undo_read_only_write(wt, task, attempt, before)` — the soft reset of M13-01, the put-back, the copies, the reason.
+  `read_only_checks` calls it after a turn; recovery's `Planning | Reviewing` branch calls it with the saved state (`runner::tree_before`), so it escalates
+  only on what the role changed and leaves the owner's files alone. **No saved state** (an attempt from before M13, or one that died before its first turn):
+  today's behaviour — any dirty file escalates.
+- **A turn that ends in an error** (`hub.turn_with` → `Err`, or `usage()` → `Err`): the undo runs before the error goes up; when the role wrote something the
+  attempt ends `Failed` (`policy_violation`) and the task escalates, then the error is returned as before. **Not tested** — no fake step makes `turn_with`
+  return `Err` (Open).
+- **Do-2:** a path that was already changed before the turn and is changed again is copied and **not** put back; the reason ends "; not put back: [...] —
+  changed already before the turn, so Toryo cannot tell your edit from the role's (what is there now is copied to <dir>)".
+- **Do-3 — the copy** (`keep_copy`): `symlink_metadata`; a link is never followed or copied; only regular files; at most 8 MB per file; what was not copied is
+  named in the reason ("no copy kept of: <path> (<why>)").
+- **Links (AC-3), found while writing the test:** Git lists the files *behind* a junction like any folder's, so the put-back would have deleted files outside
+  the worktree through it. A path with a link or junction on the way is never opened: a link that was not there before the turn is removed as a link
+  ("removed as links, not followed: [...]"), one that was is left alone and named. (`Worktree::restore`, used for the implementer's path-policy
+  violations, has the same exposure for a junction an implementer makes — not in this task's scope: Open.)
+- **Risk to know (as the list asks for it):** what the owner changes in the worktree *between* the crash and the `resume` cannot be told from the role's
+  write either — it is put back like one, after a copy to `<run store>/read-only-writes/<attempt>/`.
+- **Earlier assertion changed:** `regress_engine::ec31_a_reviewer_that_changes_a_file_left_before_its_turn_escalates` compared the whole reason; it now asserts
+  the old sentence as the prefix, the "not put back" part and the copy (this test is AC-2).
+- **Unit test:** `the_copy_of_a_read_only_write_is_capped_and_never_follows_a_link`.
+- **Three things the review of the diff found, fixed before this commit:**
+  (1) a role that deletes a tracked folder and leaves a link of that name: the tracked files stayed deleted once the link was gone — the tree is now
+  read again after a link is removed (`m13_06_a_tracked_folder_replaced_by_a_link_is_put_back`, failed first);
+  (2) `Worktree::restore` does not say when Git refuses (a stale `index.lock`): console and reason said "put back" while the edit was still there —
+  the tree is looked at after the put-back and the reason ends "; could NOT be put back: [...]"
+  (`m13_06_a_put_back_that_git_refuses_is_named_in_the_reason`, failed first);
+  (3) recovery closed the read-only attempt before it ran the undo — an error in the undo would have left nothing `Running` for the next `resume` to
+  check. The undo now runs first. **No test:** nothing was found that makes the undo return an error (a broken `.git` fails earlier in recovery; an
+  `index.lock` is case 2).
 
 
 ## Open

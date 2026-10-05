@@ -255,6 +255,26 @@ impl<'a> Recovery<'a> {
                 }
             }
             St::Planning | St::Reviewing => {
+                // M13-06: the turn's `before` state is in the run store — escalate only on what
+                // the role changed since then, and put that back (the same code as after a
+                // turn that ended normally); what the owner had in the tree is left alone.
+                // Before the attempt is closed: an error here leaves it `Running`, and the
+                // next `resume` comes back to this place.
+                let before = match atts
+                    .iter()
+                    .rev()
+                    .find(|a| a.status == AttemptStatus::Running)
+                {
+                    Some(a) => super::runner::tree_before(self.store, &t, a)?.map(|b| (a, b)),
+                    None => None,
+                };
+                let saved = before.is_some();
+                let undone = match &before {
+                    Some((a, before)) => {
+                        super::runner::undo_read_only_write(&wt, &t, &a.id, before)?
+                    }
+                    None => None,
+                };
                 let mut had = false;
                 for a in atts.iter().filter(|a| a.status == AttemptStatus::Running) {
                     had = true;
@@ -270,16 +290,29 @@ impl<'a> Recovery<'a> {
                     )?;
                     notes.push(format!("{}: interrupted (read-only stage, re-run; Claude resumes its session, R48)", a.id));
                 }
-                // read-only roles cannot write: a dirty tree means something else wrote into it
-                let changed = wt.changed()?;
-                if had && !changed.is_empty() {
-                    let paths: Vec<String> = changed.into_iter().map(|c| c.1).collect();
-                    let reason = format!("policy_violation: the worktree changed during a read-only stage: {paths:?}");
-                    let i = id.to_string();
-                    self.store.call(move |tx| {
-                        store::transition(tx, &i, Ev::Escalate { reason }).map(|_| ())
-                    })?;
-                    notes.push("escalated: dirty worktree after a read-only stage".into());
+                if saved {
+                    if let Some(reason) = undone {
+                        let i = id.to_string();
+                        self.store.call(move |tx| {
+                            store::transition(tx, &i, Ev::Escalate { reason }).map(|_| ())
+                        })?;
+                        notes.push(
+                            "escalated: the read-only role changed the worktree (put back)".into(),
+                        );
+                    }
+                } else {
+                    // an attempt from before M13, or one that died before its first turn: a
+                    // dirty tree means something wrote into it (read-only roles cannot write)
+                    let changed = wt.changed()?;
+                    if had && !changed.is_empty() {
+                        let paths: Vec<String> = changed.into_iter().map(|c| c.1).collect();
+                        let reason = format!("policy_violation: the worktree changed during a read-only stage: {paths:?}");
+                        let i = id.to_string();
+                        self.store.call(move |tx| {
+                            store::transition(tx, &i, Ev::Escalate { reason }).map(|_| ())
+                        })?;
+                        notes.push("escalated: dirty worktree after a read-only stage".into());
+                    }
                 }
             }
             _ => {
