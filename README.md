@@ -147,16 +147,20 @@ run on the checkpoint commit, stop at the first failure, and the exit code decid
   `environment_gates.<name>` in the machine config (`program`, `args`, `lock`, `env`, `secret_env`, `confirm`). It runs
   with your normal rights, in an empty working directory, from a **byte-exact export** of the checkpoint commit, under a
   machine-wide lock (one deploy per lock at a time). `confirm: never | first | always` asks you **before** the deploy;
-  a plain `toryo resume <ID>` is the yes. Toryo records which task and commit each lock's environment holds
-  (`toryo status`).
+  a plain `toryo resume <ID>` is the yes. To say no: `toryo resume <ID> --note "…"` (the implementer gets your note; one
+  fix cycle) or `toryo task cleanup <ID>` (gives the task up). Toryo records which task and commit each lock's
+  environment holds (`toryo status`).
 - **Output.** The whole redacted output of a gate is written to `<run store>\gate-logs\` (first 1 MB and last 8 MB are
   kept), a long-running gate prints a line every minute, and the failure line names the log. Text is decoded line by
   line with the machine's OEM code page when it is not UTF-8.
 - **Line endings.** A repository with `text` / `eol=crlf` attributes over blobs that still hold CRLF makes Git report the
   verify checkout as modified: run `git add --renormalize .` once and commit, or every verify stops with
   `verify_mutated_tree`.
-- **Cannot start** (missing program or script) → the task stops with `gate_unavailable` before any gate runs; a gate
-  that runs into its timeout stops the task for you (`environment_gate_timeout`) with no implementer turn.
+- **Cannot start** → the task stops before any gate runs, and no implementer turn is spent:
+  a **check gate** whose program is not on the machine → `gate_unavailable`;
+  an **environment gate** whose program, script or secret is missing → `environment_gate_unavailable`
+  (`task create` already refuses one whose script is missing). An environment gate that runs into its timeout stops the
+  task for you (`environment_gate_timeout`), also with no implementer turn.
 
 ## What the boundary does and does not buy
 

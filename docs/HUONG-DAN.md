@@ -1119,7 +1119,8 @@ toryo run SJP-1234        # plan → anh duyệt plan → implement → gate bui
   (đã che secret, tối đa 1 MB đầu + 8 MB cuối) nằm ở `<run store>\gate-logs\`, và dòng thất bại nêu đường dẫn.
 - **`confirm: first`**: trước khi deploy lần đầu của task, Toryo dừng (`environment_gate_confirm`) và in gate, lock, commit,
   20 dòng đầu của `git diff --stat` và lệnh. Xem bản checkpoint (`git -C <worktree> show --stat <sha>`), rồi
-  **`toryo resume SJP-1234`** là "đồng ý" (không bao giờ `--yes`). Cổng cuối: xem branch `toryo/SJP-1234`, rồi
+  **`toryo resume SJP-1234`** là "đồng ý" (không bao giờ `--yes`); không đồng ý: `toryo resume SJP-1234 --note "…"`
+  (một vòng sửa) hoặc `toryo task cleanup SJP-1234`. Cổng cuối: xem branch `toryo/SJP-1234`, rồi
   `toryo approve SJP-1234 --gate final`; `toryo status` ghi lock nào đang chứa commit nào.
 - Ctrl+C trong `toryo run` kill tiến trình (không có `run_ended`, không có toast): dừng đúng cách bằng `toryo stop SJP-1234` ở
   cửa sổ khác.
@@ -1219,10 +1220,10 @@ Có năm dạng `next:`; cột "gõ gì" nói dạng nào:
 
 | Lớp (`reason_class`) | Nghĩa | Gõ gì |
 |---|---|---|
-| `gate_unavailable` | chương trình của một **check gate** không có trên máy này (không ở trên PATH, đường dẫn tuyệt đối không tồn tại, script `-File` không có) — kiểm tra **trước khi** gate nào chạy; `doctor` báo trước ở dòng `gates` | [máy]: cài chương trình / đặt script lại → `toryo resume`; sửa `commands.verify` hoặc gate trong org chart → `task config --reload` |
+| `gate_unavailable` | chương trình của một **check gate** không có trên máy này (không ở trên PATH, đường dẫn tuyệt đối không tồn tại) — kiểm tra **trước khi** gate nào chạy; `doctor` báo trước ở dòng `gates`. Script mà check gate chạy (`-File scripts/build.ps1`) là file của repo: **không** kiểm tra ở đây — script thiếu thì gate chạy và thất bại như mọi gate | [máy]: cài chương trình / đặt script lại → `toryo resume`; sửa `commands.verify` hoặc gate trong org chart → `task config --reload` |
 | `environment_gate_unavailable` | máy không chạy được **gate môi trường**: secret thiếu, chương trình không tìm thấy hoặc nằm trong repo/worktrees/verify root, script thiếu, hoặc bản xuất commit không khớp byte-exact — kiểm tra trước các check gate (không tốn một lần build) | [máy]: thêm secret vào Credential Manager, cài chương trình → `toryo resume`; sửa `environment_gates.<tên>` → `task config --reload` |
 | `environment_gate_timeout` | gate môi trường chạy quá `timeout:` và bị kill giữa chừng — môi trường có thể đã đổi một nửa; Toryo **không** tự thử lại | [máy]: xem môi trường, rồi `toryo resume` (chạy lại Verify và gate) |
-| `environment_gate_confirm` | `confirm: first/always` — Toryo hỏi **trước khi deploy** (xem commit, gate, lock, `git diff --stat`, lệnh trong lý do) | [máy]: **`toryo resume <id>` trơn là "đồng ý"**; `--yes` không bao giờ đồng ý (`resume <id> --yes` bị từ chối; `resume` không id bỏ qua task này) |
+| `environment_gate_confirm` | `confirm: first/always` — Toryo hỏi **trước khi deploy** (xem commit, gate, lock, `git diff --stat`, lệnh trong lý do) | [máy]: **`toryo resume <id>` trơn là "đồng ý"**; `--yes` không bao giờ đồng ý (`resume <id> --yes` bị từ chối; `resume` không id bỏ qua task này). **Không đồng ý:** `toryo resume <id> --note "…"` (implementer nhận ghi chú của bạn; tốn một vòng sửa) hoặc `toryo task cleanup <id>` (bỏ task) |
 | `skill_unavailable` | skill cần cho lượt này không tìm thấy (lý do nêu cả hai đường dẫn đã tìm), hoặc `SKILL.md` không phải UTF-8 — chưa chạy lượt nào, không tốn token | [máy]: đặt skill lại / lưu UTF-8 → `toryo resume`; đổi `skills` trong role file / `skills_dir` → `task config --reload` |
 | `context_over_budget` | ngữ cảnh kèm skill vẫn quá `context.budget_kb.<role>` (skill, TASK.md, PLAN.md không bao giờ bị cắt) | [máy]: chọn ít skill hơn hoặc nâng `context.budget_kb.<role>` → `task config --reload` → `toryo resume` |
 | `context_unreadable` | một file ngữ cảnh (global, `AGENTS.md`/`CLAUDE.md`, `.toryo\context\*.md`, culture, instructions, file của task pack) **không phải UTF-8** (UTF-16 hoặc code page) — lý do nêu tên file; không tốn lượt | [máy]: lưu file thành UTF-8 → `toryo resume` |

@@ -5406,7 +5406,15 @@ pub fn next_action(t: &TaskRow) -> String {
         St::WaitingFinalApproval => format!("review the branch {} (REVIEW.md in the run store), then `toryo approve {id} --gate final` or `toryo reject {id} --gate final --reason \"…\"`", t.branch),
         St::Escalated => {
             let why = t.machine.reason().unwrap_or("");
-            if t
+            if t.machine.reason_class() == Some(super::gates::ENV_CONFIRM) {
+                // M13-09: the question before a deploy — nothing to fix; what to look at, how
+                // to say yes, and how to say no
+                format!(
+                    "{why}\n  → look at the diff (`git -C \"{}\" show --stat {}`); yes: `toryo resume {id}`; no: `toryo resume {id} --note \"…\"` (one fix cycle) or `toryo task cleanup {id}`",
+                    t.worktree.display(),
+                    t.machine.checkpoint().map(short).unwrap_or("HEAD")
+                )
+            } else if t
                 .machine
                 .reason_class()
                 .is_some_and(crate::engine::state::is_machine_caused)
@@ -6613,6 +6621,10 @@ mod tests {
     #[test]
     fn next_action_of_the_five_machine_caused_classes() {
         for class in crate::engine::state::MACHINE_CAUSED {
+            // M13-09: the question before a deploy has no cause to fix — its own text below
+            if class == crate::engine::gates::ENV_CONFIRM {
+                continue;
+            }
             let mut t = task_in(&[
                 Ev::Start,
                 Ev::Escalate {
@@ -6626,6 +6638,22 @@ mod tests {
                 "{class}"
             );
         }
+        // M13-09 AC-1: `environment_gate_confirm` — what to look at, how to say yes, how to say no
+        let mut t = task_in(&[
+            Ev::Start,
+            Ev::Escalate {
+                reason: "environment_gate_confirm: x".into(),
+            },
+        ]);
+        t.machine
+            .set_reason_class(crate::engine::gates::ENV_CONFIRM);
+        assert_eq!(
+            next_action(&t),
+            format!(
+                "environment_gate_confirm: x\n  → look at the diff (`git -C \"{}\" show --stat HEAD`); yes: `toryo resume T-1`; no: `toryo resume T-1 --note \"…\"` (one fix cycle) or `toryo task cleanup T-1`",
+                t.worktree.display()
+            )
+        );
         // the same reason without the typed class is an ordinary escalation: the text is never
         // parsed for it
         let t = task_in(&[

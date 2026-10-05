@@ -2888,3 +2888,110 @@ fn m13_08_a_timeout_names_every_environment_gate_that_runs_again() {
         "{d:?}"
     );
 }
+
+// ── M13-09: `environment_gate_confirm` says what to type, and how to say no ───────────────
+
+/// AC-2: `doctor` prints `confirm:` on every environment-gate line — also on a FAIL — and
+/// says what really happens: only a missing **script** is refused by `task create`; a missing
+/// program is admitted and stops the run at Verify. (Was: `confirm:` on OK lines only, and
+/// "`task create` refuses it" for every problem.)
+#[test]
+fn m13_09_doctor_says_confirm_on_every_environment_gate_line() {
+    let env = confirm_fixture("first").0;
+    let lines = |env: &Env| -> Vec<String> {
+        let o = command(env, &["doctor"], &[]).output().unwrap();
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| l.contains("environment gate `dbsync`"))
+            .map(str::to_string)
+            .collect()
+    };
+    let ok = lines(&env);
+    assert!(
+        ok.len() == 1 && ok[0].contains("[OK  ]") && ok[0].contains("confirm: first"),
+        "{ok:?}"
+    );
+    // the program is not on this machine
+    let m = std::fs::read_to_string(&env.machine).unwrap();
+    let program = if cfg!(windows) {
+        "program: pwsh"
+    } else {
+        "program: sh"
+    };
+    assert!(m.contains(program), "{m}");
+    std::fs::write(
+        &env.machine,
+        m.replace(program, "program: no-such-program-r9"),
+    )
+    .unwrap();
+    let bad = lines(&env);
+    assert!(
+        bad.len() == 1
+            && bad[0].contains("[FAIL]")
+            && bad[0].contains("no-such-program-r9")
+            && bad[0].contains("confirm: first"),
+        "{bad:?}"
+    );
+    assert!(
+        !bad[0].contains("refuses") && bad[0].contains("environment_gate_unavailable"),
+        "a missing program is not refused by `task create`: {bad:?}"
+    );
+    // the script is not there: this one `task create` does refuse
+    std::fs::write(&env.machine, &m).unwrap();
+    let script_file = env.root.join("gates").join(if cfg!(windows) {
+        "dbsync.ps1"
+    } else {
+        "dbsync.sh"
+    });
+    std::fs::remove_file(&script_file).unwrap();
+    let bad = lines(&env);
+    assert!(
+        bad.len() == 1
+            && bad[0].contains("[FAIL]")
+            && bad[0].contains("`task create` refuses it")
+            && bad[0].contains("confirm: first"),
+        "{bad:?}"
+    );
+}
+
+/// AC-3: the README and the guide name the right class for a gate that cannot start, and say
+/// how to say **no** to a deploy.
+#[test]
+fn m13_09_the_readme_and_the_guide_say_which_class_and_how_to_say_no() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+    let guide = std::fs::read_to_string(root.join("docs").join("HUONG-DAN.md")).unwrap();
+    let flat = readme.replace("\r\n", "\n").replace("\n  ", " ");
+    // README: an environment gate is not under `gate_unavailable`
+    assert!(
+        !flat.contains("(missing program or script) → the task stops with `gate_unavailable`"),
+        "the old sentence"
+    );
+    assert!(
+        flat.contains("a **check gate** whose program is not on the machine → `gate_unavailable`")
+            && flat.contains("→ `environment_gate_unavailable`"),
+        "README: which class"
+    );
+    assert!(
+        flat.contains("To say no: `toryo resume <ID> --note \"…\"`")
+            && flat.contains("`toryo task cleanup <ID>`"),
+        "README: how to say no"
+    );
+    // guide §9.1: `gate_unavailable` does not claim a check gate's `-File` is checked
+    let row = |class: &str| -> &str {
+        guide
+            .lines()
+            .find(|l| l.starts_with(&format!("| `{class}` |")))
+            .unwrap_or_else(|| panic!("no row for {class}"))
+    };
+    assert!(
+        !row("gate_unavailable").contains("script `-File` không có)"),
+        "{}",
+        row("gate_unavailable")
+    );
+    let confirm = row("environment_gate_confirm");
+    assert!(
+        confirm.contains("--note") && confirm.contains("task cleanup"),
+        "the guide: how to say no — {confirm}"
+    );
+}

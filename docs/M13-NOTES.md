@@ -15,7 +15,7 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
 - [x] Review of M13-01…06 (acceptance criteria against code and tests)
 - [x] M13-07 `task cleanup` that cannot look fails closed; `doctor` never loops on a link
 - [x] M13-08 The gate resolver is one resolver; the timeout stop names every gate that re-runs
-- [ ] M13-09 `environment_gate_confirm` says what to type, and how to say no
+- [x] M13-09 `environment_gate_confirm` says what to type, and how to say no
 - [ ] M13-10 `doctor` looks at long paths where the first run will hit them
 - [ ] M13-11 `task create` is all or nothing (X28)
 - [ ] M13-12 Ctrl+C on `toryo run` is a stop request (X29)
@@ -235,6 +235,24 @@ failed first; the rest is under "Open".
 - **The xpp text:** a project of a `tool: xpp` command that runs out of time says the limit it was given — "timed out after 734 s (what the projects
   before it left of the command's 30 min)", or "was not started: the projects before it used up the command's 30 min"; the first project still says
   "timed out after 30 min". Unit test `a_timeout_says_what_the_run_was_given_and_what_runs_again` (no MSBuild on this machine: not run end to end).
+
+
+### M13-09 — `environment_gate_confirm` says what to type, and how to say no
+
+- **`next_action`** has its own arm for the class (before the generic machine-caused text, which said "fix the cause" where there is none):
+  "→ look at the diff (`git -C "<worktree>" show --stat <commit>`); yes: `toryo resume <id>`; no: `toryo resume <id> --note "…"` (one fix cycle) or
+  `toryo task cleanup <id>`". `<commit>` is the checkpoint the question is about (the short SHA).
+- **Earlier assertion changed (the one the list names):** `runner::tests::next_action_of_the_five_machine_caused_classes` looped over every class of
+  `MACHINE_CAUSED` with the generic text; `environment_gate_confirm` is taken out of the loop and gets its own `assert_eq!` on the new text (AC-1).
+  It failed first with the old text on the left.
+- **`doctor`** prints `(confirm: …)` on every environment-gate line, also on a FAIL, and says what happens: "`task create` refuses it (the script is not
+  there), and a run would stop …" only when a script is missing; for a missing program "`task create` admits the task, and a run would stop with
+  `environment_gate_unavailable` before any gate ran". Test `m11_env_gates::m13_09_doctor_says_confirm_on_every_environment_gate_line` (AC-2; before:
+  no `confirm:` on the FAIL line, and "refuses it" for a missing program).
+- **Texts (AC-3, `m13_09_the_readme_and_the_guide_say_which_class_and_how_to_say_no` greps them):** README "Cannot start" names `gate_unavailable` for a
+  check gate's program and `environment_gate_unavailable` for an environment gate's program, script or secret (and says that only an *environment*
+  gate's timeout stops the task); README and HUONG-DAN (§9.1 row and the `confirm: first` paragraph) say how to say no; the HUONG-DAN row of
+  `gate_unavailable` no longer claims that a check gate's `-File` script is checked (it is the repository's: never asked).
 
 
 ## Open

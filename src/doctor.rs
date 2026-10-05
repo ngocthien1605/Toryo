@@ -214,7 +214,15 @@ pub fn gate_checks(cfg: &Effective) -> Vec<Check> {
             {
                 problems.push(e);
             }
-            problems.extend(gates::script_problems(&m.args));
+            let scripts = gates::script_problems(&m.args);
+            // M13-09: only a missing script is refused by `task create` (`env_gates_refusal`);
+            // a missing program is admitted and stops the run at Verify
+            let refused = if scripts.is_empty() {
+                "`task create` admits the task, and"
+            } else {
+                "`task create` refuses it (the script is not there), and"
+            };
+            problems.extend(scripts);
             if problems.is_empty() {
                 add(
                     Level::Ok,
@@ -227,9 +235,10 @@ pub fn gate_checks(cfg: &Effective) -> Vec<Check> {
                 add(
                     Level::Fail,
                     format!(
-                        "environment gate `{name}`: {} — fix `environment_gates.{name}` in the machine config; `task create` refuses it and a run would stop with `{}` before any gate ran",
+                        "environment gate `{name}`: {} — fix `environment_gates.{name}` in the machine config; {refused} a run would stop with `{}` before any gate ran (confirm: {})",
                         problems.join("; "),
-                        crate::engine::runner::ENV_UNAVAILABLE
+                        crate::engine::runner::ENV_UNAVAILABLE,
+                        m.confirm.as_str()
                     ),
                 );
             }
