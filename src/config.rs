@@ -1368,19 +1368,24 @@ pub fn data_dir() -> PathBuf {
         .join("toryo")
 }
 
+/// A `%NAME%` reference, the name in group 1: names may contain `(` `)`, as in
+/// `%ProgramFiles(x86)%` (EC-28). One pattern for what [`expand_vars`] expands and for what
+/// `doctor` warns about where nothing is expanded (M13-07).
+pub const VAR_PATTERN: &str = r"%([A-Za-z_][A-Za-z0-9_()]*)%";
+
 /// Expand `%VAR%` (Windows style) and `${VAR}` / `$VAR`-free paths. Unknown variables are an error.
 /// Names may contain `(` `)`, as in `%ProgramFiles(x86)%` (EC-28).
 /// M11-R12: the first `%NAME%` token in `s`, if any — used to catch a `%VAR%` that survived
 /// [`expand_vars`] because a variable's own value contained it (it is never expanded again).
 pub fn residual_var(s: &str) -> Option<String> {
-    regex::Regex::new(r"%([A-Za-z_][A-Za-z0-9_()]*)%")
+    regex::Regex::new(VAR_PATTERN)
         .expect("regex")
         .captures(s)
         .map(|c| c[1].to_string())
 }
 
 pub fn expand_vars(s: &str) -> Result<String> {
-    let re = regex::Regex::new(r"%([A-Za-z_][A-Za-z0-9_()]*)%").expect("regex");
+    let re = regex::Regex::new(VAR_PATTERN).expect("regex");
     let mut err = None;
     let out = re.replace_all(s, |c: &regex::Captures| match std::env::var(&c[1]) {
         Ok(v) => v,

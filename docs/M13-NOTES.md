@@ -13,7 +13,7 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
 - [x] M13-05 The deploy confirmation is a database row bound to gate, commit and digest (X26)
 - [x] M13-06 Read-only turns: the checks also run when the turn errors; the copy is safe
 - [x] Review of M13-01…06 (acceptance criteria against code and tests)
-- [ ] M13-07 `task cleanup` that cannot look fails closed; `doctor` never loops on a link
+- [x] M13-07 `task cleanup` that cannot look fails closed; `doctor` never loops on a link
 - [ ] M13-08 The gate resolver is one resolver; the timeout stop names every gate that re-runs
 - [ ] M13-09 `environment_gate_confirm` says what to type, and how to say no
 - [ ] M13-10 `doctor` looks at long paths where the first run will hit them
@@ -194,6 +194,23 @@ failed first; the rest is under "Open".
 - **M13-01/-02 — the two "by hand" texts:** the path after `git -C` is quoted (a worktree path with a space), and both say that an unfinished Git
   operation is finished or aborted first (`reset --soft` fails in the middle of a merge). No assertion pinned these texts.
 - **M13-06:** three findings, fixed inside the M13-06 commit (see there).
+
+
+### M13-07 — `task cleanup` that cannot look fails closed; `doctor` never loops on a link
+
+- **Failing tests first:** `m12_cli::m13_07_cleanup_that_cannot_look_refuses_without_force` (AC-1 — before: the cleanup went on, cancelled the task and
+  only stopped at `git worktree remove`, which cannot remove a worktree with a broken `.git` file either);
+  `m12_config::m13_07_doctor_does_not_follow_a_link_under_the_toryo_folder` (AC-2 — before: "64 text file(s)" for one file: the walk went through the
+  junction until the path was too long for Windows; it did end, but only there);
+  `m12_config::m13_07_doctor_warns_about_a_parenthesised_variable_in_a_profile_env` (AC-3 — before: no line).
+- **(a)** `cleanup_would_lose` returns `Result`: when Git cannot say what the worktree holds, `task cleanup` stops with "cannot tell what the worktree
+  holds (<error>) — pass `--force` to delete it anyway" before anything is changed. **Added so that the message is true:** with `--force`, when
+  `git worktree remove --force` fails, the folder is removed directly and `git worktree prune` forgets it (the test asserts both). Without `--force`
+  a failing `git worktree remove` is still the error it was.
+- **(b)** The walk of `encoding_checks` asks `DirEntry::file_type()` (what the entry is, not what it points at): a folder is walked, a link or junction
+  to a folder gets one `info` line ("is a link to a folder: not followed") and is skipped. A link to a file is read as before.
+- **(c)** `config::VAR_PATTERN` — one pattern for `expand_vars`, `residual_var` and `doctor`'s profile-`env:` warning.
+- **Windows-only parts:** the junction (`mklink /J`) in AC-2; on Unix the same test uses a symlink.
 
 
 ## Open

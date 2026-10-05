@@ -540,3 +540,56 @@ fn m12_17_doctor_says_whether_toryo_runs_elevated() {
         );
     }
 }
+
+// ── M13-07: `doctor` never follows a link; one pattern for `%NAME%` ───────────────────────
+
+/// (b) A link under `.toryo/` that points back at `.toryo/` (a junction on Windows, a symlink
+/// elsewhere). Was: the walk followed it (`is_dir()` follows links) and read the same files
+/// again at every level until the path was too long for the system. Now the link is not
+/// followed: one text file is counted once and the link gets one info line.
+#[test]
+fn m13_07_doctor_does_not_follow_a_link_under_the_toryo_folder() {
+    let env = setup("codex-openai");
+    let dir = env.repo.join(".toryo");
+    let ctx = dir.join("context");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::write(ctx.join("10-ok.md"), "plain text\n").unwrap();
+    let link = dir.join("loop");
+    #[cfg(windows)]
+    {
+        let o = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&dir)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&dir, &link).unwrap();
+    let lines = doctor_lines(&env, None);
+    let l = line_with(&lines, "text file(s) under .toryo/ are UTF-8");
+    assert!(l.contains("OK") && l.contains("1 text file(s)"), "{l}");
+    let l = line_with(&lines, "is a link to a folder: not followed");
+    assert!(l.contains("[info]") && l.contains("loop"), "{l}");
+}
+
+/// (c) `%ProgramFiles(x86)%` — a name `expand_vars` expands — is warned like any `%NAME%` in
+/// a profile `env:` value. (Was: the pattern of the warning had no parentheses.)
+#[test]
+fn m13_07_doctor_warns_about_a_parenthesised_variable_in_a_profile_env() {
+    let env = setup("codex-openai");
+    let m = std::fs::read_to_string(&env.machine).unwrap();
+    assert!(m.contains("exe: codex-not-installed }"), "{m}");
+    std::fs::write(
+        &env.machine,
+        m.replace(
+            "exe: codex-not-installed }",
+            "exe: codex-not-installed, env: { TOOLS: '%ProgramFiles(x86)%/Tools' } }",
+        ),
+    )
+    .unwrap();
+    let lines = doctor_lines(&env, None);
+    let l = line_with(&lines, "env TOOLS contains %ProgramFiles(x86)%");
+    assert!(l.contains("WARN") && l.contains("not expanded here"), "{l}");
+}

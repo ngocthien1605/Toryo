@@ -573,7 +573,13 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
             };
             // M12-12 (a): what cleanup deletes cannot be had back — say what, and ask for --force
             if !*force {
-                let lost = cleanup_would_lose(&g, &t);
+                // M13-07: a cleanup that cannot look does not delete
+                let lost = match cleanup_would_lose(&g, &t) {
+                    Ok(lost) => lost,
+                    Err(e) => bail!(
+                        "{id}: cannot tell what the worktree holds ({e:#}) — pass `--force` to delete it anyway (`toryo task cleanup {id} --force`)"
+                    ),
+                };
                 if !lost.is_empty() {
                     bail!(
                         "{id}: `task cleanup` would delete {} — look at it first (`git -C {} status`); `toryo task cleanup {id} --force` deletes it anyway",
@@ -589,11 +595,18 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
             toryo::engine::verify::cleanup(&g, &t, cfg.as_ref())?;
             if t.worktree.exists() {
                 let w = t.worktree.display().to_string().replace('\\', "/");
-                g.run(
-                    &toryo::git::Loc::Discover(t.repo.clone()),
-                    false,
-                    &["worktree", "remove", "--force", &w],
-                )?;
+                let repo = toryo::git::Loc::Discover(t.repo.clone());
+                if let Err(e) = g.run(&repo, false, &["worktree", "remove", "--force", &w]) {
+                    // M13-07: Git does not remove a worktree it cannot look into (a broken
+                    // `.git` file) — `--force` deletes the folder itself and forgets it
+                    if !*force {
+                        return Err(e);
+                    }
+                    eprintln!("note: {e:#} — removing the folder itself");
+                    std::fs::remove_dir_all(&t.worktree)
+                        .with_context(|| format!("removing {}", t.worktree.display()))?;
+                    let _ = g.run(&repo, false, &["worktree", "prune"]);
+                }
             }
             if t.run_store.exists() {
                 std::fs::remove_dir_all(&t.run_store)
@@ -612,14 +625,13 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
 
 /// M12-12 (a): what `task cleanup` would delete that exists nowhere else — uncommitted changes
 /// in the worktree and the partial snapshots of the run store (the branch is kept). Empty: a
-/// clean worktree and no snapshot.
-fn cleanup_would_lose(g: &toryo::git::GitCmd, t: &TaskRow) -> Vec<String> {
+/// clean worktree and no snapshot. `Err`: Git could not say what the worktree holds (M13-07).
+fn cleanup_would_lose(g: &toryo::git::GitCmd, t: &TaskRow) -> Result<Vec<String>> {
     let mut lost = Vec::new();
     if t.worktree.exists() {
         let n = toryo::engine::worktree::Worktree::new(g, &t.worktree)
-            .changed()
-            .map(|c| c.len())
-            .unwrap_or(0);
+            .changed()?
+            .len();
         if n > 0 {
             lost.push(format!(
                 "{n} uncommitted change(s) in the worktree {}",
@@ -635,7 +647,7 @@ fn cleanup_would_lose(g: &toryo::git::GitCmd, t: &TaskRow) -> Vec<String> {
             partial.display()
         ));
     }
-    lost
+    Ok(lost)
 }
 
 fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Result<i32> {

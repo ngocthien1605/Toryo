@@ -415,8 +415,23 @@ pub fn encoding_checks(cfg: &Effective) -> Vec<Check> {
     while let Some(dir) = stack.pop() {
         for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             let p = e.path();
-            if p.is_dir() {
+            // M13-07: what the entry is, not what it points at — a link or junction to a folder
+            // is never walked into (one that points back at `.toryo` would never end)
+            let Ok(kind) = e.file_type() else { continue };
+            if kind.is_dir() {
                 stack.push(p);
+                continue;
+            }
+            if kind.is_symlink() && p.is_dir() {
+                out.push(Check {
+                    level: Level::Info,
+                    area: area.into(),
+                    message: format!(
+                        "{} is a link to a folder: not followed (the files behind it are not checked)",
+                        p.display()
+                    ),
+                    source: None,
+                });
                 continue;
             }
             let text = p
@@ -527,7 +542,7 @@ pub fn is_elevated() -> bool {
 /// and Codex started without its login.)
 pub fn profile_env_checks(cfg: &Effective) -> Vec<Check> {
     static VAR: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"%[A-Za-z_][A-Za-z0-9_]*%").expect("regex"));
+        std::sync::LazyLock::new(|| regex::Regex::new(crate::config::VAR_PATTERN).expect("regex"));
     let mut out = Vec::new();
     for (name, p) in &cfg.repo.profiles {
         for (k, v) in &p.env {

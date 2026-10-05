@@ -142,3 +142,30 @@ fn m12_21_version_names_the_commit() {
     assert!(re.is_match(&out), "{out}");
     assert!(out.contains(env!("CARGO_PKG_VERSION")), "{out}");
 }
+
+/// M13-07 (a): a worktree Git cannot look into (its `.git` file holds garbage) with a file
+/// nobody committed. Was: a failing `git status` counted as "nothing to lose" and `task
+/// cleanup` deleted the folder without `--force`. Now the cleanup that cannot look refuses.
+#[test]
+fn m13_07_cleanup_that_cannot_look_refuses_without_force() {
+    let env = setup("codex-openai");
+    escalated(&env, "C-7");
+    let t = task(&env, "C-7");
+    std::fs::write(t.worktree.join(".git"), "garbage\n").unwrap();
+    let wip = t.worktree.join("unsaved.txt");
+    std::fs::write(&wip, "not committed\n").unwrap();
+    let (code, err) = toryo(&env, &["task", "cleanup", "C-7"], &[]);
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains("cannot tell what the worktree holds") && err.contains("--force"),
+        "{err}"
+    );
+    assert!(wip.exists() && t.run_store.exists(), "{err}");
+    assert_eq!(task(&env, "C-7").state, St::Escalated);
+    // `--force` does what the message says, also where `git worktree remove` cannot
+    let (code, err) = toryo(&env, &["task", "cleanup", "C-7", "--force"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!t.worktree.exists() && !t.run_store.exists(), "{err}");
+    let listed = git(&env.repo, &["worktree", "list"]);
+    assert!(!listed.contains("C-7"), "{listed}");
+}
