@@ -874,6 +874,10 @@ impl<'a> Engine<'a> {
         if self.turn_blocked(t, &turn.stage, &turn.profile)? {
             return Ok(None);
         }
+        // M13-01 (X24): the attempt begins at the anchor, never at whatever HEAD happens to be
+        if !self.start_at_anchor(t, wt)? {
+            return Ok(None);
+        }
         let head_before = wt.head()?;
         let tmp = t.worktree.join(".toryo-tmp");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -932,6 +936,60 @@ impl<'a> Engine<'a> {
             head_before,
             stop,
         }))
+    }
+
+    /// M13-01 (X24): the **anchor** — the last commit Toryo recorded for the task.
+    fn anchor(&self, t: &TaskRow) -> Result<String> {
+        let i = self.id.clone();
+        let atts = self.store.call(move |tx| store::attempts(tx, &i))?;
+        Ok(anchor_of(t, &atts))
+    }
+
+    /// M13-01 (X24): a writing attempt and a fresh checkpoint start at the anchor. HEAD at another
+    /// commit is never trusted — and who made that commit is never asked. When HEAD descends
+    /// from the anchor on the task branch it is soft-reset to the anchor: the changes of the
+    /// commits stay in the tree and go through the checks every turn's changes get. Otherwise
+    /// (another branch, a detached HEAD, an unfinished operation, a history that does not
+    /// descend from the anchor) nothing is reset and the task escalates. `false`: escalated.
+    fn start_at_anchor(&self, t: &TaskRow, wt: &Worktree) -> Result<bool> {
+        let anchor = self.anchor(t)?;
+        let head = wt.head().ok();
+        if head.as_deref() == Some(anchor.as_str()) {
+            return Ok(true);
+        }
+        let at = head.as_deref().map(short).unwrap_or("?").to_string();
+        let on_branch = wt.head_ref()? == Some(format!("refs/heads/{}", t.branch));
+        let unfinished = wt.unfinished_operation()?;
+        let descends = head.is_some() && wt.contains(&anchor)?;
+        if on_branch && descends && unfinished.is_none() {
+            wt.soft_reset(&anchor)?;
+            eprintln!(
+                "note: commits {}..{at} on top of the anchor were undone; their changes stay in the tree and are checked like any turn's",
+                short(&anchor)
+            );
+            let (i, payload) = (
+                self.id.clone(),
+                json!({"kind": "commits on the anchor", "action": "soft reset", "head": head, "reset_to": anchor}),
+            );
+            self.store
+                .call(move |tx| store::event(tx, Some(&i), None, "policy_violation", &payload))?;
+            return Ok(true);
+        }
+        let why = match (&unfinished, on_branch) {
+            (Some(op), _) => format!("an unfinished Git operation ({op}) is in the task worktree"),
+            (None, false) => format!("HEAD is not on the task branch {}", t.branch),
+            (None, true) => "it does not descend from that commit".to_string(),
+        };
+        let w = t.worktree.display();
+        let reason = format!(
+            "policy_violation: HEAD is at {at}, not at the last commit Toryo recorded for this task ({}), and {why}; nothing was reset or committed — put the task branch back by hand (`git -C {w} checkout {}`, then `git -C {w} reset --soft {}`: what the branch held stays in the tree and is checked), then `toryo resume {} --note \"…\"`",
+            short(&anchor),
+            t.branch,
+            short(&anchor),
+            t.id
+        );
+        self.escalate("policy_violation", reason)?;
+        Ok(false)
     }
 
     /// What the finished turn leads to, in this order: the HEAD guard, whatever the turn's
@@ -1370,6 +1428,10 @@ impl<'a> Engine<'a> {
                 )
             }
             _ => {
+                // M13-01 (X24): a fresh checkpoint is made on the anchor, nowhere else
+                if !self.start_at_anchor(t, &wt)? {
+                    return Ok(Flow::Next);
+                }
                 // §8: deny paths are checked again right before the commit
                 let denied: Vec<String> = wt
                     .changed()?
@@ -2701,6 +2763,22 @@ impl<'a> Engine<'a> {
             // checkpoint — `git add -A` of a fix cycle would commit it under the implementer's
             // name. Paths that were clean or absent before the turn are put back (tracked →
             // HEAD, new → removed); what a human had changed before stays.
+            // M13-01 (X24): a commit the role made on the task branch is undone first (soft
+            // reset to where the turn began), so that what it committed is put back like what
+            // it only wrote — it must not wait at the branch tip for the next fix cycle.
+            let mut after = after;
+            if let (Some(began), true) = (&before.head, before.head != after.head) {
+                let on_branch =
+                    wt.head_ref().ok().flatten() == Some(format!("refs/heads/{}", t.branch));
+                if on_branch && wt.unfinished_operation()?.is_none() {
+                    wt.soft_reset(began)?;
+                    eprintln!(
+                        "   the read-only role had moved HEAD — soft reset to {}",
+                        short(began)
+                    );
+                    after = TreeState::read(&wt)?;
+                }
+            }
             if before.head == after.head {
                 let written: Vec<String> = after
                     .changed_since(before)
@@ -3706,6 +3784,20 @@ impl GitAfterTurn {
     }
 }
 
+/// M13-01 (X24): the anchor of a task — the newest attempt's checkpoint (`git_head_after`) or
+/// recovery checkpoint (`partial_commit`), else the task's base commit.
+pub(super) fn anchor_of(t: &TaskRow, attempts: &[AttemptRow]) -> String {
+    attempts
+        .iter()
+        .rev()
+        .find_map(|a| {
+            a.git_head_after
+                .clone()
+                .or_else(|| a.partial_commit.clone())
+        })
+        .unwrap_or_else(|| t.base_commit.clone())
+}
+
 /// What the HEAD guard does about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum HeadGuard {
@@ -3758,7 +3850,13 @@ impl HeadGuard {
             ),
         }
         };
-        let checkout = format!(" — check out {branch} again first");
+        // M13-01 (X24): the way out must not walk the owner past the check — the commits an
+        // agent left on the branch are undone into the tree at the next writing attempt
+        let checkout = format!(
+            " — check out {branch} again; `toryo resume {} --note \"…\"` then undoes the commits made since {} into the tree and checks them",
+            branch.strip_prefix("toryo/").unwrap_or("<id>"),
+            short(head_before)
+        );
         if let Some(op) = &g.unfinished {
             return violation(
                 "unfinished git operation",

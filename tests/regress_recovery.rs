@@ -277,7 +277,9 @@ fn f4_recovery_never_resets_or_commits_on_the_branch_the_agent_switched_to() {
         "B-1",
         code,
         &err,
-        "policy_violation: after the Implementer turn HEAD is on refs/heads/other, not on the task branch toryo/B-1 (R12); nothing was reset or committed — check out toryo/B-1 again first",
+        // (M13-01: the way out no longer says "again first" — it names the resume that undoes
+        // the commits made since the anchor, so the text cannot walk the owner past the check)
+        &format!("policy_violation: after the Implementer turn HEAD is on refs/heads/other, not on the task branch toryo/B-1 (R12); nothing was reset or committed — check out toryo/B-1 again; `toryo resume B-1 --note \"…\"` then undoes the commits made since {} into the tree and checks them", &base[..12]),
     );
     // … which is true: the teammate's branch holds the teammate's and the agent's commits,
     // the task branch its base, the worktree the agent's edit
@@ -313,7 +315,7 @@ fn f4_recovery_escalates_an_unrepairable_git_state_with_nothing_reset() {
             // land on the task branch (was: committed on the detached HEAD)
             "detached" => (
                 vec![put(&gd.join("HEAD"), &format!("{base}\n"))],
-                format!("HEAD is detached at {}, not on the task branch toryo/{id} (R12); nothing was reset or committed — check out toryo/{id} again first", &base[..12]),
+                format!("HEAD is detached at {}, not on the task branch toryo/{id} (R12); nothing was reset or committed — check out toryo/{id} again; `toryo resume {id} --note \"…\"` then undoes the commits made since {} into the tree and checks them", &base[..12], &base[..12]),
                 base.clone(),
             ),
             // the task branch at a commit that does not descend from the base (was: a
@@ -983,4 +985,247 @@ fn m12_01_a_forged_partial_commit_under_another_commit_is_not_taken() {
     assert!(!log.contains(&first) && !log.contains(&second), "{log}");
     assert_eq!(code, 0, "{err}");
     assert_eq!(task(&env, "H-U").state, St::Completed, "{err}");
+}
+
+// ── M13-01 (X24): every writing attempt starts at the anchor ──────────────────────────────
+
+const DENY_ZZZ: &str = "policy:\n  deny_paths: [\"**/ZZZ/**\"]\n";
+
+/// AC-1. The implementer commits a **denied** file on the task branch and detaches HEAD; the
+/// HEAD guard escalates ("check out the branch again …"). The owner does that and resumes. Was:
+/// the next attempt began at the agent's commit, saw a clean tree, and the task completed with
+/// the file on its branch. Now the attempt starts at the anchor — the last commit Toryo
+/// recorded: the commit is undone into the tree and its file meets the path policy.
+#[test]
+fn m13_01_a_commit_left_at_the_branch_tip_is_undone_before_the_next_attempt() {
+    let env = setup_with("codex-openai", DENY_ZZZ);
+    create(&env, "A-1");
+    let w = wt(&env, "A-1");
+    let base = rev(&w, "HEAD");
+    let branch = env.repo.join(".git/refs/heads/toryo/A-1");
+    let x = commit_of(
+        &env,
+        &w,
+        &base,
+        Some(&base),
+        &[
+            ("src/Calculator.psm1", &with_divide(&w, &base)),
+            ("src/ZZZ/secret.ps1", "evil\n"),
+        ],
+        "agent commit",
+    );
+    let s = script(
+        &env,
+        "a1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![
+                write("src/Calculator.psm1", DIVIDE),
+                write("src/ZZZ/secret.ps1", "evil\n"),
+                put(&branch, &format!("{x}\n")),
+                put(&git_dir(&w).join("HEAD"), &format!("{x}\n")),
+                implementation(),
+            ])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "A-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "A-1").state, St::Escalated, "{err}");
+    let why = reason(&env, "A-1");
+    assert!(
+        why.contains("HEAD is detached")
+            && why.contains("check out toryo/A-1 again;")
+            && why.contains(&format!("undoes the commits made since {}", &base[..12])),
+        "the text must not walk the owner past the check: {why}"
+    );
+    // the owner does what the text says
+    git(&w, &["checkout", "-q", "toryo/A-1"]);
+    assert_eq!(rev(&w, "HEAD"), x);
+    let s2 = script(
+        &env,
+        "a1b.json",
+        json!({
+            "implementer": [turn(vec![implementation()]), turn(vec![implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "A-1",
+            "--note",
+            "go on",
+            "--yes",
+            "--fake-agents",
+            &s2,
+        ],
+        &[],
+    );
+    let log = git(&w, &["log", "--format=%H", "main..HEAD"]);
+    assert!(
+        !log.contains(&x),
+        "the agent's commit is on the branch: {log}\n{err}"
+    );
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!files.contains("ZZZ"), "{files}\n{err}");
+    assert!(
+        err.contains("on top of the anchor") && err.contains(&base[..12]),
+        "{err}"
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "A-1").state, St::Completed, "{err}");
+    // every writing attempt after the first began at the anchor
+    let second = attempt(&env, "A-1/fix-1/1");
+    assert_eq!(second.git_head_before.as_deref(), Some(base.as_str()));
+}
+
+/// AC-2. The **reviewer** commits. Was: "HEAD moved" was reported, nothing was reset, and the
+/// fix cycle after `resume --note` checkpointed on top of the reviewer's commit. Now HEAD is
+/// soft-reset to where the turn began and what the role wrote is put back.
+#[test]
+fn m13_01_a_commit_by_the_reviewer_is_undone_and_its_file_put_back() {
+    let env = setup_with("codex-openai", DENY_ZZZ);
+    create(&env, "A-2");
+    let s = script(
+        &env,
+        "a2.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["run", "A-2", "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "review:after_begin")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let w = wt(&env, "A-2");
+    let c1 = rev(&w, "HEAD");
+    let branch = env.repo.join(".git/refs/heads/toryo/A-2");
+    let x = commit_of(
+        &env,
+        &w,
+        &c1,
+        Some(&c1),
+        &[("src/ZZZ/secret.ps1", "evil\n")],
+        "reviewer commit",
+    );
+    let s2 = script(
+        &env,
+        "a2b.json",
+        json!({ "reviewer": [turn(vec![
+            write("src/ZZZ/secret.ps1", "evil\n"),
+            put(&branch, &format!("{x}\n")),
+            approved(),
+        ])] }),
+    );
+    let (_, err) = toryo(&env, &["resume", "A-2", "--yes", "--fake-agents", &s2], &[]);
+    assert_eq!(task(&env, "A-2").state, St::Escalated, "{err}");
+    assert!(
+        reason(&env, "A-2").starts_with("policy_violation:"),
+        "{err}"
+    );
+    assert_eq!(
+        rev(&w, "HEAD"),
+        c1,
+        "the reviewer's commit is undone: {err}"
+    );
+    assert!(!w.join("src/ZZZ/secret.ps1").exists(), "put back: {err}");
+    let s3 = script(
+        &env,
+        "a2c.json",
+        json!({
+            "implementer": [turn(vec![implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "A-2",
+            "--note",
+            "again",
+            "--yes",
+            "--fake-agents",
+            &s3,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "A-2").state, St::Completed, "{err}");
+    let log = git(&w, &["log", "--format=%H", "main..HEAD"]);
+    assert!(!log.contains(&x), "{log}");
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!files.contains("ZZZ"), "{files}");
+}
+
+/// AC-3. HEAD at a commit that does not descend from the anchor (an orphan on the task branch):
+/// nothing is reset — a soft reset would not undo it — and the task escalates naming both
+/// commits. Was: after `resume --note` the next attempt began at the orphan and checkpointed on it.
+#[test]
+fn m13_01_a_head_that_does_not_descend_from_the_anchor_escalates() {
+    let env = setup("codex-openai");
+    create(&env, "A-3");
+    let w = wt(&env, "A-3");
+    let base = rev(&w, "HEAD");
+    let branch = env.repo.join(".git/refs/heads/toryo/A-3");
+    let orphan = commit_of(
+        &env,
+        &w,
+        &base,
+        None,
+        &[("src/Calculator.psm1", &with_divide(&w, &base))],
+        "rewritten",
+    );
+    crash_after_the_turn(
+        &env,
+        "A-3",
+        vec![
+            write("src/Calculator.psm1", DIVIDE),
+            put(&branch, &format!("{orphan}\n")),
+            implementation(),
+        ],
+    );
+    let (code, err) = run_after_the_crash(&env, "A-3");
+    assert_eq!(code, 1, "{err}");
+    assert!(reason(&env, "A-3").contains("history rewritten"), "{err}");
+    let s = script(
+        &env,
+        "a3.json",
+        json!({
+            "implementer": [turn(vec![implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "A-3",
+            "--note",
+            "go on",
+            "--yes",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "A-3").state, St::Escalated, "{err}");
+    let why = reason(&env, "A-3");
+    assert!(
+        why.starts_with("policy_violation:")
+            && why.contains(&orphan[..12])
+            && why.contains(&base[..12])
+            && why.contains("nothing was reset"),
+        "{why}"
+    );
+    assert_eq!(rev(&w, "refs/heads/toryo/A-3"), orphan, "not reset");
+    assert_eq!(
+        attempts(&env, "A-3").len(),
+        2,
+        "plan/1, implement/1: no further attempt began"
+    );
 }
