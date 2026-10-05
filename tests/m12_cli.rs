@@ -249,3 +249,145 @@ fn m13_11_a_create_that_fails_after_the_worktree_removes_branch_and_worktree() {
     create(&env, "N-2");
     assert_eq!(task(&env, "N-2").state, St::New);
 }
+
+// ── M13-12 (X29): Ctrl+C on `toryo run` is a stop request ─────────────────────────────────
+
+/// `toryo run <id>` that presses Ctrl+C on itself at `presses` (milliseconds after its start;
+/// `TORYO_TEST_INTERRUPT_AFTER_MS`). On Windows it gets a console of its own, without a window
+/// — the key goes to every process of a console, and the test must not get it. Returns the
+/// exit code (`None`: ended by a signal) and what it printed to stderr.
+fn run_and_press_ctrl_c(env: &Env, id: &str, script: &str, presses: &str) -> (Option<i32>, String) {
+    let mut c = command(
+        env,
+        &["run", id, "--yes", "--fake-agents", script],
+        &[("TORYO_TEST_INTERRUPT_AFTER_MS", presses)],
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let log = env.root.join(format!("{id}-ctrl-c.log"));
+    c.stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap());
+    let mut child = c.spawn().unwrap();
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(90) {
+            let _ = child.kill();
+            panic!(
+                "`toryo run {id}` did not end after Ctrl+C:\n{}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    (
+        status.code(),
+        std::fs::read_to_string(&log).unwrap_or_default(),
+    )
+}
+
+fn event_types(env: &Env, id: &str) -> Vec<String> {
+    std::fs::read_to_string(task(env, id).run_store.join("events.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v["type"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// AC-1: one Ctrl+C while the planner's turn runs. Was: the process was killed — no
+/// `run_ended`, the attempt left `Running`, recovery had to clean up. Now it is what
+/// `toryo stop` is: the turn is ended, the attempt is `Interrupted`, the state stays (R38),
+/// `run_ended` is written, and the first press says what the second one does.
+#[test]
+fn m13_12_ctrl_c_on_run_is_a_stop_request() {
+    let env = setup("codex-openai");
+    create(&env, "K-1");
+    let s = script(&env, "k1.json", json!({"planner": [turn(vec![hang()])]}));
+    let (code, err) = run_and_press_ctrl_c(&env, "K-1", &s, "6000");
+    assert!(
+        err.contains("stop requested — the running turn or gate is ended at the next boundary; press Ctrl+C again to end now"),
+        "{err}"
+    );
+    assert!(
+        err.contains("stop request handled"),
+        "as after `toryo stop`: {err}"
+    );
+    assert!(code.is_some(), "the process ended by itself: {err}");
+    let a = attempts(&env, "K-1")
+        .into_iter()
+        .find(|a| a.id == "K-1/plan/1")
+        .expect("the plan attempt");
+    assert_eq!(
+        a.status,
+        toryo::engine::store::AttemptStatus::Interrupted,
+        "{err}"
+    );
+    assert_eq!(
+        task(&env, "K-1").state,
+        St::Planning,
+        "a stop leaves the state (R38)"
+    );
+    assert_eq!(
+        event_types(&env, "K-1").last().map(String::as_str),
+        Some("run_ended"),
+        "{err}"
+    );
+    // and `resume` goes on, as after `toryo stop`
+    let s2 = script(
+        &env,
+        "k1b.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(&env, &["resume", "K-1", "--yes", "--fake-agents", &s2], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "K-1").state, St::Completed, "{err}");
+}
+
+/// AC-2: two presses, one right after the other — the second ends the process at once, as
+/// Ctrl+C always did: nothing is recorded (the attempt stays `Running`, no `run_ended`), and
+/// the next `resume` recovers as today.
+#[test]
+fn m13_12_a_second_ctrl_c_ends_the_process_at_once() {
+    let env = setup("codex-openai");
+    create(&env, "K-2");
+    let s = script(&env, "k2.json", json!({"planner": [turn(vec![hang()])]}));
+    let (code, err) = run_and_press_ctrl_c(&env, "K-2", &s, "6000,6000");
+    assert_ne!(code, Some(0), "killed, not ended: {err}");
+    let a = attempts(&env, "K-2")
+        .into_iter()
+        .find(|a| a.id == "K-2/plan/1")
+        .expect("the plan attempt");
+    assert_eq!(
+        a.status,
+        toryo::engine::store::AttemptStatus::Running,
+        "nothing was recorded: {err}"
+    );
+    assert_ne!(
+        event_types(&env, "K-2").last().map(String::as_str),
+        Some("run_ended"),
+        "{err}"
+    );
+    let s2 = script(
+        &env,
+        "k2b.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(&env, &["resume", "K-2", "--yes", "--fake-agents", &s2], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("recovery:"), "{err}");
+    assert_eq!(task(&env, "K-2").state, St::Completed, "{err}");
+}

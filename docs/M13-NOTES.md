@@ -18,7 +18,7 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
 - [x] M13-09 `environment_gate_confirm` says what to type, and how to say no
 - [x] M13-10 `doctor` looks at long paths where the first run will hit them
 - [x] M13-11 `task create` is all or nothing (X28)
-- [ ] M13-12 Ctrl+C on `toryo run` is a stop request (X29)
+- [x] M13-12 Ctrl+C on `toryo run` is a stop request (X29)
 - [ ] M13-13 A launch error before the agent starts does not reserve a budget
 - [ ] M13-14 Tests the review asked for
 - [ ] M13-15 Notes, guide, `STATUS.md`
@@ -299,6 +299,35 @@ failed first; the rest is under "Open".
 - **Not tested end to end:** a failure after the row exists (the first artifacts, the protected baseline) — nothing cheap makes those fail. The
   removal of the row has the unit test `store::tests::a_task_that_was_never_finished_is_taken_back`.
 - **AC-2:** every existing create test passes unchanged (full run).
+
+
+### M13-12 — Ctrl+C on `toryo run` is a stop request (X29)
+
+- **No new crate.** `engine::lock::catch_interrupt()` (called at the start of every drive: `run`, `resume`) installs a console handler
+  (`SetConsoleCtrlHandler`) on Windows and a `SIGINT` handler elsewhere — the pattern `watch` already had. The **first** Ctrl+C (or Ctrl+Break) is
+  counted and prints "stop requested — the running turn or gate is ended at the next boundary; press Ctrl+C again to end now". The **second** is not
+  handled: on Windows the handler returns "not handled" and the system's default ends the process; on Unix the first press already put the default
+  action back.
+- **The same flag as `toryo stop`:** the stop watcher of the running stage (every 100 ms) and the check at every stage boundary turn a counted Ctrl+C
+  into the row `toryo stop` writes (`store::insert_stop`, requested by "<owner> (Ctrl+C)") — once per owner — and from there nothing is new: the turn
+  or gate is cancelled, the attempt ends `Interrupted`, the state stays (R38), `run_ended` is written, the toast is sent. A `resume` without an id
+  that drives several tasks stops each of them at its first boundary.
+- **Children:** agents and gates are started without a console (`CREATE_NO_WINDOW`) inside their Job — they never saw the key and still do not; they
+  are ended by the stop, as after `toryo stop`.
+- **Tests — with a real console event, also on Windows** (`tests/m12_cli.rs`; before the change both hung until the test killed the run):
+  `m13_12_ctrl_c_on_run_is_a_stop_request` (AC-1: the note, "stop request handled", attempt `Interrupted`, state `Planning`, last event `run_ended`,
+  then `resume` completes) and `m13_12_a_second_ctrl_c_ends_the_process_at_once` (AC-2: two presses → the process is gone, the attempt is still
+  `Running`, no `run_ended`; the next `resume` recovers and completes).
+  **How the key is pressed:** the test starts `toryo run` with a console of its own (`CREATE_NO_WINDOW`: the key goes to every process of a console,
+  and the test runner must not get it) and with **`TORYO_TEST_INTERRUPT_AFTER_MS`** (tests only: `6000`, or `6000,6000` for two presses), which makes
+  the process send itself the event after that time — `GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)` on Windows, `raise(SIGINT)` on Unix. So the
+  system delivers the event and the real handler runs. On Windows the hook first clears an inherited "ignore Ctrl+C" (a process started by one
+  that ignores the key inherits that — `cargo test` under this session did; without it no event arrived).
+- **Not done by hand:** this session has no interactive console; the two tests above are the evidence. Worth one manual press by the owner on the
+  first real run.
+- **Open:** a `toryo run` that was itself started with Ctrl+C ignored (`start /b`, some CI shells) does not see the key, as before — only the test
+  hook clears that. The Unix halves (handler, `raise`) are written by reading (the `watch` handler next to it compiles on Linux and has the same
+  shape); CI is their first build.
 
 
 ## Open

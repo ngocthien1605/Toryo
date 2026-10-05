@@ -329,6 +329,8 @@ fn recovered_events(
 /// exit — also an error before the first stage (an unverified profile, a bad fake script, a
 /// Git or store error) — ends with one `run_ended` (R1): `watch` stops and the owner is told.
 fn drive(store: &Store, lock: &TaskLock, rec: &Recorder, d: &DriveArgs) -> Result<i32> {
+    // M13-12 (X29): from here on Ctrl+C is a stop request for the task being driven
+    lock::catch_interrupt();
     rec.emit_quiet(EngineEvent::RunStarted {
         owner: lock::owner_label(),
     });
