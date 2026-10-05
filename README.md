@@ -393,7 +393,9 @@ from the repository checkout (`project.root`), never from a task worktree, and e
     always` (default `never`: as before): `first` once per task, `always` once per checkpoint commit. The question is
     a machine stop **before any gate runs** (`environment_gate_confirm`): the reason shows the gate, the lock, the
     commit, the first 20 lines of `git diff --stat <base>..<commit>` and the command; a plain `toryo resume <id>`
-    is the "yes" (no fix cycle); `--yes` never confirms a deploy. `config show` and `doctor` print the setting.
+    is the "yes" (no fix cycle); `--yes` never confirms a deploy (`resume <id> --yes` is refused, and a `resume`
+    without an id skips such a task). `first` asks once per **task**: a later commit of the same task deploys
+    without asking again — use `always` to look at every one. `config show` and `doctor` print the setting.
   - **The script contract** (`templates/toryo.local.yaml.example`): exit code decides (PowerShell: `$ErrorActionPreference
     = 'Stop'` and `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }` after every native call); deploy only
     `$env:TORYO_VERIFY_CHECKOUT` / `$env:TORYO_VERIFY_BUILD`, never your main repository folder; idempotent; print

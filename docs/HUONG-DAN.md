@@ -792,7 +792,9 @@ trượt đầu tiên; exit code quyết định; mọi gate có `TORYO_TASK`, `
   always` (mặc định `never`: như cũ) — `first` một lần cho mỗi task, `always` một lần cho mỗi commit checkpoint. Câu
   hỏi là một lần dừng do máy **trước khi bất kỳ gate nào chạy** (`environment_gate_confirm`): lý do ghi gate, lock,
   commit, 20 dòng đầu của `git diff --stat <base>..<commit>` và lệnh; `toryo resume ID` thường là "đồng ý" (không tốn
-  vòng sửa); `--yes` không bao giờ xác nhận một lần deploy. `config show` và `doctor` in cài đặt này.
+  vòng sửa); `--yes` không bao giờ xác nhận một lần deploy (`resume ID --yes` bị từ chối; `resume` không có id bỏ qua
+  task đó). `first` hỏi một lần cho mỗi **task**: commit sau đó của cùng task deploy không hỏi lại — dùng `always`
+  nếu muốn xem từng commit. `config show` và `doctor` in cài đặt này.
 
 **Ví dụ D365FO**: build kiểm tra (check) rồi DB sync (environment).
 

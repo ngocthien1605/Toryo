@@ -2380,13 +2380,28 @@ fn m12_07_confirm_first_stops_before_any_gate_and_resume_is_the_yes() {
         "cf1b.json",
         json!({ "reviewer": [turn(vec![approved()])] }),
     );
+    // … but not `resume --yes` (it is for the gates, never a deploy), and not a resume of
+    // everything (no id)
     let (code, err) = toryo(
         &env,
         &["resume", "CF-1", "--yes", "--fake-agents", &s2],
         &[],
     );
-    assert_eq!(code, 0, "{err}");
+    assert_ne!(code, 0, "{err}");
+    assert!(err.contains("--yes never confirms a deploy"), "{err}");
+    assert_eq!(task(&env, "CF-1").state, St::Escalated);
+    let (_, err) = toryo(&env, &["resume", "--fake-agents", &s2], &[]);
+    assert!(
+        err.contains("CF-1: waits for your yes before it deploys"),
+        "{err}"
+    );
+    assert_eq!(task(&env, "CF-1").state, St::Escalated);
+    assert!(!probe.exists() && !marker.exists());
+    let (_, err) = toryo(&env, &["resume", "CF-1", "--fake-agents", &s2], &[]);
     assert!(err.contains("deploy confirmed (dbsync"), "{err}");
+    assert_eq!(task(&env, "CF-1").state, St::WaitingFinalApproval, "{err}");
+    let (code, err) = toryo(&env, &["approve", "CF-1", "--gate", "final"], &[]);
+    assert_eq!(code, 0, "{err}");
     let t = task(&env, "CF-1");
     assert_eq!(t.state, St::Completed, "{err}");
     assert_eq!(t.fix_cycle, 0, "no fix cycle for the question");
@@ -2434,18 +2449,22 @@ fn m12_07_first_asks_once_per_task_and_always_once_per_checkpoint() {
             &format!("{id}-2.json"),
             json!({ "reviewer": [turn(vec![approved()])] }),
         );
-        let (code, err) = toryo(&env, &["resume", &id, "--yes", "--fake-agents", &s1], &[]);
+        let (code, err) = toryo(&env, &["resume", &id, "--fake-agents", &s1], &[]);
         let mut err = err;
         if mode == "always" {
             // the second checkpoint stops again; one more yes
             assert_eq!(code, 1, "{mode}: {err}");
             assert_eq!(task(&env, &id).state, St::Escalated, "{mode}: {err}");
-            let (code, e2) = toryo(&env, &["resume", &id, "--yes", "--fake-agents", &s2], &[]);
-            assert_eq!(code, 0, "{mode}: {e2}");
+            let (_, e2) = toryo(&env, &["resume", &id, "--fake-agents", &s2], &[]);
             err = e2;
-        } else {
-            assert_eq!(code, 0, "{mode}: {err}");
         }
+        assert_eq!(
+            task(&env, &id).state,
+            St::WaitingFinalApproval,
+            "{mode}: {err}"
+        );
+        let (code, e3) = toryo(&env, &["approve", &id, "--gate", "final"], &[]);
+        assert_eq!(code, 0, "{mode}: {e3}");
         let t = task(&env, &id);
         assert_eq!(t.state, St::Completed, "{mode}: {err}");
         assert_eq!(confirm_stops(&env, &id), stops, "{mode}");

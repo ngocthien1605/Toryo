@@ -20,32 +20,33 @@ pub const GATE_UNAVAILABLE: &str = "gate_unavailable";
 /// Script extensions of an absolute argument that must exist (environment gates).
 const SCRIPT_EXTENSIONS: [&str; 8] = [".ps1", ".psm1", ".cmd", ".bat", ".sh", ".py", ".js", ".exe"];
 
-/// The extensions a bare name may take on this machine: `PATHEXT` on Windows (the default list
-/// when it is unset), none elsewhere.
-fn extensions() -> Vec<String> {
-    if !cfg!(windows) {
-        return vec![String::new()];
-    }
-    let from_env = std::env::var("PATHEXT").unwrap_or_default();
-    let list: Vec<String> = from_env
-        .split(';')
-        .filter(|e| !e.is_empty())
-        .map(|e| e.to_ascii_lowercase())
-        .collect();
-    let list = if list.is_empty() {
-        [".com", ".exe", ".bat", ".cmd"].map(String::from).to_vec()
-    } else {
-        list
-    };
-    std::iter::once(String::new()).chain(list).collect()
+/// A file the system would let a process start — or, on Windows, anything that is not a folder
+/// where `metadata` cannot see through it (an App Execution Alias of the Store `pwsh.exe` is a
+/// reparse point `is_file()` calls false). Lenient on purpose: if the start then fails, the
+/// typed spawn error stops the gate the same way.
+fn startable(p: &Path) -> bool {
+    p.is_file()
+        || (cfg!(windows) && std::fs::symlink_metadata(p).is_ok_and(|m| !m.file_type().is_dir()))
 }
 
-/// `name` found in a folder of `path` (with each of `exts` appended), as a file.
-fn on_path(name: &str, path: &OsStr, exts: &[String]) -> Option<PathBuf> {
-    for dir in std::env::split_paths(path) {
-        for ext in exts {
+/// `name` the way the engine starts a bare program: a folder of `path` with nothing, `.exe` or
+/// `.cmd` appended (`checks::which_in`) — not `PATHEXT`: a `.bat` or `.com` alone does not start
+/// (M12-05 review) — then, as `CreateProcess` would, the folder of this program and the system
+/// folder on Windows.
+fn on_path(name: &str, path: &OsStr) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
+    if cfg!(windows) {
+        dirs.extend(
+            std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(Path::to_path_buf)),
+        );
+        dirs.extend(std::env::var_os("SystemRoot").map(|r| PathBuf::from(r).join("System32")));
+    }
+    for dir in dirs {
+        for ext in ["", ".exe", ".cmd"] {
             let p = dir.join(format!("{name}{ext}"));
-            if p.is_file() {
+            if startable(&p) {
                 return Some(p);
             }
         }
@@ -59,12 +60,17 @@ pub fn program_problem(program: &str, path: Option<&OsStr>) -> Option<String> {
     let has_sep = program.contains('/') || program.contains('\\');
     let p = Path::new(program);
     if p.is_absolute() || p.has_root() {
-        return (!p.is_file()).then(|| format!("program `{program}` does not exist"));
+        // an absolute path without an extension starts `<path>.exe` on Windows
+        let found = startable(p)
+            || (cfg!(windows)
+                && p.extension().is_none()
+                && startable(&PathBuf::from(format!("{program}.exe"))));
+        return (!found).then(|| format!("program `{program}` does not exist"));
     }
     if has_sep {
         return None;
     }
-    let found = path.and_then(|path| on_path(program, path, &extensions()));
+    let found = path.and_then(|path| on_path(program, path));
     found.is_none().then(|| {
         format!("program `{program}` is not on the PATH the gate gets (PATH of this process)")
     })
@@ -248,6 +254,15 @@ mod tests {
         assert!(program_problem(&gone, None)
             .unwrap()
             .contains("does not exist"));
+        // (review) the engine starts `name`, `name.exe` or `name.cmd` — not PATHEXT: a `.bat`
+        // alone does not start, so it is a stop at the preflight and not after it
+        std::fs::write(d.path().join("only-a-batch.bat"), "x").unwrap();
+        assert!(program_problem("only-a-batch", Some(&path)).is_some());
+        // an absolute path without an extension starts `<path>.exe` on Windows
+        if cfg!(windows) {
+            let no_ext = d.path().join("tool").display().to_string();
+            assert_eq!(program_problem(&no_ext, None), None);
+        }
         // a repository path is not asked here (M18)
         assert_eq!(program_problem("scripts/build.ps1", None), None);
         assert_eq!(program_problem("./gradlew", None), None);

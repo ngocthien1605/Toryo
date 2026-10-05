@@ -14,7 +14,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] M12-05 A gate that cannot start is a machine stop, and `doctor` finds it first
 - [x] M12-06 An environment gate that times out stops for the owner (X18)
 - [x] M12-07 Confirm before deploy (X17)
-- [ ] Review of M12-05…07 (subagent, in place)
+- [x] Review of M12-05…07 (subagent, in place)
 - [x] M12-08 `base_branch` is honoured; keys without effect say so (X19, X20)
 - [ ] M12-09 `./toryo.yaml` before `$TORYO_CONFIG` (X21)
 - [ ] M12-10 Text files: BOM ignored, non-UTF-8 refused by name (X22)
@@ -217,6 +217,32 @@ One High, four Medium, four Low; the High and the Mediums fixed here.
 - **Tests:** `tests/m12_config.rs` — `m12_08_base_branch_is_the_base_of_task_create` (AC-1: `feature/wip` checked out,
   the task branches from `main`, the note; `--base` wins; a missing branch names the key),
   `m12_08_without_the_key_the_checked_out_branch_is_the_base` (AC-2), `m12_08_keys_without_effect_say_so` (AC-3).
+
+### Review of M12-05…07 (independent subagent, in place, no build) — follow-up commit
+
+No Critical or High; three Medium, fixed here.
+- **Medium — `toryo resume` without an id confirmed every deploy stop**, and **`resume <id> --yes`** confirmed too
+  (contradicting "`--yes` never confirms a deploy"). Now: `resume <id> --yes` on an `environment_gate_confirm` stop is
+  refused ("--yes never confirms a deploy … `toryo resume <id>` without --yes"); a resume of everything skips such a
+  task and says it waits for the owner's yes (exit code 1). The confirm tests now resume without `--yes` and approve
+  the final gate by hand.
+- **Medium — the resolver did not look programs up like the spawn does** (`checks::which_in`: nothing, `.exe`, `.cmd`;
+  Rust adds `.exe` to an absolute path without an extension; `CreateProcess` also looks in the folder of the
+  program and in System32). `gates::program_problem` follows that, **not `PATHEXT`** (deviation from the list's "with
+  `PATHEXT`": a `.bat` or `.com` alone does not start, so it is a stop at the preflight, not after it). It is lenient
+  for a Windows reparse point (an App Execution Alias of Store `pwsh.exe`; `is_file()` is false for it) — if the start
+  then fails, the typed spawn error stops the gate the same way.
+- **Low–Medium — the timeout stop lost what the gate had printed:** the reason now carries the last 40 lines
+  (`untrusted::wrap`ped). The spawn-failure hint also says "or the working directory and the rights it needs".
+- **Docs:** `first` is once per **task**, not per commit — README and HUONG-DAN say so.
+- **Recorded, not changed (Open):** a gate that exits 0 while a descendant keeps the pipe open past the limit is
+  reported as timed out; a stop request that lands after the timeout wins and the timeout warning is lost (the next
+  resume re-runs the gate); `doctor` shows `confirm:` only on OK lines; the `git -C <worktree> show` hint does not
+  quote a path with spaces; if the pending file is lost, "deploy confirmed ()" is printed and Verify asks once more;
+  `script_problems` would refuse an absolute non-existent output path ending in `.js` / `.py` / `.exe`; UNC `is_file`
+  calls can block `doctor` / `task create`; the environment-gate spawn-error branch, a `--note` after a confirm stop
+  and a reload mid-task have no test; whether `Path::is_file()` is true for a Store App Execution Alias is
+  **unverified** here (the preflight is lenient for it).
 
 ## Open
 

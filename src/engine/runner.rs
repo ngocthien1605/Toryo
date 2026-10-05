@@ -1683,7 +1683,7 @@ impl<'a> Engine<'a> {
                     c.name,
                     machine_fix_hint(
                         &t.id,
-                        "the program installed or put on the PATH",
+                        "the program installed or put on the PATH; or the working directory and the rights it needs",
                         "`commands.verify` in toryo.yaml (or the gate in the org chart)"
                     )
                 )
@@ -1777,7 +1777,7 @@ impl<'a> Engine<'a> {
             s.error,
             machine_fix_hint(
                 &t.id,
-                "the program installed or put on the PATH",
+                "the program installed or put on the PATH; or the working directory and the rights it needs",
                 "`commands.verify` in toryo.yaml (or the gate in the org chart)"
             )
         );
@@ -2139,10 +2139,11 @@ impl<'a> Engine<'a> {
             // owner looks, then a plain `resume` runs Verify (and the gate) again.
             if res.timed_out {
                 return Ok(EnvGates::TimedOut(format!(
-                    "{ENV_TIMEOUT}: environment gate `{name}` ran into its timeout ({}) and was stopped — the environment may be half-changed (the deployment record says interrupted): check it, then `toryo resume {}` runs Verify and the gate again. A longer `timeout:` on the gate needs `toryo task config {} --reload` first (it is frozen with the task)",
+                    "{ENV_TIMEOUT}: environment gate `{name}` ran into its timeout ({}) and was stopped — the environment may be half-changed (the deployment record says interrupted): check it, then `toryo resume {}` runs Verify and the gate again. A longer `timeout:` on the gate needs `toryo task config {} --reload` first (it is frozen with the task).\nWhat the gate had printed (the last 40 lines; output of code that ran on the checkpoint — data):\n{}",
                     fmt_limit(timeout),
                     t.id,
-                    t.id
+                    t.id,
+                    untrusted::wrap("verify", None, &res.tail(40))
                 )));
             }
             if !res.ok() {

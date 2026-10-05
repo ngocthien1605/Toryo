@@ -990,8 +990,27 @@ fn machine_caused_stop(t: &TaskRow) -> bool {
         && t.machine.escalated_from().is_some_and(|s| s.is_running())
 }
 
+/// M12-07: the task is stopped with `environment_gate_confirm` — it waits for the owner's "yes".
+fn waits_for_a_deploy_yes(t: &TaskRow) -> bool {
+    machine_caused_stop(t) && t.machine.reason_class() == Some(toryo::engine::gates::ENV_CONFIRM)
+}
+
 fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
     let t = get(st, &lock.task)?;
+    // M12-07 (X17): `--yes` never confirms a deploy — it is for the plan and the final gate
+    if d.yes
+        && waits_for_a_deploy_yes(&t)
+        && r.note.is_none()
+        && !r.discard_partial
+        && !r.keep_partial
+    {
+        bail!(
+            "{}: --yes never confirms a deploy. Look at the checkpoint, then `toryo resume {}` without --yes (the final gate is then approved with `toryo approve {} --gate final`)",
+            t.id,
+            t.id,
+            t.id
+        );
+    }
     let protected = t.state == PipelineState::Escalated
         && t.machine
             .reason()
@@ -1137,6 +1156,16 @@ pub fn resume(id: Option<&str>, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
             let tasks = st.call(store::list_tasks)?;
             let mut code = 0;
             for t in tasks.into_iter().filter(|t| !t.state.is_terminal()) {
+                // M12-07 (review): a stop that asks before a deploy is answered by `resume <id>`
+                // — never by a resume of everything
+                if waits_for_a_deploy_yes(&t) {
+                    eprintln!(
+                        "\n{}: waits for your yes before it deploys — look at it, then `toryo resume {}`",
+                        t.id, t.id
+                    );
+                    code = code.max(1);
+                    continue;
+                }
                 match TaskLock::acquire(&st, &t.id) {
                     Ok(lock) => {
                         eprintln!("\n▶ resume {}", t.id);
