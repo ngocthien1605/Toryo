@@ -174,13 +174,24 @@ pub struct WaitOptions {
     pub stall: Option<Duration>,
     /// Polled about once per second; returning true terminates the tree (spike stand-in for R38 control requests).
     pub cancel: Option<Box<dyn Fn() -> bool + Send>>,
+    /// M12-16: called with the time the process tree has run, every `Duration` — also while it
+    /// prints nothing (a database sync is silent for half an hour).
+    pub heartbeat: Option<(Duration, Heartbeat)>,
 }
+
+/// The callback of [`WaitOptions::heartbeat`].
+pub type Heartbeat = Box<dyn FnMut(Duration) + Send>;
 
 impl Running {
     /// Drain output (calling `on_chunk` for every redacted chunk) until the root
     /// process exits and both pipes are closed, or a limit fires.
-    pub fn wait(mut self, opts: WaitOptions, mut on_chunk: impl FnMut(Chunk)) -> Result<ExitInfo> {
+    pub fn wait(
+        mut self,
+        mut opts: WaitOptions,
+        mut on_chunk: impl FnMut(Chunk),
+    ) -> Result<ExitInfo> {
         let mut last_output = Instant::now();
+        let mut last_beat = Instant::now();
         let (mut timed_out, mut stalled, mut cancelled) = (false, false, false);
         let mut last_cancel_poll = Instant::now();
         let mut exited_at: Option<Instant> = None;
@@ -225,6 +236,12 @@ impl Running {
             if let Some(stall) = opts.stall {
                 if last_output.elapsed() > stall {
                     stalled = true;
+                }
+            }
+            if let Some((every, beat)) = opts.heartbeat.as_mut() {
+                if last_beat.elapsed() >= *every {
+                    last_beat = Instant::now();
+                    beat(self.started.elapsed());
                 }
             }
             if let Some(c) = &opts.cancel {

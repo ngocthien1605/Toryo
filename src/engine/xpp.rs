@@ -512,6 +512,7 @@ pub fn not_started(name: &str) -> CommandResult {
         duration_ms: 0,
         output: "not started: the earlier projects of this command used up its timeout_min".into(),
         signal: None,
+        log: None,
     }
 }
 
@@ -530,7 +531,7 @@ pub fn entry(run: &Run, tc: &Toolchain, res: &CommandResult, diags: &Diagnostics
     let argv: Vec<String> = std::iter::once(tc.msbuild.display().to_string())
         .chain(run.command.iter().cloned())
         .collect();
-    json!({
+    let mut v = json!({
         "name": run.name,
         "kind": "xpp",
         "scope": "compile",
@@ -547,7 +548,12 @@ pub fn entry(run: &Run, tc: &Toolchain, res: &CommandResult, diags: &Diagnostics
         "warnings_total": diags.warnings_total,
         "output_tail": res.tail(40),
         "toolchain": toolchain_json(tc),
-    })
+    });
+    // M12-16: the file with the whole (bounded, redacted) output
+    if let Some(l) = &res.log {
+        v["log"] = json!(l.display().to_string());
+    }
+    v
 }
 
 // ── diagnostics (B3, ARCH-10) ──────────────────────────────────────────────────────────

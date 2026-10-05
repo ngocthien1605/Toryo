@@ -23,7 +23,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] M12-13 Long paths on Windows
 - [x] M12-14 An agent CLI that dies without a result shows its error text
 - [x] M12-15 Gate output: OEM code page; one UI language for every gate (X23)
-- [ ] M12-16 Gate output for the owner: full log, heartbeat, bounded memory
+- [x] M12-16 Gate output for the owner: full log, heartbeat, bounded memory
 - [ ] M12-17 `doctor` checks what a first run needs
 - [ ] M12-18 The D365FO template loads as shipped; example gate scripts
 - [ ] M12-19 Guide: "First real task on D365FO", one escalation table, stale lines
@@ -389,6 +389,32 @@ No Critical or High; three Medium, fixed here.
   gate and an environment gate under an inherited Japanese `VSLANG`).
 - **Not tested end to end:** a gate that really prints cp932 through the pipeline — this machine's OEM code page is not 932,
   and `decode_output` reads the machine's, so only the inner function is pinned.
+
+
+### M12-16 — Gate output for the owner: full log, heartbeat, bounded memory (review M1)
+
+- **(c) Bounded memory (`src/runner.rs`):** `BoundedOutput` keeps the first 1 MB and the last 8 MB of the raw output (a
+  `VecDeque` for the tail), counts what it drops and puts one marker line between ("[... N bytes of output omitted: Toryo
+  keeps the first 1 MB and the last 8 MB of a gate's output ...]"). The whole kept text is decoded (M12-15), stripped and
+  redacted once at the end, as before — so `CommandResult.output` is at most ~9 MB (was unbounded, held twice).
+- **(a) Log:** `LocalRunner::run_with(spec, sink, GateIo { log, heartbeat })` (`CommandRunner::run` is `run_with` with
+  nothing). The engine passes `<run store>/gate-logs/<unix ms>-<gate>.log` for every check gate, `tool: xpp` run and
+  environment gate (`Engine::gate_io`); the file holds exactly `output` (redacted, bounded). `VERIFY_RESULT.json` entries
+  get `"log"`; a failing gate prints `    full output: <path>` under its ✘ line. A log that cannot be written is a WARNING, not
+  a failing gate. `task cleanup` removes it with the run store. **Note on the spec:** (a) says "the full output" and (c) says
+  the log holds "the same text" as the bounded memory — I followed (c): the log is the bounded text, not 50 MB.
+- **(b) Heartbeat:** `WaitOptions.heartbeat` (called from `Running::wait`'s loop, so also while the gate prints nothing):
+  `  ... <gate> still running: M:SS elapsed, N bytes of output so far` on stderr every 60 s. `TORYO_GATE_HEARTBEAT_SECS`
+  shortens it — a knob for the test, not documented for the owner.
+- **Struct changes:** `CommandResult.log` (serialised only when set) — the seven struct literals in the unit tests got
+  `log: None`; `WaitOptions.heartbeat` (the one literal outside `Default` got `heartbeat: None`).
+- **Tests:** `runner::tests::bounded_output_keeps_the_head_and_the_tail`; `m12_gates::m12_16_a_gate_that_prints_50_mb_is_bounded`
+  (AC-2: 50 MB through `pwsh` / `sh`: exit 0, head and tail kept, marker, `output.len() <= 9 MB + 300`, the log equals the
+  output); `m12_16_a_silent_gate_gets_a_heartbeat_line` (AC-3, 1 s interval, and the log named in `VERIFY_RESULT.json`);
+  `m12_16_a_failing_gate_names_its_log`; `m11_env_gates::m12_16_the_gate_log_is_redacted` (AC-1: the secret is `[REDACTED:…]`
+  in the log; the check gate has a log too). `an_environment_gate_secret_is_redacted_everywhere` (EG-5) already walks the
+  whole run store for the secret and still passes with the logs in it.
+- **Not done:** live streaming of the output (the list says it is not part of this task).
 
 
 ## Open

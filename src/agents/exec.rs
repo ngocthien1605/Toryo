@@ -246,6 +246,7 @@ pub fn run_turn_with(
         max: Some(opts.max),
         stall: Some(opts.stall),
         cancel,
+        heartbeat: None,
     };
     // M12-14: what the CLI printed to stderr, kept (the tail) for a turn that ends without a
     // result — a rejected flag is printed there and nowhere else

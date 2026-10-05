@@ -164,3 +164,176 @@ fn m12_05_a_program_that_exists_but_cannot_start_is_the_same_stop() {
     assert_eq!(t.fix_cycle, 0);
     assert_eq!(stage(&env, "G-2", "implement").len(), 1);
 }
+
+// ── M12-16: gate output for the owner — the log file, the heartbeat, bounded memory ───────
+
+/// AC-2: a gate that prints 50 MB neither fails nor is held in memory: the result keeps the
+/// first 1 MB and the last 8 MB with one marker line between, and the log file holds the same
+/// text.
+#[test]
+fn m12_16_a_gate_that_prints_50_mb_is_bounded() {
+    use toryo::process::redact::Redactions;
+    use toryo::runner::{GateIo, LocalRunner, RunSpec, OUTPUT_HEAD_KEEP, OUTPUT_TAIL_KEEP};
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (program, args): (&str, Vec<String>) = if cfg!(windows) {
+        (
+            "pwsh",
+            vec![
+                "-NoProfile".into(),
+                "-Command".into(),
+                // 50 lines of 1 MB, the first line "HEAD…", the last "…TAIL"
+                "$s = 'x' * 1048574; 1..50 | ForEach-Object { if ($_ -eq 1) { 'HEAD' + $s } elseif ($_ -eq 50) { $s + 'TAIL' } else { $s } }".into(),
+            ],
+        )
+    } else {
+        (
+            "sh",
+            vec![
+                "-c".into(),
+                "printf HEAD; yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx | head -c 52428700; echo; echo TAIL"
+                    .into(),
+            ],
+        )
+    };
+    let d = tempfile::tempdir().unwrap();
+    let log = d.path().join("logs").join("big.log");
+    let spec = RunSpec {
+        name: "big".into(),
+        program: toryo::engine::checks::resolve_program(program),
+        args,
+        cwd: d.path().to_path_buf(),
+        env: std::env::vars().collect(),
+        boundary: toryo::process::Boundary::None,
+        timeout: std::time::Duration::from_secs(300),
+        cancel: None,
+        redact: Redactions::empty(),
+    };
+    let res = rt
+        .block_on(LocalRunner.run_with(
+            spec,
+            None,
+            GateIo {
+                log: Some(log.clone()),
+                heartbeat: None,
+            },
+        ))
+        .unwrap();
+    assert_eq!(res.exit, Some(0), "{}", res.tail(3));
+    assert!(res.output.starts_with("HEAD"), "the first bytes are kept");
+    assert!(
+        res.output.trim_end().ends_with("TAIL"),
+        "the last bytes are kept"
+    );
+    assert!(
+        res.output.contains("bytes of output omitted"),
+        "the marker is there"
+    );
+    assert!(
+        res.output.len() <= OUTPUT_HEAD_KEEP + OUTPUT_TAIL_KEEP + 300,
+        "bounded: {} bytes",
+        res.output.len()
+    );
+    assert_eq!(res.log.as_deref(), Some(log.as_path()));
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), res.output);
+}
+
+/// AC-3: a gate that prints nothing for a while still gets its line on the console — gate,
+/// elapsed time, bytes so far. (`TORYO_GATE_HEARTBEAT_SECS` shortens the minute.)
+#[test]
+fn m12_16_a_silent_gate_gets_a_heartbeat_line() {
+    use toryo::engine::PipelineState::Completed;
+    let (ps1, sh) = (
+        "\"started\"\nStart-Sleep -Seconds 4\n\"done\"\nexit 0\n",
+        "echo started\nsleep 4\necho done\nexit 0\n",
+    );
+    let (env, _marker) = {
+        // the check gate `probe` of the m11 helpers, copied: a gate script between the
+        // fixture's `divide-present` and nothing else
+        let probe = if cfg!(windows) {
+            "  probe: { kind: check, program: pwsh, args: [-NoProfile, -NonInteractive, -File, scripts/probe.ps1], timeout: 2m }\n"
+        } else {
+            "  probe: { kind: check, program: sh, args: [scripts/probe.sh], timeout: 2m }\n"
+        };
+        let org = ORGCHART.replace("IMPLEMENTER", "codex-openai").replacen(
+            "gates:\n",
+            &format!("gates:\n{probe}"),
+            1,
+        );
+        let file = if cfg!(windows) {
+            "scripts/probe.ps1"
+        } else {
+            "scripts/probe.sh"
+        };
+        let env = setup_orgchart(
+            "codex-openai",
+            "",
+            &[
+                (".toryo/toryo-orgchart.yaml", &org),
+                (
+                    ".toryo/roles/implementer/toryo-role.yaml",
+                    "toryo: 1\npurpose: Change the code.\nbefore_handoff: [divide-present, probe]\n",
+                ),
+                (file, if cfg!(windows) { ps1 } else { sh }),
+            ],
+        );
+        (env, ())
+    };
+    create(&env, "HB-1");
+    let s = script(
+        &env,
+        "hb1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["run", "HB-1", "--yes", "--fake-agents", &s],
+        &[("TORYO_GATE_HEARTBEAT_SECS", "1")],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "HB-1").state, Completed, "{err}");
+    assert!(
+        err.contains("probe still running:") && err.contains("bytes of output so far"),
+        "{err}"
+    );
+    // AC-1: the log file is named in VERIFY_RESULT.json and holds the output
+    let vr: Value = serde_json::from_slice(
+        &std::fs::read(task(&env, "HB-1").artifacts().join("VERIFY_RESULT.json")).unwrap(),
+    )
+    .unwrap();
+    let probe = vr["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "probe")
+        .unwrap_or_else(|| panic!("{vr}"));
+    let log = std::fs::read_to_string(probe["log"].as_str().unwrap()).unwrap();
+    assert!(log.contains("started") && log.contains("done"), "{log}");
+}
+
+/// AC-1: the failure line names the log file.
+#[test]
+fn m12_16_a_failing_gate_names_its_log() {
+    let env = setup("codex-openai");
+    with_verify_command(
+        &env,
+        r#"    - { name: no-text, program: git, args: ["grep", "-q", "text-that-is-nowhere", "--", "src"] }"#,
+    );
+    create(&env, "FL-1");
+    let err = run_to_the_gate(&env, "FL-1");
+    assert!(err.contains("✘ no-text (exit 1"), "{err}");
+    let line = err
+        .lines()
+        .find(|l| l.contains("full output:"))
+        .unwrap_or_else(|| panic!("{err}"));
+    assert!(
+        line.contains("gate-logs") && line.contains("no-text.log"),
+        "{line}"
+    );
+}

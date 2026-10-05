@@ -52,7 +52,7 @@ use crate::config::{expand_vars, Billing, CommandKind, CommandSpec, Effective, P
 use crate::domain::{ErrorClass, OpenSession, Role, StageOutcome, Tri, TurnInput, TurnLimits};
 use crate::git::GitCmd;
 use crate::process::Boundary;
-use crate::runner::{CommandResult, CommandRunner, LocalRunner, RunSpec};
+use crate::runner::{CommandResult, GateIo, LocalRunner, RunSpec};
 use crate::team::Level;
 use crate::usage::{Accounting, Weights};
 
@@ -1948,6 +1948,22 @@ impl<'a> Engine<'a> {
         Ok(Some(None))
     }
 
+    /// M12-16: the output of the gate `name` goes to a log file in the run store, and a line
+    /// says that the gate still runs every minute (`TORYO_GATE_HEARTBEAT_SECS` shortens it for
+    /// the tests).
+    fn gate_io(&self, name: &str) -> GateIo {
+        GateIo {
+            log: self.task().ok().map(|t| gate_log_path(&t.run_store, name)),
+            heartbeat: Some(Duration::from_secs(
+                std::env::var("TORYO_GATE_HEARTBEAT_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|s| *s > 0)
+                    .unwrap_or(60),
+            )),
+        }
+    }
+
     /// One verify process through `LocalRunner`, with its ✔/✘ line; `None` when a stop
     /// request ended it (R38). R50: LocalRunner strips ANSI (CSI/OSC) from what it captures.
     fn run_verify_command(&self, run: RunSpec, stop: &StopWatch) -> Result<Option<CommandResult>> {
@@ -1963,7 +1979,8 @@ impl<'a> Engine<'a> {
         kind: Option<&str>,
     ) -> Result<Option<CommandResult>> {
         let name = run.name.clone();
-        let res = self.hub.block_on(LocalRunner.run(run, None))?;
+        let io = self.gate_io(&name);
+        let res = self.hub.block_on(LocalRunner.run_with(run, None, io))?;
         if res.cancelled || stop.stopped() {
             return Ok(None);
         }
@@ -1975,6 +1992,9 @@ impl<'a> Engine<'a> {
             duration_ms: res.duration_ms as u64,
             kind: kind.map(str::to_string),
         });
+        if let (false, Some(log)) = (res.ok(), &res.log) {
+            eprintln!("    full output: {}", log.display());
+        }
         Ok(Some(res))
     }
 
@@ -2085,7 +2105,8 @@ impl<'a> Engine<'a> {
                 cancel: Some(stop.flag.clone()),
                 redact: crate::process::redact::Redactions::new(&redact),
             };
-            let res = match self.hub.block_on(LocalRunner.run(run, None)) {
+            let io = self.gate_io(name);
+            let res = match self.hub.block_on(LocalRunner.run_with(run, None, io)) {
                 Ok(r) => r,
                 Err(e) => {
                     // it did not start: say so in the record, not "interrupted"
@@ -2114,6 +2135,9 @@ impl<'a> Engine<'a> {
             // hold a partial deploy, so the record says interrupted (`ok` empty), not failed. A
             // stop that arrived after the gate finished keeps the gate's real result.
             let ok = deployment_ok(&res);
+            if let (false, Some(log)) = (res.ok(), &res.log) {
+                eprintln!("    full output: {}", log.display());
+            }
             let (i, l) = (t.id.clone(), lock_name.clone());
             self.store
                 .call(move |tx| store::deployment_end(tx, &l, &i, ok))?;
@@ -2140,7 +2164,11 @@ impl<'a> Engine<'a> {
             let argv: Vec<String> = std::iter::once(m.program.clone())
                 .chain(m.args.iter().cloned())
                 .collect();
-            results.push(json!({"name": name, "kind": "environment", "lock": lock_name, "machine": machine, "argv": argv, "exit": res.exit, "timed_out": res.timed_out, "ms": res.duration_ms, "output_tail": res.tail(40), "source": "export", "source_tree": export.tree}));
+            let mut entry = json!({"name": name, "kind": "environment", "lock": lock_name, "machine": machine, "argv": argv, "exit": res.exit, "timed_out": res.timed_out, "ms": res.duration_ms, "output_tail": res.tail(40), "source": "export", "source_tree": export.tree});
+            if let Some(l) = &res.log {
+                entry["log"] = json!(l.display().to_string());
+            }
+            results.push(entry);
             // M11-R9: the gate must not have written into what it deploys from (E3 AC-8)
             if let Some(reason) = verify::export_changed(&export) {
                 return Ok(EnvGates::Mutated(reason));
@@ -4214,6 +4242,24 @@ fn correction_prompt(violations: &[String]) -> String {
     format!("Your previous final response was rejected and was not used. Validation error: {}. Return only a corrected JSON object matching the schema.", violations.join("; "))
 }
 
+/// M12-16: where the output of the gate `name` run now is written: `<run store>/gate-logs/`.
+fn gate_log_path(run_store: &Path, name: &str) -> PathBuf {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    run_store.join("gate-logs").join(format!("{at}-{safe}.log"))
+}
+
 /// One verify command's entry in VERIFY_RESULT.json.
 fn command_result(c: &CommandSpec, res: &CommandResult) -> Value {
     let argv: Vec<String> = match c.kind() {
@@ -4226,6 +4272,10 @@ fn command_result(c: &CommandSpec, res: &CommandResult) -> Value {
     // M11-R17: the signal that ended it (Unix), only when there is one
     if let Some(s) = res.signal {
         v["signal"] = json!(s);
+    }
+    // M12-16: the file with the whole (bounded, redacted) output
+    if let Some(l) = &res.log {
+        v["log"] = json!(l.display().to_string());
     }
     v
 }
@@ -5971,6 +6021,7 @@ mod tests {
             duration_ms: 1500,
             output,
             signal: None,
+            log: None,
         };
         // M11-R17: how a command ended, in words
         assert_eq!(res.ended(), "exit 1");
@@ -6022,6 +6073,7 @@ mod tests {
                 duration_ms: 10,
                 output: output.into(),
                 signal: None,
+                log: None,
             };
         let many: String = (1..=45).map(|i| format!("line {i}\n")).collect();
         let tail: Vec<String> = (6..=45).map(|i| format!("line {i}")).collect();
@@ -6277,6 +6329,7 @@ mod tests {
             duration_ms: 1,
             output: String::new(),
             signal: None,
+            log: None,
         };
         // finished: its own result — also when a stop came afterwards (the stop flag is not
         // an input)

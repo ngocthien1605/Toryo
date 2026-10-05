@@ -2539,3 +2539,52 @@ fn m12_15_every_gate_gets_the_ui_language() {
         tail("dbsync")
     );
 }
+
+/// M12-16 AC-1: the whole output of an environment gate is in a log file of the run store, named
+/// in `VERIFY_RESULT.json`, and it is redacted like the rest.
+#[test]
+fn m12_16_the_gate_log_is_redacted() {
+    const SECRET: &str = "d365-sync-s3cr3t-88";
+    let env = env_gate_setup("codex-openai", "error", "");
+    define_gates(
+        &env,
+        &machine_gate(
+            &env,
+            "dbsync",
+            "d365-env",
+            "\"using $env:D365_SYNC_SECRET\"\nexit 0\n",
+            "echo \"using $D365_SYNC_SECRET\"\nexit 0\n",
+            "    secret_env: { D365_SYNC_SECRET: 'env:TORYO_M12_SYNC_SECRET' }\n",
+        ),
+    );
+    create(&env, "LG-1");
+    let s = script(
+        &env,
+        "lg1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["run", "LG-1", "--yes", "--fake-agents", &s],
+        &[("TORYO_M12_SYNC_SECRET", SECRET)],
+    );
+    assert_eq!(code, 0, "{err}");
+    let vr = verify_result(&env, "LG-1");
+    let entry = &vr["commands"][1];
+    assert_eq!(entry["name"], "dbsync");
+    let log = PathBuf::from(entry["log"].as_str().unwrap_or_else(|| panic!("{vr}")));
+    assert!(
+        log.starts_with(task(&env, "LG-1").run_store.join("gate-logs")),
+        "{}",
+        log.display()
+    );
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(text.contains("using [REDACTED:D365_SYNC_SECRET]"), "{text}");
+    assert!(!text.contains(SECRET), "{text}");
+    // the check gate has its log too
+    assert!(vr["commands"][0]["log"].as_str().is_some(), "{vr}");
+}
