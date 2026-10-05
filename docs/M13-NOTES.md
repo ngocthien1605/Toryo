@@ -19,7 +19,7 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
 - [x] M13-10 `doctor` looks at long paths where the first run will hit them
 - [x] M13-11 `task create` is all or nothing (X28)
 - [x] M13-12 Ctrl+C on `toryo run` is a stop request (X29)
-- [ ] M13-13 A launch error before the agent starts does not reserve a budget
+- [x] M13-13 A launch error before the agent starts does not reserve a budget
 - [ ] M13-14 Tests the review asked for
 - [ ] M13-15 Notes, guide, `STATUS.md`
 - [ ] Finish, push, pull request, CI
@@ -328,6 +328,20 @@ failed first; the rest is under "Open".
 - **Open:** a `toryo run` that was itself started with Ctrl+C ignored (`start /b`, some CI shells) does not see the key, as before — only the test
   hook clears that. The Unix halves (handler, `raise`) are written by reading (the `watch` handler next to it compiles on Linux and has the same
   shape); CI is their first build.
+
+
+### M13-13 — A launch error before the agent starts does not reserve a budget
+
+- **Failing test first:** `m12_cli::m13_13_a_launch_error_reserves_nothing_and_says_what_is_wrong` — real adapters (no `--fake-agents`, `--accept-unverified`), the
+  fixture's planner profile (`exe: claude-not-installed`), `pipeline.budget_tokens: 100000`. Before: "planner turn failed: ProcessCrashed (starting
+  claude-not-installed: … program not found) — the same turn again", then "admission cap reached: 200000 tokens used (0 spent + ~200000 reserved) of
+  100000" → `Paused`. Now: `Escalated`, the reason holds "ProcessCrashed" and the program's name, `reserved_tokens = 0`, no usage row with a reservation.
+  No program is started by this test: the profile names one that exists on no machine.
+- **How:** `agents::exec::NotStarted` marks an error of `run_turn_with` that happened before a process existed — the profile's secrets
+  (`profile_env`: a missing Credential Manager entry), the `exe` (`expand_vars`), the spawn itself. The CLI adapter then reports a **provisional zero**
+  usage before the `TurnFailed` (as a preflight refusal already did, `CliSession::refuse`): a turn that never started holds no reservation. The class
+  stays `ProcessCrashed` with the OS error in the detail; the retries of plan §11 still happen (each without a reservation), then the task escalates.
+- **Not changed:** an error *after* the process started (waiting, the capture files) still has unknown usage and still reserves — that is R41.
 
 
 ## Open

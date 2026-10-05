@@ -166,6 +166,24 @@ pub fn run_turn(
     )
 }
 
+/// M13-13: the turn's process was never started — its profile's secret is not there (a missing
+/// Credential Manager entry), its `exe` cannot be expanded, or the program cannot be started.
+/// Nothing ran, so nothing was used: the turn fails with this text and holds no reservation.
+#[derive(Debug)]
+pub struct NotStarted(pub String);
+
+impl std::fmt::Display for NotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotStarted {}
+
+fn not_started(e: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(NotStarted(format!("{e:#}")))
+}
+
 /// `run_turn`, calling `on_line` with every complete (redacted) stdout line as it arrives —
 /// the adapters turn these into live `AgentEvent`s.
 #[allow(clippy::too_many_arguments)]
@@ -180,12 +198,12 @@ pub fn run_turn_with(
     opts: TurnOpts,
     on_line: &mut (dyn FnMut(&[u8]) + Send),
 ) -> Result<TurnRun> {
-    let (mut env, red, secret_keys) = profile_env(profile_name, profile)?;
+    let (mut env, red, secret_keys) = profile_env(profile_name, profile).map_err(not_started)?;
     for (k, v) in &opts.env {
         env.retain(|e, _| !e.eq_ignore_ascii_case(k));
         env.insert(k.clone(), v.clone());
     }
-    let program = PathBuf::from(crate::config::expand_vars(&profile.exe)?);
+    let program = PathBuf::from(crate::config::expand_vars(&profile.exe).map_err(not_started)?);
     std::fs::create_dir_all(run_dir)?;
     let argv_view: Vec<String> = std::iter::once(program.display().to_string())
         .chain(args.iter().cloned())
@@ -222,7 +240,9 @@ pub fn run_turn_with(
     };
     let mut out_file = Capture::create(&run_dir.join(format!("{label}.stdout.jsonl")))?;
     let mut err_file = Capture::create(&run_dir.join(format!("{label}.stderr.txt")))?;
-    let running = spawn(&spec, &red).with_context(|| format!("starting {}", program.display()))?;
+    let running = spawn(&spec, &red)
+        .with_context(|| format!("starting {}", program.display()))
+        .map_err(not_started)?;
     let mut splitter = LineSplitter::new(LineSplitter::DEFAULT_CAP);
     let mut claude = ClaudeParser::new();
     let mut codex = CodexParser::new();

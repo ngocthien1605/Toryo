@@ -17,11 +17,12 @@ use super::adapter::{AgentAdapter, AgentSession, TurnId};
 use super::claude::{ClaudeLaunch, LaunchMode};
 use super::codex::CodexLaunch;
 use super::events::{terminal_events, LiveEvents};
-use super::exec::{run_turn_with, TurnOpts};
+use super::exec::{run_turn_with, NotStarted, TurnOpts};
 use super::TurnOutcome;
 use crate::config::{expand_vars, Effective, Profile, ProfileKind};
 use crate::domain::{
-    AgentEvent, AgentHealth, ErrorClass, OpenSession, Role, Tri, TurnInput, UsageCapabilities,
+    AgentEvent, AgentHealth, ErrorClass, OpenSession, Role, TokenUsage, Tri, TurnInput,
+    UsageCapabilities,
 };
 use crate::usage::{Accounting, Buckets};
 
@@ -317,6 +318,15 @@ impl AgentSession for CliSession {
                     }
                 }
                 Err(e) => {
+                    // M13-13: a process that never started used nothing. A provisional zero,
+                    // as for a preflight refusal (`refuse`): no reservation is held for it —
+                    // a wrong `exe` must not end as a pause on the budget
+                    if e.downcast_ref::<NotStarted>().is_some() {
+                        let _ = tx.send(AgentEvent::Usage(TokenUsage {
+                            buckets: Some(Buckets::default()),
+                            accounting: Accounting::Provisional,
+                        }));
+                    }
                     let _ = tx.send(AgentEvent::TurnFailed {
                         class: ErrorClass::ProcessCrashed,
                         detail: format!("{e:#}"),

@@ -391,3 +391,36 @@ fn m13_12_a_second_ctrl_c_ends_the_process_at_once() {
     assert!(err.contains("recovery:"), "{err}");
     assert_eq!(task(&env, "K-2").state, St::Completed, "{err}");
 }
+
+// ── M13-13: a launch error before the agent starts does not reserve a budget ──────────────
+
+/// AC-1: the planner's CLI cannot be started (the fixture's profile names a program that is
+/// not on any machine) and the task has a small budget. Real adapters: no `--fake-agents` —
+/// and nothing is started. Was: the turn that never ran reserved the tokens of a turn with
+/// unknown usage (600 000), and the task paused on "budget" without a word about the program.
+/// Now nothing is reserved and the task escalates with the launch error in the reason.
+#[test]
+fn m13_13_a_launch_error_reserves_nothing_and_says_what_is_wrong() {
+    let env = setup_with("codex-openai", "pipeline:\n  budget_tokens: 100000\n");
+    create(&env, "L-1");
+    let (code, err) = toryo(&env, &["run", "L-1", "--yes", "--accept-unverified"], &[]);
+    assert_ne!(code, 0, "{err}");
+    let t = task(&env, "L-1");
+    assert_eq!(t.state, St::Escalated, "not paused on the budget: {err}");
+    let why = t.machine.reason().unwrap_or_default().to_string();
+    assert!(
+        why.contains("ProcessCrashed") && why.contains("claude-not-installed"),
+        "the launch error is the reason: {why}"
+    );
+    assert_eq!(t.reserved_tokens, 0, "{err}");
+    let reserved: i64 = db(&env)
+        .call(|tx| {
+            Ok(tx.query_row(
+                "SELECT COALESCE(SUM(reservation_tokens), 0) FROM usage WHERE task_id = 'L-1'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(reserved, 0, "no usage row holds a reservation: {err}");
+}
