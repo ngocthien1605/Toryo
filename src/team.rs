@@ -2360,6 +2360,32 @@ mod tests {
         assert!(e.contains("not found on PATH"), "{e}");
     }
 
+    /// M13-08: an environment gate's program is found with the leniency of a check gate's
+    /// (`gates::startable`). A file `is_file()` cannot see through — an App Execution Alias of
+    /// the Store `pwsh.exe`; here a file link whose target is missing — is not "not found" at
+    /// the preflight (was: a hard `environment_gate_unavailable` while a check gate with the
+    /// same program passed); whether it starts is the system's answer at the start.
+    #[cfg(windows)]
+    #[test]
+    fn a_gate_program_is_file_cannot_see_through_passes_the_preflight() {
+        let (d, y, m) = draft_repo(&[]);
+        let cfg = crate::config::Effective::load(&y, Some(&m)).unwrap();
+        let bin = d.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let alias = bin.join("alias-r8.exe");
+        if std::os::windows::fs::symlink_file(bin.join("nowhere.exe"), &alias).is_err() {
+            eprintln!("skipped: this account may not create a file link");
+            return;
+        }
+        assert!(!alias.is_file(), "what `is_file()` says of it");
+        let path = std::env::join_paths([&bin]).unwrap();
+        let by_name = crate::engine::runner::env_gate_program(&cfg, "alias-r8", Some(&path));
+        assert_eq!(by_name, Ok(alias.clone()));
+        let by_path =
+            crate::engine::runner::env_gate_program(&cfg, &alias.display().to_string(), None);
+        assert_eq!(by_path, Ok(alias));
+    }
+
     /// M11-R9 (X6 replaces X2; was `an_environment_gate_needs_a_clean_checkout`): the
     /// environment gates deploy from a fresh export of the commit, not from the checkout, so a
     /// `tracked` checkout with an environment gate loads.

@@ -2723,3 +2723,168 @@ fn m13_05_a_reload_that_changes_the_configuration_asks_again() {
     );
     assert_eq!(confirm_stops(&env, "CD-2"), 2);
 }
+
+// ── M13-08: one gate resolver; the timeout stop names every gate that runs again ──────────
+
+/// One run of `id` with agents that would complete it.
+fn run_to_the_gates(env: &Env, id: &str) -> String {
+    let s = script(
+        env,
+        &format!("{id}.json"),
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    toryo(env, &["run", id, "--yes", "--fake-agents", &s], &[]).1
+}
+
+/// AC-1 (and item 2 of M13-14): a text file where the program of an **environment** gate
+/// should be passes the preflight (it exists) and fails at the start — the same machine stop
+/// as for a check gate (`m12_05_a_program_that_exists_but_cannot_start_is_the_same_stop`): no
+/// implementer turn, no gate retry, and the deployment record says it did not run.
+#[test]
+fn m13_08_an_environment_gate_program_that_cannot_start_is_a_machine_stop() {
+    let env = env_gate_setup("codex-openai", "error", "");
+    let bad = env.root.join(if cfg!(windows) {
+        "not-a-program.exe"
+    } else {
+        "not-a-program"
+    });
+    std::fs::write(&bad, "this is text, not a program\n").unwrap();
+    define_gates(
+        &env,
+        &format!(
+            "  dbsync:\n    program: '{}'\n    args: []\n    lock: d365-env\n",
+            fwd(&bad)
+        ),
+    );
+    create(&env, "SP-1");
+    let err = run_to_the_gates(&env, "SP-1");
+    let t = task(&env, "SP-1");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_unavailable"),
+        "{err}"
+    );
+    let why = t.machine.reason().unwrap();
+    assert!(
+        why.contains("could not be started") && why.contains("not-a-program"),
+        "{why}"
+    );
+    assert_eq!(t.fix_cycle, 0, "a machine stop costs no fix cycle");
+    assert_eq!(
+        attempts(&env, "SP-1")
+            .iter()
+            .filter(|a| a.stage == "implement")
+            .count(),
+        1,
+        "no implementer turn"
+    );
+    let d = deployments(&env);
+    assert_eq!(
+        (d.len(), d[0].ok),
+        (1, Some(false)),
+        "it did not run: {d:?}"
+    );
+}
+
+/// AC-3: a gate that is killed by its timeout **after** it wrote into the export it deploys
+/// from. Was: the export was looked at first — `verify_mutated_tree`, which only a
+/// `resume --note` (a fix cycle) leaves. Now it is the timeout it is: a plain `resume`.
+#[test]
+fn m13_08_a_gate_killed_by_its_timeout_after_writing_into_the_export_is_a_timeout() {
+    let env = env_gate_setup_timeout("codex-openai", "error", "", "8s");
+    define_gates(
+        &env,
+        &machine_gate(
+            &env,
+            "dbsync",
+            "d365-env",
+            "Add-Content -Path (Join-Path $env:TORYO_VERIFY_CHECKOUT 'src/Calculator.psm1') -Value '# synced'\n'written'\nStart-Sleep -Seconds 120\nexit 0\n",
+            "echo '# synced' >> \"$TORYO_VERIFY_CHECKOUT/src/Calculator.psm1\"\necho written\nsleep 120\nexit 0\n",
+            "",
+        ),
+    );
+    create(&env, "TO-3");
+    let err = run_to_the_gates(&env, "TO-3");
+    let t = task(&env, "TO-3");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_timeout"),
+        "{err}"
+    );
+    assert!(
+        t.machine.reason().unwrap().contains("written"),
+        "(the gate had written into the export before it was stopped): {err}"
+    );
+    assert_eq!(t.fix_cycle, 0);
+}
+
+/// AC-4: two environment gates, the second runs into its timeout. A `resume` runs Verify from
+/// the start — the first gate deploys again. Was: the reason said "the gate" runs again. Now it
+/// names both.
+#[test]
+fn m13_08_a_timeout_names_every_environment_gate_that_runs_again() {
+    let org = ORGCHART.replace("IMPLEMENTER", "codex-openai").replacen(
+        "gates:\n",
+        "gates:\n  seed: { kind: environment, timeout: 2m, if_missing: error }\n  dbsync: { kind: environment, timeout: 4s, if_missing: error }\n",
+        1,
+    );
+    let env = setup_orgchart(
+        "codex-openai",
+        "",
+        &[
+            (".toryo/toryo-orgchart.yaml", &org),
+            (
+                ".toryo/roles/implementer/toryo-role.yaml",
+                "toryo: 1\npurpose: Change the code.\nbefore_handoff: [divide-present, seed, dbsync]\n",
+            ),
+        ],
+    );
+    let seed = machine_gate(
+        &env,
+        "seed",
+        "seed-env",
+        "'seeded'\nexit 0\n",
+        "echo seeded\nexit 0\n",
+        "",
+    );
+    let sync = machine_gate(
+        &env,
+        "dbsync",
+        "d365-env",
+        "Start-Sleep -Seconds 120\nexit 0\n",
+        "sleep 120\nexit 0\n",
+        "",
+    );
+    define_gates(&env, &format!("{seed}{sync}"));
+    create(&env, "TO-4");
+    let err = run_to_the_gates(&env, "TO-4");
+    let t = task(&env, "TO-4");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_timeout"),
+        "{err}"
+    );
+    let why = t.machine.reason().unwrap().to_string();
+    assert!(
+        why.contains("`dbsync` ran into its timeout (4 s)")
+            && why.contains(
+                "`toryo resume TO-4` runs Verify and every environment gate again: `seed`"
+            )
+            && why.contains("deploys again), then `dbsync`"),
+        "{why}"
+    );
+    let d = deployments(&env);
+    let of = |gate: &str| d.iter().find(|d| d.gate == gate).map(|d| d.ok);
+    assert_eq!(
+        (of("seed"), of("dbsync")),
+        (Some(Some(true)), Some(None)),
+        "{d:?}"
+    );
+}

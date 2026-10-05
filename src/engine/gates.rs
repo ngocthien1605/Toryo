@@ -12,7 +12,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use crate::config::{CommandKind, CommandSpec, EnvGate};
+use crate::config::{CommandKind, CommandSpec};
 
 /// The escalation class of a check gate that cannot be started (machine-caused).
 pub const GATE_UNAVAILABLE: &str = "gate_unavailable";
@@ -24,7 +24,7 @@ const SCRIPT_EXTENSIONS: [&str; 8] = [".ps1", ".psm1", ".cmd", ".bat", ".sh", ".
 /// where `metadata` cannot see through it (an App Execution Alias of the Store `pwsh.exe` is a
 /// reparse point `is_file()` calls false). Lenient on purpose: if the start then fails, the
 /// typed spawn error stops the gate the same way.
-fn startable(p: &Path) -> bool {
+pub(crate) fn startable(p: &Path) -> bool {
     p.is_file()
         || (cfg!(windows) && std::fs::symlink_metadata(p).is_ok_and(|m| !m.file_type().is_dir()))
 }
@@ -77,8 +77,9 @@ pub fn program_problem(program: &str, path: Option<&OsStr>) -> Option<String> {
 }
 
 /// Why the script an environment gate hands to its program cannot be there: the argument after
-/// `-File` / `-f` (case-insensitive), and every absolute argument with a script extension. One
-/// line per problem.
+/// the first `-File` / `-f` (case-insensitive), and every absolute argument with a script
+/// extension before it. What follows the script are the script's own parameters (M13-08: a
+/// `-f C:\logs\out.txt` among them is not a second script). One line per problem.
 pub fn script_problems(args: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let mut it = args.iter();
@@ -90,13 +91,18 @@ pub fn script_problems(args: &[String]) -> Vec<String> {
         let absolute = Path::new(c).is_absolute() || Path::new(c).has_root();
         let script = SCRIPT_EXTENSIONS.iter().any(|x| lower.ends_with(x));
         // an argument after `-File` is the script whatever it is called; any other argument
-        // only when it is an absolute path to a script
-        if (is_file_flag || (absolute && script)) && !Path::new(c).is_file() {
-            // a relative `-File` is the repository's (M18) — a path that is not asked here
-            if is_file_flag && !absolute {
-                continue;
-            }
+        // only when it is an absolute path to a script. A relative `-File` is the
+        // repository's (M18) — a path that is not asked here
+        let asked = if is_file_flag {
+            absolute
+        } else {
+            absolute && script
+        };
+        if asked && !Path::new(c).is_file() {
             out.push(format!("script `{c}` does not exist"));
+        }
+        if is_file_flag {
+            break;
         }
     }
     out
@@ -110,13 +116,6 @@ pub fn check_gate_problem(c: &CommandSpec, path: Option<&OsStr>) -> Option<Strin
     };
     let program = crate::config::expand_vars(program).unwrap_or_else(|_| program.to_string());
     program_problem(&program, path)
-}
-
-/// Why the environment gate `m` cannot start here — program and script — one line per problem.
-pub fn env_gate_problems(m: &EnvGate, path: Option<&OsStr>) -> Vec<String> {
-    let mut out: Vec<String> = program_problem(&m.program, path).into_iter().collect();
-    out.extend(script_problems(&m.args));
-    out
 }
 
 /// M12-05: the refusal of `task create` and `task config --reload` — the first environment gate
@@ -219,5 +218,26 @@ mod tests {
         ]))
         .is_empty());
         assert!(script_problems(&s(&["-File", "scripts/x.ps1"])).is_empty());
+    }
+
+    /// M13-08 AC-2: what follows the first `-File <script>` are the script's own parameters —
+    /// a `-f <path>` or an absolute script path among them is not asked. (Was: every `-f` /
+    /// `-File` anywhere was a script: `-File ok.ps1 -f C:\logs\out.txt` was refused.)
+    #[test]
+    fn only_the_first_file_argument_is_the_script() {
+        let d = tempfile::tempdir().unwrap();
+        let ok = d.path().join("ok.ps1");
+        std::fs::write(&ok, "x").unwrap();
+        let ok = ok.display().to_string();
+        let log = d.path().join("logs").join("out.txt").display().to_string();
+        let other = d.path().join("other.ps1").display().to_string();
+        let p = script_problems(&s(&["-NoProfile", "-File", &ok, "-f", &log]));
+        assert!(p.is_empty(), "{p:?}");
+        let p = script_problems(&s(&["-File", &ok, "-Next", &other]));
+        assert!(p.is_empty(), "{p:?}");
+        // the first one is still asked, whatever follows it
+        let p = script_problems(&s(&["-File", &other, "-f", &ok]));
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("other.ps1"), "{p:?}");
     }
 }

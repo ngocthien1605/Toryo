@@ -14,7 +14,7 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
 - [x] M13-06 Read-only turns: the checks also run when the turn errors; the copy is safe
 - [x] Review of M13-01…06 (acceptance criteria against code and tests)
 - [x] M13-07 `task cleanup` that cannot look fails closed; `doctor` never loops on a link
-- [ ] M13-08 The gate resolver is one resolver; the timeout stop names every gate that re-runs
+- [x] M13-08 The gate resolver is one resolver; the timeout stop names every gate that re-runs
 - [ ] M13-09 `environment_gate_confirm` says what to type, and how to say no
 - [ ] M13-10 `doctor` looks at long paths where the first run will hit them
 - [ ] M13-11 `task create` is all or nothing (X28)
@@ -211,6 +211,30 @@ failed first; the rest is under "Open".
   to a folder gets one `info` line ("is a link to a folder: not followed") and is skipped. A link to a file is read as before.
 - **(c)** `config::VAR_PATTERN` — one pattern for `expand_vars`, `residual_var` and `doctor`'s profile-`env:` warning.
 - **Windows-only parts:** the junction (`mklink /J`) in AC-2; on Unix the same test uses a symlink.
+
+
+### M13-08 — The gate resolver is one resolver; the timeout stop names every gate that re-runs
+
+- **`gates::env_gate_problems` is deleted** (no caller). `runner::env_gate_program` — the one resolver `doctor` and the Verify preflight use for an
+  environment gate's program — now asks `gates::startable`, as a check gate's `program_problem` does: a file `is_file()` cannot see through is not
+  "not found". **Failing test first** (Windows-only, skipped when the account may not create a file link):
+  `team::tests::a_gate_program_is_file_cannot_see_through_passes_the_preflight` — a file link with a missing target stands in for the App Execution
+  Alias (before: `Err("program `alias-r8` not found on PATH")`). The folders searched are unchanged (PATH only, as `checks::which_in`).
+- **AC-1** `m11_env_gates::m13_08_an_environment_gate_program_that_cannot_start_is_a_machine_stop` — a text file as `program`: the preflight passes and
+  the start stops with `environment_gate_unavailable` ("could not be started"), no implementer turn, deployment row `ok = false`. **It passed before
+  the change** (a text file *is* a file): kept as the test of the spawn-error branch (item 2 of M13-14).
+- **AC-2** `gates::tests::only_the_first_file_argument_is_the_script` — `script_problems` stops after the value of the first `-File` / `-f`: what
+  follows are the script's own parameters. (The list's example `-f missing.txt` is relative and was never asked; the test uses an absolute path,
+  which was refused.)
+- **AC-3** `m13_08_a_gate_killed_by_its_timeout_after_writing_into_the_export_is_a_timeout` — `timed_out` is asked before `export_changed` (before:
+  `verify_mutated_tree`).
+- **AC-4** `m13_08_a_timeout_names_every_environment_gate_that_runs_again` — with gates that finished earlier in the same Verify run, the reason says
+  "`toryo resume <id>` runs Verify and every environment gate again: `seed` (finished — the deployment record says so — and deploys again), then
+  `dbsync`"; with one gate the text is as before. **"the deployment rows say so" was read as:** the reason says what the rows say (the earlier
+  gate's row says it passed, the timed-out gate's says interrupted). The rows themselves and `status` are unchanged — Open.
+- **The xpp text:** a project of a `tool: xpp` command that runs out of time says the limit it was given — "timed out after 734 s (what the projects
+  before it left of the command's 30 min)", or "was not started: the projects before it used up the command's 30 min"; the first project still says
+  "timed out after 30 min". Unit test `a_timeout_says_what_the_run_was_given_and_what_runs_again` (no MSBuild on this machine: not run end to end).
 
 
 ## Open

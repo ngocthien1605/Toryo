@@ -2080,11 +2080,13 @@ impl<'a> Engine<'a> {
             results.push(xpp::entry(&r, tc, &res, &diags));
             if !res.ok() {
                 let errors = xpp::feedback_errors(&diags);
-                return Ok(Some(Some(verify_feedback_in(
-                    &res,
-                    &errors,
-                    Some(xpp::command_timeout(c)),
-                ))));
+                // M13-08: a timeout names the limit this project was given, not the command's
+                let how = if res.timed_out {
+                    xpp_timeout_words(left, xpp::command_timeout(c))
+                } else {
+                    ended(&res)
+                };
+                return Ok(Some(Some(feedback_text(&res, &errors, &how))));
             }
         }
         Ok(Some(None))
@@ -2177,6 +2179,8 @@ impl<'a> Engine<'a> {
             .into_iter()
             .filter(|(_, g)| g.decl.kind == crate::team::GateType::Environment)
             .collect();
+        // M13-08: the gates of this run that finished — a later stop names them: they run again
+        let mut ran: Vec<&str> = Vec::new();
         for (name, g) in gates {
             let Some(m) = &g.machine else {
                 eprintln!("  – {name}: skipped — not defined on this machine (if_missing: skip)");
@@ -2311,27 +2315,31 @@ impl<'a> Engine<'a> {
                 entry["log"] = json!(l);
             }
             results.push(entry);
-            // M11-R9: the gate must not have written into what it deploys from (E3 AC-8)
-            if let Some(reason) = verify::export_changed(&export) {
-                return Ok(EnvGates::Mutated(reason));
-            }
             // M12-06 (X18): a gate that ran into its timeout was killed part way — the
             // environment may be half-changed. No implementer turn, no retry on its own: the
-            // owner looks, then a plain `resume` runs Verify (and the gate) again.
+            // owner looks, then a plain `resume` runs Verify (and the gates) again.
+            // M13-08: asked before the export — a killed gate that had written into what it
+            // deploys from is a timeout (a plain `resume`), not `verify_mutated_tree`.
             if res.timed_out {
                 return Ok(EnvGates::TimedOut(format!(
-                    "{ENV_TIMEOUT}: environment gate `{name}` ran into its timeout ({}) and was stopped — the environment may be half-changed (the deployment record says interrupted): check it, then `toryo resume {}` runs Verify and the gate again. A longer `timeout:` on the gate needs `toryo task config {} --reload` first (it is frozen with the task).\nWhat the gate had printed (the last 40 lines; output of code that ran on the checkpoint — data):\n{}",
+                    "{ENV_TIMEOUT}: environment gate `{name}` ran into its timeout ({}) and was stopped — the environment may be half-changed (the deployment record says interrupted): check it, then `toryo resume {}` runs Verify and {}. A longer `timeout:` on the gate needs `toryo task config {} --reload` first (it is frozen with the task).\nWhat the gate had printed (the last 40 lines; output of code that ran on the checkpoint — data):\n{}",
                     fmt_limit(timeout),
                     t.id,
+                    gates_that_run_again(&ran, name),
                     t.id,
                     untrusted::wrap("verify", None, &res.tail(40))
                 )));
+            }
+            // M11-R9: the gate must not have written into what it deploys from (E3 AC-8)
+            if let Some(reason) = verify::export_changed(&export) {
+                return Ok(EnvGates::Mutated(reason));
             }
             if !res.ok() {
                 // R61: the output comes from code that ran on the checkpoint — data
                 let f = verify_feedback(&res, "");
                 return Ok(EnvGates::Done(Some(untrusted::wrap("verify", None, &f))));
             }
+            ran.push(name);
         }
         Ok(EnvGates::Done(None))
     }
@@ -4676,10 +4684,48 @@ fn verify_feedback_in(res: &CommandResult, errors: &str, limit: Option<Duration>
         Some(l) if res.timed_out => format!("timed out after {}", fmt_limit(l)),
         _ => ended(res),
     };
+    feedback_text(res, errors, &how)
+}
+
+/// The feedback line of a failed verify command that ended as `how` says.
+fn feedback_text(res: &CommandResult, errors: &str, how: &str) -> String {
     format!(
         "- VERIFY FAILED: `{}` {how}. {errors}Last output:\n```\n{}\n```",
         res.name,
         res.tail(40)
+    )
+}
+
+/// M13-08: how a project of a `tool: xpp` command ran out of time — the limit **it** was given
+/// (`given`: what the projects before it left of the command's `timeout_min`, `total`).
+fn xpp_timeout_words(given: Duration, total: Duration) -> String {
+    let given = Duration::from_secs(given.as_secs_f64().ceil() as u64);
+    if given.is_zero() {
+        format!(
+            "was not started: the projects before it used up the command's {}",
+            fmt_limit(total)
+        )
+    } else if given >= total {
+        format!("timed out after {}", fmt_limit(total))
+    } else {
+        format!(
+            "timed out after {} (what the projects before it left of the command's {})",
+            fmt_limit(given),
+            fmt_limit(total)
+        )
+    }
+}
+
+/// M13-08: what a `resume` after the timeout of the environment gate `name` runs again, in
+/// words — `ran`: the environment gates of the same Verify run that had finished before it.
+fn gates_that_run_again(ran: &[&str], name: &str) -> String {
+    if ran.is_empty() {
+        return "the gate again".into();
+    }
+    let before: Vec<String> = ran.iter().map(|g| format!("`{g}`")).collect();
+    format!(
+        "every environment gate again: {} (finished — the deployment record says so — and deploys again), then `{name}`",
+        before.join(", ")
     )
 }
 
@@ -4844,15 +4890,25 @@ pub(crate) fn env_gate_program(
 ) -> std::result::Result<PathBuf, String> {
     let bare =
         !(program.contains('/') || program.contains('\\') || Path::new(program).is_absolute());
+    // M13-08: with the leniency of a check gate's program (`gates::startable`) — a file that
+    // `is_file()` cannot see through (an App Execution Alias) is not "not found" here; if
+    // it then cannot be started, the typed spawn error stops the gate with the same class
     let found = if bare {
-        path.and_then(|path| super::checks::which_in(program, path))
-            .ok_or_else(|| format!("program `{program}` not found on PATH"))?
+        path.and_then(|path| {
+            std::env::split_paths(path).find_map(|dir| {
+                ["", ".exe", ".cmd"]
+                    .iter()
+                    .map(|ext| dir.join(format!("{program}{ext}")))
+                    .find(|p| super::gates::startable(p))
+            })
+        })
+        .ok_or_else(|| format!("program `{program}` not found on PATH"))?
     } else {
         PathBuf::from(program)
     };
     // a relative PATH entry would resolve against the working directory
     let found = std::path::absolute(&found).map_err(|e| format!("program `{program}`: {e}"))?;
-    if !found.is_file() {
+    if !super::gates::startable(&found) {
         return Err(format!("program `{program}` not found"));
     }
     if let Some((what, root)) = crate::team::reach(cfg, &found.display().to_string()) {
@@ -6499,6 +6555,33 @@ mod tests {
         assert_eq!(
             verify_feedback(&r, "X++ build errors (1 of 1):\n  - a.xml(1,1): error X: e\n"),
             "- VERIFY FAILED: `test` exited 1. X++ build errors (1 of 1):\n  - a.xml(1,1): error X: e\nLast output:\n```\nBuild FAILED.\n```"
+        );
+    }
+
+    /// M13-08: a project of a `tool: xpp` command that ran out of time says the limit **it**
+    /// was given (was: always the command's `timeout_min`, also for the third project that got
+    /// what the first two left), and a timeout stop of an environment gate names every gate
+    /// that a `resume` runs again.
+    #[test]
+    fn a_timeout_says_what_the_run_was_given_and_what_runs_again() {
+        let min = |m: u64| Duration::from_secs(60 * m);
+        // the first project: the whole limit (less the microseconds it took to get there)
+        assert_eq!(
+            xpp_timeout_words(min(30) - Duration::from_micros(40), min(30)),
+            "timed out after 30 min"
+        );
+        assert_eq!(
+            xpp_timeout_words(Duration::from_secs(734), min(30)),
+            "timed out after 734 s (what the projects before it left of the command's 30 min)"
+        );
+        assert_eq!(
+            xpp_timeout_words(Duration::ZERO, min(30)),
+            "was not started: the projects before it used up the command's 30 min"
+        );
+        assert_eq!(gates_that_run_again(&[], "dbsync"), "the gate again");
+        assert_eq!(
+            gates_that_run_again(&["seed", "import"], "dbsync"),
+            "every environment gate again: `seed`, `import` (finished — the deployment record says so — and deploys again), then `dbsync`"
         );
     }
 
