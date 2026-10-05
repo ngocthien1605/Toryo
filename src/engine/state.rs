@@ -42,8 +42,9 @@ pub const MAX_PLAN_AUTO_REJECTIONS: u32 = 2;
 /// over budget, or a gate/toolchain/boundary the machine cannot provide. Leaving one costs no
 /// fix cycle: a plain `toryo resume <id>` goes back into the stage, which checks its
 /// precondition again (a cause still there escalates again, no turn and no cycle).
-pub const MACHINE_CAUSED: [&str; 6] = [
+pub const MACHINE_CAUSED: [&str; 7] = [
     "gate_unavailable",
+    "environment_gate_timeout",
     "skill_unavailable",
     "context_over_budget",
     "environment_gate_unavailable",

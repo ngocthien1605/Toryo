@@ -47,10 +47,20 @@ fn machine_gate(env: &Env, name: &str, lock: &str, ps1: &str, sh: &str, extra: &
 /// gate `dbsync` (`if_missing`) after it; `machine_gates`: the machine's `environment_gates:`
 /// entries (none: the machine does not define dbsync).
 fn env_gate_setup(implementer: &str, if_missing: &str, org_tail: &str) -> Env {
+    env_gate_setup_timeout(implementer, if_missing, org_tail, "2m")
+}
+
+/// [`env_gate_setup`] with the environment gate's `timeout:` (M12-06: a few seconds).
+fn env_gate_setup_timeout(
+    implementer: &str,
+    if_missing: &str,
+    org_tail: &str,
+    timeout: &str,
+) -> Env {
     let org = ORGCHART.replace("IMPLEMENTER", implementer).replacen(
         "gates:\n",
         &format!(
-            "gates:\n  dbsync: {{ kind: environment, timeout: 2m, if_missing: {if_missing} }}\n"
+            "gates:\n  dbsync: {{ kind: environment, timeout: {timeout}, if_missing: {if_missing} }}\n"
         ),
         1,
     ) + org_tail;
@@ -838,15 +848,20 @@ fn a_stop_during_an_environment_gate_interrupts_it() {
 /// The fixture with a repository check gate `probe` (the script `ps1` / `sh`) between
 /// `divide-present` and the environment gate `dbsync`, whose machine script writes a marker.
 fn probe_then_dbsync(ps1: &str, sh: &str) -> (Env, PathBuf) {
+    probe_then_dbsync_timed(ps1, sh, "2m")
+}
+
+/// [`probe_then_dbsync`] with the check gate `probe`'s `timeout:` (M12-06).
+fn probe_then_dbsync_timed(ps1: &str, sh: &str, probe_timeout: &str) -> (Env, PathBuf) {
     let (decl, file, body) = if cfg!(windows) {
         (
-            "  probe: { kind: check, program: pwsh, args: [-NoProfile, -NonInteractive, -File, scripts/probe.ps1], timeout: 2m }\n",
+            format!("  probe: {{ kind: check, program: pwsh, args: [-NoProfile, -NonInteractive, -File, scripts/probe.ps1], timeout: {probe_timeout} }}\n"),
             "scripts/probe.ps1",
             ps1,
         )
     } else {
         (
-            "  probe: { kind: check, program: sh, args: [scripts/probe.sh], timeout: 2m }\n",
+            format!("  probe: {{ kind: check, program: sh, args: [scripts/probe.sh], timeout: {probe_timeout} }}\n"),
             "scripts/probe.sh",
             sh,
         )
@@ -2137,4 +2152,130 @@ fn m12_05_an_environment_gate_with_a_missing_script_is_a_machine_stop() {
     );
     assert_eq!(t.fix_cycle, 0, "no gate retry used");
     assert!(deployments(&env).is_empty());
+}
+
+/// M12-06 AC-1/AC-2 (X18): an environment gate that runs into its timeout is the owner's
+/// problem, not the implementer's. The task stops with `environment_gate_timeout` (machine-
+/// caused): no implementer turn, no gate retry used, the deployment record says interrupted,
+/// the reason says the limit and "the environment may be half-changed". A plain `resume` runs
+/// Verify — and the gate — again (a second run of the script is quick). Was: a failing gate,
+/// an implementer turn, a retry, and the sync started again unattended.
+#[test]
+fn m12_06_an_environment_gate_that_times_out_stops_for_the_owner() {
+    let env = env_gate_setup_timeout("codex-openai", "error", "", "3s");
+    let run_log = fwd(&env.root.join("gates").join("runs"));
+    // the first run sleeps past its limit, the second returns at once
+    let ps1 = format!(
+        "Add-Content -Path '{run_log}' -Value x\nif ((Get-Content '{run_log}').Count -le 1) {{ Start-Sleep -Seconds 60 }}\n'synced'\nexit 0\n"
+    );
+    let sh = format!(
+        "echo x >> '{run_log}'\nn=$(wc -l < '{run_log}')\nif [ \"$n\" -le 1 ]; then sleep 60; fi\necho synced\nexit 0\n"
+    );
+    define_gates(
+        &env,
+        &machine_gate(&env, "dbsync", "d365-env", &ps1, &sh, ""),
+    );
+    create(&env, "TO-1");
+    let s = script(
+        &env,
+        "to1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "TO-1", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "TO-1");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_timeout"),
+        "{err}"
+    );
+    let why = t.machine.reason().unwrap().to_string();
+    assert!(
+        why.contains("`dbsync` ran into its timeout (3 s)")
+            && why.contains("half-changed")
+            && why.contains("`toryo resume TO-1`"),
+        "{why}"
+    );
+    assert_eq!(
+        attempts(&env, "TO-1")
+            .iter()
+            .filter(|a| a.stage == "implement")
+            .count(),
+        1,
+        "no implementer turn"
+    );
+    assert_eq!(t.fix_cycle, 0, "no gate retry used");
+    let d = deployments(&env);
+    assert_eq!((d.len(), d[0].ok), (1, None), "interrupted: {d:?}");
+    // a plain resume runs Verify and the gate again
+    let s2 = script(
+        &env,
+        "to1b.json",
+        json!({ "reviewer": [turn(vec![approved()])] }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["resume", "TO-1", "--yes", "--fake-agents", &s2],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "TO-1");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert_eq!(t.fix_cycle, 0, "a machine stop costs no fix cycle");
+    // (the deployment table keeps one row per lock: it now says the second run passed)
+    let runs = std::fs::read_to_string(env.root.join("gates").join("runs")).unwrap();
+    assert_eq!(runs.lines().count(), 2, "the gate ran again");
+    assert_eq!(deployments(&env)[0].ok, Some(true));
+}
+
+/// M12-06 AC-3: a **check** gate that runs into its timeout is still a gate failure — the
+/// implementer is sent back with feedback that says "timed out after 3 s" (the limit it was
+/// given), and the fix cycle is counted.
+#[test]
+fn m12_06_a_check_gate_timeout_is_still_a_gate_failure_and_says_so() {
+    let (env, marker) = probe_then_dbsync_timed(
+        "Start-Sleep -Seconds 60\nexit 0\n",
+        "sleep 60\nexit 0\n",
+        "3s",
+    );
+    create(&env, "TO-2");
+    let s = script(
+        &env,
+        "to2.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()]),
+                turn(vec![implementation()]),
+                turn(vec![implementation()]),
+            ],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "TO-2", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "TO-2");
+    assert!(
+        t.fix_cycle >= 1,
+        "a gate failure: the implementer is sent back: {err}"
+    );
+    assert!(
+        !marker.exists(),
+        "no environment gate after a failing check gate"
+    );
+    let c = calls(&env, "TO-2");
+    let second = c
+        .iter()
+        .filter(|x| x["key"] == "implementer")
+        .nth(1)
+        .unwrap_or_else(|| panic!("a second implementer turn: {err}"));
+    let prompt = second["prompt"].as_str().unwrap();
+    assert!(prompt.contains("`probe` timed out after 3 s"), "{prompt}");
+    assert_ne!(
+        t.machine.reason_class(),
+        Some("environment_gate_timeout"),
+        "a check gate is not the owner's problem"
+    );
 }

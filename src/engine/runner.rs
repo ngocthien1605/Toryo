@@ -1548,6 +1548,11 @@ impl<'a> Engine<'a> {
                     return Ok(Flow::Next);
                 }
                 EnvGates::Mutated(reason) => export_mutated = Some(reason),
+                // M12-06 (X18): the owner's problem, not the implementer's
+                EnvGates::TimedOut(reason) => {
+                    self.escalate_attempt(&a, ENV_TIMEOUT.into(), reason)?;
+                    return Ok(Flow::Next);
+                }
             }
         }
         let pass = failure.is_none() && before_deploy.is_none();
@@ -1786,10 +1791,11 @@ impl<'a> Engine<'a> {
             let ran = match (c.kind(), xpp) {
                 (CommandKind::Program { program, args }, _) => {
                     let program = verify_program(&expand_vars(program)?, &co.dir);
-                    let run = at.spec(&c.name, program, args.to_vec(), xpp::command_timeout(c));
+                    let limit = xpp::command_timeout(c);
+                    let run = at.spec(&c.name, program, args.to_vec(), limit);
                     self.run_verify_command(run, stop)?.map(|res| {
                         results.push(command_result(c, &res));
-                        (!res.ok()).then(|| verify_feedback(&res, ""))
+                        (!res.ok()).then(|| verify_feedback_in(&res, "", Some(limit)))
                     })
                 }
                 (CommandKind::Xpp { .. }, Some(tc)) => {
@@ -1845,7 +1851,11 @@ impl<'a> Engine<'a> {
             results.push(xpp::entry(&r, tc, &res, &diags));
             if !res.ok() {
                 let errors = xpp::feedback_errors(&diags);
-                return Ok(Some(Some(verify_feedback(&res, &errors))));
+                return Ok(Some(Some(verify_feedback_in(
+                    &res,
+                    &errors,
+                    Some(xpp::command_timeout(c)),
+                ))));
             }
         }
         Ok(Some(None))
@@ -2045,6 +2055,17 @@ impl<'a> Engine<'a> {
             // M11-R9: the gate must not have written into what it deploys from (E3 AC-8)
             if let Some(reason) = verify::export_changed(&export) {
                 return Ok(EnvGates::Mutated(reason));
+            }
+            // M12-06 (X18): a gate that ran into its timeout was killed part way — the
+            // environment may be half-changed. No implementer turn, no retry on its own: the
+            // owner looks, then a plain `resume` runs Verify (and the gate) again.
+            if res.timed_out {
+                return Ok(EnvGates::TimedOut(format!(
+                    "{ENV_TIMEOUT}: environment gate `{name}` ran into its timeout ({}) and was stopped — the environment may be half-changed (the deployment record says interrupted): check it, then `toryo resume {}` runs Verify and the gate again. A longer `timeout:` on the gate needs `toryo task config {} --reload` first (it is frozen with the task)",
+                    fmt_limit(timeout),
+                    t.id,
+                    t.id
+                )));
             }
             if !res.ok() {
                 // R61: the output comes from code that ran on the checkpoint — data
@@ -4117,10 +4138,19 @@ fn command_result(c: &CommandSpec, res: &CommandResult) -> Value {
 /// `errors` (the parsed X++ diagnostics, R59; empty for a program) and the tail of its output
 /// (the `output_tail` of VERIFY_RESULT.json).
 fn verify_feedback(res: &CommandResult, errors: &str) -> String {
+    verify_feedback_in(res, errors, None)
+}
+
+/// [`verify_feedback`] for a command that had `limit` to finish (M12-06): a timeout says how
+/// long it was given — `timed out after 30 min`.
+fn verify_feedback_in(res: &CommandResult, errors: &str, limit: Option<Duration>) -> String {
+    let how = match limit {
+        Some(l) if res.timed_out => format!("timed out after {}", fmt_limit(l)),
+        _ => ended(res),
+    };
     format!(
-        "- VERIFY FAILED: `{}` {}. {errors}Last output:\n```\n{}\n```",
+        "- VERIFY FAILED: `{}` {how}. {errors}Last output:\n```\n{}\n```",
         res.name,
-        ended(res),
         res.tail(40)
     )
 }
@@ -4175,6 +4205,22 @@ enum EnvGates {
     /// M11-R9: an environment gate wrote into the export it deploys from — the reason
     /// (`verify_mutated_tree`).
     Mutated(String),
+    /// M12-06 (X18): an environment gate ran into its timeout — the reason
+    /// (`environment_gate_timeout`).
+    TimedOut(String),
+}
+
+/// The escalation class of an environment gate that ran into its timeout (M12-06, X18).
+pub const ENV_TIMEOUT: &str = "environment_gate_timeout";
+
+/// A time limit in words: `30 min`, `90 s`.
+fn fmt_limit(d: Duration) -> String {
+    let s = d.as_secs();
+    if s >= 60 && (s / 60) * 60 == s {
+        format!("{} min", s / 60)
+    } else {
+        format!("{s} s")
+    }
 }
 
 /// The escalation class of an environment gate this machine cannot run (M11-E3).

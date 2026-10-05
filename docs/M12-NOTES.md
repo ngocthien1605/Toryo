@@ -10,9 +10,9 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] M12-02 The protected scan fails closed (H4)
 - [x] M12-03 Read-only role checks run on every way a turn ends (H6)
 - [x] M12-04 The redactor releases complete lines (H5)
-- [ ] Review of M12-01…04 (subagent, in place)
+- [x] Review of M12-01…04 (subagent, in place)
 - [x] M12-05 A gate that cannot start is a machine stop, and `doctor` finds it first
-- [ ] M12-06 An environment gate that times out stops for the owner (X18)
+- [x] M12-06 An environment gate that times out stops for the owner (X18)
 - [ ] M12-07 Confirm before deploy (X17)
 - [ ] Review of M12-05…07 (subagent, in place)
 - [ ] M12-08 `base_branch` is honoured; keys without effect say so (X19, X20)
@@ -153,6 +153,22 @@ One High, four Medium, four Low; the High and the Mediums fixed here.
   resume completes, no fix cycle), `m12_05_a_program_that_exists_but_cannot_start_is_the_same_stop` (AC-2: a text
   file as program — the spawn error), `m11_env_gates::m12_05_an_environment_gate_with_a_missing_script_is_a_
   machine_stop` (AC-3), and the unit tests of `gates.rs`. The M18 tables are untouched.
+
+### M12-06 — an environment gate that times out stops for the owner (X18)
+
+- `run_environment_gates`: after the export check, `res.timed_out` returns `EnvGates::TimedOut` → the attempt ends with
+  the new class **`environment_gate_timeout`** (in `MACHINE_CAUSED`, now seven): `Escalated`, no implementer turn, no
+  fix cycle, plain `resume` runs Verify again. The deployment record already said "interrupted"
+  (`deployment_ok` → `None` for a timeout). The reason names the limit, "the environment may be half-changed
+  (the deployment record says interrupted): check it, then `toryo resume <id>` runs Verify and the gate again", and
+  that a longer `timeout:` needs `task config --reload` (frozen with the task). `VERIFY_RESULT.json` is not written
+  for this stop (like the other machine stops; the gate's full log comes with M12-16).
+- Check gates: still a gate failure; the feedback now says `timed out after 30 min` (`verify_feedback_in`, the limit the
+  command was given; `verify_feedback` is unchanged for every other case, so its unit test is untouched).
+- **Tests** (`m11_env_gates`): `m12_06_an_environment_gate_that_times_out_stops_for_the_owner` (AC-1, AC-2: a 3 s
+  limit, the script sleeps the first time only; the deployment row — one per lock — ends `Some(true)` after the
+  resume), `m12_06_a_check_gate_timeout_is_still_a_gate_failure_and_says_so` (AC-3). Two helper variants take a
+  timeout (`env_gate_setup_timeout`, `probe_then_dbsync_timed`); the originals delegate with `2m`.
 
 ## Open
 
