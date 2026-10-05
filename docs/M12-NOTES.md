@@ -16,7 +16,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] M12-07 Confirm before deploy (X17)
 - [x] Review of M12-05…07 (subagent, in place)
 - [x] M12-08 `base_branch` is honoured; keys without effect say so (X19, X20)
-- [ ] M12-09 `./toryo.yaml` before `$TORYO_CONFIG` (X21)
+- [x] M12-09 `./toryo.yaml` before `$TORYO_CONFIG` (X21)
 - [ ] M12-10 Text files: BOM ignored, non-UTF-8 refused by name (X22)
 - [ ] M12-11 Acceptance criteria are never dropped silently
 - [ ] M12-12 Three CLI traps
@@ -244,6 +244,21 @@ No Critical or High; three Medium, fixed here.
   and a reload mid-task have no test; whether `Path::is_file()` is true for a Store App Execution Alias is
   **unverified** here (the preflight is lenient for it).
 
+### M12-09 — `./toryo.yaml` before `$TORYO_CONFIG` (X21)
+
+- **Reproduced by reading:** `load_config` took `$TORYO_CONFIG` before `./toryo.yaml`; `--help` said the opposite.
+- **Fix:** `config_path(cli)` in `src/main.rs`: `--config`, then `./toryo.yaml` when it is a file, then `$TORYO_CONFIG`.
+  When both exist and are not the same file (canonicalised), one stderr note names both (printed once per process).
+  `$TORYO_CONFIG` pointing at a missing file with no local file: as before (the load error names it).
+- **Guide:** HUONG-DAN §3 states the order and what a variable in `$PROFILE` now means.
+- **Test:** `m12_09_the_local_config_comes_before_the_variable` (both → the local file and the note; the same file
+  twice → no note; only the variable → it, no note; only the file → it).
+- **Scripts:** `scripts/m3-stop-test.ps1`, `m4-m7-check.ps1`, `m8-check.ps1` set `$env:TORYO_CONFIG` and relied on the
+  old order when run from a folder that has its own `toryo.yaml` — see Open. No test relied on the old order (all use
+  `--config` or the environment without a local file).
+
+
 ## Open
 
+- M12-09: `scripts/m3-stop-test.ps1`, `m4-m7-check.ps1`, `m8-check.ps1` and the other M-check scripts set `$env:TORYO_CONFIG` and then run `toryo` in whatever folder they were started from. Run from a folder that has its own `toryo.yaml`, they now use that file, not the variable. Not changed (scripts are the owner's; the fix is `--config` in each call). Conservative choice: left as is, recorded here.
 (filled as the work goes)

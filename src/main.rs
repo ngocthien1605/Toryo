@@ -212,12 +212,40 @@ enum SecretsCmd {
     Set { target: String },
 }
 
+/// The repository config in use (M12-09, X21): `--config`, then `./toryo.yaml` when it exists,
+/// then `$TORYO_CONFIG` — as `--help` says. A variable in the shell profile used to win over the
+/// file of the repository the owner stood in, and `task create` silently made its worktree for
+/// another one. When both exist and are different files one note line names both.
+pub(crate) fn config_path(cli: &Cli) -> PathBuf {
+    if let Some(p) = &cli.config {
+        return p.clone();
+    }
+    let local = PathBuf::from("toryo.yaml");
+    let var = std::env::var_os("TORYO_CONFIG").map(PathBuf::from);
+    if local.is_file() {
+        if let Some(v) = var.filter(|v| v.is_file()) {
+            let same = match (std::fs::canonicalize(&local), std::fs::canonicalize(&v)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            };
+            if !same {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!(
+                        "note: using {} (the file in this folder); $TORYO_CONFIG ({}) is ignored here — pass --config to choose",
+                        std::fs::canonicalize(&local).unwrap_or(local.clone()).display(),
+                        v.display()
+                    );
+                });
+            }
+        }
+        return local;
+    }
+    var.unwrap_or(local)
+}
+
 pub(crate) fn load_config(cli: &Cli) -> Result<Effective> {
-    let path = cli
-        .config
-        .clone()
-        .or_else(|| std::env::var_os("TORYO_CONFIG").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("toryo.yaml"));
+    let path = config_path(cli);
     let machine = cli
         .machine_config
         .clone()

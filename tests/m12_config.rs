@@ -171,3 +171,71 @@ fn m12_08_keys_without_effect_say_so() {
         ])
     );
 }
+
+// ── M12-09 (X21): `./toryo.yaml` before `$TORYO_CONFIG` ───────────────────────────────────
+
+/// `toryo config show --json` run from `cwd` without `--config`, with `$TORYO_CONFIG` set to
+/// `var` (when given): the path of the repository config it read, and its stderr.
+fn config_in_use(
+    env: &Env,
+    cwd: &std::path::Path,
+    var: Option<&std::path::Path>,
+) -> (String, String) {
+    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_toryo"));
+    c.arg("--machine-config")
+        .arg(&env.machine)
+        .args(["config", "show", "--json"])
+        .env("TORYO_DATA_DIR", &env.data)
+        .env_remove("TORYO_CONFIG")
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null());
+    if let Some(v) = var {
+        c.env("TORYO_CONFIG", v);
+    }
+    let o = c.output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    let path = v["files"][0]["path"].as_str().unwrap().to_string();
+    (path, String::from_utf8_lossy(&o.stderr).to_string())
+}
+
+/// AC-1/AC-2: both present and different — the file of the folder you stand in is used and
+/// one note names both; only the variable — as before; neither flag nor file nor variable is
+/// an error that names `toryo.yaml`.
+#[test]
+fn m12_09_the_local_config_comes_before_the_variable() {
+    let env = setup("codex-openai");
+    let here = env.root.join("here");
+    let elsewhere = env.root.join("elsewhere");
+    std::fs::create_dir_all(&here).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let text = std::fs::read_to_string(&env.config).unwrap();
+    std::fs::write(here.join("toryo.yaml"), &text).unwrap();
+    let other = elsewhere.join("other.yaml");
+    std::fs::write(&other, &text).unwrap();
+    let norm = |p: &str| {
+        p.replace(std::path::MAIN_SEPARATOR, "/")
+            .trim_start_matches("//?/")
+            .to_lowercase()
+    };
+    // both present: the local file, and the note
+    let (used, err) = config_in_use(&env, &here, Some(&other));
+    // the local file is named as `toryo.yaml` (relative to the folder the command ran in)
+    assert_eq!(used, "toryo.yaml", "{used}");
+    assert!(
+        err.contains("note: using")
+            && err.contains("other.yaml")
+            && err.contains("is ignored here"),
+        "{err}"
+    );
+    // the same file twice: no note
+    let (_, err) = config_in_use(&env, &here, Some(&here.join("toryo.yaml")));
+    assert!(!err.contains("note: using"), "{err}");
+    // only the variable (nothing in the folder): as today
+    let (used, err) = config_in_use(&env, &elsewhere, Some(&other));
+    assert!(norm(&used).ends_with("/elsewhere/other.yaml"), "{used}");
+    assert!(!err.contains("note: using"), "{err}");
+    // only the file: it
+    let (used, _) = config_in_use(&env, &here, None);
+    assert!(norm(&used).ends_with("toryo.yaml"), "{used}");
+}

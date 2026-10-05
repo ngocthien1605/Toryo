@@ -125,6 +125,11 @@ $env:TORYO_CONFIG = 'C:\.thien\m0\toryo.yaml'      # để khỏi gõ --config m
 toryo doctor                                        # kiểm tra tổng quát
 ```
 
+> **Thứ tự chọn file cấu hình:** `--config`, rồi `toryo.yaml` trong thư mục đang đứng (nếu có), rồi `$TORYO_CONFIG`.
+> Đặt `TORYO_CONFIG` trong `$PROFILE` chỉ là mặc định khi thư mục hiện tại không có `toryo.yaml`; nếu có cả hai và khác
+> nhau, toryo dùng file trong thư mục và in một dòng `note: using … ; $TORYO_CONFIG (…) is ignored here`.
+> (Trước M12 biến môi trường thắng — `task create` trong repo này có thể tạo worktree cho repo khác.)
+
 > Nếu sau này thay đổi đường dẫn claude/codex, chạy lại
 > `pwsh -NoProfile -ExecutionPolicy Bypass -File C:\.thien\AgentOrchestrator\toryo\scripts\m0-smoke.ps1 -SkipSmoke`
 > để sinh lại `toryo.yaml`.
