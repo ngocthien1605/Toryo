@@ -9,7 +9,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] M12-01 Recovery never accepts a commit Toryo did not make (H1)
 - [x] M12-02 The protected scan fails closed (H4)
 - [x] M12-03 Read-only role checks run on every way a turn ends (H6)
-- [ ] M12-04 The redactor releases complete lines (H5)
+- [x] M12-04 The redactor releases complete lines (H5)
 - [ ] Review of M12-01…04 (subagent, in place)
 - [ ] M12-05 A gate that cannot start is a machine stop, and `doctor` finds it first
 - [ ] M12-06 An environment gate that times out stops for the owner (X18)
@@ -81,6 +81,18 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - **Tests** (new file `tests/m12_safety.rs`, all four fail before): reviewer + quota (AC-1), reviewer + live budget and
   reviewer + `toryo stop` (AC-2), planner + quota (AC-3); each asserts the state, the reason prefix
   `policy_violation: the worktree changed during a read-only stage` and that the file is in no checkpoint.
+
+### M12-04 — the redactor releases complete lines (H5)
+
+- `StreamRedactor::process`: when no configured secret contains a line break (`Redactions.multiline`, computed in
+  `new`), everything up to and including the last `\n` in the buffer is final — the `max_len − 1` hold-back applies
+  only to the unfinished last line. A secret with a line break (a PEM key) keeps the old rule.
+- **Tests** (unit, `process::redact`): `a_complete_line_is_released_at_once` (AC-1: `retained() == 0` after a chunk that
+  ends in `\n`; fails before), `a_secret_split_inside_a_line_is_still_redacted` (AC-2, also every split of a
+  multi-line sample), `a_secret_with_a_line_break_keeps_the_old_hold_back`; the fuzz and split tests pass unchanged.
+  AC-3 `regress_agents::unix::codex_stall_waits_for_a_running_command_with_a_secret_configured` — a fake Codex whose
+  profile has `secret_env`, a silent command longer than the stall limit: **Unix-only, never run here**; compiled on
+  Windows once by switching its `cfg(unix)` off for one `cargo check` (only the `std::os::unix` lines failed).
 
 ## Open
 

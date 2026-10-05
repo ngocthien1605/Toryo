@@ -41,6 +41,9 @@ pub struct Redactions {
     ac: Option<std::sync::Arc<AhoCorasick>>,
     replacements: Vec<Vec<u8>>,
     max_len: usize,
+    /// Some pattern contains a line break: an occurrence can then span lines, and a line
+    /// ending is no safe place to release the stream (M12-04).
+    multiline: bool,
 }
 
 impl std::fmt::Debug for Redactions {
@@ -79,9 +82,11 @@ impl Redactions {
                 ac: None,
                 replacements,
                 max_len: 0,
+                multiline: false,
             };
         }
         let max_len = patterns.iter().map(|p| p.len()).max().unwrap_or(0);
+        let multiline = patterns.iter().any(|p| p.contains(&b'\n'));
         let ac = AhoCorasickBuilder::new()
             .match_kind(MatchKind::Standard) // overlapping search; spans are unioned below
             .build(&patterns)
@@ -90,6 +95,7 @@ impl Redactions {
             ac: Some(std::sync::Arc::new(ac)),
             replacements,
             max_len,
+            multiline,
         }
     }
 
@@ -177,11 +183,20 @@ impl StreamRedactor {
         let len = self.buf.len();
         // A secret occurrence that is still incomplete must start at or after
         // `len - (max_len - 1)`; everything before that point is final.
-        let final_before = if eof {
+        let mut final_before = if eof {
             len
         } else {
             len.saturating_sub(self.r.max_len.saturating_sub(1))
         };
+        // M12-04 (H5): no secret holds a line break, so nothing that starts in a line can
+        // reach into the next one: everything up to and including the last `\n` is final. A
+        // line that ends an event must not wait for the next chunk — an adapter that waits
+        // for "command started" would see a long silent command as stalled.
+        if !eof && !self.r.multiline {
+            if let Some(nl) = self.buf.iter().rposition(|b| *b == b'\n') {
+                final_before = final_before.max(nl + 1);
+            }
+        }
         // Union of all (overlapping) occurrences, sorted by start.
         // Overlapping search reports matches by end position: sort by start (longest first).
         let mut raw: Vec<(usize, usize, usize)> = ac
@@ -395,6 +410,70 @@ mod tests {
         let r = all();
         let out = run_chunks(&r, &[b"head ", b"abcdef"]);
         assert_eq!(String::from_utf8(out).unwrap(), "head [REDACTED:KEY_B]");
+    }
+
+    /// M12-04 AC-1 (H5): with a secret configured, a chunk that ends in a line break leaves
+    /// nothing held back — an event line reaches the adapter at once.
+    #[test]
+    fn a_complete_line_is_released_at_once() {
+        let r = all();
+        let mut s = StreamRedactor::new(r);
+        let out = s.push(b"{\"type\":\"command_started\"}\n");
+        assert_eq!(s.retained(), 0);
+        assert_eq!(out, b"{\"type\":\"command_started\"}\n");
+        // a line and the start of the next: the tail is held back only as far as a secret
+        // could still begin in it
+        let out = s.push(b"second line\nabcdef0123");
+        assert!(out.starts_with(b"second line\n"), "{out:?}");
+        assert_eq!(s.retained(), "abcdef0123".len());
+        // with no line break the old rule stands: at most max_len-1 bytes are held
+        let mut s = StreamRedactor::new(all());
+        let _ = s.push(&vec![b'z'; 10_000]);
+        assert!(s.retained() < all().max_len);
+    }
+
+    /// M12-04 AC-2: a secret split across two chunks inside one line is still redacted, and
+    /// so is one before the line break of the same chunk.
+    #[test]
+    fn a_secret_split_inside_a_line_is_still_redacted() {
+        let r = all();
+        let out = run_chunks(
+            &r,
+            &[b"line one\nuse abcdef01", b"23456789 now\nline three\n"],
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "line one\nuse [REDACTED:KEY_A] now\nline three\n"
+        );
+        let out = run_chunks(&r, &[b"token abcdef0123456789\nnext", b" line\n"]);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "token [REDACTED:KEY_A]\nnext line\n"
+        );
+        // every split of a multi-line sample is still clean
+        let sample = b"a abcdef0123456789 b\nabcdef c 5678XYZ\nend 5678XYZ\n".to_vec();
+        for cut in 0..=sample.len() {
+            let out = run_chunks(&r, &[&sample[..cut], &sample[cut..]]);
+            assert_clean(&out);
+        }
+    }
+
+    /// M12-04: a secret that contains a line break can span lines, so the stream is not
+    /// released at a line end — as before.
+    #[test]
+    fn a_secret_with_a_line_break_keeps_the_old_hold_back() {
+        let r = Redactions::new(&[sec("PEM", "-----BEGIN\nMIIE-----END")]);
+        let mut s = StreamRedactor::new(r.clone());
+        let out = s.push(b"x\n-----BEGIN\n");
+        assert!(s.retained() > 0, "{out:?}");
+        let rest = s.push(b"MIIE-----END\ndone\n");
+        let mut all_out = out;
+        all_out.extend(rest);
+        all_out.extend(s.finish());
+        assert_eq!(
+            String::from_utf8(all_out).unwrap(),
+            "x\n[REDACTED:PEM]\ndone\n"
+        );
     }
 
     #[test]
