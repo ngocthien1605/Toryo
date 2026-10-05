@@ -1098,6 +1098,44 @@ mod unix {
         assert_eq!(captured_lines(d.path(), "build"), 6);
     }
 
+    /// M12-04 AC-3 (H5): the same with a secret configured (`secret_env`). Was: the redactor
+    /// held back the newline that ends `item.started`, so the adapter never saw "command
+    /// started" and the silent command was killed as stalled.
+    #[test]
+    fn codex_stall_waits_for_a_running_command_with_a_secret_configured() {
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("TORYO_M12_SECRET_SRC", "m12-secret-token-0123456789abcdef");
+        let middle = format!(
+            "{}sleep 4\n{}",
+            echo(&[codex_command("item_1", false)]),
+            echo(&[codex_command("item_1", true)])
+        );
+        let body = format!("{}{middle}{}", echo(CODEX_START), echo(CODEX_DONE));
+        let exe = fake(d.path(), "fake-codex.sh", &body);
+        let mut cfg = config(d.path(), &exe);
+        cfg.repo
+            .profiles
+            .get_mut("codex-openai")
+            .unwrap()
+            .secret_env
+            .insert("TORYO_M12_TOKEN".into(), "env:TORYO_M12_SECRET_SRC".into());
+        let hub = AgentHub::new(&cfg, LaunchMode::Restricted, None).unwrap();
+        let limits = TurnLimits {
+            max: Duration::from_secs(60),
+            stall: Duration::from_millis(1500),
+        };
+        let out = hub
+            .turn(
+                open(d.path(), "codex-openai", Role::Implementer),
+                turn_input("build"),
+                limits,
+            )
+            .unwrap();
+        assert!(!out.timed_out, "{out:?}");
+        assert!(out.success, "{out:?}");
+        assert_eq!(out.tool_activity, 1, "the command, completed");
+    }
+
     /// Once the command has ended, silence stalls the turn again, and an open item that is
     /// not a command (a file change) does not hold the stall limit off.
     #[test]

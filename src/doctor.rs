@@ -165,6 +165,79 @@ pub fn policy_checks(cfg: &Effective) -> Vec<Check> {
     .collect()
 }
 
+/// M12-05: one line per gate — can it start on this machine? A check gate's program (a bare
+/// name on the PATH, an absolute path that exists) and an environment gate's program and
+/// script (`-File`, an absolute script path). FAIL with the way out; a gate that can start is
+/// an OK line. A repository path is not asked here (the M18 rules).
+pub fn gate_checks(cfg: &Effective) -> Vec<Check> {
+    use crate::engine::gates;
+    let path = std::env::var_os("PATH");
+    let root = expand_vars(&cfg.repo.project.root).map(PathBuf::from).ok();
+    let mut out = Vec::new();
+    let mut add = |level: Level, message: String| {
+        out.push(Check {
+            level,
+            area: "gates".into(),
+            message,
+            source: None,
+        })
+    };
+    let cmds = root
+        .as_deref()
+        .and_then(|r| crate::engine::checks::verify_commands(cfg, r).ok())
+        .unwrap_or_else(|| cfg.repo.commands.verify.clone());
+    for c in &cmds {
+        if !matches!(c.kind(), crate::config::CommandKind::Program { .. }) {
+            continue;
+        }
+        match gates::check_gate_problem(c, path.as_deref()) {
+            Some(why) => add(
+                Level::Fail,
+                format!(
+                    "check gate `{}`: {why} — install it or put it on the PATH, or change `commands.verify` / the gate in the org chart; a run would stop with `{}` before any gate ran",
+                    c.name,
+                    gates::GATE_UNAVAILABLE
+                ),
+            ),
+            None => add(Level::Ok, format!("check gate `{}` can start here", c.name)),
+        }
+    }
+    if let Some(team) = &cfg.team {
+        for (name, g) in team.handoff_gates() {
+            if g.decl.kind != crate::team::GateType::Environment {
+                continue;
+            }
+            let Some(m) = &g.machine else { continue };
+            let mut problems: Vec<String> = Vec::new();
+            if let Err(e) =
+                crate::engine::runner::env_gate_program(cfg, &m.program, path.as_deref())
+            {
+                problems.push(e);
+            }
+            problems.extend(gates::script_problems(&m.args));
+            if problems.is_empty() {
+                add(
+                    Level::Ok,
+                    format!(
+                        "environment gate `{name}` can start here (confirm: {})",
+                        m.confirm.as_str()
+                    ),
+                );
+            } else {
+                add(
+                    Level::Fail,
+                    format!(
+                        "environment gate `{name}`: {} — fix `environment_gates.{name}` in the machine config; `task create` refuses it and a run would stop with `{}` before any gate ran",
+                        problems.join("; "),
+                        crate::engine::runner::ENV_UNAVAILABLE
+                    ),
+                );
+            }
+        }
+    }
+    out
+}
+
 /// M11-R8: the machine's `skills_dir` (org chart mode) — a WARN when the folder does not
 /// exist: a skill only there resolves nowhere, and the turn that needs it escalates
 /// (`skill_unavailable`).
@@ -232,14 +305,263 @@ fn version_matches(pattern: &str, actual: &str) -> bool {
             })
 }
 
-pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Result<i32> {
+/// M12-17: which repository config file is in use and why (M12-09), and whether another
+/// file `$TORYO_CONFIG` names is being ignored in this folder.
+pub fn config_source_checks(cfg: &Effective, source: &str, variable: Option<&Path>) -> Vec<Check> {
+    let mut out = vec![Check {
+        level: Level::Info,
+        area: "config".into(),
+        message: format!(
+            "{} is in use — chosen by {source}; `--config <file>` chooses another",
+            cfg.repo_path.display()
+        ),
+        source: None,
+    }];
+    if let Some(v) = variable.filter(|v| v.is_file()) {
+        let same = match (
+            std::fs::canonicalize(&cfg.repo_path),
+            std::fs::canonicalize(v),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        if !same {
+            out.push(Check {
+                level: Level::Warn,
+                area: "config".into(),
+                message: format!(
+                    "$TORYO_CONFIG names {}, which is not the file in use and is ignored here — a `task create` in this folder uses {}; remove the variable from your profile or pass `--config`",
+                    v.display(),
+                    cfg.repo_path.display()
+                ),
+                source: None,
+            });
+        }
+    }
+    out
+}
+
+/// M12-17: the base branch of `task create` (M12-08) — `project.base_branch` exists in the
+/// repository, or says which branch a task would start from.
+pub fn base_branch_checks(cfg: &Effective, g: &GitCmd) -> Vec<Check> {
+    let area = "base branch";
+    let check = |level: Level, message: String| Check {
+        level,
+        area: area.into(),
+        message,
+        source: None,
+    };
+    let Ok(root) = expand_vars(&cfg.repo.project.root) else {
+        return Vec::new();
+    };
+    let loc = Loc::Discover(PathBuf::from(&root));
+    let checked_out = g
+        .run_str(&loc, true, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .map(|s| s.trim().to_string());
+    match (&cfg.repo.project.base_branch, checked_out) {
+        (Some(b), _) => {
+            let found = g.output(
+                &loc,
+                true,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{b}^{{commit}}"),
+                ],
+            );
+            match found {
+                Ok(o) if o.status.success() => vec![check(
+                    Level::Ok,
+                    format!("project.base_branch `{b}` exists in {root}"),
+                )],
+                _ => vec![check(
+                    Level::Fail,
+                    format!(
+                        "project.base_branch: the branch `{b}` does not exist in {root} — create it, or fix the key in {} (or remove it to start from the checked-out branch); `task create` refuses it",
+                        cfg.repo_path.display()
+                    ),
+                )],
+            }
+        }
+        (None, Ok(now)) => vec![check(
+            Level::Info,
+            format!(
+                "no project.base_branch: `task create` starts from the checked-out branch (`{now}`) — set the key to start from a fixed branch whatever is checked out"
+            ),
+        )],
+        (None, Err(e)) => vec![check(
+            Level::Warn,
+            format!("{root} is not a Git repository Toryo can read ({e:#}) — `task create` needs one"),
+        )],
+    }
+}
+
+/// The file extensions of the text files under `.toryo/` (the org chart, the roles, the skills,
+/// the context).
+const TEXT_EXTENSIONS: [&str; 6] = ["md", "yaml", "yml", "txt", "json", "toml"];
+
+/// M12-17 (M12-10): every text file under `<project.root>/.toryo/` and the machine config are
+/// UTF-8 — a byte-order mark is fine, UTF-16 and code-page files are named.
+pub fn encoding_checks(cfg: &Effective) -> Vec<Check> {
+    let area = "encoding";
+    let mut out = Vec::new();
+    let mut bad = 0usize;
+    let mut seen = 0usize;
+    let root = expand_vars(&cfg.repo.project.root)
+        .map(|r| PathBuf::from(r).join(".toryo"))
+        .ok();
+    let mut stack: Vec<PathBuf> = root.into_iter().filter(|d| d.is_dir()).collect();
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let text = p
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| TEXT_EXTENSIONS.contains(&x.to_ascii_lowercase().as_str()));
+            if !text {
+                continue;
+            }
+            seen += 1;
+            if let Err(e) = crate::textfile::read_text(&p) {
+                bad += 1;
+                out.push(Check {
+                    level: Level::Fail,
+                    area: area.into(),
+                    message: format!("{e:#} — a turn that reads it would stop with `context_unreadable`; `task create` refuses an org chart, role file or skill that is not UTF-8"),
+                    source: None,
+                });
+            }
+        }
+    }
+    if seen > 0 && bad == 0 {
+        out.push(Check {
+            level: Level::Ok,
+            area: area.into(),
+            message: format!(
+                "{seen} text file(s) under .toryo/ are UTF-8 (a byte-order mark is ignored)"
+            ),
+            source: None,
+        });
+    }
+    if let Some(m) = &cfg.machine_path {
+        out.push(match crate::textfile::read_text(m) {
+            Ok(_) => Check {
+                level: Level::Ok,
+                area: area.into(),
+                message: format!("machine config {} is UTF-8", m.display()),
+                source: None,
+            },
+            Err(e) => Check {
+                level: Level::Fail,
+                area: area.into(),
+                message: format!("{e:#}"),
+                source: None,
+            },
+        });
+    }
+    out
+}
+
+/// M12-17: Toryo runs with an administrator token. The agents and the Low-integrity gates get
+/// a copy of that token.
+pub fn elevation_check(elevated: bool) -> Check {
+    if elevated {
+        Check {
+            level: Level::Warn,
+            area: "token".into(),
+            message: "Toryo runs elevated: agents and the Low-integrity gates get an administrator token — start Toryo from a normal shell and elevate inside the environment gate script".into(),
+            source: None,
+        }
+    } else {
+        Check {
+            level: Level::Ok,
+            area: "token".into(),
+            message: "Toryo runs with a normal (not elevated) token".into(),
+            source: None,
+        }
+    }
+}
+
+/// Whether this process has an elevated token (Windows; `false` elsewhere).
+pub fn is_elevated() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        // SAFETY: the token handle is opened and closed here; the output buffer is a
+        // TOKEN_ELEVATION of the size passed
+        unsafe {
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return false;
+            }
+            let mut e = TOKEN_ELEVATION { TokenIsElevated: 0 };
+            let mut len = 0u32;
+            let ok = GetTokenInformation(
+                token,
+                TokenElevation,
+                &mut e as *mut TOKEN_ELEVATION as *mut _,
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut len,
+            );
+            CloseHandle(token);
+            ok != 0 && e.TokenIsElevated != 0
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// M12-17: a profile `env:` value that contains `%NAME%` — Toryo passes it as written; only
+/// the `exe` of a profile is expanded. (`CODEX_HOME: '%USERPROFILE%...'` was frozen literally
+/// and Codex started without its login.)
+pub fn profile_env_checks(cfg: &Effective) -> Vec<Check> {
+    static VAR: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"%[A-Za-z_][A-Za-z0-9_]*%").expect("regex"));
+    let mut out = Vec::new();
+    for (name, p) in &cfg.repo.profiles {
+        for (k, v) in &p.env {
+            if let Some(m) = VAR.find(v) {
+                out.push(Check {
+                    level: Level::Warn,
+                    area: format!("profile {name}"),
+                    message: format!(
+                        "env {k} contains {} — not expanded here: the value is passed to the agent as written; write the absolute path in the machine config",
+                        m.as_str()
+                    ),
+                    source: None,
+                });
+            }
+        }
+    }
+    out
+}
+
+pub fn run(
+    cfg: Option<&Effective>,
+    cfg_err: Option<String>,
+    json: bool,
+    config_source: &str,
+    config_variable: Option<&Path>,
+) -> Result<i32> {
     let mut r = Report::default();
     r.add(
         Level::Info,
         "toryo",
         format!(
-            "version {} on {}",
+            "version {} ({}) on {}",
             env!("CARGO_PKG_VERSION"),
+            env!("TORYO_COMMIT"),
             std::env::consts::OS
         ),
     );
@@ -259,7 +581,7 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
         Ok(o) => r.add(
             Level::Ok,
             "git",
-            String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            crate::process::decode_output(&o.stdout).trim().to_string(),
         ),
         Err(e) => r.add(Level::Fail, "git", format!("{}: {e}", git.display())),
     }
@@ -306,8 +628,23 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
         ),
     }
     verify_root_check(&mut r, cfg);
+    path_length_check(&mut r, cfg);
     r.0.extend(origin_checks(cfg));
     r.0.extend(policy_checks(cfg));
+    // M12-08 (X20): keys that are accepted and do nothing
+    for key in cfg.keys_without_effect() {
+        r.add(Level::Warn, "config", Effective::no_effect_line(key));
+    }
+    r.0.extend(config_source_checks(cfg, config_source, config_variable));
+    if let Ok(g) = &gc {
+        r.0.extend(base_branch_checks(cfg, g));
+    }
+    r.0.extend(encoding_checks(cfg));
+    if cfg!(windows) {
+        r.0.push(elevation_check(is_elevated()));
+    }
+    r.0.extend(profile_env_checks(cfg));
+    r.0.extend(gate_checks(cfg));
     r.0.extend(skills_dir_checks(cfg));
 
     // Profiles
@@ -536,6 +873,38 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
         ),
     }
     finish(r, json)
+}
+
+/// Above this many characters a root leaves too little of the 260 a Windows tool allows for the
+/// repository's own paths (D365FO metadata paths reach 200).
+const LONG_ROOT: usize = 70;
+
+/// M12-13: the lengths of `worktrees_root` and `verify_root` — every file of a task lives
+/// under `<worktrees_root>\<task id>\` and its verify checkout under `<verify_root>\…`, which
+/// adds about 60 characters. Toryo's own Git calls allow long paths on Windows; the build tools
+/// and the agents' tools may not.
+fn path_length_check(r: &mut Report, cfg: &Effective) {
+    let area = "paths";
+    let (Ok(wt), Ok(vr)) = (
+        expand_vars(&cfg.repo.project.worktrees_root),
+        expand_vars(crate::engine::verify::verify_root_setting(cfg)),
+    ) else {
+        return;
+    };
+    let (w, v) = (wt.chars().count(), vr.chars().count());
+    let long = w.max(v) > LONG_ROOT;
+    r.add(
+        if long && cfg!(windows) { Level::Warn } else { Level::Info },
+        area,
+        format!(
+            "worktrees_root is {w} characters ({wt}), verify_root is {v} ({vr}); every file of a task sits under them and Windows tools stop at 260 characters — {}",
+            if long {
+                r"keep them short (for example D:\w and D:\v): a root of more than 70 characters leaves too little room for D365FO metadata paths"
+            } else {
+                "short enough"
+            }
+        ),
+    );
 }
 
 /// R36 precondition (M0 finding F7): the Low-IL verify boundary needs a `verify_root`
@@ -816,7 +1185,7 @@ fn vswhere_msbuild() -> Option<PathBuf> {
         ])
         .output()
         .ok()?;
-    String::from_utf8_lossy(&out.stdout)
+    crate::process::decode_output(&out.stdout)
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())

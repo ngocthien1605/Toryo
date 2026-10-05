@@ -47,10 +47,20 @@ fn machine_gate(env: &Env, name: &str, lock: &str, ps1: &str, sh: &str, extra: &
 /// gate `dbsync` (`if_missing`) after it; `machine_gates`: the machine's `environment_gates:`
 /// entries (none: the machine does not define dbsync).
 fn env_gate_setup(implementer: &str, if_missing: &str, org_tail: &str) -> Env {
+    env_gate_setup_timeout(implementer, if_missing, org_tail, "2m")
+}
+
+/// [`env_gate_setup`] with the environment gate's `timeout:` (M12-06: a few seconds).
+fn env_gate_setup_timeout(
+    implementer: &str,
+    if_missing: &str,
+    org_tail: &str,
+    timeout: &str,
+) -> Env {
     let org = ORGCHART.replace("IMPLEMENTER", implementer).replacen(
         "gates:\n",
         &format!(
-            "gates:\n  dbsync: {{ kind: environment, timeout: 2m, if_missing: {if_missing} }}\n"
+            "gates:\n  dbsync: {{ kind: environment, timeout: {timeout}, if_missing: {if_missing} }}\n"
         ),
         1,
     ) + org_tail;
@@ -838,15 +848,20 @@ fn a_stop_during_an_environment_gate_interrupts_it() {
 /// The fixture with a repository check gate `probe` (the script `ps1` / `sh`) between
 /// `divide-present` and the environment gate `dbsync`, whose machine script writes a marker.
 fn probe_then_dbsync(ps1: &str, sh: &str) -> (Env, PathBuf) {
+    probe_then_dbsync_timed(ps1, sh, "2m")
+}
+
+/// [`probe_then_dbsync`] with the check gate `probe`'s `timeout:` (M12-06).
+fn probe_then_dbsync_timed(ps1: &str, sh: &str, probe_timeout: &str) -> (Env, PathBuf) {
     let (decl, file, body) = if cfg!(windows) {
         (
-            "  probe: { kind: check, program: pwsh, args: [-NoProfile, -NonInteractive, -File, scripts/probe.ps1], timeout: 2m }\n",
+            format!("  probe: {{ kind: check, program: pwsh, args: [-NoProfile, -NonInteractive, -File, scripts/probe.ps1], timeout: {probe_timeout} }}\n"),
             "scripts/probe.ps1",
             ps1,
         )
     } else {
         (
-            "  probe: { kind: check, program: sh, args: [scripts/probe.sh], timeout: 2m }\n",
+            format!("  probe: {{ kind: check, program: sh, args: [scripts/probe.sh], timeout: {probe_timeout} }}\n"),
             "scripts/probe.sh",
             sh,
         )
@@ -2061,4 +2076,515 @@ fn a_gate_frozen_with_a_variable_does_not_start() {
     assert_eq!(t.fix_cycle, 0);
     let d = deployments(&env);
     assert_eq!((d.len(), d[0].ok), (1, Some(true)));
+}
+
+/// M12-05 AC-3: an environment gate whose `-File` script is not there. `doctor` FAILs and
+/// `task create` refuses it (like a gate the machine does not define); when the script
+/// disappears after `task create`, Verify stops with `environment_gate_unavailable` — no
+/// implementer turn, no gate retry used, no deployment. (Was: PowerShell starts, exits 2, and
+/// that counts as a failing gate: a typo in the machine config cost two implementer turns.)
+#[test]
+fn m12_05_an_environment_gate_with_a_missing_script_is_a_machine_stop() {
+    let env = env_gate_setup("codex-openai", "error", "");
+    let g = machine_gate(&env, "dbsync", "d365-env", "exit 0\n", "exit 0\n", "");
+    define_gates(&env, &g);
+    let script_file = env.root.join("gates").join(if cfg!(windows) {
+        "dbsync.ps1"
+    } else {
+        "dbsync.sh"
+    });
+    assert!(script_file.is_file());
+    // the script is there: doctor is quiet, `task create` accepts
+    let o = command(&env, &["doctor"], &[]).output().unwrap();
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    assert!(
+        out.lines()
+            .any(|l| l.contains("environment gate `dbsync` can start here")),
+        "{out}"
+    );
+    create(&env, "MS-1");
+    // … and gone: doctor FAILs, a new task is refused
+    std::fs::remove_file(&script_file).unwrap();
+    let o = command(&env, &["doctor"], &[]).output().unwrap();
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    let line = out
+        .lines()
+        .find(|l| l.contains("environment gate `dbsync`") && l.contains("FAIL"))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(line.contains("does not exist"), "{line}");
+    let (code, err) = toryo(
+        &env,
+        &["task", "create", "--file", "TASK.md", "--id", "MS-2"],
+        &[],
+    );
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("environment_gate_unavailable: environment gate `dbsync` cannot start")
+            && err.contains("does not exist"),
+        "{err}"
+    );
+    // the task made before: Verify stops, nothing was spent on it
+    let s = script(
+        &env,
+        "ms1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "MS-1", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "MS-1");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_unavailable"),
+        "{err}"
+    );
+    let why = t.machine.reason().unwrap().to_string();
+    assert!(why.contains("does not exist"), "{why}");
+    assert_eq!(
+        attempts(&env, "MS-1")
+            .iter()
+            .filter(|a| a.stage == "implement")
+            .count(),
+        1,
+        "no implementer turn"
+    );
+    assert_eq!(t.fix_cycle, 0, "no gate retry used");
+    assert!(deployments(&env).is_empty());
+}
+
+/// M12-06 AC-1/AC-2 (X18): an environment gate that runs into its timeout is the owner's
+/// problem, not the implementer's. The task stops with `environment_gate_timeout` (machine-
+/// caused): no implementer turn, no gate retry used, the deployment record says interrupted,
+/// the reason says the limit and "the environment may be half-changed". A plain `resume` runs
+/// Verify — and the gate — again (a second run of the script is quick). Was: a failing gate,
+/// an implementer turn, a retry, and the sync started again unattended.
+#[test]
+fn m12_06_an_environment_gate_that_times_out_stops_for_the_owner() {
+    let env = env_gate_setup_timeout("codex-openai", "error", "", "3s");
+    let run_log = fwd(&env.root.join("gates").join("runs"));
+    // the first run sleeps past its limit, the second returns at once
+    let ps1 = format!(
+        "Add-Content -Path '{run_log}' -Value x\nif ((Get-Content '{run_log}').Count -le 1) {{ Start-Sleep -Seconds 60 }}\n'synced'\nexit 0\n"
+    );
+    let sh = format!(
+        "echo x >> '{run_log}'\nn=$(wc -l < '{run_log}')\nif [ \"$n\" -le 1 ]; then sleep 60; fi\necho synced\nexit 0\n"
+    );
+    define_gates(
+        &env,
+        &machine_gate(&env, "dbsync", "d365-env", &ps1, &sh, ""),
+    );
+    create(&env, "TO-1");
+    let s = script(
+        &env,
+        "to1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "TO-1", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "TO-1");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_timeout"),
+        "{err}"
+    );
+    let why = t.machine.reason().unwrap().to_string();
+    assert!(
+        why.contains("`dbsync` ran into its timeout (3 s)")
+            && why.contains("half-changed")
+            && why.contains("`toryo resume TO-1`"),
+        "{why}"
+    );
+    assert_eq!(
+        attempts(&env, "TO-1")
+            .iter()
+            .filter(|a| a.stage == "implement")
+            .count(),
+        1,
+        "no implementer turn"
+    );
+    assert_eq!(t.fix_cycle, 0, "no gate retry used");
+    let d = deployments(&env);
+    assert_eq!((d.len(), d[0].ok), (1, None), "interrupted: {d:?}");
+    // a plain resume runs Verify and the gate again
+    let s2 = script(
+        &env,
+        "to1b.json",
+        json!({ "reviewer": [turn(vec![approved()])] }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["resume", "TO-1", "--yes", "--fake-agents", &s2],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "TO-1");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert_eq!(t.fix_cycle, 0, "a machine stop costs no fix cycle");
+    // (the deployment table keeps one row per lock: it now says the second run passed)
+    let runs = std::fs::read_to_string(env.root.join("gates").join("runs")).unwrap();
+    assert_eq!(runs.lines().count(), 2, "the gate ran again");
+    assert_eq!(deployments(&env)[0].ok, Some(true));
+}
+
+/// M12-06 AC-3: a **check** gate that runs into its timeout is still a gate failure — the
+/// implementer is sent back with feedback that says "timed out after 3 s" (the limit it was
+/// given), and the fix cycle is counted.
+#[test]
+fn m12_06_a_check_gate_timeout_is_still_a_gate_failure_and_says_so() {
+    let (env, marker) = probe_then_dbsync_timed(
+        "Start-Sleep -Seconds 60\nexit 0\n",
+        "sleep 60\nexit 0\n",
+        "3s",
+    );
+    create(&env, "TO-2");
+    let s = script(
+        &env,
+        "to2.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()]),
+                turn(vec![implementation()]),
+                turn(vec![implementation()]),
+            ],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "TO-2", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "TO-2");
+    assert!(
+        t.fix_cycle >= 1,
+        "a gate failure: the implementer is sent back: {err}"
+    );
+    assert!(
+        !marker.exists(),
+        "no environment gate after a failing check gate"
+    );
+    let c = calls(&env, "TO-2");
+    let second = c
+        .iter()
+        .filter(|x| x["key"] == "implementer")
+        .nth(1)
+        .unwrap_or_else(|| panic!("a second implementer turn: {err}"));
+    let prompt = second["prompt"].as_str().unwrap();
+    assert!(prompt.contains("`probe` timed out after 3 s"), "{prompt}");
+    assert_ne!(
+        t.machine.reason_class(),
+        Some("environment_gate_timeout"),
+        "a check gate is not the owner's problem"
+    );
+}
+
+// ── M12-07: confirm before deploy (X17) ──────────────────────────────────────────────────
+
+/// The `probe_then_dbsync` fixture with `confirm: <mode>` on the machine's `dbsync`. The check
+/// gate `probe` logs each run to the returned file, so a test can tell that none ran.
+fn confirm_fixture(mode: &str) -> (Env, PathBuf, PathBuf) {
+    let log_name = "probe-runs";
+    let (env, marker) = {
+        // the probe script needs the log path, which needs the env: write it afterwards
+        let (env, marker) = probe_then_dbsync("exit 0\n", "exit 0\n");
+        (env, marker)
+    };
+    let log = env.root.join("gates").join(log_name);
+    let l = fwd(&log);
+    // the probe script is committed in the repository: add the log line and commit it
+    let (file, body) = if cfg!(windows) {
+        (
+            "scripts/probe.ps1",
+            format!("Add-Content -Path '{l}' -Value x\nexit 0\n"),
+        )
+    } else {
+        ("scripts/probe.sh", format!("echo x >> '{l}'\nexit 0\n"))
+    };
+    commit_repo(&env, &[(file, &body)], "the probe logs its runs");
+    let m = std::fs::read_to_string(&env.machine).unwrap();
+    assert!(m.contains("    lock: d365-env\n"), "{m}");
+    std::fs::write(
+        &env.machine,
+        m.replace(
+            "    lock: d365-env\n",
+            &format!("    lock: d365-env\n    confirm: {mode}\n"),
+        ),
+    )
+    .unwrap();
+    (env, marker, log)
+}
+
+fn confirm_stops(env: &Env, id: &str) -> usize {
+    events(env, id)
+        .iter()
+        .filter(|e| e["type"] == "escalated" && e["reason_class"] == "environment_gate_confirm")
+        .count()
+}
+
+/// AC-1/AC-2/AC-4, `first`: the first Verify stops **before any gate ran** (no check gate, no
+/// deploy); the reason has the gate, the lock, the commit, the `git diff --stat` lines, the
+/// command and "then `toryo resume`"; `run --yes` does not skip the stop; a plain `resume`
+/// confirms, costs no fix cycle, and the gates run.
+#[test]
+fn m12_07_confirm_first_stops_before_any_gate_and_resume_is_the_yes() {
+    let (env, marker, probe) = confirm_fixture("first");
+    create(&env, "CF-1");
+    let s = script(
+        &env,
+        "cf1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "CF-1", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "CF-1");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_confirm"),
+        "{err}"
+    );
+    let why = t.machine.reason().unwrap().to_string();
+    let head = t.machine.checkpoint().map(str::to_string);
+    assert!(
+        why.contains("gate `dbsync` (lock d365-env, confirm: first)")
+            && why.contains("src/Calculator.psm1")
+            && why.contains("`toryo resume CF-1` allows the deploy")
+            && why.contains("show --stat"),
+        "{why}"
+    );
+    let _ = head;
+    assert!(!probe.exists(), "no check gate ran");
+    assert!(
+        !marker.exists() && deployments(&env).is_empty(),
+        "nothing deployed"
+    );
+    assert_eq!(
+        attempts(&env, "CF-1")
+            .iter()
+            .filter(|a| a.stage == "implement")
+            .count(),
+        1
+    );
+    // `--yes` is no confirmation: `run --yes` finds the task still waiting
+    let (_, err) = toryo(&env, &["run", "CF-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "CF-1").state, St::Escalated, "{err}");
+    assert!(!probe.exists() && !marker.exists());
+    // the plain resume is the yes
+    let s2 = script(
+        &env,
+        "cf1b.json",
+        json!({ "reviewer": [turn(vec![approved()])] }),
+    );
+    // … but not `resume --yes` (it is for the gates, never a deploy), and not a resume of
+    // everything (no id)
+    let (code, err) = toryo(
+        &env,
+        &["resume", "CF-1", "--yes", "--fake-agents", &s2],
+        &[],
+    );
+    assert_ne!(code, 0, "{err}");
+    assert!(err.contains("--yes never confirms a deploy"), "{err}");
+    assert_eq!(task(&env, "CF-1").state, St::Escalated);
+    let (_, err) = toryo(&env, &["resume", "--fake-agents", &s2], &[]);
+    assert!(
+        err.contains("CF-1: waits for your yes before it deploys"),
+        "{err}"
+    );
+    assert_eq!(task(&env, "CF-1").state, St::Escalated);
+    assert!(!probe.exists() && !marker.exists());
+    let (_, err) = toryo(&env, &["resume", "CF-1", "--fake-agents", &s2], &[]);
+    assert!(err.contains("deploy confirmed (dbsync"), "{err}");
+    assert_eq!(task(&env, "CF-1").state, St::WaitingFinalApproval, "{err}");
+    let (code, err) = toryo(&env, &["approve", "CF-1", "--gate", "final"], &[]);
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "CF-1");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert_eq!(t.fix_cycle, 0, "no fix cycle for the question");
+    assert!(
+        probe.exists() && marker.exists(),
+        "the gates ran after the yes"
+    );
+    assert_eq!(confirm_stops(&env, "CF-1"), 1);
+}
+
+/// AC-2 (the second half): with `first` a later checkpoint of the same task does not stop;
+/// AC-3: with `always` every new checkpoint stops once.
+#[test]
+fn m12_07_first_asks_once_per_task_and_always_once_per_checkpoint() {
+    for (mode, stops) in [("first", 1), ("always", 2)] {
+        let (env, _marker, probe) = confirm_fixture(mode);
+        let id = format!("CM-{mode}");
+        create(&env, &id);
+        // the reviewer asks for changes once: a second checkpoint
+        let s = script(
+            &env,
+            &format!("{id}.json"),
+            json!({
+                "planner": [turn(vec![plan()])],
+                "implementer": [
+                    turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()]),
+                    turn(vec![write("src/Notes.txt", "second checkpoint\n"), implementation()]),
+                ],
+                "reviewer": [turn(vec![changes()]), turn(vec![approved()])],
+            }),
+        );
+        let (_, err) = toryo(&env, &["run", &id, "--yes", "--fake-agents", &s], &[]);
+        assert_eq!(task(&env, &id).state, St::Escalated, "{mode}: {err}");
+        // each process starts its script from the top: what the rest of the run needs
+        let s1 = script(
+            &env,
+            &format!("{id}-1.json"),
+            json!({
+                "implementer": [turn(vec![write("src/Notes.txt", "second checkpoint\n"), implementation()])],
+                "reviewer": [turn(vec![changes()]), turn(vec![approved()])],
+            }),
+        );
+        let s2 = script(
+            &env,
+            &format!("{id}-2.json"),
+            json!({ "reviewer": [turn(vec![approved()])] }),
+        );
+        let (code, err) = toryo(&env, &["resume", &id, "--fake-agents", &s1], &[]);
+        let mut err = err;
+        if mode == "always" {
+            // the second checkpoint stops again; one more yes
+            assert_eq!(code, 1, "{mode}: {err}");
+            assert_eq!(task(&env, &id).state, St::Escalated, "{mode}: {err}");
+            let (_, e2) = toryo(&env, &["resume", &id, "--fake-agents", &s2], &[]);
+            err = e2;
+        }
+        assert_eq!(
+            task(&env, &id).state,
+            St::WaitingFinalApproval,
+            "{mode}: {err}"
+        );
+        let (code, e3) = toryo(&env, &["approve", &id, "--gate", "final"], &[]);
+        assert_eq!(code, 0, "{mode}: {e3}");
+        let t = task(&env, &id);
+        assert_eq!(t.state, St::Completed, "{mode}: {err}");
+        assert_eq!(confirm_stops(&env, &id), stops, "{mode}");
+        let runs = std::fs::read_to_string(&probe).unwrap();
+        assert_eq!(
+            runs.lines().count(),
+            2,
+            "{mode}: both checkpoints were verified"
+        );
+    }
+}
+
+/// M12-15 (X23): every check gate and every environment gate gets the UI language of `tool: xpp`
+/// (`DOTNET_CLI_UI_LANGUAGE`, `VSLANG`), replacing what the process inherited — except a name
+/// the environment gate's own `env:` sets. (Was: MSBuild runs only.)
+#[test]
+fn m12_15_every_gate_gets_the_ui_language() {
+    let probe_ps1 = "\"UI=$env:VSLANG/$env:DOTNET_CLI_UI_LANGUAGE\"\nexit 0\n";
+    let probe_sh = "echo \"UI=$VSLANG/$DOTNET_CLI_UI_LANGUAGE\"\nexit 0\n";
+    let (env, _marker) = probe_then_dbsync(probe_ps1, probe_sh);
+    // the environment gate prints the same two values (its script replaced; the owner's `env:`
+    // puts VSLANG to 1042 for it)
+    let gate = env.root.join("gates").join(if cfg!(windows) {
+        "dbsync.ps1"
+    } else {
+        "dbsync.sh"
+    });
+    std::fs::write(&gate, if cfg!(windows) { probe_ps1 } else { probe_sh }).unwrap();
+    let m = std::fs::read_to_string(&env.machine).unwrap();
+    assert!(m.contains("    lock: d365-env\n"), "{m}");
+    std::fs::write(
+        &env.machine,
+        m.replace(
+            "    lock: d365-env\n",
+            "    lock: d365-env\n    env: { VSLANG: '1042' }\n",
+        ),
+    )
+    .unwrap();
+    create(&env, "UI-1");
+    let s = script(
+        &env,
+        "ui1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    // the owner's shell has a Japanese Visual Studio
+    let (_, err) = toryo(
+        &env,
+        &["run", "UI-1", "--yes", "--fake-agents", &s],
+        &[("VSLANG", "1041"), ("DOTNET_CLI_UI_LANGUAGE", "ja-JP")],
+    );
+    assert_eq!(task(&env, "UI-1").state, St::Completed, "{err}");
+    let vr = verify_result(&env, "UI-1");
+    let tail = |n: &str| {
+        vr["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == n)
+            .unwrap_or_else(|| panic!("{n} in {vr}"))["output_tail"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert!(tail("probe").contains("UI=1033/en-US"), "{}", tail("probe"));
+    assert!(
+        tail("dbsync").contains("UI=1042/en-US"),
+        "{}",
+        tail("dbsync")
+    );
+}
+
+/// M12-16 AC-1: the whole output of an environment gate is in a log file of the run store, named
+/// in `VERIFY_RESULT.json`, and it is redacted like the rest.
+#[test]
+fn m12_16_the_gate_log_is_redacted() {
+    const SECRET: &str = "d365-sync-s3cr3t-88";
+    let env = env_gate_setup("codex-openai", "error", "");
+    define_gates(
+        &env,
+        &machine_gate(
+            &env,
+            "dbsync",
+            "d365-env",
+            "\"using $env:D365_SYNC_SECRET\"\nexit 0\n",
+            "echo \"using $D365_SYNC_SECRET\"\nexit 0\n",
+            "    secret_env: { D365_SYNC_SECRET: 'env:TORYO_M12_SYNC_SECRET' }\n",
+        ),
+    );
+    create(&env, "LG-1");
+    let s = script(
+        &env,
+        "lg1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["run", "LG-1", "--yes", "--fake-agents", &s],
+        &[("TORYO_M12_SYNC_SECRET", SECRET)],
+    );
+    assert_eq!(code, 0, "{err}");
+    let vr = verify_result(&env, "LG-1");
+    let entry = &vr["commands"][1];
+    assert_eq!(entry["name"], "dbsync");
+    let log = PathBuf::from(entry["log"].as_str().unwrap_or_else(|| panic!("{vr}")));
+    assert!(
+        log.starts_with(task(&env, "LG-1").run_store.join("gate-logs")),
+        "{}",
+        log.display()
+    );
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(text.contains("using [REDACTED:D365_SYNC_SECRET]"), "{text}");
+    assert!(!text.contains(SECRET), "{text}");
+    // the check gate has its log too
+    assert!(vr["commands"][0]["log"].as_str().is_some(), "{vr}");
 }

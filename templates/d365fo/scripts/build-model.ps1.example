@@ -1,0 +1,50 @@
+# build-model.ps1.example (M12-18) — the `build` check gate of .toryo/toryo-orgchart.yaml.
+#
+# TODO(owner):
+#   1. Copy this file to scripts/build-model.ps1 in the D365FO repository and COMMIT it before
+#      the first `toryo task create`: a gate script that is not committed is refused
+#      (`verify_script_missing`).
+#   2. Replace the TODO(owner) block below with the build you trust. This example is PRINT-ONLY:
+#      it prints what Toryo gave it and exits 0, so a run of the whole pipeline can be rehearsed
+#      with `toryo run <id> --fake-agents <script.json>` before any real build exists.
+#      Toryo does not know your build commands and this file does not guess them.
+#   3. Or do not use a script at all: the built-in `tool: xpp` gate (see the comment at `gates.build`
+#      in toryo-orgchart.yaml) compiles the projects headlessly with nothing to maintain.
+#
+# THE CONTRACT of a check gate script
+#   Started by      pwsh -NoProfile -NonInteractive -File scripts/build-model.ps1
+#   Working dir     the checkout of the checkpoint commit (TORYO_VERIFY_CHECKOUT), at Low integrity.
+#   Variables       TORYO_TASK             the task id
+#                   TORYO_SHA              the checkpoint commit being verified
+#                   TORYO_VERIFY_CHECKOUT  the checkout (also the working directory)
+#                   TORYO_VERIFY_BUILD     the folder to write build output to
+#   Exit code       0 = pass; anything else = fail. PowerShell exits 0 even when a native .exe
+#                   failed: after EVERY native call write `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`.
+#   Timeout         the gate's `timeout:` in toryo-orgchart.yaml (20m); the whole process tree is killed.
+#   May write       TORYO_VERIFY_BUILD and the temp folders Toryo gave this process — nothing else.
+#                   At Low integrity it CANNOT write PackagesLocalDirectory, your profile, the
+#                   repository, the task's worktree or Toryo's database. A build that can only run
+#                   in place belongs to an environment gate, not here.
+#   Must not        read a secret, wait for input, or start anything that outlives the script.
+#   Output          the last 40 lines go to the AI vendor as the implementer's fix feedback (and the
+#                   whole output to the run store). Print no connection string, key or token.
+#   Build again     from TORYO_VERIFY_CHECKOUT. TORYO_VERIFY_BUILD is written at Low integrity by
+#                   code an agent wrote — NEVER deploy from it, and never dot-source or run
+#                   anything from it.
+
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$ErrorActionPreference = 'Stop'
+
+'build-model.ps1.example: print-only (replace the TODO(owner) block with your build)'
+Get-ChildItem Env:TORYO_* | Sort-Object Name | ForEach-Object { '{0}={1}' -f $_.Name, $_.Value }
+"cwd=$((Get-Location).Path)"
+
+# TODO(owner): your build goes here. Shape of a build step (the program and its arguments are
+# YOURS — Toryo ships none):
+#
+#   & '<absolute path of the build tool>' <arguments> 2>&1
+#   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+#
+# Call every tool by its absolute path; the PATH of a gate is not yours.
+
+exit 0

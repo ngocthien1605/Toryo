@@ -934,8 +934,17 @@ fn ec31_a_reviewer_write_is_a_policy_violation() {
         ],
     );
     assert!(log.trim().is_empty(), "never committed: {log}");
-    // left in place for the human, uncommitted
-    assert!(git(&t.worktree, &["status", "--porcelain"]).contains("src/Calculator.psm1"));
+    // (M12-03 review) put back, never left in the tree for the next checkpoint to commit
+    // (was: "left in place for the human, uncommitted"); a copy is kept in the run store
+    assert!(!git(&t.worktree, &["status", "--porcelain"]).contains("src/Calculator.psm1"));
+    assert!(std::fs::read_to_string(
+        t.run_store
+            .join("read-only-writes")
+            .join("H-1-review-1")
+            .join("src/Calculator.psm1")
+    )
+    .unwrap()
+    .contains("REVIEWER-WROTE-THIS"));
 }
 
 /// Run `id` until the reviewer's quota pauses it, then leave `review-notes.txt` in the

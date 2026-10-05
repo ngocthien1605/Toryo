@@ -3,7 +3,7 @@
 
 **Planner** — list every object you create or extend (type, name, model) and every Chain of Command
 method or event handler with its base method; name the labels you add. Say which acceptance criteria
-only the cloud tier can prove (DB sync, SysTest): Verify cannot.
+only the owner can prove by hand in the environment (data, SysTest): the gates cannot.
 
 **Implementer** — edit the metadata XML in `Metadata/<Package>/<Model>/Ax<Type>/<Name>.xml` and keep
 the structure Visual Studio writes (element order, X++ source in CDATA). A new object is a new file in

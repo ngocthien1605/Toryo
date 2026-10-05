@@ -23,7 +23,7 @@ use spike_cli::{run_canaries, spike, SpikeCmd};
 #[derive(Parser)]
 #[command(
     name = "toryo",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("TORYO_COMMIT"), ")"),
     about = "Toryo (棟梁) — orchestrates Claude Code and Codex through a gated, verified workflow"
 )]
 pub(crate) struct Cli {
@@ -212,12 +212,53 @@ enum SecretsCmd {
     Set { target: String },
 }
 
+/// The repository config in use (M12-09, X21): `--config`, then `./toryo.yaml` when it exists,
+/// then `$TORYO_CONFIG` — as `--help` says. A variable in the shell profile used to win over the
+/// file of the repository the owner stood in, and `task create` silently made its worktree for
+/// another one. When both exist and are different files one note line names both.
+pub(crate) fn config_path(cli: &Cli) -> PathBuf {
+    if let Some(p) = &cli.config {
+        return p.clone();
+    }
+    let local = PathBuf::from("toryo.yaml");
+    let var = std::env::var_os("TORYO_CONFIG").map(PathBuf::from);
+    if local.is_file() {
+        if let Some(v) = var.filter(|v| v.is_file()) {
+            let same = match (std::fs::canonicalize(&local), std::fs::canonicalize(&v)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            };
+            if !same {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!(
+                        "note: using {} (the file in this folder); $TORYO_CONFIG ({}) is ignored here — pass --config to choose",
+                        std::fs::canonicalize(&local).unwrap_or(local.clone()).display(),
+                        v.display()
+                    );
+                });
+            }
+        }
+        return local;
+    }
+    var.unwrap_or(local)
+}
+
+/// Why [`config_path`] chose its file, in words (M12-17: `doctor` says it).
+fn config_source(cli: &Cli) -> String {
+    if cli.config.is_some() {
+        "`--config`".into()
+    } else if PathBuf::from("toryo.yaml").is_file() {
+        "the toryo.yaml of the folder you are in".into()
+    } else if std::env::var_os("TORYO_CONFIG").is_some() {
+        "$TORYO_CONFIG (there is no toryo.yaml in this folder)".into()
+    } else {
+        "the default `./toryo.yaml`".into()
+    }
+}
+
 pub(crate) fn load_config(cli: &Cli) -> Result<Effective> {
-    let path = cli
-        .config
-        .clone()
-        .or_else(|| std::env::var_os("TORYO_CONFIG").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("toryo.yaml"));
+    let path = config_path(cli);
     let machine = cli
         .machine_config
         .clone()
@@ -260,7 +301,17 @@ fn run(cli: Cli) -> Result<i32> {
                 Ok(c) => (Some(c), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             };
-            let code = toryo::doctor::run(cfg.as_ref(), err, *json)?;
+            // `$TORYO_CONFIG` is only worth a word when it could have been the choice
+            let variable = std::env::var_os("TORYO_CONFIG")
+                .map(PathBuf::from)
+                .filter(|_| cli.config.is_none());
+            let code = toryo::doctor::run(
+                cfg.as_ref(),
+                err,
+                *json,
+                &config_source(&cli),
+                variable.as_deref(),
+            )?;
             if !failed.is_empty() {
                 eprintln!("canaries that did not pass: {}", failed.join(", "));
                 return Ok(code.max(1));

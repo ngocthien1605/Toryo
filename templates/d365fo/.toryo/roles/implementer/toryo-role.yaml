@@ -18,10 +18,9 @@
 #   this seat is decided in toryo-orgchart.yaml. If Codex runs out of quota and
 #   Claude takes over, this file does not change.
 #
-# HOW TO READ THIS FILE (for the implementer)
+# WHAT TORYO DOES WITH THIS FILE
 #   - The role name is the FOLDER name (roles/implementer/), not a field here.
-#   - Unknown fields must be a hard error (serde deny_unknown_fields), with a
-#     friendly message and a "did you mean ...?" hint.
+#   - An unknown field is an error, with a "did you mean ...?" hint.
 #   - Every path is relative to the repository root unless stated otherwise.
 # =============================================================================
 
@@ -85,13 +84,30 @@ skills: [xpp-axclass, xpp-batch]
 #     fence; a file outside it is restored and sent back to the implementer.
 # The fence can only NARROW what toryo.yaml allows: a path in
 # policy.protected_paths or deny_paths stays forbidden even if it matches.
-writes: [Metadata/**]
+writes: [Metadata/ContosoCore/**]   # TODO(owner): the ONE model folder of your repository this role may change (add more only when a task needs them)
 
 # Files this role must NEVER change, even inside `writes`.
 # Rule: `never` ALWAYS WINS over `writes`. A violation is reported by name
 # ("touched a never path: ...") so the reason is clear. A task can open one
 # for itself with its `## Allow protected` list, like a protected path.
 never:  ["**/Descriptor/*.xml"]    # model descriptors: only when the task says so
+# TODO(owner) — files a build LOADS OR RUNS: an agent that can write one gets code executed with your
+# rights at the next build or deploy. Check the list against your repository, then replace the
+# `never:` line above by it. A task that really must change one lists it under `## Allow protected`
+# in its TASK.md (see templates/d365fo/TASK.example.md).
+# never:
+#   - "**/Descriptor/*.xml"
+#   - "**/bin/**"
+#   - "*.dll"
+#   - "*.exe"
+#   - "*.ps1"
+#   - "*.psm1"
+#   - "*.cmd"
+#   - "*.bat"
+#   - "*.props"
+#   - "*.targets"
+#   - "*.rsp"
+#   - "*.rnrproj"
 
 # Gates that must PASS before the work is handed to review.
 # A gate is a NAME, not a file. It is declared in toryo-orgchart.yaml under

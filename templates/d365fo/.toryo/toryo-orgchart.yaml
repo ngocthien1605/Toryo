@@ -4,10 +4,13 @@
 #
 # TODO(owner):
 #   1. seats.*.profile / fallback — names of profiles YOUR machine config defines (R60).
-#   2. gates.build — write scripts/build-model.ps1 (it must be committed before a task is
-#      created, M18), or switch to the built-in `tool: xpp` alternative shown below.
-#   3. gates.dbsync — define `environment_gates.dbsync` in the machine config, or set
-#      `if_missing: skip` on machines without a D365FO environment.
+#   2. gates.build — copy templates/d365fo/scripts/build-model.ps1.example to
+#      scripts/build-model.ps1 and write your build into it (it must be committed before a task is
+#      created, M18), or switch to the built-in `tool: xpp` alternative shown below. WHICH ONE: see
+#      "tool: xpp or a script?" at `gates.build`.
+#   3. gates.dbsync — define `environment_gates.dbsync` in the machine config (the machine example
+#      has the entry; copy templates/d365fo/machine/dbsync.ps1.example next to it and write your
+#      deploy into it), or set `if_missing: skip` on machines without a D365FO environment.
 #   4. limits / checks — the defaults proposed on 2026-10-01.
 #   5. culture — CULTURE.md at the repository root, or remove the key.
 #
@@ -22,14 +25,14 @@
 #   Analogy: the org chart assigns people to positions; the role file is the
 #   job card for each position. Swapping the person must not change the job.
 #
-# HOW TO READ THIS FILE (for the implementer)
-#   - Unknown fields must be a hard error (serde deny_unknown_fields), with a
-#     friendly message and a "did you mean ...?" hint, e.g.
+# WHAT TORYO DOES WITH THIS FILE
+#   - An unknown field is an error, with a "did you mean ...?" hint, e.g.
 #         seat 'reviwer' not found. Did you mean 'reviewer'?
-#   - Every cross-reference must be validated BEFORE anything is launched:
-#     seat -> role folder, role gate names -> gates below (or the machine's
-#     environment_gates), role skills -> repo .toryo/skills/ or the
-#     machine's skills_dir, seat profiles -> the machine's profiles.
+#   - Every cross-reference is checked BEFORE anything is launched (`toryo
+#     doctor`, `toryo config show`, `toryo task create`): seat -> role folder,
+#     role gate names -> gates below (or the machine's environment_gates), role
+#     skills -> repo .toryo/skills/ or the machine's skills_dir, seat profiles
+#     -> the machine's profiles.
 #   - Paths are relative to the repository root unless stated otherwise.
 #   - When this file exists, toryo.yaml must not also set `roles:`,
 #     `commands:` or `pipeline.max_fix_cycles` -- they live here now.
@@ -127,6 +130,15 @@ culture: ./CULTURE.md              # optional team-wide norms
 #   TORYO_VERIFY_BUILD     build output folder, written by the check gates at
 #                          Low integrity. An environment gate must treat it as
 #                          untrusted and build again from TORYO_VERIFY_CHECKOUT
+#
+# tool: xpp or a script?  (one paragraph; the guide, docs/HUONG-DAN.md, says the same)
+#   Use the built-in `tool: xpp` when what you need is "does the X++ compile": Toryo runs MSBuild on
+#   the build projects you list, headlessly, at Low integrity, parses the diagnostics and sends the
+#   implementer file, line and code. Nothing to maintain, nothing an agent can edit. Use a script
+#   gate when you need something the built-in cannot do — a different build call, a model's own
+#   tests, a package step: the script is yours to maintain, Toryo protects it from agents, and it
+#   runs under the same Low-integrity limits (it cannot write PackagesLocalDirectory). Neither
+#   changes the environment: that is what the `dbsync` environment gate, below, is for.
 gates:
   build:
     kind: check
@@ -146,9 +158,12 @@ gates:
     #   timeout: 90m
 
   dbsync:
-    kind: environment     # command: toryo.local.yaml -> environment_gates.dbsync
+    kind: environment     # command: toryo.local.yaml -> environment_gates.dbsync (confirm: first there)
     timeout: 30m
     if_missing: error
+    # This gate DEPLOYS the checkpoint to the dev environment before the review and before you have
+    # read the code. `confirm: first` on the machine entry makes the first run of a task stop and
+    # ask you; `toryo resume <id>` is the yes.
 
 # -----------------------------------------------------------------------------
 # SEATS  --  who sits where
@@ -171,11 +186,11 @@ gates:
 #   model     optional. Overrides the profile's default model.
 #   fallback  optional ORDERED list of profile names to switch to when the
 #             primary cannot run (quota exhausted, rate limit after retries).
-#             The switch is sticky for the task. Omitted = no fallback.
-#             (Today's toryo.yaml treats omitted as "the planner's profile";
-#             the new loader maps omitted to `fallback: []`.)
-#             Today only the implementer may have a fallback; on the planner
-#             or reviewer it is a validation error until Toryo supports it.
+#             The switch is sticky for the task. Omitted = no fallback (a
+#             toryo.yaml-only repository, without an org chart, still uses the
+#             planner's profile when `fallback` is omitted).
+#             Only the implementer may have a fallback; on the planner or
+#             reviewer it is a validation error.
 #
 # The machine config may override a seat for that machine only (key `seats`,
 # same fields), e.g. the company laptop uses claude-foundry for the planner.
@@ -202,9 +217,9 @@ seats:
 #                      the implementer to fix. Then stop and ask the human.
 #   max_review_rounds  review: how many rejections (review -> build) are
 #                      allowed. Then stop and hand the decision to the human.
-# Both optional. Toryo today has ONE counter for both (max_fix_cycles, R4).
-# Splitting it is a small state-machine change; to keep one counter instead,
-# replace both keys with `max_fix_cycles: 3`.
+# Both optional, counted separately (a failing gate and a rejected review each
+# have their own bound). To keep one counter for both instead, replace the two
+# keys with `max_fix_cycles: 3`.
 limits:
   max_gate_retries: 3
   max_review_rounds: 3

@@ -246,7 +246,11 @@ pub fn run_turn_with(
         max: Some(opts.max),
         stall: Some(opts.stall),
         cancel,
+        heartbeat: None,
     };
+    // M12-14: what the CLI printed to stderr, kept (the tail) for a turn that ends without a
+    // result — a rejected flag is printed there and nowhere else
+    let mut stderr_tail: Vec<u8> = Vec::new();
     let exit = running.wait(wait, |c| match c {
         Chunk::Stdout(b) => {
             out_file.write(&b);
@@ -261,7 +265,13 @@ pub fn run_turn_with(
                 }
             }
         }
-        Chunk::Stderr(b) => err_file.write(&b),
+        Chunk::Stderr(b) => {
+            err_file.write(&b);
+            stderr_tail.extend_from_slice(&b);
+            if stderr_tail.len() > STDERR_TAIL_BYTES {
+                stderr_tail.drain(..stderr_tail.len() - STDERR_TAIL_BYTES);
+            }
+        }
     })?;
     if let Some(rest) = splitter.finish() {
         on_line(&rest);
@@ -275,6 +285,15 @@ pub fn run_turn_with(
         ProfileKind::Codex => codex.finish(exit.code, CodexSubsets::default()),
     };
     outcome.oversized_lines = splitter.oversized;
+    // M12-14: a turn that died without a result says why, in the CLI's own words (the chunks
+    // are redacted already; the derived text is redacted again below)
+    if !outcome.success && outcome.error_class == Some(crate::domain::ErrorClass::ProcessCrashed) {
+        if let Some(lines) = stderr_last_lines(&stderr_tail, STDERR_LINES) {
+            let detail = outcome.error_detail.take().unwrap_or_default();
+            outcome.error_detail =
+                Some(format!("{detail}; the CLI's stderr (last lines):\n{lines}"));
+        }
+    }
     fail_on_capture_errors(
         &mut outcome,
         [out_file.error, err_file.error]
@@ -304,6 +323,30 @@ pub fn run_turn_with(
         run_dir: run_dir.to_path_buf(),
         argv: argv_view,
         argv_sha256,
+    })
+}
+
+/// How much stderr is kept for [`stderr_last_lines`].
+const STDERR_TAIL_BYTES: usize = 16 * 1024;
+/// How many stderr lines a crashed turn's reason carries.
+const STDERR_LINES: usize = 10;
+
+/// The last `n` non-empty lines of `bytes` as text — colour codes stripped, each line cut at
+/// 300 characters; `None` when there is none.
+fn stderr_last_lines(bytes: &[u8], n: usize) -> Option<String> {
+    let text = crate::process::strip_ansi(&crate::process::decode_output(bytes));
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| l.trim_end().chars().take(300).collect::<String>())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let from = lines.len().saturating_sub(n);
+    (!lines[from..].is_empty()).then(|| {
+        lines[from..]
+            .iter()
+            .map(|l| format!("  | {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     })
 }
 
@@ -372,5 +415,30 @@ pub fn print_summary(r: &TurnRun) {
     eprintln!("captured in      : {}", r.run_dir.display());
     if let Some(s) = &o.structured {
         println!("{}", serde_json::to_string_pretty(s).unwrap_or_default());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M12-14: the last 10 non-empty lines, colour codes stripped, long lines cut.
+    #[test]
+    fn the_stderr_tail_is_the_last_ten_lines_without_colour_codes() {
+        let mut text = String::new();
+        for i in 1..=14 {
+            text.push_str(&format!("line {i}\n\n"));
+        }
+        text.push_str("\u{1b}[31merror: unknown option --x\u{1b}[0m\n");
+        text.push_str(&"y".repeat(500));
+        let got = stderr_last_lines(text.as_bytes(), 10).unwrap();
+        let lines: Vec<&str> = got.lines().collect();
+        assert_eq!(lines.len(), 10, "{got}");
+        assert_eq!(lines[8], "  | error: unknown option --x");
+        assert_eq!(lines[9].chars().count(), 4 + 300);
+        assert!(!got.contains("line 5") && got.contains("line 7"), "{got}");
+        assert!(!got.contains('\u{1b}'));
+        assert_eq!(stderr_last_lines(b"  \n\n", 10), None);
+        assert_eq!(stderr_last_lines(b"", 10), None);
     }
 }

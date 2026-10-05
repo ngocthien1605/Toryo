@@ -36,6 +36,7 @@ use super::checks::{
 use super::context;
 use super::contracts;
 use super::flight::{EngineEvent, Recorder, TurnUsage};
+use super::gates::GATE_UNAVAILABLE;
 use super::lock::{EnvLock, StopWatch, TaskLock};
 use super::protect;
 use super::state::{GateKind, Machine, PipelineEvent as Ev, PipelineState as St};
@@ -51,7 +52,7 @@ use crate::config::{expand_vars, Billing, CommandKind, CommandSpec, Effective, P
 use crate::domain::{ErrorClass, OpenSession, Role, StageOutcome, Tri, TurnInput, TurnLimits};
 use crate::git::GitCmd;
 use crate::process::Boundary;
-use crate::runner::{CommandResult, CommandRunner, LocalRunner, RunSpec};
+use crate::runner::{CommandResult, GateIo, LocalRunner, RunSpec};
 use crate::team::Level;
 use crate::usage::{Accounting, Weights};
 
@@ -129,7 +130,7 @@ pub fn task_policy(t: &TaskRow, cfg: &Effective) -> Result<(GitCmd, Protected, V
             t.id
         );
     }
-    let task_md = String::from_utf8_lossy(&task_md).to_string();
+    let task_md = crate::textfile::decode(&t.artifacts().join("TASK.md"), &task_md)?;
     // R59: `tool: xpp` adds `**/Directory.Build.*` — MSBuild reads them from parent folders
     let mut globs = cfg.repo.policy.protected_paths.clone();
     globs.extend(verify_globs(&cmds));
@@ -289,8 +290,15 @@ impl<'a> Engine<'a> {
             ))
         } else {
             let c = context::assemble(&req)?;
-            context::over_budget(&c)
-                .map(|r| (context::CONTEXT_OVER_BUDGET, over_budget_reason(t, r)))
+            if !c.unreadable.is_empty() {
+                Some((
+                    context::CONTEXT_UNREADABLE,
+                    context_unreadable_reason(t, stage, profile, &c.unreadable),
+                ))
+            } else {
+                context::over_budget(&c)
+                    .map(|r| (context::CONTEXT_OVER_BUDGET, over_budget_reason(t, r)))
+            }
         };
         match blocked {
             Some((class, reason)) => {
@@ -1331,11 +1339,36 @@ impl<'a> Engine<'a> {
             &stage,
             a.attempt,
         )? {
-            Some(c) if !c.partial => (
-                c.sha,
-                if c.no_change { "no_change" } else { "normal" },
-                true,
-            ),
+            Some(c) if !c.partial => {
+                // M12-01 (H1): a commit found by its trailers is taken only when it is HEAD,
+                // its first parent is a commit Toryo recorded for this task, and its diff
+                // passes the same path policy a fresh commit gets — who made it is never asked
+                let why = super::recovery::foreign_commit(
+                    &wt,
+                    &self.protect,
+                    a.git_head_before.as_deref(),
+                    &c.sha,
+                )?;
+                if let Some(why) = why {
+                    // undone like an agent commit: the changes stay in the tree, HEAD is where
+                    // the attempt began (the next turn's policy checks see them)
+                    let undone = match (&a.git_head_before, wt.head()? == c.sha) {
+                        (Some(before), true) => {
+                            wt.soft_reset(before)?;
+                            format!("; the commit was undone (soft reset to {})", short(before))
+                        }
+                        _ => String::new(),
+                    };
+                    let reason = format!("policy_violation: commit {} carries the trailers of this checkpoint but is not Toryo's ({why}); nothing was accepted{undone}", short(&c.sha));
+                    self.escalate("policy_violation", reason)?;
+                    return Ok(Flow::Next);
+                }
+                (
+                    c.sha,
+                    if c.no_change { "no_change" } else { "normal" },
+                    true,
+                )
+            }
             _ => {
                 // §8: deny paths are checked again right before the commit
                 let denied: Vec<String> = wt
@@ -1461,6 +1494,18 @@ impl<'a> Engine<'a> {
             self.escalate_attempt(&a, ENV_UNAVAILABLE.into(), reason)?;
             return Ok(Flow::Next);
         }
+        // M12-05: the same for the check gates — a program that is not on this machine is a
+        // machine stop before any gate runs, not a failing gate and not a plain error
+        if let Some(reason) = self.check_gates_preflight(t) {
+            self.escalate_attempt(&a, GATE_UNAVAILABLE.into(), reason)?;
+            return Ok(Flow::Next);
+        }
+        // M12-07 (X17): a gate that asks before it deploys — before any gate runs, so nothing
+        // was built or deployed. A plain `resume` is the "yes".
+        if let Some(reason) = self.confirm_preflight(t, &head)? {
+            self.escalate_attempt(&a, super::gates::ENV_CONFIRM.into(), reason)?;
+            return Ok(Flow::Next);
+        }
         let Some((b, co)) = self.verify_checkout(t, &a, &head)? else {
             return Ok(Flow::Next);
         };
@@ -1479,9 +1524,13 @@ impl<'a> Engine<'a> {
             )?;
             e.stopped()
         };
-        let Some((mut results, mut failure)) =
-            self.run_verify_commands(b, &co, &head, &stop, xpp.as_ref())?
-        else {
+        let ran = match self.run_verify_commands(b, &co, &head, &stop, xpp.as_ref()) {
+            Ok(r) => r,
+            // M12-05: the program disappeared between the preflight and the start (or is no
+            // executable): the same class, with the OS error
+            Err(e) => return self.gate_start_failed(t, &a, e),
+        };
+        let Some((mut results, mut failure)) = ran else {
             return interrupted(self);
         };
         // M11-R9 (X6, replaces X2): the environment gates read a fresh export of the commit,
@@ -1512,6 +1561,11 @@ impl<'a> Engine<'a> {
                     return Ok(Flow::Next);
                 }
                 EnvGates::Mutated(reason) => export_mutated = Some(reason),
+                // M12-06 (X18): the owner's problem, not the implementer's
+                EnvGates::TimedOut(reason) => {
+                    self.escalate_attempt(&a, ENV_TIMEOUT.into(), reason)?;
+                    return Ok(Flow::Next);
+                }
             }
         }
         let pass = failure.is_none() && before_deploy.is_none();
@@ -1624,6 +1678,120 @@ impl<'a> Engine<'a> {
             })
     }
 
+    /// M12-05: the reason the first check gate of this run cannot start here — its program is
+    /// not on the PATH the gate gets, or an absolute path does not exist
+    /// ([`super::gates::check_gate_problem`]) — or `None`. Nothing is run.
+    fn check_gates_preflight(&self, t: &TaskRow) -> Option<String> {
+        let path = std::env::var_os("PATH");
+        self.cmds.iter().find_map(|c| {
+            super::gates::check_gate_problem(c, path.as_deref()).map(|why| {
+                format!(
+                    "{GATE_UNAVAILABLE}: check gate `{}` cannot start — {why} — {}",
+                    c.name,
+                    machine_fix_hint(
+                        &t.id,
+                        "the program installed or put on the PATH; or the working directory and the rights it needs",
+                        "`commands.verify` in toryo.yaml (or the gate in the org chart)"
+                    )
+                )
+            })
+        })
+    }
+
+    /// M12-07 (X17): the reason this verify run must wait for the owner — an environment gate of
+    /// the run whose `confirm` is `first` (once per task) or `always` (once per checkpoint
+    /// commit) and that was not confirmed yet — or `None`. Writes what a plain `resume` will
+    /// confirm. Nothing is run.
+    fn confirm_preflight(&self, t: &TaskRow, head: &str) -> Result<Option<String>> {
+        use super::gates::{is_confirmed, set_pending, Asked};
+        let Some(team) = self.cfg.team.as_ref() else {
+            return Ok(None);
+        };
+        let done = super::gates::confirmations(&t.run_store);
+        let asked: Vec<(&str, &crate::config::EnvGate)> = team
+            .handoff_gates()
+            .into_iter()
+            .filter(|(_, g)| g.decl.kind == crate::team::GateType::Environment)
+            .filter_map(|(name, g)| g.machine.as_ref().map(|m| (name, m)))
+            .filter(|(name, m)| !is_confirmed(&done, m.confirm, name, head))
+            .collect();
+        if asked.is_empty() {
+            return Ok(None);
+        }
+        set_pending(
+            &t.run_store,
+            asked
+                .iter()
+                .map(|(name, _)| Asked {
+                    gate: name.to_string(),
+                    commit: head.to_string(),
+                })
+                .collect(),
+        )?;
+        let wt = Worktree::new(&self.g, &t.worktree);
+        let stat = self
+            .g
+            .run_str(
+                &wt.loc,
+                true,
+                &["diff", "--stat", &format!("{}..{head}", t.base_commit)],
+            )
+            .unwrap_or_default();
+        let stat: Vec<&str> = stat.lines().take(20).collect();
+        let mut s = format!(
+            "{}: the checkpoint {} would be deployed to the environment before the review and before any human has read it.\n",
+            super::gates::ENV_CONFIRM,
+            short(head)
+        );
+        for (name, m) in &asked {
+            let argv: Vec<&str> = std::iter::once(m.program.as_str())
+                .chain(m.args.iter().map(String::as_str))
+                .collect();
+            s.push_str(&format!(
+                "  gate `{name}` (lock {}, confirm: {}) runs: {}\n",
+                super::lock::lock_key(&m.lock),
+                m.confirm.as_str(),
+                argv.join(" ")
+            ));
+        }
+        s.push_str(&format!(
+            "  changes since the base commit (git diff --stat, first 20 lines):\n{}\n",
+            stat.iter()
+                .map(|l| format!("    {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+        s.push_str(&format!(
+            "  look at it (`git -C {} show --stat {}`), then `toryo resume {}` allows the deploy",
+            t.worktree.display(),
+            short(head),
+            t.id
+        ));
+        Ok(Some(s))
+    }
+
+    /// M12-05: a verify run ended in an error — when that is a command that could not be
+    /// started ([`crate::runner::StartFailed`]), the attempt ends `gate_unavailable` (machine-
+    /// caused: plain `resume` goes back into the stage); any other error stays an error.
+    fn gate_start_failed(&self, t: &TaskRow, a: &AttemptRow, e: anyhow::Error) -> Result<Flow> {
+        let Some(s) = e.downcast_ref::<crate::runner::StartFailed>() else {
+            return Err(e);
+        };
+        let reason = format!(
+            "{GATE_UNAVAILABLE}: check gate `{}` could not be started ({}): {} — {}",
+            s.name,
+            s.program,
+            s.error,
+            machine_fix_hint(
+                &t.id,
+                "the program installed or put on the PATH; or the working directory and the rights it needs",
+                "`commands.verify` in toryo.yaml (or the gate in the org chart)"
+            )
+        );
+        self.escalate_attempt(a, GATE_UNAVAILABLE.into(), reason)?;
+        Ok(Flow::Next)
+    }
+
     /// M11-R16: what the environment gate `name` needs from this machine before it can start —
     /// no `%NAME%` left in its command (a task frozen before M11-R3), a valid lock name, every
     /// `secret_env` reference resolved, the program found and outside the roots agent code can
@@ -1672,6 +1840,11 @@ impl<'a> Engine<'a> {
         }
         let program = env_gate_program(&self.cfg, &m.program, std::env::var_os("PATH").as_deref())
             .map_err(unavailable)?;
+        // M12-05: the script it is handed (`-File`, an absolute script path) is there — a typo
+        // in the machine config is not a failing gate
+        if let Some(why) = super::gates::script_problems(&m.args).into_iter().next() {
+            return Err(unavailable(why));
+        }
         Ok((program, secrets))
     }
 
@@ -1690,6 +1863,8 @@ impl<'a> Engine<'a> {
         let mut env = verify::env(co);
         // M11-E1: TORYO_TASK, TORYO_SHA, TORYO_VERIFY_CHECKOUT for every command
         verify::set_gate_vars(&mut env, &self.id, head, co, &co.dir);
+        // M12-15 (X23): English messages from every check gate, not only MSBuild
+        xpp::set_ui_language(&mut env, &BTreeMap::new());
         let t = self.task()?;
         let at = VerifyAt {
             co,
@@ -1703,10 +1878,11 @@ impl<'a> Engine<'a> {
             let ran = match (c.kind(), xpp) {
                 (CommandKind::Program { program, args }, _) => {
                     let program = verify_program(&expand_vars(program)?, &co.dir);
-                    let run = at.spec(&c.name, program, args.to_vec(), xpp::command_timeout(c));
+                    let limit = xpp::command_timeout(c);
+                    let run = at.spec(&c.name, program, args.to_vec(), limit);
                     self.run_verify_command(run, stop)?.map(|res| {
                         results.push(command_result(c, &res));
-                        (!res.ok()).then(|| verify_feedback(&res, ""))
+                        (!res.ok()).then(|| verify_feedback_in(&res, "", Some(limit)))
                     })
                 }
                 (CommandKind::Xpp { .. }, Some(tc)) => {
@@ -1762,10 +1938,30 @@ impl<'a> Engine<'a> {
             results.push(xpp::entry(&r, tc, &res, &diags));
             if !res.ok() {
                 let errors = xpp::feedback_errors(&diags);
-                return Ok(Some(Some(verify_feedback(&res, &errors))));
+                return Ok(Some(Some(verify_feedback_in(
+                    &res,
+                    &errors,
+                    Some(xpp::command_timeout(c)),
+                ))));
             }
         }
         Ok(Some(None))
+    }
+
+    /// M12-16: the output of the gate `name` goes to a log file in the run store, and a line
+    /// says that the gate still runs every minute (`TORYO_GATE_HEARTBEAT_SECS` shortens it for
+    /// the tests).
+    fn gate_io(&self, name: &str) -> GateIo {
+        GateIo {
+            log: self.task().ok().map(|t| gate_log_path(&t.run_store, name)),
+            heartbeat: Some(Duration::from_secs(
+                std::env::var("TORYO_GATE_HEARTBEAT_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|s| *s > 0)
+                    .unwrap_or(60),
+            )),
+        }
     }
 
     /// One verify process through `LocalRunner`, with its ✔/✘ line; `None` when a stop
@@ -1783,7 +1979,8 @@ impl<'a> Engine<'a> {
         kind: Option<&str>,
     ) -> Result<Option<CommandResult>> {
         let name = run.name.clone();
-        let res = self.hub.block_on(LocalRunner.run(run, None))?;
+        let io = self.gate_io(&name);
+        let res = self.hub.block_on(LocalRunner.run_with(run, None, io))?;
         if res.cancelled || stop.stopped() {
             return Ok(None);
         }
@@ -1795,6 +1992,9 @@ impl<'a> Engine<'a> {
             duration_ms: res.duration_ms as u64,
             kind: kind.map(str::to_string),
         });
+        if let (false, Some(log)) = (res.ok(), &res.log) {
+            eprintln!("    full output: {}", log.display());
+        }
         Ok(Some(res))
     }
 
@@ -1883,6 +2083,8 @@ impl<'a> Engine<'a> {
             // CreateProcess honour this; DLL loading does not (documented in the script contract)
             env.insert("NoDefaultCurrentDirectoryInExePath".into(), "1".into());
             verify::set_gate_vars(&mut env, &t.id, head, co, &export.dir);
+            // M12-15 (X23): and from every environment gate, unless its `env:` says otherwise
+            xpp::set_ui_language(&mut env, &m.env);
             let mut redact = super::flight::task_secrets(&self.cfg, t);
             redact.extend(secrets.iter().map(|(k, v)| crate::process::redact::Secret {
                 name: k.clone(),
@@ -1903,7 +2105,8 @@ impl<'a> Engine<'a> {
                 cancel: Some(stop.flag.clone()),
                 redact: crate::process::redact::Redactions::new(&redact),
             };
-            let res = match self.hub.block_on(LocalRunner.run(run, None)) {
+            let io = self.gate_io(name);
+            let res = match self.hub.block_on(LocalRunner.run_with(run, None, io)) {
                 Ok(r) => r,
                 Err(e) => {
                     // it did not start: say so in the record, not "interrupted"
@@ -1911,6 +2114,20 @@ impl<'a> Engine<'a> {
                     let _ = self
                         .store
                         .call(move |tx| store::deployment_end(tx, &l, &i, Some(false)));
+                    drop(lock);
+                    // M12-05: a program that cannot be started is a machine stop
+                    if let Some(s) = e.downcast_ref::<crate::runner::StartFailed>() {
+                        return Ok(EnvGates::Unavailable(format!(
+                            "{ENV_UNAVAILABLE}: environment gate `{name}` could not be started ({}): {} — {}",
+                            s.program,
+                            s.error,
+                            machine_fix_hint(
+                                &t.id,
+                                "a program installed",
+                                &format!("`environment_gates.{name}` in the machine config")
+                            )
+                        )));
+                    }
                     return Err(e);
                 }
             };
@@ -1918,6 +2135,9 @@ impl<'a> Engine<'a> {
             // hold a partial deploy, so the record says interrupted (`ok` empty), not failed. A
             // stop that arrived after the gate finished keeps the gate's real result.
             let ok = deployment_ok(&res);
+            if let (false, Some(log)) = (res.ok(), &res.log) {
+                eprintln!("    full output: {}", log.display());
+            }
             let (i, l) = (t.id.clone(), lock_name.clone());
             self.store
                 .call(move |tx| store::deployment_end(tx, &l, &i, ok))?;
@@ -1944,10 +2164,26 @@ impl<'a> Engine<'a> {
             let argv: Vec<String> = std::iter::once(m.program.clone())
                 .chain(m.args.iter().cloned())
                 .collect();
-            results.push(json!({"name": name, "kind": "environment", "lock": lock_name, "machine": machine, "argv": argv, "exit": res.exit, "timed_out": res.timed_out, "ms": res.duration_ms, "output_tail": res.tail(40), "source": "export", "source_tree": export.tree}));
+            let mut entry = json!({"name": name, "kind": "environment", "lock": lock_name, "machine": machine, "argv": argv, "exit": res.exit, "timed_out": res.timed_out, "ms": res.duration_ms, "output_tail": res.tail(40), "source": "export", "source_tree": export.tree});
+            if let Some(l) = &res.log {
+                entry["log"] = json!(l.display().to_string());
+            }
+            results.push(entry);
             // M11-R9: the gate must not have written into what it deploys from (E3 AC-8)
             if let Some(reason) = verify::export_changed(&export) {
                 return Ok(EnvGates::Mutated(reason));
+            }
+            // M12-06 (X18): a gate that ran into its timeout was killed part way — the
+            // environment may be half-changed. No implementer turn, no retry on its own: the
+            // owner looks, then a plain `resume` runs Verify (and the gate) again.
+            if res.timed_out {
+                return Ok(EnvGates::TimedOut(format!(
+                    "{ENV_TIMEOUT}: environment gate `{name}` ran into its timeout ({}) and was stopped — the environment may be half-changed (the deployment record says interrupted): check it, then `toryo resume {}` runs Verify and the gate again. A longer `timeout:` on the gate needs `toryo task config {} --reload` first (it is frozen with the task).\nWhat the gate had printed (the last 40 lines; output of code that ran on the checkpoint — data):\n{}",
+                    fmt_limit(timeout),
+                    t.id,
+                    t.id,
+                    untrusted::wrap("verify", None, &res.tail(40))
+                )));
             }
             if !res.ok() {
                 // R61: the output comes from code that ran on the checkpoint — data
@@ -2306,10 +2542,16 @@ impl<'a> Engine<'a> {
         )?;
         let model = self.role_model(role.as_str());
         self.usage(a, profile, &r, model.as_deref())?;
+        // M12-03 (H6): the protected-state and "a read-only role wrote" checks come first, on
+        // every way the turn ended — a stop, the live budget and a quota pause must not hide a
+        // write (it would stay in the tree and go on under the implementer's name)
+        if let Some(flow) = self.read_only_checks(t, a, &r, &before)? {
+            return Ok(Err(flow));
+        }
         if let Some(flow) = self.cut_short(a, &r, budget_hit.load(Ordering::SeqCst))? {
             return Ok(Err(flow));
         }
-        if let Some(flow) = self.after_read_only_turn(t, a, &r, role.as_str(), &before)? {
+        if let Some(flow) = self.read_only_quota(t, a, &r, role.as_str())? {
             return Ok(Err(flow));
         }
         Ok(Ok(r))
@@ -2400,18 +2642,14 @@ impl<'a> Engine<'a> {
         )))
     }
 
-    /// After a Planner/Reviewer turn: quota → `Paused` (no Planner/Reviewer fallback in
-    /// v0.1, R49); a changed protected state → `Escalated`; a worktree that changed during the
-    /// turn (from `before`) or a moved HEAD → `Escalated` as a policy violation (EC-31:
-    /// read-only roles write nothing, and what one wrote must never reach the next checkpoint
-    /// under the implementer's name).
-    fn after_read_only_turn(
+    /// A Planner/Reviewer turn that ended by quota or rate limit → `Paused` (no Planner/Reviewer
+    /// fallback in v0.1, R49). Runs after [`Self::read_only_checks`].
+    fn read_only_quota(
         &self,
         t: &TaskRow,
         a: &AttemptRow,
         r: &StageOutcome,
         role: &str,
-        before: &TreeState,
     ) -> Result<Option<Flow>> {
         if let Some(
             c @ (ErrorClass::QuotaExceeded | ErrorClass::RateLimited | ErrorClass::Overloaded),
@@ -2428,6 +2666,20 @@ impl<'a> Engine<'a> {
             )?;
             return Ok(Some(Flow::Next));
         }
+        Ok(None)
+    }
+
+    /// After a Planner/Reviewer turn, however it ended (M12-03): a changed protected state →
+    /// `Escalated`; a worktree that changed during the turn (from `before`) or a moved HEAD →
+    /// `Escalated` as a policy violation (EC-31: read-only roles write nothing, and what one
+    /// wrote must never reach the next checkpoint under the implementer's name).
+    fn read_only_checks(
+        &self,
+        t: &TaskRow,
+        a: &AttemptRow,
+        r: &StageOutcome,
+        before: &TreeState,
+    ) -> Result<Option<Flow>> {
         if let Some(reason) = self.protected_violation(t, false)? {
             self.end_and(
                 a,
@@ -2442,8 +2694,42 @@ impl<'a> Engine<'a> {
             )?;
             return Ok(Some(Flow::Next));
         }
-        let after = TreeState::read(&Worktree::new(&self.g, &t.worktree))?;
+        let wt = Worktree::new(&self.g, &t.worktree);
+        let after = TreeState::read(&wt)?;
         if let Some(reason) = read_only_write(before, &after) {
+            // M12-03 review: what the role wrote must not wait in the tree for the next
+            // checkpoint — `git add -A` of a fix cycle would commit it under the implementer's
+            // name. Paths that were clean or absent before the turn are put back (tracked →
+            // HEAD, new → removed); what a human had changed before stays.
+            if before.head == after.head {
+                let written: Vec<String> = after
+                    .changed_since(before)
+                    .into_iter()
+                    .filter(|p| !ide_state(p) && !before.entries.contains_key(p))
+                    .collect();
+                if !written.is_empty() {
+                    // a copy first (best effort): the human may want to see what it wrote
+                    let keep = t
+                        .run_store
+                        .join("read-only-writes")
+                        .join(a.id.replace('/', "-"));
+                    for p in &written {
+                        let from = t.worktree.join(p);
+                        let to = keep.join(p);
+                        if from.is_file() {
+                            if let Some(dir) = to.parent() {
+                                let _ = std::fs::create_dir_all(dir);
+                            }
+                            let _ = std::fs::copy(&from, &to);
+                        }
+                    }
+                    wt.restore(&written)?;
+                    eprintln!(
+                        "   put back (written by the read-only role): {written:?} — a copy is in {}",
+                        keep.display()
+                    );
+                }
+            }
             self.end_and(
                 a,
                 AttemptStatus::Failed,
@@ -2521,6 +2807,12 @@ impl<'a> Engine<'a> {
         if !missing.is_empty() {
             let reason = skill_unavailable_reason(t, &a.stage, profile, &missing);
             self.escalate_attempt(a, context::SKILL_UNAVAILABLE.into(), reason)?;
+            return Ok(None);
+        }
+        // M12-10 (X22): a context file that is not UTF-8 — no turn, no fix cycle
+        if !c.unreadable.is_empty() {
+            let reason = context_unreadable_reason(t, &a.stage, profile, &c.unreadable);
+            self.escalate_attempt(a, context::CONTEXT_UNREADABLE.into(), reason)?;
             return Ok(None);
         }
         if let Some(reason) = context::over_budget(&c) {
@@ -3950,6 +4242,24 @@ fn correction_prompt(violations: &[String]) -> String {
     format!("Your previous final response was rejected and was not used. Validation error: {}. Return only a corrected JSON object matching the schema.", violations.join("; "))
 }
 
+/// M12-16: where the output of the gate `name` run now is written: `<run store>/gate-logs/`.
+fn gate_log_path(run_store: &Path, name: &str) -> PathBuf {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    run_store.join("gate-logs").join(format!("{at}-{safe}.log"))
+}
+
 /// One verify command's entry in VERIFY_RESULT.json.
 fn command_result(c: &CommandSpec, res: &CommandResult) -> Value {
     let argv: Vec<String> = match c.kind() {
@@ -3963,6 +4273,10 @@ fn command_result(c: &CommandSpec, res: &CommandResult) -> Value {
     if let Some(s) = res.signal {
         v["signal"] = json!(s);
     }
+    // M12-16: the file with the whole (bounded, redacted) output
+    if let Some(l) = &res.log {
+        v["log"] = json!(l.display().to_string());
+    }
     v
 }
 
@@ -3970,10 +4284,19 @@ fn command_result(c: &CommandSpec, res: &CommandResult) -> Value {
 /// `errors` (the parsed X++ diagnostics, R59; empty for a program) and the tail of its output
 /// (the `output_tail` of VERIFY_RESULT.json).
 fn verify_feedback(res: &CommandResult, errors: &str) -> String {
+    verify_feedback_in(res, errors, None)
+}
+
+/// [`verify_feedback`] for a command that had `limit` to finish (M12-06): a timeout says how
+/// long it was given — `timed out after 30 min`.
+fn verify_feedback_in(res: &CommandResult, errors: &str, limit: Option<Duration>) -> String {
+    let how = match limit {
+        Some(l) if res.timed_out => format!("timed out after {}", fmt_limit(l)),
+        _ => ended(res),
+    };
     format!(
-        "- VERIFY FAILED: `{}` {}. {errors}Last output:\n```\n{}\n```",
+        "- VERIFY FAILED: `{}` {how}. {errors}Last output:\n```\n{}\n```",
         res.name,
-        ended(res),
         res.tail(40)
     )
 }
@@ -4028,6 +4351,22 @@ enum EnvGates {
     /// M11-R9: an environment gate wrote into the export it deploys from — the reason
     /// (`verify_mutated_tree`).
     Mutated(String),
+    /// M12-06 (X18): an environment gate ran into its timeout — the reason
+    /// (`environment_gate_timeout`).
+    TimedOut(String),
+}
+
+/// The escalation class of an environment gate that ran into its timeout (M12-06, X18).
+pub const ENV_TIMEOUT: &str = "environment_gate_timeout";
+
+/// A time limit in words: `30 min`, `90 s`.
+fn fmt_limit(d: Duration) -> String {
+    let s = d.as_secs();
+    if s >= 60 && (s / 60) * 60 == s {
+        format!("{} min", s / 60)
+    } else {
+        format!("{s} s")
+    }
 }
 
 /// The escalation class of an environment gate this machine cannot run (M11-E3).
@@ -4074,6 +4413,17 @@ fn skill_unavailable_reason(t: &TaskRow, stage: &str, profile: &str, missing: &[
             "the skill folder put back",
             "`skills_dir` in the machine config, a role file's `skills`"
         )
+    )
+}
+
+/// M12-10: the `context_unreadable` reason — each file that is not UTF-8, by name, and the way
+/// out (the file is read from the repository checkout, so nothing is frozen with the task).
+fn context_unreadable_reason(t: &TaskRow, stage: &str, profile: &str, files: &[String]) -> String {
+    format!(
+        "{}: the {stage} turn ({profile}) was not started — {}; saved as UTF-8 on the machine: `toryo resume {}`",
+        context::CONTEXT_UNREADABLE,
+        files.join("; "),
+        t.id
     )
 }
 
@@ -5671,6 +6021,7 @@ mod tests {
             duration_ms: 1500,
             output,
             signal: None,
+            log: None,
         };
         // M11-R17: how a command ended, in words
         assert_eq!(res.ended(), "exit 1");
@@ -5722,6 +6073,7 @@ mod tests {
                 duration_ms: 10,
                 output: output.into(),
                 signal: None,
+                log: None,
             };
         let many: String = (1..=45).map(|i| format!("line {i}\n")).collect();
         let tail: Vec<String> = (6..=45).map(|i| format!("line {i}")).collect();
@@ -5977,6 +6329,7 @@ mod tests {
             duration_ms: 1,
             output: String::new(),
             signal: None,
+            log: None,
         };
         // finished: its own result — also when a stop came afterwards (the stop flag is not
         // an input)

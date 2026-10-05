@@ -170,6 +170,7 @@ fn store() -> Result<Store> {
 }
 
 fn get(store: &Store, id: &str) -> Result<TaskRow> {
+    task::valid_task_id(id)?;
     let i = id.to_string();
     store.call(move |tx| store::get_task(tx, &i))
 }
@@ -177,6 +178,7 @@ fn get(store: &Store, id: &str) -> Result<TaskRow> {
 /// [`get`] in a read-only transaction (R6): for the commands that only look (`status`, `task
 /// show`, `usage`, `watch`).
 fn read_task(store: &Store, id: &str) -> Result<TaskRow> {
+    task::valid_task_id(id)?;
     let i = id.to_string();
     store.read(move |tx| store::get_task(tx, &i))
 }
@@ -557,10 +559,6 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
                     t.state
                 );
             }
-            if !t.state.is_terminal() {
-                let i = id.clone();
-                st.call(move |tx| store::transition(tx, &i, PipelineEvent::Cancel).map(|_| ()))?;
-            }
             // EC-12: a task whose frozen configuration cannot be read can still be removed
             let cfg = match frozen_config(&t) {
                 Ok(c) => Some(c),
@@ -573,6 +571,21 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
                 Some(c) => task::task_git(c, &t.repo)?,
                 None => task::cleanup_git(&t.repo)?,
             };
+            // M12-12 (a): what cleanup deletes cannot be had back — say what, and ask for --force
+            if !*force {
+                let lost = cleanup_would_lose(&g, &t);
+                if !lost.is_empty() {
+                    bail!(
+                        "{id}: `task cleanup` would delete {} — look at it first (`git -C {} status`); `toryo task cleanup {id} --force` deletes it anyway",
+                        lost.join(" and "),
+                        t.worktree.display()
+                    );
+                }
+            }
+            if !t.state.is_terminal() {
+                let i = id.clone();
+                st.call(move |tx| store::transition(tx, &i, PipelineEvent::Cancel).map(|_| ()))?;
+            }
             toryo::engine::verify::cleanup(&g, &t, cfg.as_ref())?;
             if t.worktree.exists() {
                 let w = t.worktree.display().to_string().replace('\\', "/");
@@ -595,6 +608,34 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+/// M12-12 (a): what `task cleanup` would delete that exists nowhere else — uncommitted changes
+/// in the worktree and the partial snapshots of the run store (the branch is kept). Empty: a
+/// clean worktree and no snapshot.
+fn cleanup_would_lose(g: &toryo::git::GitCmd, t: &TaskRow) -> Vec<String> {
+    let mut lost = Vec::new();
+    if t.worktree.exists() {
+        let n = toryo::engine::worktree::Worktree::new(g, &t.worktree)
+            .changed()
+            .map(|c| c.len())
+            .unwrap_or(0);
+        if n > 0 {
+            lost.push(format!(
+                "{n} uncommitted change(s) in the worktree {}",
+                t.worktree.display()
+            ));
+        }
+    }
+    let partial = t.run_store.join("artifacts").join("partial");
+    let n = std::fs::read_dir(&partial).map_or(0, |d| d.flatten().count());
+    if n > 0 {
+        lost.push(format!(
+            "the partial snapshot(s) of {n} attempt(s) in {}",
+            partial.display()
+        ));
+    }
+    lost
 }
 
 fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Result<i32> {
@@ -622,6 +663,10 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     let mut new = load_config(cli)?;
     // review H2 (M11-A2): a reload cannot go below the machine floor either
     if let Some(reason) = toryo::engine::verify::below_floor(&new) {
+        bail!("{reason}");
+    }
+    // M12-05: an environment gate this machine cannot start is refused here too
+    if let Some(reason) = toryo::engine::gates::env_gates_refusal(&new) {
         bail!("{reason}");
     }
     // M11-R21: a changed `verify_root` is probed as `task create` and `doctor` do — a root
@@ -986,8 +1031,27 @@ fn machine_caused_stop(t: &TaskRow) -> bool {
         && t.machine.escalated_from().is_some_and(|s| s.is_running())
 }
 
+/// M12-07: the task is stopped with `environment_gate_confirm` — it waits for the owner's "yes".
+fn waits_for_a_deploy_yes(t: &TaskRow) -> bool {
+    machine_caused_stop(t) && t.machine.reason_class() == Some(toryo::engine::gates::ENV_CONFIRM)
+}
+
 fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
     let t = get(st, &lock.task)?;
+    // M12-07 (X17): `--yes` never confirms a deploy — it is for the plan and the final gate
+    if d.yes
+        && waits_for_a_deploy_yes(&t)
+        && r.note.is_none()
+        && !r.discard_partial
+        && !r.keep_partial
+    {
+        bail!(
+            "{}: --yes never confirms a deploy. Look at the checkpoint, then `toryo resume {}` without --yes (the final gate is then approved with `toryo approve {} --gate final`)",
+            t.id,
+            t.id,
+            t.id
+        );
+    }
     let protected = t.state == PipelineState::Escalated
         && t.machine
             .reason()
@@ -1075,6 +1139,18 @@ fn resume_before_drive(st: &Store, t: &TaskRow, r: &ResumeArgs, protected: bool)
         // the machine cannot run) — a plain `toryo resume` goes back into the stage, which
         // checks its precondition again. No fix cycle, no implementer turn for nothing.
         let class = t.machine.reason_class().unwrap_or_default().to_string();
+        // M12-07 (X17): this resume is the owner's "yes" to the deploy the stop asked about
+        if class == toryo::engine::gates::ENV_CONFIRM {
+            let said = toryo::engine::gates::record_confirmation(&t.run_store)?;
+            eprintln!(
+                "{}: deploy confirmed ({})",
+                t.id,
+                said.iter()
+                    .map(|a| format!("{} @ {}", a.gate, short(&a.commit)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         let i = t.id.clone();
         st.call(move |tx| store::transition(tx, &i, PipelineEvent::ResumeStage).map(|_| ()))?;
         toryo::engine::decisions::append(
@@ -1108,6 +1184,19 @@ fn resume_before_drive(st: &Store, t: &TaskRow, r: &ResumeArgs, protected: bool)
 }
 
 pub fn resume(id: Option<&str>, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
+    // M12-12 (b): these flags belong to one task — `resume --note "x"` used to be accepted
+    // and then ignored
+    if id.is_none() {
+        let one = [
+            ("--note", r.note.is_some()),
+            ("--discard-partial", r.discard_partial),
+            ("--keep-partial", r.keep_partial),
+            ("--accept-protected-change", !r.accept_protected.is_empty()),
+        ];
+        if let Some((flag, _)) = one.iter().find(|(_, set)| *set) {
+            bail!("{flag} belongs to one task — `toryo resume <id> {flag} …`; without an id `toryo resume` takes every waiting task as it is");
+        }
+    }
     let st = store()?;
     match id {
         Some(id) => {
@@ -1121,11 +1210,33 @@ pub fn resume(id: Option<&str>, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
             let tasks = st.call(store::list_tasks)?;
             let mut code = 0;
             for t in tasks.into_iter().filter(|t| !t.state.is_terminal()) {
+                // M12-12 (b): a task that was never started is `run`, not `resume`
+                if t.state == PipelineState::New {
+                    eprintln!("\n{}: not started — `toryo run {}`", t.id, t.id);
+                    continue;
+                }
+                // M12-07 (review): a stop that asks before a deploy is answered by `resume <id>`
+                // — never by a resume of everything
+                if waits_for_a_deploy_yes(&t) {
+                    eprintln!(
+                        "\n{}: waits for your yes before it deploys — look at it, then `toryo resume {}`",
+                        t.id, t.id
+                    );
+                    code = code.max(1);
+                    continue;
+                }
                 match TaskLock::acquire(&st, &t.id) {
                     Ok(lock) => {
                         eprintln!("\n▶ resume {}", t.id);
-                        let c = resume_one(&st, &lock, &ResumeArgs::default(), d)?;
-                        code = code.max(c);
+                        // M12-12 (b): one failing task does not stop the others; the exit
+                        // code says that one failed
+                        match resume_one(&st, &lock, &ResumeArgs::default(), d) {
+                            Ok(c) => code = code.max(c),
+                            Err(e) => {
+                                eprintln!("{}: error: {e:#}", t.id);
+                                code = code.max(2);
+                            }
+                        }
                         lock.release();
                     }
                     Err(e) => match e.downcast_ref::<lock::TaskActive>() {

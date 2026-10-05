@@ -14,6 +14,7 @@ env:
 jobs:
   test:
     name: test (${{ matrix.os }})
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -64,6 +65,7 @@ jobs:
 
   release-build:
     name: toryo.exe (release)
+    timeout-minutes: 45
     needs: test
     runs-on: windows-latest
     steps:

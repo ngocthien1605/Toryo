@@ -1,0 +1,128 @@
+# Toryo — status (the first file a session reads)
+
+Updated at the end of M12 (2026-10-05). When you finish work: edit the open list **in place** (delete a closed row and name
+it in the commit message — never strike it through), add decisions to [`DECISIONS.md`](DECISIONS.md), append the round's record
+to the milestone notes. Never start a new "Open (the older ones still stand)" list.
+
+## 1. State
+
+| | |
+|---|---|
+| **Code** | `main` @ `4ad97c3` (M11, pull request #4) plus branch `m12/first-run` (M12, 21 tasks, one commit each; pull request pending the owner's merge). `Cargo.toml` version `0.12.0`; `toryo --version` prints the commit. |
+| **Tests** | 681 passed, 0 failed, 6 ignored on Windows (623 at `4ad97c3`). CI: `test (windows-latest)`, `test (ubuntu-latest)` (fmt, tests, clippy, clippy without the kit), `toryo.exe (release)` (artifact `toryo-windows-x64`). Code under `#[cfg(unix)]` is first built by CI. |
+| **Milestones** (repo numbering; plan v0.8 numbers differ after M8) | M0 spike · M1–M7 core, engine, store, context, protection, artifacts, verify, usage · M8 E2E on the real CLIs · M9 trust boundaries, `tool: xpp`, D365FO template · M10 typed events, `events.jsonl`, `watch`, `usage`, toast · M11 org chart, role files, skills, write fence, environment gates (5 review rounds) · M12 ready for the first real task. |
+| **Where things are** | `README.md` (reference), `docs/HUONG-DAN.md` (the guide, Vietnamese; §7.3 "Task thật đầu tiên trên D365FO", §9.1 escalation table), `docs/DECISIONS.md`, `docs/M12-NOTES.md` (what M12 changed, per task), `docs/archive/M11-NOTES.md` (the M11 record), `docs/M9-NOTES.md`, `docs/M10-NOTES.md`, `docs/REVIEW-2026-10-01.md` + `-status.md` (the review and the status of its 62 items). The plan (v0.8) is **not** in the repository. |
+
+## 2. What has run for real, and what never has
+
+| Ran for real | Evidence |
+|---|---|
+| M0 on the owner's Windows machine: Claude Code and Codex CLI, Job Objects, Git canaries, Low-integrity labels | `docs/M0-RESULTS.md` (11 of 12 M0-VERIFY items; #6 Foundry not run) |
+| M8 end to end on the real CLIs: calculator fixture and BatchRename (BR-001, BR-002 with a real fix cycle); live budget interrupt, fail-closed Codex preflight, silent Codex command not killed as stalled | commit `b8b3dbf`, `scripts/m8-check.ps1` |
+| M9 canaries with the real CLIs (2026-09-29): injection canary with the real reviewer, implementer isolation | `docs/M9-NOTES.md` |
+
+**Never run, only against fakes:** a real X++ build (`tool: xpp`: the MSBuild command line, response file, NuGet layout, duration,
+diagnostics) · a build at Low integrity (`toryo xpp build --low`) · an environment gate against a real D365FO environment · a real
+D365FO task from `TASK.md` to the final gate · a Japanese-Windows run (the cp932 decode is pinned by a unit test with the code page
+given, not through a pipeline) · the elevated-token branch of `doctor` · Foundry under `--restricted` (V07-VERIFY 1).
+The M12 template run (`tests/m12_template.rs`) uses fake agents and the print-only example scripts.
+
+## 3. How to resume work
+
+- Branch from `main`; one task = one commit, subject `area: what (M12-07)`; the four checks before every commit:
+  `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, the same with `--no-default-features`,
+  `cargo test --locked`. Every fix has a test that failed before it; never weaken or delete a test (name the assertion and why in
+  the commit body).
+- **Never run `claude` or `codex`** (fake agents: `--fake-agents <script.json>`), never touch the owner's configs, data folders or a
+  D365FO environment or repository. `git push` may be denied to the agent: then the owner pushes.
+- A statement is *reproduced* (seen with the binary) or *read* (code only: write the failing test first; if it does not fail, record it
+  under Open and move on). Keep fixes small — no refactoring. M18 rules (`src/engine/cmdline.rs`, the entry-script and catch-all code
+  in `checks.rs`) and the export comparison in `verify.rs` had five review rounds: do not change them without a new round.
+- `#[cfg(unix)]` code is not compiled on the Windows machine: when a type or signature changes, search its Unix-only uses by hand.
+
+## 4. The open list
+
+Priority is for an owner about to run the **first real D365FO task**: **P0** before it, **P1** soon after (or know it before), **P2**
+later. Kinds: bug · gap · decision · machine (needs a check on the real machine) · doc. IDs are those of the 2026-10-05 audit
+(`O-nn`); M12 rows `N-nn` are new.
+
+### P0 — before the first real D365FO task
+
+| ID | What | Kind |
+|---|---|---|
+| O-01 | **The real X++ build has never run.** Run `toryo xpp build` by hand on the UDE machine first (`--print-only`, then for real); a wrong command line would fail every verify and burn fix cycles. | machine |
+| O-02 | **Whether it works at Low integrity is unknown** (`toryo xpp build --low`). It decides `verify.boundary` for the repository: `low_integrity` or trusted-code mode (needs `verify: { min_boundary: none }` in the machine config). | machine + decision |
+| O-04 | **Decide whether the first run includes the `dbsync` environment gate.** It runs the owner's script with full rights at every verify, before review. Now: `confirm: first` asks first, the shipped example scripts are print-only (`templates/d365fo/`); the real deploy and sync commands are the owner's. | decision + machine |
+| O-05 | **Use a `toryo.exe` built from the merged `main`** (`cargo build --release --locked`, or the CI artifact); `toryo --version` shows version and commit. No binary is in the repository. | gap |
+| O-06 | Only with `claude-foundry`: V07-VERIFY 1 (Foundry under `--restricted --safe-mode`) must pass; the R51 gate refuses the run until `toryo doctor --canaries` passed for that profile. | machine |
+
+### P1 — soon after, or know it before the run
+
+| ID | What | Kind |
+|---|---|---|
+| O-11 | Review **M19**: after a crash in a read-only stage *any* dirty file (also `.vs\`, also the owner's) escalates `policy_violation`. | bug |
+| O-14 | Review **M3**: a launch error before the agent starts (missing Credential Manager entry, wrong exe) reserves ~600k tokens and pauses on "Budget". | bug |
+| O-15 | Ctrl+C on `toryo run` kills the process (no `run_ended`, no toast); use `toryo stop <id>` from a second window. | gap |
+| O-16 | Where MSBuild puts `obj\` is unknown; see it once on the real machine (the fix would be `/p:BaseIntermediateOutputPath`). | machine |
+| O-17 | `git add --renormalize .` must change nothing in the D365FO repository, else every verify stops with `verify_mutated_tree`. | machine |
+| O-18 | Performance on a D365FO-sized repository is unmeasured (protected scan every loop, `clean -ffdx`, export and two hash passes per gate). Watch the first run. | machine |
+| O-19 | Decision 9: `verify.checkout` for D365FO — `clean` (default) or `tracked`; measure both durations in O-01. | decision |
+| O-20 | Decision 10: what the implementer may touch (template: `writes: [Metadata/ContosoCore/**]`, `never: Descriptor/*.xml`, a commented `never:` block; confirm after the first task). | decision |
+| O-21 | Decision 19: an X++ build inside the implementer's turn is not built — decide from the fix cycles of the first real task. | decision |
+| O-22 | A file a gate script itself loads (dot-sourced, imported) is not protected by M18: keep the script in one file, or list helpers in `policy.protected_paths` and `never:`. | gap |
+| O-23 | `TORYO_VERIFY_BUILD` is written by Low code and shared between tasks; matters once two tasks verify at the same time. | gap |
+| O-24 | `xppbp.exe` (best-practice check) is not supported: `bp_check: true` is refused at load. V08-VERIFY 4 never ran. | gap + machine |
+| O-25 | Plan v0.9 does not exist; the plan knows nothing of the org chart, environment gates, skills, the fence, X1–X23. Stop rule 4 (compare hours after M8) has no record. | decision |
+| O-26 | Review **H3**: canary evidence is bound to the CLI version only — not to the launch mode, exe or profile settings; re-run `toryo doctor --canaries` after any profile change. | gap |
+| O-29 | Review **L8**: a `task create` that fails half-way leaves the run store and the branch; the retry is refused. | bug |
+| O-30 | Review **T3**/**T4**: CI floats on `stable` and mutable action tags (broke once, `f5ad5e1`); the owner's binary has only version + commit as provenance. | gap |
+| O-32 | Decision 18: which machine facts stay in the repository file (`project.root`, `worktrees_root`, `runs_root`, `policy.allow_submodules` still do). Decide before anyone else commits to `toryo.yaml`. | decision |
+| N-01 | After a reviewer failure the only exits are `approve --force` or `resume --note` (a fix turn, then build and sync again). A forced approval after a rejected review shows "reviewer skipped" and hides the blocking issue. Raising `limits` and reloading changes nothing in the running task. | gap |
+| N-02 | `verify.final_clean` is not implemented (M12-08 says so: the key is accepted and noted). Environment-gate output always goes to the implementer and into `VERIFY_RESULT.json` (an option to share nothing is missing). Check gates run with the checkout as working directory and without `NoDefaultCurrentDirectoryInExePath`. | gap |
+| N-03 | `%VAR%` is expanded in repository-chosen paths (`worktrees_root`, `verify_root`, a check gate's `program`): a commit can pull any variable of the owner's shell into paths and logs. A symlinked `instructions.md`, culture or skill file is followed outside the repository. Context files are read live at every turn, outside the frozen configuration. | gap |
+| N-04 | `task cleanup` after a half-removed worktree fails forever; no retention of run stores, verify checkouts, exports and the new `gate-logs`; the deployment table keeps one row per lock; the SQL schema version was never raised. | gap |
+| N-05 | A gate that exits 0 while a descendant keeps the pipe open past its limit is reported as timed out; a stop that lands after a gate timeout hides the timeout warning (the next resume re-runs the gate); `doctor` shows `confirm:` only on OK lines; the `git -C <worktree> show` hint does not quote a path with spaces; `script_problems` would refuse an absolute non-existent output path ending in `.js`/`.py`/`.exe`. (M12-05..07 review.) | bug (small) |
+| N-06 | The protected scan descends into every folder of the worktree (not only protected ones) and fails closed: one unlistable folder (a root-owned Docker data folder) escalates `protected_config_changed`. A stop that came with a write prints "stopped at a stage boundary" although the task escalated. (M12-02/03.) | gap |
+| N-07 | `scripts/m3-stop-test.ps1`, `m4-m7-check.ps1`, `m8-check.ps1` set `$env:TORYO_CONFIG` and run `toryo` where they were started: from a folder with its own `toryo.yaml` they now use that file (M12-09). Fix: `--config` in each call. | doc / gap |
+| N-08 | The gate log (`<run store>\gate-logs\`) holds the same bounded text as the result (first 1 MB + last 8 MB), not the whole of a 50 MB output; a secret split by the cut is not redacted. Gate-log names use the clock in milliseconds. | gap |
+| N-09 | A `SKILL.md` that is not UTF-8 stops a turn as `skill_unavailable`, not `context_unreadable`. | gap (small) |
+
+### P2 — later / never
+
+| ID | What | Kind |
+|---|---|---|
+| O-34 | Review M4 (Git dir discovered from the worktree), M5 (inherited handles in the Low child), M6 (housekeeping in the Low tree), M7 (`tree_gone` not enforced; on Unix a killed toryo leaves an environment gate's process group running while the lock is free). | bug / gap |
+| O-35 | Review M9 (terminal escape sequences in printed vendor text), M10 (a gate decision lost in a crash window), M14 rest (`artifact_tampered` is not machine-caused), M15 (`events.jsonl` not synced), M16 (`--discard/--keep-partial` without the HEAD guard), M17 (manifest paths not validated). | bug |
+| O-36 | Review M20 (`m0-kit` on by default, CI runs no tests without it), M21 (agent-subprocess tests are Unix-only), T1 (test Git calls inherit the developer's global config), T2 (`stop took < 6s` has no margin), T5 rest. | gap |
+| O-37 | Review M22, M23, L22 and the M0 kit: `spike pipeline` verifies with `Boundary::None` whatever the floor says — never use it on a real repository. | gap |
+| O-38 | Review L2–L7, L9–L21, L23 (20 Low items; evidence in `REVIEW-2026-10-01-status.md`). | bug |
+| O-39 | Maintainability Mt1–Mt4: `runner.rs` 6,000+ lines; duplicates (`end_with`/`finish_and`/`finish_classed`, `billing()`, `gate_name`); `engine_cli.rs`; test hooks honoured in release builds (`TORYO_TEST_*`; M12 adds `TORYO_GATE_HEARTBEAT_SECS`). | maintainability |
+| O-40 | `DIFF.patch` is not scanned for known secret values. | gap |
+| O-41 | M18 detection limits that protect less than one might expect (interpreter and `make` rules not applied inside a command string; a script behind `env`, `timeout`, `!`; `nmake /f`; `pwsh -EncodedCommand`; …). | gap |
+| O-42 | M18 detection limits that protect more or stay silent (caps depth 6 / 4096 words / 32 folders are silent; here-document read as `sh` only; a fixed PATHEXT list). | gap |
+| O-43 | `checks::verify_commands` takes the `scripts/build.ps1` / `test.ps1` fallback from the worktree as it is (`toryo.yaml`-only mode, empty `commands.verify`). | gap |
+| O-44 | `verify::mutated` looks at tracked files only: an untracked `npm.cmd` left by one check gate would be found by a later `cmd` gate. | gap |
+| O-45 | The preflight checks every environment gate before the build: a gate whose program or secret an earlier gate creates can never start. | gap |
+| O-46 | A symlinked parent folder can carry a build-output entry into a checkpoint (Unix, or `core.symlinks=true`). | gap |
+| O-47 | Byte-exact export check limits (framing by on-disk size; a file name with a line break; a leading space in a path). | gap |
+| O-48 | Case folding of the export: `to_lowercase` is not NTFS's table; a per-directory case-sensitive folder gives a false collision. | gap |
+| O-49 | The after-gate export check guards the owner's own script (a contract, not a boundary); a changed `verify_root` leaves the old checkout folder. | gap / doc |
+| O-50 | `verify.boundary: none` together with an environment gate gets no warning (becomes P1 if O-02 ends at `none`). | gap |
+| O-51 | A `skills_dir` that contains an agent root is not refused; skill files are read through links without a containment check. | gap |
+| O-52 | Skills budget: the plan-time check omits the render scaffolding; a budget lowered after approval is not re-checked; `SKILL.md` is hashed per attempt, not frozen. | gap |
+| O-53 | Fence patterns: `{ } [ ]` and a leading `!` are refused; ignored files outside `writes` are not seen; a fence violation found by crash recovery escalates. | gap |
+| O-54 | Wording after `resume --note` with split limits ("2 gate retries used" after 3 cycles, "1 review rounds"). | bug (text) |
+| O-55 | `which_in` tries only `""`, `.exe`, `.cmd`; `named_path` reads `a.ps1;b.ps1` as one path. (M12-05 made the preflight agree with `which_in`.) | bug |
+| O-56 | The `spike_e2e` flake on `ubuntu-latest` (`pwsh` ended by a signal); a flaky `an_environment_gate_runs_when_the_blobs_keep_crlf_under_eol_crlf` was seen once on Windows (racy Git timing). | bug (test) |
+| O-58 | Accepted by the owner, kept so nobody reopens them: a task created before M11 with `boundary: none` keeps it; after `same_vendor_review`, `resume --note` costs one more implementer turn; `instructions:` outside the role folder is refused; `task create --trusted-code` was not added. | decided |
+| O-59 | Small loader leftovers: an unknown enum value keeps serde's message; `templates_keep_their_m10_hash` reads the dogfood template whose `project.root` is this repository. | gap |
+| O-60–O-65 | The elevated-`status` check never done by hand; a hard kill between `record_usage_in` and `turn_finished`; `vendor_reported_cost_usd` never filled; transitions made outside the engine take their class from the reason prefix; a `%` in a path breaks the MSBuild response file; the Low-IL run of Toryo's own test suite on Windows never verified. | mixed |
+| O-66–O-78 | Plan items: V07-VERIFY 2, 3, 5 (Codex `TEMP`, usage fixtures); EC/TS known gaps with no trace in the repository; "v0.2 seams"; decisions 3, 4, 5, 11, 14 (Git LFS: `git.trusted_filters: {}` in the template), 16, 17. | decision / gap |
+| N-10 | Tests and structure before more features: a fake agent CLI that runs on Windows (today every test that starts an agent process in a Job is Unix-only; M12-14 uses `toryo` itself as the failing CLI); property tests for `cmdline.rs`; `serde_yaml` is deprecated and the trust checks rest on it; six path normalisers with three case rules; escalation classes are strings in seven files; CI time (about 105 `git` processes per pipeline run). | gap |
+
+## 5. Not in this milestone
+
+Everything in the lists above that is not marked fixed in `docs/M12-NOTES.md`. M12 fixed: review H1, H4, H5, H6, M1, M8, M11, M12,
+M13, L1 (see `REVIEW-2026-10-01-status.md`); audit rows O-03, O-07–O-10, O-12, O-13, O-27, O-28, O-31, O-33, O-57 (and the H5 part of
+O-06) are closed and no longer listed. Plan §3.3 says what comes next: finish v0.1 with V08-VERIFY 2–4 and one real D365FO task, close
+decisions 9, 10, 12, 14, re-plan as v0.9, then the v1 order.

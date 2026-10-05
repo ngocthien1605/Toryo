@@ -653,13 +653,19 @@ fn lock_first_recovery() {
             .iter()
             .any(|x| x.stage == "implement" && x.status == AttemptStatus::Running)
     });
-    // B: `resume` without an id skips A and runs B
+    // B: `resume` without an id skips A (it is driven) — and since M12-12 does not start B
+    // either: a task that is still `New` is `run`, not `resume`d. (This assertion was: B is
+    // planned by the resume.)
     let b_s = script(&env, "b.json", json!({ "planner": [turn(vec![plan()])] }));
     let (_, err) = toryo(&env, &["resume", "--fake-agents", &b_s], &[]);
     assert!(
         err.contains("A-1 is active") && err.contains("skipped"),
         "{err}"
     );
+    assert!(err.contains("B-1: not started"), "{err}");
+    assert_eq!(task(&env, "B-1").state, St::New, "{err}");
+    let (code, err) = toryo(&env, &["run", "B-1", "--fake-agents", &b_s], &[]);
+    assert_eq!(code, 0, "{err}");
     assert_eq!(task(&env, "B-1").state, St::WaitingPlanApproval, "{err}");
     // every mutating command on A refuses with task_active, touching nothing
     for args in [

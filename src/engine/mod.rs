@@ -8,6 +8,7 @@ pub mod context;
 pub mod contracts;
 pub mod decisions;
 pub mod flight;
+pub mod gates;
 pub mod lock;
 pub mod protect;
 pub mod recovery;

@@ -57,6 +57,9 @@ pub const SKILL_UNAVAILABLE: &str = "skill_unavailable";
 /// M11-R5: with its skills (never trimmed) and TASK.md / PLAN.md (never trimmed to make room
 /// for them) the context does not fit its budget.
 pub const CONTEXT_OVER_BUDGET: &str = "context_over_budget";
+/// M12-10 (X22): a context file (instructions, culture, policy, `AGENTS.md`, `CLAUDE.md`, the
+/// global context, a task-pack file) exists and is not UTF-8 — the turn is not started.
+pub const CONTEXT_UNREADABLE: &str = "context_unreadable";
 
 /// Whether a task-pack file (by its label) is trusted (R61). A file added to the pack later is
 /// untrusted unless it is listed in [`TRUSTED_PACK`].
@@ -141,6 +144,10 @@ pub struct Assembled {
     pub sources: Vec<Source>,
     /// Sources that were looked for and not found (logged, not an error).
     pub skipped: Vec<String>,
+    /// M12-10 (X22): sources that exist and are not UTF-8 — each reason names the file. The
+    /// turn does not start: `context_unreadable`, a machine stop (no turn, no cycle).
+    #[serde(skip)]
+    pub unreadable: Vec<String>,
     pub warnings: Vec<String>,
     pub sha256: String,
     #[serde(skip)]
@@ -197,10 +204,15 @@ struct Part {
     untrusted: bool,
 }
 
-fn read(p: &Path) -> Option<String> {
-    std::fs::read(p)
-        .ok()
-        .map(|b| String::from_utf8_lossy(&b).replace("\r\n", "\n"))
+/// M12-10: a missing file is `Ok(None)` (skipped and reported); a file that is not UTF-8 is
+/// `Err` with its name — never lossy text. A byte-order mark is ignored.
+fn read(p: &Path) -> std::result::Result<Option<String>, String> {
+    match std::fs::read(p) {
+        Err(_) => Ok(None),
+        Ok(b) => crate::textfile::decode(p, &b)
+            .map(|t| Some(t.replace("\r\n", "\n")))
+            .map_err(|e| format!("{e:#}")),
+    }
 }
 
 fn disp(p: &Path) -> String {
@@ -211,13 +223,15 @@ fn disp(p: &Path) -> String {
 pub fn assemble(req: &Request) -> Result<Assembled> {
     let mut parts: Vec<Part> = Vec::new();
     let mut skipped = Vec::new();
+    let mut unreadable: Vec<String> = Vec::new();
     let mut add = |n: u8,
                    label: &str,
                    path: &Path,
                    heading: String,
                    rank: Option<u32>,
                    skipped: &mut Vec<String>| match read(path) {
-        Some(body) => parts.push(Part {
+        Err(why) => unreadable.push(why),
+        Ok(Some(body)) => parts.push(Part {
             n,
             label: label.to_string(),
             path: path.to_path_buf(),
@@ -230,7 +244,7 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
             truncated: false,
             untrusted: false,
         }),
-        None => skipped.push(format!("{n}: {}", disp(path))),
+        Ok(None) => skipped.push(format!("{n}: {}", disp(path))),
     };
     // trim ranks: task-pack inline → path (10+), global (100), CLAUDE.md (110), AGENTS.md (120),
     // must-inline task pack (200+)
@@ -338,7 +352,8 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
     // M11-C1: the role's instructions.md is added after the built-in rules, never instead
     if let Some((rel, path)) = req.team.as_ref().and_then(|t| t.instructions.as_ref()) {
         match read(path) {
-            Some(body) => parts.push(Part {
+            Err(why) => unreadable.push(why),
+            Ok(Some(body)) => parts.push(Part {
                 n: 4,
                 label: rel.clone(),
                 path: path.clone(),
@@ -351,7 +366,7 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
                 truncated: false,
                 untrusted: false,
             }),
-            None => skipped.push(format!("4: {}", disp(path))),
+            Ok(None) => skipped.push(format!("4: {}", disp(path))),
         }
     }
     // M11-D2: the planner chooses the implementer's skills from this menu
@@ -400,9 +415,16 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
     let mut data = Vec::new();
     let mut data_sources = Vec::new();
     for (i, (label, path)) in req.pack.iter().enumerate() {
-        let Some(body) = read(path) else {
-            skipped.push(format!("5: {} ({})", label, disp(path)));
-            continue;
+        let body = match read(path) {
+            Ok(Some(body)) => body,
+            Ok(None) => {
+                skipped.push(format!("5: {} ({})", label, disp(path)));
+                continue;
+            }
+            Err(why) => {
+                unreadable.push(why);
+                continue;
+            }
         };
         let sha256 = sha256_hex(body.as_bytes());
         let untrusted = !is_trusted(label);
@@ -521,6 +543,7 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
         budget: req.budget,
         sources,
         skipped,
+        unreadable,
         warnings,
         sha256: sha256_hex(text.as_bytes()),
         text,

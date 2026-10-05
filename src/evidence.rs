@@ -169,7 +169,7 @@ pub fn run_version(
     if info.timed_out {
         anyhow::bail!("--version timed out");
     }
-    Ok(String::from_utf8_lossy(&out)
+    Ok(crate::process::decode_output(&out)
         .trim()
         .lines()
         .next()
@@ -189,7 +189,7 @@ pub fn git_version() -> Option<String> {
         .arg("--version")
         .output()
         .ok()?;
-    parse_version(&String::from_utf8_lossy(&o.stdout))
+    parse_version(&crate::process::decode_output(&o.stdout))
 }
 
 /// The canary that verifies a profile's isolation (R18 / R44b).
@@ -396,6 +396,18 @@ pub fn render_markdown(records: &[Value]) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// M12-21: the version of Toryo that wrote a record is information, not a key — a record of an
+    /// older Toryo (`0.0.1`, before the version moved to 0.12.0) is as valid as it was: only the
+    /// spike, the profile, the pass flag and the CLI versions decide.
+    #[test]
+    fn a_record_of_an_older_toryo_stays_valid() {
+        let rec = json!({"spike": "codex-canary", "profile": "cx", "pass": true, "ts": "t1",
+            "summary": "ok", "toryo_version": "0.0.1", "cli_versions": { "cx": "1.0.0" }});
+        assert!(evidence_status(&[rec], "codex-canary", "cx", "cx", Some("1.0.0")).is_verified());
+        let now = Record::new("codex-canary", Some("cx"), &[]);
+        assert_ne!(now.toryo_version, "0.0.1");
+    }
 
     #[test]
     fn evidence_is_bound_to_the_cli_version() {

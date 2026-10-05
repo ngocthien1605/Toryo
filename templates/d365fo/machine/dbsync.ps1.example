@@ -1,0 +1,60 @@
+# dbsync.ps1.example (M12-18) — the `dbsync` environment gate of this machine.
+#
+# TODO(owner):
+#   1. Copy this file OUTSIDE every repository (for example C:\toryo-gates\dbsync.ps1) and point
+#      `environment_gates.dbsync.args` of the machine config (toryo.local.yaml) at it. An agent
+#      must never be able to edit it: the command of an environment gate comes only from the
+#      machine config, and the script it runs is part of that trust.
+#   2. Replace the TODO(owner) block below with the deploy and database sync you trust. This
+#      example is PRINT-ONLY: it prints what Toryo gave it and exits 0, so a run of the whole
+#      pipeline can be rehearsed with `toryo run <id> --fake-agents <script.json>` first.
+#      Toryo does not know your deploy or sync commands and this file does not guess them.
+#   3. `confirm: first` in the machine config makes the first run of a task stop and ask you before
+#      anything is deployed (`toryo resume <id>` is your yes).
+#
+# THE CONTRACT of an environment gate script
+#   Started by      the `program` and `args` of environment_gates.dbsync (e.g. powershell -NoProfile
+#                   -NonInteractive -File <this file>), with YOUR normal user rights.
+#   Working dir     an empty folder. Never rely on it: find the code through the variables below,
+#                   call every tool by its absolute path, and do not run `git` — use TORYO_SHA.
+#   Variables       TORYO_TASK             the task id
+#                   TORYO_SHA              the checkpoint commit being deployed
+#                   TORYO_VERIFY_CHECKOUT  a fresh, byte-exact export of that commit (no .git) that
+#                                          no agent code could touch
+#                   TORYO_VERIFY_BUILD     build output written by the check gates AT LOW INTEGRITY
+#                                          from agent-written code: untrusted
+#                   plus the `env:` and `secret_env:` of the machine entry
+#   Exit code       0 = pass; anything else = fail. After EVERY native call write
+#                   `if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`.
+#   Timeout         the gate's `timeout:` in toryo-orgchart.yaml (30m); a gate that runs into it is
+#                   killed part way: the environment may be half-changed, Toryo stops and tells you.
+#   Idempotent      Toryo runs it again in the next fix cycle and after a crash.
+#   Must not        write into TORYO_VERIFY_CHECKOUT (checked afterwards: verify_mutated_tree), or
+#                   wait for input.
+#   Build again     from TORYO_VERIFY_CHECKOUT. TORYO_VERIFY_BUILD is written at Low integrity by
+#                   agent-written code — NEVER deploy from it, and never dot-source or start
+#                   anything in it.
+#   Output          the last 40 lines go to the AI vendor as the implementer's fix feedback (and the
+#                   whole output to the run store). Print no connection string, key or token;
+#                   only the values of `secret_env` are redacted.
+#   Elevation       if the deploy needs an administrator, elevate INSIDE this script. Start Toryo
+#                   itself from a normal shell: an elevated Toryo gives every agent an
+#                   administrator token.
+
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$ErrorActionPreference = 'Stop'
+
+'dbsync.ps1.example: print-only (replace the TODO(owner) block with your deploy and sync)'
+Get-ChildItem Env:TORYO_* | Sort-Object Name | ForEach-Object { '{0}={1}' -f $_.Name, $_.Value }
+"cwd=$((Get-Location).Path)"
+
+# TODO(owner): your deploy and database sync go here. Shape of a step (the program and its
+# arguments are YOURS — Toryo ships none):
+#
+#   & '<absolute path of the tool>' <arguments> 2>&1
+#   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+#
+# Deploy what Toryo verified: the source in $env:TORYO_VERIFY_CHECKOUT (commit $env:TORYO_SHA),
+# built again here — never anything from $env:TORYO_VERIFY_BUILD.
+
+exit 0

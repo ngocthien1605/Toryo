@@ -28,7 +28,6 @@ verify:
   checkout: tracked            # keeps the cargo cache and target folder between the runs of a task
   boundary: low_integrity
   verify_root: '%LOCALAPPDATA%\toryo-verify'
-  final_clean: true            # the final gate still needs one passing clean run
 
 commands:
   verify:

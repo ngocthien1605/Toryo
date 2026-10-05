@@ -22,6 +22,24 @@ pub struct CreateArgs {
     pub max_fix_cycles: Option<u32>,
 }
 
+/// M12-12 (c): a task id is a file name (the lock file, the run store): `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`
+/// and never `..` — checked before any file is touched, on every command that takes an id.
+pub fn valid_task_id(id: &str) -> Result<()> {
+    let mut chars = id.chars();
+    let ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && !id.contains("..");
+    if !ok {
+        bail!(
+            "`{id}` is not a task id — letters, digits, `.`, `_` and `-`, starting with a letter or digit, at most 64 characters, never `..`"
+        );
+    }
+    Ok(())
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -283,10 +301,10 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         repo.join(&a.file)
     };
     let file = std::path::absolute(&file)?;
-    let text =
-        std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+    let text = crate::textfile::read_text(&file)?;
     let ac = parse_acceptance_ids(&text)?;
     let id = task_id(&text, &file, a.id.as_deref());
+    valid_task_id(&id)?;
     if !id
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -308,6 +326,10 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     let g = task_git(cfg, &repo)?;
     // R36/R45 admission: the verify boundary must be available before anything is created
     super::verify::probe(cfg)?;
+    // M12-05: an environment gate this machine cannot start is refused, like one it does not define
+    if let Some(reason) = super::gates::env_gates_refusal(cfg) {
+        bail!("{reason}");
+    }
     // R59 admission: a `tool: xpp` command needs MSBuild and the five CI/CD packages here
     super::xpp::for_config(cfg)?;
     let repol = Loc::Discover(repo.clone());
@@ -318,15 +340,53 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     {
         bail!("{} is not a Git repository", repo.display());
     }
-    let base_ref = match &a.base {
-        Some(b) => b.clone(),
-        None => g.run_str(&repol, true, &["rev-parse", "--abbrev-ref", "HEAD"])?,
+    // M12-08 (X19): `--base`, else `project.base_branch` when the file sets it (a branch that
+    // does not exist is an error naming the key), else the checked-out branch, as before
+    let checked_out = g.run_str(&repol, true, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let base_ref = match (&a.base, &cfg.repo.project.base_branch) {
+        (Some(b), _) => b.clone(),
+        (None, Some(branch)) => {
+            let found = g.output(
+                &repol,
+                true,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}^{{commit}}"),
+                ],
+            )?;
+            if !found.status.success() {
+                bail!(
+                    "project.base_branch: the branch `{branch}` does not exist in {} — create it, or fix the key in {} (or remove it to start from the checked-out branch)",
+                    repo.display(),
+                    cfg.repo_path.display()
+                );
+            }
+            branch.clone()
+        }
+        (None, None) => checked_out.clone(),
     };
     let base = g.run_str(
         &repol,
         true,
         &["rev-parse", &format!("{base_ref}^{{commit}}")],
     )?;
+    eprintln!("base: {base_ref} @ {}", crate::git::short(&base));
+    if base_ref != checked_out {
+        eprintln!(
+            "note: {checked_out} is checked out in {}; the task starts from {base_ref} ({})",
+            repo.display(),
+            if a.base.is_some() {
+                "--base"
+            } else {
+                "project.base_branch"
+            }
+        );
+    }
+    for key in cfg.keys_without_effect() {
+        eprintln!("note: {}", Effective::no_effect_line(key));
+    }
     // M11-R14 (X9): the entry scripts admitted as build output are frozen with the task
     let admitted = Effective {
         build_entries: check_entry_points(cfg, &g, &repo, &base)?,

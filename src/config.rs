@@ -36,15 +36,22 @@ pub struct Project {
     pub worktrees_root: String,
     #[serde(default = "default_runs_root")]
     pub runs_root: String,
-    #[serde(default = "default_base_branch")]
-    pub base_branch: String,
+    /// M12-08 (X19): the branch `task create` starts from when the file sets it; unset: the
+    /// checked-out branch. Written as `main` into the frozen configuration when unset, as
+    /// before (the digest of an existing configuration stays; the engine never reads it there).
+    #[serde(default, serialize_with = "serialize_base_branch")]
+    pub base_branch: Option<String>,
+}
+
+fn serialize_base_branch<S: serde::Serializer>(
+    v: &Option<String>,
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    s.serialize_str(v.as_deref().unwrap_or("main"))
 }
 
 fn default_runs_root() -> String {
     "%LOCALAPPDATA%\\toryo\\runs".into()
-}
-fn default_base_branch() -> String {
-    "main".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -489,6 +496,33 @@ pub struct MachineConfig {
     pub verify: MachineVerify,
 }
 
+/// `environment_gates.<name>.confirm` (M12-07, X17): does the gate ask the owner before it
+/// deploys? `never` (the default, as before), `first` (once per task) or `always` (once per
+/// checkpoint commit). The question is a machine stop before any gate runs; a plain `toryo
+/// resume` is the "yes".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Confirm {
+    #[default]
+    Never,
+    First,
+    Always,
+}
+
+impl Confirm {
+    pub fn is_never(&self) -> bool {
+        *self == Confirm::Never
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Confirm::Never => "never",
+            Confirm::First => "first",
+            Confirm::Always => "always",
+        }
+    }
+}
+
 /// `environment_gates.<name>` in the machine config (M11-E3): the command an org chart's
 /// `kind: environment` gate runs, with the owner's normal token, in an empty working directory
 /// (M11-R2); it deploys from a fresh export of the checkpoint commit (M11-R9, X6).
@@ -509,6 +543,10 @@ pub struct EnvGate {
     /// `credman:<target>` or `env:<VAR>` references, resolved when the gate runs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub secret_env: BTreeMap<String, String>,
+    /// M12-07 (X17): ask the owner before it deploys. Left out of the frozen configuration when
+    /// `never`, so an existing configuration keeps its hash.
+    #[serde(default, skip_serializing_if = "Confirm::is_never")]
+    pub confirm: Confirm,
 }
 
 /// `verify:` in the machine config (review H2, M11-A2): the repository chooses the sandbox its
@@ -544,8 +582,7 @@ pub struct Notify {
 impl MachineConfig {
     /// Read and parse a machine config file.
     pub fn load(path: &Path) -> Result<Self> {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let text = crate::textfile::read_text(path)?;
         // M11-B3: an unknown key gets the friendly form with a "did you mean" hint
         let mut m: Self =
             serde_yaml::from_str(&text).map_err(|e| {
@@ -665,8 +702,7 @@ impl Effective {
     pub fn load(repo_path: &Path, machine_path: Option<&Path>) -> Result<Self> {
         let bytes =
             std::fs::read(repo_path).with_context(|| format!("reading {}", repo_path.display()))?;
-        let text = String::from_utf8(bytes.clone())
-            .with_context(|| format!("reading {}", repo_path.display()))?;
+        let text = crate::textfile::decode(repo_path, &bytes)?;
         // R60 (ARCH-05): the repository file never defines an agent's program, environment
         // or secrets — checked on the raw text, before anything is merged
         if let Some(part) =
@@ -900,6 +936,29 @@ impl Effective {
         let v = serde_json::to_value(self).expect("config serialises");
         // serde_json::Map is a BTreeMap without the preserve_order feature: keys are sorted.
         serde_json::to_string(&v).expect("json")
+    }
+
+    /// M12-08 (X20): the keys of the repository file that are accepted and that no engine code
+    /// reads — set to something other than their default. Each is announced by `config show`,
+    /// `doctor` and `task create` as "accepted but has no effect in this version". The test
+    /// `keys_without_effect_are_read_nowhere` fails when one of them starts being used.
+    pub fn keys_without_effect(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.repo.project.runs_root != default_runs_root() {
+            out.push("project.runs_root");
+        }
+        if !self.repo.verify.final_clean {
+            out.push("verify.final_clean");
+        }
+        if self.repo.pipeline.budget_usd_est.is_some() {
+            out.push("pipeline.budget_usd_est");
+        }
+        out
+    }
+
+    /// The line for one key of [`Self::keys_without_effect`].
+    pub fn no_effect_line(key: &str) -> String {
+        format!("`{key}` is accepted but has no effect in this version")
     }
 
     pub fn sha256(&self) -> String {
@@ -2218,7 +2277,11 @@ commands:
             (
                 t.join("d365fo").join("toryo.yaml.example"),
                 t.join("d365fo").join("toryo.local.yaml.example"),
-                "fd5f27ff14d049d67848df01c4054a141ca02c0fb36b3ed1cf0e0dec0792bd91",
+                // M12-18: the d365fo machine example itself changed (the `codex-openai` profile
+                // the org chart seats, `seats`, `verify`, the `dbsync` environment gate with
+                // `confirm: first`); it was `fd5f27ff…` (M10). The loader-neutrality this test
+                // pins is still held by the two templates beside it, whose files did not change.
+                "919cfa7aec8e707d98772fb5be7eed6ce7abd5924f4db5ba2635778704e0deb4",
             ),
             (
                 t.join("dogfood").join("toryo.yaml.example"),
@@ -2286,6 +2349,104 @@ commands:
         assert_eq!(m.verify.min_boundary.as_deref(), Some("low_integrity"));
     }
 
+    /// M12-08 (X20): the keys `keys_without_effect` announces are read by no engine code. When
+    /// one starts being used this test fails — take it off the list (and out of the notes), so
+    /// that the message "has no effect" stays true.
+    #[test]
+    fn keys_without_effect_are_read_nowhere() {
+        fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    rs_files(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        rs_files(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let mut seen = 0;
+        for f in files {
+            if f.file_name().is_some_and(|n| n == "config.rs") {
+                continue;
+            }
+            seen += 1;
+            let text = std::fs::read_to_string(&f).unwrap();
+            for field in [".runs_root", ".final_clean", ".budget_usd_est"] {
+                assert!(
+                    !text.contains(field),
+                    "{field} is read in {} — it has an effect now: update Effective::keys_without_effect",
+                    f.display()
+                );
+            }
+        }
+        assert!(seen > 20, "the scan found the sources ({seen} files)");
+        // and the list itself: set to a non-default value, a key is announced
+        let mut e = Effective::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("templates")
+                .join("toryo.yaml.example"),
+            Some(
+                &Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("templates")
+                    .join("toryo.local.yaml.example"),
+            ),
+        )
+        .unwrap();
+        assert!(e.keys_without_effect().is_empty());
+        e.repo.verify.final_clean = false;
+        e.repo.pipeline.budget_usd_est = Some(1.0);
+        e.repo.project.runs_root = "D:/x".into();
+        assert_eq!(
+            e.keys_without_effect(),
+            [
+                "project.runs_root",
+                "verify.final_clean",
+                "pipeline.budget_usd_est"
+            ]
+        );
+    }
+
+    /// M12-07 (X17): `confirm` is `never`, `first` or `always`; `never` is the default and is
+    /// left out of the frozen configuration, so an existing configuration keeps its hash.
+    #[test]
+    fn the_confirm_key_of_an_environment_gate() {
+        let gate = |extra: &str| {
+            format!("environment_gates:\n  dbsync:\n    program: powershell\n    lock: d365-env\n{extra}")
+        };
+        let d = tempfile::tempdir().unwrap();
+        let load = |text: &str| {
+            let p = d.path().join("m.yaml");
+            std::fs::write(&p, text).unwrap();
+            MachineConfig::load(&p)
+        };
+        for (word, want) in [
+            ("first", Confirm::First),
+            ("always", Confirm::Always),
+            ("never", Confirm::Never),
+        ] {
+            let m = load(&gate(&format!("    confirm: {word}\n"))).unwrap();
+            assert_eq!(m.environment_gates["dbsync"].confirm, want);
+        }
+        let none = load(&gate("")).unwrap();
+        let g = &none.environment_gates["dbsync"];
+        assert_eq!(g.confirm, Confirm::Never);
+        assert!(
+            !serde_json::to_string(g).unwrap().contains("confirm"),
+            "never is not frozen: the digest of an existing configuration stays"
+        );
+        let first = load(&gate("    confirm: first\n")).unwrap();
+        assert!(serde_json::to_string(&first.environment_gates["dbsync"])
+            .unwrap()
+            .contains("\"confirm\":\"first\""));
+        let err = format!("{:#}", load(&gate("    confirm: sometimes\n")).unwrap_err());
+        assert!(err.contains("sometimes") && err.contains("first"), "{err}");
+    }
+
     /// The shipped templates keep loading under the checks.
     #[test]
     fn templates_load() {
@@ -2314,7 +2475,9 @@ commands:
         .unwrap();
         assert!(cfg.repo.commands.verify[0].is_xpp());
         assert!(cfg.toolchains.xpp.is_some());
-        assert_eq!(cfg.origins.profiles.len(), 3);
+        // (4 since M12-18: the machine example also defines `codex-openai`, the org chart's
+        // implementer; it was 3)
+        assert_eq!(cfg.origins.profiles.len(), 4);
         assert!(cfg.repo.policy.deny_paths.iter().any(|d| d == "**/ZZZ/**"));
         assert_eq!(cfg.repo.verify.checkout, "clean");
         let mut files = vec![
