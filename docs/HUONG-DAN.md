@@ -125,7 +125,8 @@ $env:TORYO_CONFIG = 'C:\.thien\m0\toryo.yaml'      # để khỏi gõ --config m
 toryo doctor                                        # kiểm tra tổng quát
 ```
 
-> **Thứ tự chọn file cấu hình:** `--config`, rồi `toryo.yaml` trong thư mục đang đứng (nếu có), rồi `$TORYO_CONFIG`.
+> **Thứ tự chọn file cấu hình:** `--config`, rồi `toryo.yaml` trong thư mục đang đứng (nếu có) — tức thư mục anh **đang
+> đứng khi gõ `toryo`**, không phải gốc repo —, rồi `$TORYO_CONFIG`.
 > Đặt `TORYO_CONFIG` trong `$PROFILE` chỉ là mặc định khi thư mục hiện tại không có `toryo.yaml`; nếu có cả hai và khác
 > nhau, toryo dùng file trong thư mục và in một dòng `note: using … ; $TORYO_CONFIG (…) is ignored here`.
 > (Trước M12 biến môi trường thắng — `task create` trong repo này có thể tạo worktree cho repo khác.)
@@ -429,7 +430,7 @@ toryo task show BR-003                             # stage attempts, các lần 
 | Kill ngay sau commit checkpoint | tìm commit theo trailer `(task, stage, attempt)` → không commit lần hai | không |
 | Phần sửa dở có đụng file protected (TASK.md, AGENTS.md…) | **Escalated** `recovery_policy_violation`, không commit gì | `toryo resume ID --discard-partial` (bỏ phần dở, snapshot vẫn giữ) hoặc tự sửa worktree rồi `toryo resume ID --keep-partial` |
 | Muốn lấy lại phần đã bỏ | — | `toryo partial export ID --attempt 1 --into C:\temp\x` |
-| Muốn dừng task đang chạy | — | `toryo stop BR-003` (ở cửa sổ khác; dừng trong vài giây, attempt thành `interrupted`) |
+| Muốn dừng task đang chạy | — | `toryo stop BR-003` ở cửa sổ khác, hoặc Ctrl+C một lần trong cửa sổ đang chạy (dừng trong vài giây, attempt thành `interrupted`) |
 | Task đang `Escalated` và anh chấp nhận kết quả mà không cần review của AI | — | `toryo approve ID --gate final --force` (mở cổng cuối, ghi "reviewer skipped") |
 | Bỏ task (xoá worktree và run store; branch được giữ) | — | `toryo task cleanup ID`; cần **`--force`** khi task chưa kết thúc, khi worktree có thay đổi chưa commit hoặc run store có snapshot phục hồi — lệnh nói rõ sẽ mất gì |
 | Chạy lệnh trên task đang chạy ở cửa sổ khác | **từ chối**, exit code 3 `task_active` (lock-first, R38) | chờ, hoặc `toryo stop` |
@@ -1010,7 +1011,9 @@ Copy `templates\d365fo\toryo.local.yaml.example` vào `%USERPROFILE%\.toryo\tory
 một `profiles:`, một `seats:`, một `git:`). Điền các `TODO(owner)`: `exe` của claude/codex; **`codex-openai`** (ghế
 implementer của org chart mẫu) và `claude-max`; Foundry chỉ khi máy này dùng (xoá hai profile `*-foundry` nếu không);
 `toolchains.xpp` (MSBuild — `toryo doctor` đề xuất đường dẫn vswhere tìm được —, thư mục NuGet CI/CD, `ude_metadata`);
-`verify: { min_boundary, verify_root }` (thư mục **ngắn**: công cụ Windows dừng ở 260 ký tự, `toryo doctor` in độ dài);
+`verify: { min_boundary, verify_root }` (thư mục **ngắn**: công cụ Windows dừng ở 260 ký tự, `toryo doctor` in độ dài, và
+từ M13 hai dòng `paths` nữa: `core.longpaths` của repo — Git của chính agent cần nó, lệnh `git -C <repo> config
+core.longpaths true` — và `LongPathsEnabled` của máy cho MSBuild / PowerShell, kèm dòng `reg add` cần quyền admin một lần);
 `environment_gates.dbsync` với `confirm: first` và đường dẫn tới script **ngoài mọi repo**. Giá trị `%TÊN%` trong `env:` của
 profile **không** được mở rộng (viết đường dẫn đầy đủ; `toryo doctor` cảnh báo).
 
@@ -1101,7 +1104,9 @@ toryo task cleanup SJP-1234 --force ; git branch -D toryo/SJP-1234
 #### 7. Viết TASK.md
 
 Theo `TASK.example.md`: `## Goal`, `## Acceptance criteria` mỗi tiêu chí một dòng `- AC-1: …` (sau id: `:`, `.`, `)`, `：` hoặc
-` — ` / ` – ` / ` - `; một dòng bắt đầu bằng `AC` + chữ số mà sai dạng làm `task create` từ chối, nêu số dòng), `## Scope`,
+` — ` / ` – ` / ` - `; một dòng bắt đầu bằng `AC` + chữ số mà sai dạng làm `task create` từ chối, nêu số dòng — kể cả một
+câu văn xuôi **bắt đầu** bằng id (`AC-5 kiểm bằng tay`) hay một dòng bảng; câu chỉ nhắc tới id ở giữa thì không sao),
+`## Scope`,
 `## Out of scope`, `## Verification` (ghi rõ AC nào chỉ kiểm được bằng tay trong môi trường, sau gate `dbsync` và duyệt cuối),
 và — chỉ khi task phải sửa file được bảo vệ — `## Allow protected` với mỗi đường dẫn một dòng `- <path>`.
 **TASK.md bị đóng băng lúc `task create`** (sửa file sau đó không đổi gì; muốn đổi thì task mới) và **id là vĩnh viễn**
@@ -1115,15 +1120,17 @@ toryo run SJP-1234        # plan → anh duyệt plan → implement → gate bui
 ```
 
 - **Cổng plan**: đọc `PLAN.md` (có dòng `Skills for the implementer`); `toryo approve SJP-1234 --gate plan --continue`.
-- **Gate chạy lâu** in một dòng mỗi phút (`… <gate> still running: M:SS elapsed, N bytes of output so far`); toàn bộ output
-  (đã che secret, tối đa 1 MB đầu + 8 MB cuối) nằm ở `<run store>\gate-logs\`, và dòng thất bại nêu đường dẫn.
+- **Gate chạy lâu** in một dòng mỗi phút (`… <gate> still running: M:SS elapsed, N bytes of output so far`); output đã che
+  secret nằm ở `<run store>\gate-logs\` — đúng đoạn văn bản đã giới hạn mà kết quả giữ (1 MB đầu + 8 MB cuối, cắt theo
+  ranh giới dòng, một dòng đánh dấu chỗ bị bỏ), **không phải** toàn bộ một output dài hơn —, và dòng thất bại nêu đường dẫn.
 - **`confirm: first`**: trước khi deploy lần đầu của task, Toryo dừng (`environment_gate_confirm`) và in gate, lock, commit,
   20 dòng đầu của `git diff --stat` và lệnh. Xem bản checkpoint (`git -C <worktree> show --stat <sha>`), rồi
   **`toryo resume SJP-1234`** là "đồng ý" (không bao giờ `--yes`); không đồng ý: `toryo resume SJP-1234 --note "…"`
   (một vòng sửa) hoặc `toryo task cleanup SJP-1234`. Cổng cuối: xem branch `toryo/SJP-1234`, rồi
   `toryo approve SJP-1234 --gate final`; `toryo status` ghi lock nào đang chứa commit nào.
-- Ctrl+C trong `toryo run` kill tiến trình (không có `run_ended`, không có toast): dừng đúng cách bằng `toryo stop SJP-1234` ở
-  cửa sổ khác.
+- **Ctrl+C trong cửa sổ `toryo run`** là một yêu cầu dừng, giống `toryo stop SJP-1234` (M13-12): lượt hoặc gate đang chạy
+  được kết thúc, attempt thành `interrupted`, có `run_ended` và toast; Toryo in `stop requested — … press Ctrl+C again to
+  end now`. Ctrl+C **lần hai** kết thúc tiến trình ngay như trước (không ghi gì; `toryo resume` phục hồi).
 
 #### 9. Khi nó dừng
 

@@ -123,7 +123,7 @@ pub fn parse_acceptance_ids(task: &str) -> Result<Vec<String>> {
             .map(|(n, l)| format!("line {n}: `{l}`"))
             .collect();
         bail!(
-            "TASK.md: {} under `## Acceptance criteria` look{} like acceptance criteria but would be dropped — {}. Write each as `- AC-1: text` (the id `AC-<n>` in ASCII digits, then `:`, `.`, `)`, `：` or ` — `); a table row or a sentence that only mentions an id does not count (R28)",
+            "TASK.md: {} under `## Acceptance criteria` look{} like acceptance criteria but would be dropped — {}. Write each as `- AC-1: text` (the id `AC-<n>` in ASCII digits, then `:`, `.`, `)`, `：` or ` — `). A line that **starts** with an id is never plain text: a table row or a prose sentence that begins with `AC-5 …` is refused like this — reword it, or write it as an item; a sentence that mentions an id further in is fine (R28)",
             if refused.len() == 1 { "a line".to_string() } else { format!("{} lines", refused.len()) },
             if refused.len() == 1 { "s" } else { "" },
             lines.join("; ")

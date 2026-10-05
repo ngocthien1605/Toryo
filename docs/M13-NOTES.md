@@ -21,7 +21,7 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
 - [x] M13-12 Ctrl+C on `toryo run` is a stop request (X29)
 - [x] M13-13 A launch error before the agent starts does not reserve a budget
 - [x] M13-14 Tests the review asked for
-- [ ] M13-15 Notes, guide, `STATUS.md`
+- [x] M13-15 Notes, guide, `STATUS.md`
 - [ ] Finish, push, pull request, CI
 
 ## Tasks
@@ -376,6 +376,21 @@ Nine items, each its own test. "ok at once" = the test passed without a producti
    stray "; " when the turn had no detail of its own; `exec::with_stderr` makes the tail the detail then (the one line the review called free).
 
 
+### M13-15 — Notes, guide, `STATUS.md`
+
+- **This file:** a paragraph per task, the review after M13-06, the "Open" list and the summary at the end.
+- **`docs/STATUS.md`:** the test counts (683 at the end of M12 — the file said 681 —, 732 now, 705 on Linux at the end of M12); audit rows O-11,
+  O-14, O-15, O-29 are closed and deleted in place; N-04, N-05, N-08 lost the parts M13 fixed; new rows N-11 (the threat model of the run store
+  and the database, as the list words it), N-12 … N-16 (what the review and the later tasks left open); O-35, O-39 (the new test variables), O-56
+  (two tests that depend on the machine's speed) updated; §2 says what has still never run.
+- **`docs/DECISIONS.md`:** X24–X29.
+- **README / HUONG-DAN:** `./toryo.yaml` is the folder you run `toryo` in; the gate log is the bounded text, not the whole output; what `first` and
+  `always` mean, and that a reload that changes the configuration asks again; Ctrl+C; the two new `paths` lines of `doctor`; a prose line that
+  starts with an id is refused (guide §7.3). How to say no to a deploy and the corrected `gate_unavailable` texts came with M13-09.
+- **One text in code** (the list puts it here): the refusal of M12-11 said "a table row or a sentence that only mentions an id does not count" — but
+  a table row and a prose line that *starts* with an id are refused. It now says so. The existing tests of that refusal pass unchanged.
+
+
 ## Open
 
 What does not match the list, was not fixed, or is left for a later milestone. (Collected from the task paragraphs above; M13-15 carries the
@@ -421,4 +436,48 @@ items that are plans into `docs/STATUS.md`.)
 17. `m11_env_gates::a_timed_out_environment_gate_is_recorded_as_interrupted` (a 6 s gate timeout that must hold two `pwsh` start-ups) and
     `m12_06_an_environment_gate_that_times_out_stops_for_the_owner` (3 s) failed in single runs on this machine while it was slow (the whole file took
     120–137 s instead of 70 s) — the first one also at the commit of M13-05, without the change under test. Both pass when run again. Not changed.
+
+**From M13-07 … M13-14**
+
+18. **M13-08, "the deployment rows say so":** read as "the reason says what the rows say". `status` still shows the first gate's row as passed, with
+    no word that a `resume` deploys it again (STATUS N-05). **AC-1** (a text file as an environment gate's `program`) passed before the change; the
+    failing test for the resolver is the Windows-only file-link test.
+19. **M13-11 AC-1** as written (a file at `<worktrees_root>\<id>`) is refused before anything is made, before and after; the test puts the file at
+    `worktrees_root`. A failure **after** the database row exists is covered by a unit test of the removal only.
+20. **M13-12:** tested with a console event the process sends itself (`TORYO_TEST_INTERRUPT_AFTER_MS`), not with a key pressed by a hand; a
+    `toryo run` started with Ctrl+C ignored does not see the key (as before); the Unix halves were written by reading (STATUS N-16).
+21. **M13-14 item 4:** the pinned digest is the value the source of `4ad97c3` pins for the template, not one recomputed by running that code
+    (exporting the commit was refused by the session's permission layer; no worktree may be made).
+22. **M13-14 item 8 changed production code** (`valid_task_id` refuses Windows device names and a trailing dot): the item names that behaviour and the
+    test failed without it.
+23. **M13-10, my mistake:** one run of the built `toryo doctor` without `--config` used the owner's `$TORYO_CONFIG` and probed the owner's data folder
+    and verify root (a probe file and folder, made and removed; `toryo.db` was not opened). Nothing else of the owner's was touched in this milestone.
+24. **M13-15:** the refusal text of M12-11 (`checks::parse_acceptance_ids`, not M18 code) was reworded in this documentation commit, as the list asks;
+    the escalation table already named a task-pack file under `context_unreadable` (nothing to add).
+
+## Summary
+
+- **Tests on Windows:** 683 passed / 0 failed / 6 ignored before M13 → **732 passed / 0 failed / 6 ignored** after (49 new tests; the full suite ran
+  green before every commit: 687, 690, 691, 693, 696, 701 (M13-06), 704 (review), 707, 713, 715, 718, 721, 723, 724, 732).
+  **Linux:** 705 at the end of M12; M13's count is the one `test (ubuntu-latest)` prints on the pull request (the session cannot build for Linux).
+- **Assertions from before M13 that changed** (each named in its commit): the text of two F4 tests and
+  `the_head_guard_resets_only_an_agent_commit_on_the_task_branch` (M13-01: the reason now names `resume --note`);
+  `m12_16_a_silent_gate_gets_a_heartbeat_line` and `m12_16_the_gate_log_is_redacted` (M13-04: `"log"` is relative);
+  `ec31_a_reviewer_that_changes_a_file_left_before_its_turn_escalates` (M13-06: the reason goes on with "not put back");
+  `next_action_of_the_five_machine_caused_classes` (M13-09: the class has its own text). None was deleted or skipped.
+- **Windows-only tests (all pass here; not compiled on Linux):**
+  `team::tests::a_gate_program_is_file_cannot_see_through_passes_the_preflight` (M13-08; skips itself when the account may not create a file link),
+  `m12_config::m13_10_doctor_reads_core_longpaths_of_the_repository`, `m12_config::m13_10_doctor_reads_long_paths_enabled` (M13-10),
+  `m12_gates::m13_14_a_cp932_line_of_a_gate_reaches_the_fix_prompt_as_text` (M13-14; skips itself without code page 932).
+  **Tests with a Windows half and a Unix half** (junction / symlink, console event / signal): `regress_engine::m13_06_a_link_left_by_the_read_only_role_is_removed_not_followed`,
+  `regress_engine::m13_06_a_tracked_folder_replaced_by_a_link_is_put_back`, `runner::review_tests::the_copy_of_a_read_only_write_is_capped_and_never_follows_a_link`,
+  `m12_config::m13_07_doctor_does_not_follow_a_link_under_the_toryo_folder`, `m12_cli::m13_12_*` (two). Their Unix halves, and the `SIGINT` handler
+  of M13-12, are first built by CI.
+- **New test-only variables:** `TORYO_OEM_CODE_PAGE`, `TORYO_TEST_INTERRUPT_AFTER_MS`; new crash point `read_only:after_turn` (STATUS O-39).
+- **No new crate, no new `windows-sys` feature.** `Cargo.lock` is unchanged.
+- **What changes for an existing configuration:** (1) M13-05 — the deploy confirmation is a table of the database (schema version 2: an older
+  `toryo.exe` refuses the database afterwards); a `confirmations.json` left by M12 confirms nothing, the owner is simply asked once more.
+  (2) M13-11 — a failed `task create` removes what it made. (3) M13-12 — Ctrl+C on `toryo run` stops the task cleanly; twice ends the process.
+  Also: `doctor` has two more `paths` lines on Windows (WARN until `core.longpaths` / `LongPathsEnabled` are set), and a task id that is a Windows
+  device name is refused.
 

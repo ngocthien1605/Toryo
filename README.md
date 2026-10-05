@@ -69,7 +69,8 @@ toryo approve ID --gate plan|final [--continue] [--expect DIGEST] [--force]
 toryo reject  ID --gate plan|final --reason "…"
 toryo resume [ID] [--note "…" | --discard-partial | --keep-partial | --accept-protected-change PATH]
                                           # no id: every waiting task as it is (never one still in New)
-toryo stop ID                             # ask the running owner to stop (use this, not Ctrl+C)
+toryo stop ID                             # ask the running owner to stop; Ctrl+C in the window of `toryo run`
+                                          # does the same (a second Ctrl+C ends the process at once)
 toryo status [ID] [--json] · toryo task list|show ID [--json] · toryo watch ID [--json]
 toryo task config ID [--reload]           # the frozen configuration; reload only while the task waits
 toryo task cleanup ID [--force]           # --force when it would delete unsaved work or snapshots
@@ -82,7 +83,8 @@ toryo partial export ID --attempt N --into DIR · toryo secrets set <target> · 
 ```
 
 🔒 = takes the task lock; a second command on a running task is refused (`task_active`, exit code 3).
-The repository file is chosen by `--config`, else `./toryo.yaml`, else `$TORYO_CONFIG`.
+The repository file is chosen by `--config`, else `./toryo.yaml` — the file in the folder you run `toryo` **in** (the
+current directory, not the repository root) — else `$TORYO_CONFIG`.
 
 ## Configuration
 
@@ -146,13 +148,16 @@ run on the checkpoint commit, stop at the first failure, and the exit code decid
 - **`kind: environment`** is only *declared* in the repository (`timeout`, `if_missing: error | skip`); its command is
   `environment_gates.<name>` in the machine config (`program`, `args`, `lock`, `env`, `secret_env`, `confirm`). It runs
   with your normal rights, in an empty working directory, from a **byte-exact export** of the checkpoint commit, under a
-  machine-wide lock (one deploy per lock at a time). `confirm: never | first | always` asks you **before** the deploy;
+  machine-wide lock (one deploy per lock at a time). `confirm: never | first | always` asks you **before** the deploy
+  (`first`: once per task — its later checkpoints deploy without a question; `always`: before the deploy of every
+  checkpoint; after a `task config --reload` that changed the configuration you are asked again);
   a plain `toryo resume <ID>` is the yes. To say no: `toryo resume <ID> --note "…"` (the implementer gets your note; one
   fix cycle) or `toryo task cleanup <ID>` (gives the task up). Toryo records which task and commit each lock's
   environment holds (`toryo status`).
-- **Output.** The whole redacted output of a gate is written to `<run store>\gate-logs\` (first 1 MB and last 8 MB are
-  kept), a long-running gate prints a line every minute, and the failure line names the log. Text is decoded line by
-  line with the machine's OEM code page when it is not UTF-8.
+- **Output.** The redacted output of a gate is written to `<run store>\gate-logs\` — the same bounded text the result
+  holds: the first 1 MB and the last 8 MB, cut on line boundaries, with one line where output was dropped (not the whole
+  of a longer output). A long-running gate prints a line every minute, and the failure line names the log. Text is
+  decoded line by line with the machine's OEM code page when it is not UTF-8.
 - **Line endings.** A repository with `text` / `eol=crlf` attributes over blobs that still hold CRLF makes Git report the
   verify checkout as modified: run `git add --renormalize .` once and commit, or every verify stops with
   `verify_mutated_tree`.
