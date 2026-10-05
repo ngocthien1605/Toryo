@@ -21,7 +21,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] M12-11 Acceptance criteria are never dropped silently
 - [x] M12-12 Three CLI traps
 - [x] M12-13 Long paths on Windows
-- [ ] M12-14 An agent CLI that dies without a result shows its error text
+- [x] M12-14 An agent CLI that dies without a result shows its error text
 - [ ] M12-15 Gate output: OEM code page; one UI language for every gate (X23)
 - [ ] M12-16 Gate output for the owner: full log, heartbeat, bounded memory
 - [ ] M12-17 `doctor` checks what a first run needs
@@ -348,6 +348,22 @@ No Critical or High; three Medium, fixed here.
   still stop at 260 — that is outside Toryo's Git. (M12-17 lists this line among its doctor lines: done here.)
 - **Tests:** the reproduction above (now green; it is not Windows-only, a Linux Git has no such limit) and
   `m12_13_doctor_prints_the_root_lengths`.
+
+
+### M12-14 — An agent CLI that dies without a result shows its error text
+
+- **Fix (`src/agents/exec.rs`, one place for Claude and Codex):** `run_turn_with` keeps the last 16 KiB of the
+  (already redacted) stderr chunks; when the parser's outcome is `ProcessCrashed` and not a success, `error_detail`
+  gets "; the CLI's stderr (last lines):" and the last 10 non-empty lines (`stderr_last_lines`: colour codes stripped with
+  `process::strip_ansi`, each line cut at 300 characters, prefixed `  | `). Then the existing derived-text redaction
+  runs over it. The engine's escalation reason and the console already carry `error_detail`, so both show it.
+  `claude.rs` / `codex.rs` are unchanged: they do not see stderr. The full stderr was always in `<label>.stderr.txt`.
+- **Not done:** a turn that fails for another class (a result event with `is_error`, a timeout) is not given the stderr —
+  the list asks for the no-result case only.
+- **Tests:** `m12_14_a_cli_that_dies_without_a_result_shows_its_error_text` (AC-1: the `toryo` binary stands in for the
+  agent CLI — it is an executable on every platform, a `.cmd` fake is refused by Rust's batch-file argument check — and
+  rejects the Claude flags: the escalation reason and the console hold `error: unexpected argument …`, no escape
+  codes), and the unit test `agents::exec::tests::the_stderr_tail_is_the_last_ten_lines_without_colour_codes`.
 
 
 ## Open
