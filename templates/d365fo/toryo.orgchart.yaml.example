@@ -18,7 +18,6 @@ version: 1
 project:
   root: D:\D365-Git                         # TODO(owner) 1
   worktrees_root: D:\D365-worktrees         # TODO(owner) 1
-  runs_root: '%LOCALAPPDATA%\toryo\runs'
   base_branch: main
 
 pipeline:
@@ -47,7 +46,6 @@ verify:
   checkout: clean                           # TODO(owner) 3
   boundary: low_integrity                   # TODO(owner) 4
   verify_root: '%LOCALAPPDATA%\toryo-verify'
-  final_clean: true
 
 timeouts:
   agent_stall_min: 10

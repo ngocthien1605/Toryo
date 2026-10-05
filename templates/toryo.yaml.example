@@ -4,7 +4,6 @@ version: 1
 project:
   root: C:\.thien\m0\calc                 # created by: toryo spike init-fixture --into C:\.thien\m0\calc
   worktrees_root: C:\.thien\m0\worktrees
-  runs_root: '%LOCALAPPDATA%\toryo\runs'
   base_branch: main
 
 # R60: no `profiles:` here — agent profiles (exe, env, secrets, Codex settings) live only in the
@@ -26,7 +25,6 @@ verify:
   checkout: clean
   boundary: low_integrity
   verify_root: '%LOCALAPPDATA%\toryo-verify'
-  final_clean: true
 
 commands:
   verify:

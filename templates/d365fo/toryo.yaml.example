@@ -14,7 +14,6 @@ version: 1
 project:
   root: D:\D365-Git                         # TODO(owner) 1
   worktrees_root: D:\D365-worktrees         # TODO(owner) 1
-  runs_root: '%LOCALAPPDATA%\toryo\runs'
   base_branch: main
 
 roles:                                      # names of profiles the machine config defines (R60)
@@ -49,7 +48,6 @@ verify:
   checkout: clean                           # TODO(owner) 5
   boundary: low_integrity                   # TODO(owner) 6
   verify_root: '%LOCALAPPDATA%\toryo-verify'
-  final_clean: true
 
 commands:
   verify:

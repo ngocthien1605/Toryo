@@ -15,7 +15,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] M12-06 An environment gate that times out stops for the owner (X18)
 - [x] M12-07 Confirm before deploy (X17)
 - [ ] Review of M12-05…07 (subagent, in place)
-- [ ] M12-08 `base_branch` is honoured; keys without effect say so (X19, X20)
+- [x] M12-08 `base_branch` is honoured; keys without effect say so (X19, X20)
 - [ ] M12-09 `./toryo.yaml` before `$TORYO_CONFIG` (X21)
 - [ ] M12-10 Text files: BOM ignored, non-UTF-8 refused by name (X22)
 - [ ] M12-11 Acceptance criteria are never dropped silently
@@ -195,6 +195,28 @@ One High, four Medium, four Low; the High and the Mediums fixed here.
   `first` stops once over two checkpoints, `always` twice). AC-1: the whole existing suite passes unchanged with the
   default. AC-5: README and HUONG-DAN gate paragraphs; M12-18 puts `confirm: first` into the machine example, M12-19
   the class into the escalation table.
+
+### M12-08 — `base_branch` is honoured; keys without effect say so (X19, X20)
+
+- **`project.base_branch`** is `Option<String>` now. `task create` without `--base`: the branch's tip when the file sets
+  it (a branch that does not exist is an error naming the key and the file), else the checked-out branch as before.
+  `task create` prints `base: <branch> @ <commit>` and, when another branch is checked out, one `note:` line (the
+  checked-out branch, and why: `--base` or `project.base_branch`). **Digest:** the frozen configuration writes
+  `"base_branch": "main"` when the key is unset (custom `serialize_with`) — exactly as before, so no existing task's
+  `config_sha256` changes (the engine never reads the frozen value).
+- **Keys without effect** (`Effective::keys_without_effect`): `project.runs_root`, `verify.final_clean`,
+  `pipeline.budget_usd_est` — none is read by any engine code (`budget_usd_est` only exists as a database column that
+  nothing writes from the key). Announced as "`<key>` is accepted but has no effect in this version" by `task create`
+  (`note:`), `doctor` (WARN, area `config`), `config show` (text `note:` and `--json` `"no_effect"`). **Deviation:**
+  a key is announced when its value differs from the default (the loader does not keep whether the file wrote it);
+  `final_clean: true` — the default — is silent. The four templates no longer set `runs_root` / `final_clean`;
+  HUONG-DAN says `final_clean` does nothing (the dogfood line "the final gate still needs one passing clean run" is
+  gone). `final_clean` is **not** implemented (STATUS.md, M12-20).
+- **Guard (AC-3, as far as cheap):** `config::tests::keys_without_effect_are_read_nowhere` fails when any source file
+  other than `config.rs` reads one of the three fields — then the list and the message must change.
+- **Tests:** `tests/m12_config.rs` — `m12_08_base_branch_is_the_base_of_task_create` (AC-1: `feature/wip` checked out,
+  the task branches from `main`, the note; `--base` wins; a missing branch names the key),
+  `m12_08_without_the_key_the_checked_out_branch_is_the_base` (AC-2), `m12_08_keys_without_effect_say_so` (AC-3).
 
 ## Open
 

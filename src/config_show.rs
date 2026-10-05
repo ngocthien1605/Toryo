@@ -137,6 +137,8 @@ pub fn json(cfg: &Effective) -> Value {
             json!({"path": p, "source": source(cfg.origins.skills_dir)})
         }),
         "verify": verify,
+        // M12-08 (X20): keys the file sets that no engine code reads
+        "no_effect": cfg.keys_without_effect(),
         "limits": team.map(|t| json!(t.limits)),
         "checks": team.map(|t| json!(t.checks)),
     })
@@ -311,6 +313,9 @@ pub fn text(cfg: &Effective) -> String {
             .map(|(k, v)| format!("{k} {}", v.as_str().unwrap_or_default()))
             .collect();
         s.push_str(&format!("checks: {}\n", c.join(", ")));
+    }
+    for key in cfg.keys_without_effect() {
+        s.push_str(&format!("\nnote: {}\n", Effective::no_effect_line(key)));
     }
     s
 }

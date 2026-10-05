@@ -381,6 +381,10 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
     verify_root_check(&mut r, cfg);
     r.0.extend(origin_checks(cfg));
     r.0.extend(policy_checks(cfg));
+    // M12-08 (X20): keys that are accepted and do nothing
+    for key in cfg.keys_without_effect() {
+        r.add(Level::Warn, "config", Effective::no_effect_line(key));
+    }
     r.0.extend(gate_checks(cfg));
     r.0.extend(skills_dir_checks(cfg));
 

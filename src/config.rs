@@ -36,15 +36,22 @@ pub struct Project {
     pub worktrees_root: String,
     #[serde(default = "default_runs_root")]
     pub runs_root: String,
-    #[serde(default = "default_base_branch")]
-    pub base_branch: String,
+    /// M12-08 (X19): the branch `task create` starts from when the file sets it; unset: the
+    /// checked-out branch. Written as `main` into the frozen configuration when unset, as
+    /// before (the digest of an existing configuration stays; the engine never reads it there).
+    #[serde(default, serialize_with = "serialize_base_branch")]
+    pub base_branch: Option<String>,
+}
+
+fn serialize_base_branch<S: serde::Serializer>(
+    v: &Option<String>,
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    s.serialize_str(v.as_deref().unwrap_or("main"))
 }
 
 fn default_runs_root() -> String {
     "%LOCALAPPDATA%\\toryo\\runs".into()
-}
-fn default_base_branch() -> String {
-    "main".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -931,6 +938,29 @@ impl Effective {
         let v = serde_json::to_value(self).expect("config serialises");
         // serde_json::Map is a BTreeMap without the preserve_order feature: keys are sorted.
         serde_json::to_string(&v).expect("json")
+    }
+
+    /// M12-08 (X20): the keys of the repository file that are accepted and that no engine code
+    /// reads — set to something other than their default. Each is announced by `config show`,
+    /// `doctor` and `task create` as "accepted but has no effect in this version". The test
+    /// `keys_without_effect_are_read_nowhere` fails when one of them starts being used.
+    pub fn keys_without_effect(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.repo.project.runs_root != default_runs_root() {
+            out.push("project.runs_root");
+        }
+        if !self.repo.verify.final_clean {
+            out.push("verify.final_clean");
+        }
+        if self.repo.pipeline.budget_usd_est.is_some() {
+            out.push("pipeline.budget_usd_est");
+        }
+        out
+    }
+
+    /// The line for one key of [`Self::keys_without_effect`].
+    pub fn no_effect_line(key: &str) -> String {
+        format!("`{key}` is accepted but has no effect in this version")
     }
 
     pub fn sha256(&self) -> String {
@@ -2315,6 +2345,68 @@ commands:
         );
         assert!(g.secret_env.contains_key("D365_SYNC_SECRET"));
         assert_eq!(m.verify.min_boundary.as_deref(), Some("low_integrity"));
+    }
+
+    /// M12-08 (X20): the keys `keys_without_effect` announces are read by no engine code. When
+    /// one starts being used this test fails — take it off the list (and out of the notes), so
+    /// that the message "has no effect" stays true.
+    #[test]
+    fn keys_without_effect_are_read_nowhere() {
+        fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    rs_files(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        rs_files(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let mut seen = 0;
+        for f in files {
+            if f.file_name().is_some_and(|n| n == "config.rs") {
+                continue;
+            }
+            seen += 1;
+            let text = std::fs::read_to_string(&f).unwrap();
+            for field in [".runs_root", ".final_clean", ".budget_usd_est"] {
+                assert!(
+                    !text.contains(field),
+                    "{field} is read in {} — it has an effect now: update Effective::keys_without_effect",
+                    f.display()
+                );
+            }
+        }
+        assert!(seen > 20, "the scan found the sources ({seen} files)");
+        // and the list itself: set to a non-default value, a key is announced
+        let mut e = Effective::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("templates")
+                .join("toryo.yaml.example"),
+            Some(
+                &Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("templates")
+                    .join("toryo.local.yaml.example"),
+            ),
+        )
+        .unwrap();
+        assert!(e.keys_without_effect().is_empty());
+        e.repo.verify.final_clean = false;
+        e.repo.pipeline.budget_usd_est = Some(1.0);
+        e.repo.project.runs_root = "D:/x".into();
+        assert_eq!(
+            e.keys_without_effect(),
+            [
+                "project.runs_root",
+                "verify.final_clean",
+                "pipeline.budget_usd_est"
+            ]
+        );
     }
 
     /// M12-07 (X17): `confirm` is `never`, `first` or `always`; `never` is the default and is

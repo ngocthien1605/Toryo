@@ -322,15 +322,53 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     {
         bail!("{} is not a Git repository", repo.display());
     }
-    let base_ref = match &a.base {
-        Some(b) => b.clone(),
-        None => g.run_str(&repol, true, &["rev-parse", "--abbrev-ref", "HEAD"])?,
+    // M12-08 (X19): `--base`, else `project.base_branch` when the file sets it (a branch that
+    // does not exist is an error naming the key), else the checked-out branch, as before
+    let checked_out = g.run_str(&repol, true, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let base_ref = match (&a.base, &cfg.repo.project.base_branch) {
+        (Some(b), _) => b.clone(),
+        (None, Some(branch)) => {
+            let found = g.output(
+                &repol,
+                true,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}^{{commit}}"),
+                ],
+            )?;
+            if !found.status.success() {
+                bail!(
+                    "project.base_branch: the branch `{branch}` does not exist in {} — create it, or fix the key in {} (or remove it to start from the checked-out branch)",
+                    repo.display(),
+                    cfg.repo_path.display()
+                );
+            }
+            branch.clone()
+        }
+        (None, None) => checked_out.clone(),
     };
     let base = g.run_str(
         &repol,
         true,
         &["rev-parse", &format!("{base_ref}^{{commit}}")],
     )?;
+    eprintln!("base: {base_ref} @ {}", crate::git::short(&base));
+    if base_ref != checked_out {
+        eprintln!(
+            "note: {checked_out} is checked out in {}; the task starts from {base_ref} ({})",
+            repo.display(),
+            if a.base.is_some() {
+                "--base"
+            } else {
+                "project.base_branch"
+            }
+        );
+    }
+    for key in cfg.keys_without_effect() {
+        eprintln!("note: {}", Effective::no_effect_line(key));
+    }
     // M11-R14 (X9): the entry scripts admitted as build output are frozen with the task
     let admitted = Effective {
         build_entries: check_entry_points(cfg, &g, &repo, &base)?,

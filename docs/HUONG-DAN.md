@@ -1030,8 +1030,9 @@ CI chạy: `cargo fmt --check`, `clippy -D warnings` (có và không có M0 kit)
 - **Profile vẫn chỉ ở machine config** (R60) — `toryo.yaml` của repo chỉ ghi tên profile trong `roles`.
 - **Task nhỏ, không dùng `--yes`**: tự đọc plan và diff ở hai gate; mỗi task một thay đổi có test.
 - **`verify.checkout: tracked`**: cache cargo và thư mục `target` (trong `verify_root`, không nằm trong repo) giữ
-  lại giữa các lần verify của một task nên nhanh hơn nhiều; final gate vẫn cần một lần verify `clean`
-  (`final_clean: true`). Lần verify đầu tải crate vào cache Low-IL, lâu hơn.
+  lại giữa các lần verify của một task nên nhanh hơn nhiều. (`verify.final_clean` được nhận nhưng chưa có tác dụng
+  ở bản này — Toryo chưa tự chạy thêm một lần verify `clean` trước final gate; M12-08.) Lần verify đầu tải crate
+  vào cache Low-IL, lâu hơn.
 - **Codex có thể không chạy được cargo trong sandbox** (ghi vào `%USERPROFILE%\.cargo` bị chặn). Không sao: Verify
   build và test hộ, lỗi được gửi lại ở vòng fix.
 - **Không bao giờ thêm `.cargo` vào `writable_roots`** của Codex: agent khi đó sửa được source crate trong cache,
