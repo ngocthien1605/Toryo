@@ -80,6 +80,7 @@ fn decode_line(line: &[u8], _code_page: u32) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     const LINE: &str = "C:\\作業\\ソース\\能力表.xml(12,5): error XPP0001: x\r\n";
 
     /// [`LINE`] in cp932 (Shift-JIS): the trail bytes of ソ (0x83 0x5C) and 能 (0x94 0x5C)
