@@ -7,7 +7,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 ## Progress
 
 - [x] M12-01 Recovery never accepts a commit Toryo did not make (H1)
-- [ ] M12-02 The protected scan fails closed (H4)
+- [x] M12-02 The protected scan fails closed (H4)
 - [ ] M12-03 Read-only role checks run on every way a turn ends (H6)
 - [ ] M12-04 The redactor releases complete lines (H5)
 - [ ] Review of M12-01…04 (subagent, in place)
@@ -54,6 +54,21 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
   commit and database update — fails before). AC-3: the existing F4/F8 tests and
   `engine_e2e::a_crash_in_any_stage_resumes_to_completion_with_a_clean_tree` (`checkpoint:after_commit`) pass
   unchanged. The role's `never` fence uses the same `violates` as `deny_paths` (the tests use `deny_paths`).
+
+### M12-02 — the protected scan fails closed (H4)
+
+- `protect::walk`, the hooks folder of `git_meta` and `hash_file`: only "does not exist" stays quiet. Any other error
+  is an `Unreadable { path, what: list | read, error }` (names the path); `rd.flatten()` no longer swallows entry
+  errors. `protect::check` turns it into one hard `Change` (`cannot list <path> (<os error>)`), so every caller
+  that escalates on hard changes escalates `protected_config_changed: cannot list …` — recovery, the loop-top check
+  and the post-turn check — and nothing runs on. A baseline that cannot be taken (`baseline_or_init`) stays a plain
+  error: the task cannot start.
+- **Tests** (`tests/regress_recovery.rs`): `m12_02_an_unlistable_protected_folder_escalates` — the owner dies after
+  the turn, the test puts `.claude/settings.local.json` into a folder it then makes unlistable, `run` recovers:
+  `Escalated`, "protected_config_changed: cannot list …\.claude" (AC-1 Unix: mode 000, **never run here**; AC-2
+  Windows: `icacls /deny <user>:(RD)` works in a test — run here, fails before; the ACL is removed before the
+  temporary folder drops; the test says why and returns where listing cannot be taken away, e.g. root).
+  `m12_02_a_missing_protected_folder_is_still_fine` (AC-3).
 
 ## Open
 

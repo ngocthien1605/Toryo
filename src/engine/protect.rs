@@ -72,6 +72,32 @@ impl Change {
     }
 }
 
+/// M12-02 (H4): a protected folder or file the scan could not read. "Does not exist" is quiet;
+/// anything else is an error that names the path — an unlistable folder is not an empty one.
+#[derive(Debug)]
+pub struct Unreadable {
+    pub path: String,
+    /// `list` or `read`
+    pub what: &'static str,
+    pub error: String,
+}
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cannot {} {}: {}", self.what, self.path, self.error)
+    }
+}
+
+impl std::error::Error for Unreadable {}
+
+fn unreadable(path: &Path, what: &'static str, e: &std::io::Error) -> anyhow::Error {
+    anyhow::Error::new(Unreadable {
+        path: path.display().to_string(),
+        what,
+        error: e.to_string(),
+    })
+}
+
 /// The current state of everything protected.
 pub struct Scan {
     pub entries: BTreeMap<String, (PathBuf, PEntry)>,
@@ -107,13 +133,19 @@ fn git_meta(g: &GitCmd, wt: &Path) -> Result<Vec<(String, PathBuf)>> {
             own.join("config.worktree"),
         ),
     ];
-    if let Ok(d) = std::fs::read_dir(common.join("hooks")) {
-        for e in d.flatten() {
-            let n = e.file_name().to_string_lossy().to_string();
-            if !n.ends_with(".sample") {
-                v.push((format!("{META}hooks/{n}"), e.path()));
+    let hooks = common.join("hooks");
+    match std::fs::read_dir(&hooks) {
+        Ok(d) => {
+            for e in d {
+                let e = e.map_err(|x| unreadable(&hooks, "list", &x))?;
+                let n = e.file_name().to_string_lossy().to_string();
+                if !n.ends_with(".sample") {
+                    v.push((format!("{META}hooks/{n}"), e.path()));
+                }
             }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(unreadable(&hooks, "list", &e)),
     }
     Ok(v)
 }
@@ -124,11 +156,16 @@ fn walk(
     protect: &Protected,
     out: &mut Vec<(String, PathBuf)>,
 ) -> Result<()> {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return Ok(());
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(unreadable(dir, "list", &e)),
     };
-    for e in rd.flatten() {
-        let ft = e.file_type()?;
+    for e in rd {
+        let e = e.map_err(|x| unreadable(dir, "list", &x))?;
+        let ft = e
+            .file_type()
+            .map_err(|x| unreadable(&e.path(), "read", &x))?;
         let p = e.path();
         let rel = p
             .strip_prefix(root)
@@ -167,7 +204,7 @@ fn hash_file(p: &Path) -> Result<(u64, String, Option<String>)> {
     if !md.is_file() {
         return Ok((0, sha256_hex(b"special file"), None));
     }
-    let b = std::fs::read(p).with_context(|| format!("reading {}", p.display()))?;
+    let b = std::fs::read(p).map_err(|e| unreadable(p, "read", &e))?;
     Ok((b.len() as u64, sha256_hex(&b), None))
 }
 
@@ -513,7 +550,28 @@ pub fn escalation_reason(task: &str, bad: &[&Change], diff: Option<&Path>) -> St
 /// Compare the current state with the baseline in force; on hard changes write the diff.
 pub fn check(store: &Store, t: &TaskRow, g: &GitCmd, protect: &Protected) -> Result<Check> {
     let (id, base) = baseline_or_init(store, t, g, protect)?;
-    let now = scan(g, &t.worktree, protect)?;
+    let now = match scan(g, &t.worktree, protect) {
+        Ok(now) => now,
+        Err(e) => {
+            // M12-02: a protected folder that cannot be listed is a protected-state problem,
+            // never an empty folder: a hard change, so the engine escalates (any other error
+            // is not ours to turn into one)
+            let u = e.downcast::<Unreadable>()?;
+            return Ok(Check {
+                baseline_id: id,
+                changes: vec![Change {
+                    path: format!("{} ({})", u.path, u.error),
+                    kind: if u.what == "list" {
+                        "cannot list"
+                    } else {
+                        "cannot read"
+                    },
+                    tracked: false,
+                }],
+                diff_path: None,
+            });
+        }
+    };
     let changes = compare_since_base(g, &t.worktree, &t.base_commit, &base, &now);
     let mut diff_path = None;
     if changes.iter().any(Change::is_hard) {

@@ -841,3 +841,100 @@ fn m12_01_a_forged_commit_in_checkpointing_is_refused() {
         "no checkpoint was recorded"
     );
 }
+
+// ── M12-02 (H4): the protected scan fails closed ─────────────────────────────────────────
+
+/// Take away the right to list `dir` (Unix: mode 000; Windows: a deny ACL for the current
+/// user). `None`: it could not be done, or it has no effect here (running as root).
+fn deny_listing(dir: &Path) -> Option<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).ok()?;
+        std::fs::read_dir(dir).is_err().then_some(())
+    }
+    #[cfg(windows)]
+    {
+        let user = std::env::var("USERNAME").ok()?;
+        let ok = Command::new("icacls")
+            .arg(dir)
+            .args(["/deny", &format!("{user}:(RD)")])
+            .output()
+            .ok()?
+            .status
+            .success();
+        (ok && std::fs::read_dir(dir).is_err()).then_some(())
+    }
+}
+
+/// Undo [`deny_listing`] (the temporary folder must be removable).
+fn allow_listing(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(user) = std::env::var("USERNAME") {
+            let _ = Command::new("icacls")
+                .arg(dir)
+                .args(["/remove:d", &user])
+                .output();
+        }
+    }
+}
+
+/// The review's scenario: a protected folder (`.claude`, agent settings) that cannot be listed
+/// is "empty" to the scan, so a new settings file inside it went unseen and the task completed.
+/// Now the scan is an error that names the folder and the engine escalates
+/// `protected_config_changed` ("cannot list …"). Unix: mode 000; Windows: a deny ACL (`icacls`).
+#[test]
+fn m12_02_an_unlistable_protected_folder_escalates() {
+    let env = setup("codex-openai");
+    create(&env, "P-1");
+    let w = wt(&env, "P-1");
+    crash_after_the_turn(
+        &env,
+        "P-1",
+        vec![write("src/Calculator.psm1", DIVIDE), implementation()],
+    );
+    let dir = w.join(".claude");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("settings.local.json"), "{\"hooks\": {}}\n").unwrap();
+    if deny_listing(&dir).is_none() {
+        allow_listing(&dir);
+        eprintln!("skipped: the right to list a folder cannot be taken away here (root?)");
+        return;
+    }
+    let (code, err) = run_after_the_crash(&env, "P-1");
+    allow_listing(&dir);
+    assert_eq!(code, 1, "{err}");
+    let t = task(&env, "P-1");
+    assert_ne!(t.state, St::Completed, "{err}");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    let why = reason(&env, "P-1");
+    assert!(
+        why.starts_with("protected_config_changed: cannot list ") && why.contains(".claude"),
+        "{why}"
+    );
+}
+
+/// A protected folder that does not exist is fine, as before.
+#[test]
+fn m12_02_a_missing_protected_folder_is_still_fine() {
+    let env = setup("codex-openai");
+    create(&env, "P-2");
+    let s = script(
+        &env,
+        "p2.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(&env, &["run", "P-2", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "P-2").state, St::Completed);
+}
