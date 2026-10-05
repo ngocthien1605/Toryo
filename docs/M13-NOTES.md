@@ -16,7 +16,7 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
 - [x] M13-07 `task cleanup` that cannot look fails closed; `doctor` never loops on a link
 - [x] M13-08 The gate resolver is one resolver; the timeout stop names every gate that re-runs
 - [x] M13-09 `environment_gate_confirm` says what to type, and how to say no
-- [ ] M13-10 `doctor` looks at long paths where the first run will hit them
+- [x] M13-10 `doctor` looks at long paths where the first run will hit them
 - [ ] M13-11 `task create` is all or nothing (X28)
 - [ ] M13-12 Ctrl+C on `toryo run` is a stop request (X29)
 - [ ] M13-13 A launch error before the agent starts does not reserve a budget
@@ -253,6 +253,27 @@ failed first; the rest is under "Open".
   check gate's program and `environment_gate_unavailable` for an environment gate's program, script or secret (and says that only an *environment*
   gate's timeout stops the task); README and HUONG-DAN (§9.1 row and the `confirm: first` paragraph) say how to say no; the HUONG-DAN row of
   `gate_unavailable` no longer claims that a check gate's `-File` script is checked (it is the repository's: never asked).
+
+
+### M13-10 — `doctor` looks at long paths where the first run will hit them
+
+- **Two new lines in the `paths` area, on Windows only** (`doctor::long_path_checks`; nothing on other systems):
+  `core.longpaths` as a plain Git sees it in `project.root` (`git -C <root> config --type=bool --get core.longpaths`: system, global and repository
+  configuration — what the agents' own Git reads; the task worktrees share the repository's configuration) — OK, or WARN with
+  `git -C "<root>" config core.longpaths true`; and the machine's `LongPathsEnabled`
+  (`reg query HKLM\SYSTEM\CurrentControlSet\Control\FileSystem /v LongPathsEnabled`, `reg.exe` taken from `%SystemRoot%\System32`) — OK when 1, else
+  WARN with the `reg add` line and "needs an administrator once; Toryo itself does not need it".
+- **Read-only:** two child processes that read; the test asserts that `core.longpaths` is the same before and after `doctor`.
+- **No new dependency and no new `windows-sys` feature** (the registry is read through `reg.exe`, as the instructions allow).
+- **Windows-only tests (each failed first: "no line with …"):** `m12_config::m13_10_doctor_reads_core_longpaths_of_the_repository` (sets the key in a
+  temporary repository: `false` → WARN, `true` → OK) and `m12_config::m13_10_doctor_reads_long_paths_enabled` (the line exists and agrees with what
+  `reg query` returns on the machine — here 0: WARN). On every system: unit `doctor::tests::the_long_path_lines_say_what_was_read_and_what_to_type`.
+- **To record (the list asks for it):** the agents' own Git and the build tools (MSBuild, PowerShell) are **not** long-path safe by anything Toryo
+  does — M12-13 covers Toryo's own Git calls only, and this task only warns. With `worktrees_root` and `verify_root` kept short (the existing line
+  of M12-13) D365FO metadata paths stay under 260 characters; the two new lines say what to set when they cannot.
+- **A mistake of mine while checking this task, for the owner to know:** I ran the built `toryo doctor` once from the repository folder without
+  `--config`; it used `$TORYO_CONFIG` (`C:\.thien\m0\toryo.yaml`) and so probed the owner's data folder and verify root (a probe file and a probe
+  folder, created and removed — `doctor` does that on every run; `toryo.db` was not opened or changed). Nothing else was touched.
 
 
 ## Open
