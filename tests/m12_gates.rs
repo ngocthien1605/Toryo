@@ -313,8 +313,22 @@ fn m12_16_a_silent_gate_gets_a_heartbeat_line() {
         .iter()
         .find(|c| c["name"] == "probe")
         .unwrap_or_else(|| panic!("{vr}"));
-    let log = std::fs::read_to_string(probe["log"].as_str().unwrap()).unwrap();
+    // M13-04: the path is relative to the run store (`gate-logs/<file>`), so that the copy of
+    // VERIFY_RESULT.json in the reviewer's pack names no folder of the owner's profile
+    let rel = probe["log"].as_str().unwrap();
+    assert!(
+        rel.starts_with("gate-logs/") && rel.ends_with("-probe.log"),
+        "{rel}"
+    );
+    let log = std::fs::read_to_string(task(&env, "HB-1").run_store.join(rel)).unwrap();
     assert!(log.contains("started") && log.contains("done"), "{log}");
+    // AC-3: nothing in the file names the data directory
+    let data = env.data.display().to_string();
+    let text = vr.to_string().replace("\\\\", "/").replace('\\', "/");
+    assert!(
+        !text.contains(&data.replace('\\', "/")),
+        "VERIFY_RESULT.json names the data directory: {text}"
+    );
 }
 
 /// AC-1: the failure line names the log file.
@@ -336,4 +350,80 @@ fn m12_16_a_failing_gate_names_its_log() {
         line.contains("gate-logs") && line.contains("no-text.log"),
         "{line}"
     );
+}
+
+// ── M13-04 (X27): gate output is cut on line boundaries ──────────────────────────────────
+
+/// AC-1: a secret that straddles the 1 MB cut. The gate prints 1 MB − 10 bytes of `x`, then the
+/// secret and a line break, then 9 MB of `y`. Was: the head ended ten bytes into the secret, the
+/// redactor (which runs on the cut text) could not see it, and the fragment was in `output` and
+/// in the log. Now neither holds the value nor a fragment of 8 bytes or more.
+#[test]
+fn m13_04_a_secret_at_the_cut_leaves_no_fragment() {
+    use toryo::process::redact::{Redactions, Secret};
+    use toryo::runner::{GateIo, LocalRunner, RunSpec};
+    const SECRET: &str = "SECRET-VALUE-20CHARS";
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (program, args): (&str, Vec<String>) = if cfg!(windows) {
+        (
+            "pwsh",
+            vec![
+                "-NoProfile".into(),
+                "-Command".into(),
+                format!("[Console]::Out.Write('x' * 1048566); '{SECRET}'; 'y' * 9437184"),
+            ],
+        )
+    } else {
+        (
+            "sh",
+            vec![
+                "-c".into(),
+                format!("printf '%*s' 1048566 '' | tr ' ' x; echo {SECRET}; printf '%*s' 9437184 '' | tr ' ' y; echo"),
+            ],
+        )
+    };
+    let d = tempfile::tempdir().unwrap();
+    let log = d.path().join("logs").join("cut.log");
+    let spec = RunSpec {
+        name: "cut".into(),
+        program: toryo::engine::checks::resolve_program(program),
+        args,
+        cwd: d.path().to_path_buf(),
+        env: std::env::vars().collect(),
+        boundary: toryo::process::Boundary::None,
+        timeout: std::time::Duration::from_secs(300),
+        cancel: None,
+        redact: Redactions::new(&[Secret {
+            name: "GATE_SECRET".into(),
+            value: SECRET.into(),
+        }]),
+    };
+    let res = rt
+        .block_on(LocalRunner.run_with(
+            spec,
+            None,
+            GateIo {
+                log: Some(log.clone()),
+                heartbeat: None,
+            },
+        ))
+        .unwrap();
+    assert_eq!(res.exit, Some(0), "{}", res.tail(3));
+    let logged = std::fs::read_to_string(&log).unwrap();
+    for text in [&res.output, &logged] {
+        assert!(
+            text.contains("bytes of output omitted"),
+            "the output was cut"
+        );
+        for i in 0..=SECRET.len() - 8 {
+            let fragment = &SECRET[i..i + 8];
+            assert!(
+                !text.contains(fragment),
+                "a fragment of the secret is left: {fragment}"
+            );
+        }
+    }
 }

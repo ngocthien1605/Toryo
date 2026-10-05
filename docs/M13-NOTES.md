@@ -9,7 +9,7 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
 - [x] M13-01 The anchor: a writing attempt starts at the last commit Toryo recorded (X24)
 - [x] M13-02 A fresh checkpoint runs the full path policy; a refused found commit does not loop (X25)
 - [x] M13-03 The redactor: a line break may only be the last byte of a secret
-- [ ] M13-04 Gate output is cut on line boundaries; the log path the vendor sees is relative (X27)
+- [x] M13-04 Gate output is cut on line boundaries; the log path the vendor sees is relative (X27)
 - [ ] M13-05 The deploy confirmation is a database row bound to gate, commit and digest (X26)
 - [ ] M13-06 Read-only turns: the checks also run when the turn errors; the copy is safe
 - [ ] Review of M13-01…06 (acceptance criteria against code and tests)
@@ -83,6 +83,24 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
   the `max_len − 1` hold-back; `ab\n` is still a line end (`retained() == 0` after a full line). A secret that holds only line breaks is dropped from the
   patterns with one `note:` (as a pattern it would redact every line end).
 - **AC-2:** the M12-04 tests, the split tests and the fuzz test pass unchanged.
+
+
+### M13-04 — Gate output is cut on line boundaries; the log path the vendor sees is relative (X27)
+
+- **Failing test first:** `m12_gates::m13_04_a_secret_at_the_cut_leaves_no_fragment` (AC-1: 1 MB − 10 bytes of `x`, the secret and a line break, 9 MB of `y`,
+  through `LocalRunner` with the secret in its redactions) — before: `SECRET-V…` was left in `output` and in the log.
+- **(a) The cut** (`BoundedOutput::into_bytes_cut(hold)`): when bytes were dropped, the head ends at its last line break and the tail starts after its first;
+  what that drops counts as omitted; the marker line is unchanged (preceded and followed by a line break). **A side with no line break at all** — one line
+  longer than the bound, which is exactly the case of AC-1's head and of the M12-16 bound test on Windows (a first line of 1 MB) — cannot be cut on a
+  line: it loses `hold` bytes at the cut instead, `hold` = the longest secret − 1 (`Redactions::max_len()`, new accessor), the most a fragment can be.
+  Without secrets nothing extra is dropped, so the M12-16 bound test and `bounded_output_keeps_the_head_and_the_tail` pass unchanged (AC-2). In that
+  no-line-break case a multi-byte character can still be torn at the cut (recorded in Open). Unit test `bounded_output_is_cut_on_line_boundaries`.
+- **(b) `"log"` in `VERIFY_RESULT.json`** is `gate-logs/<file>` — relative to the run store (`runner::gate_log_rel`, used for check gates, environment gates
+  and `tool: xpp` entries). The console line `full output:` keeps the absolute path.
+- **Earlier assertions changed (the M12-16 tests read `"log"` as an absolute path):** `m12_gates::m12_16_a_silent_gate_gets_a_heartbeat_line` and
+  `m11_env_gates::m12_16_the_gate_log_is_redacted` now join it to the run store and assert the `gate-logs/` prefix.
+- **AC-3:** the heartbeat test also asserts that `VERIFY_RESULT.json` names nothing under the data directory. Not asserted on the *rendered context*: the
+  reviewer's context names its pack files by their run-store path on purpose (it reads them there), so an absolute run-store path is in every context.
 
 
 ## Open

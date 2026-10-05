@@ -119,6 +119,12 @@ impl Redactions {
         self.ac.is_none()
     }
 
+    /// The length of the longest pattern (0 without secrets): text cut within that many bytes
+    /// of a secret's start can hold a fragment of it (M13-04).
+    pub fn max_len(&self) -> usize {
+        self.max_len
+    }
+
     /// Redact a complete, already-buffered value (e.g. a stored event payload).
     /// Defence in depth only: streams must go through [`StreamRedactor`].
     pub fn redact_all(&self, input: &[u8]) -> Vec<u8> {

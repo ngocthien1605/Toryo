@@ -109,20 +109,43 @@ impl BoundedOutput {
 
     /// The kept bytes, with the marker line where bytes were dropped.
     pub fn into_bytes(self) -> Vec<u8> {
-        let mut out = self.head;
-        if self.omitted > 0 {
-            out.extend(
+        self.into_bytes_cut(0)
+    }
+
+    /// [`Self::into_bytes`], cut on line boundaries (M13-04, X27): when bytes were dropped, the
+    /// head ends at its last line break and the tail starts after its first one — the text is
+    /// redacted only after the cut, so a secret must be whole or gone, never a fragment, and no
+    /// multi-byte character is torn. A side with no line break at all (one line longer than the
+    /// bound) loses `hold` bytes at the cut instead: `hold` is the longest secret minus one, the
+    /// most a fragment can be. What is dropped counts as omitted.
+    pub fn into_bytes_cut(self, hold: usize) -> Vec<u8> {
+        let mut head = self.head;
+        let mut tail: Vec<u8> = self.tail.into();
+        let mut omitted = self.omitted;
+        if omitted > 0 {
+            let keep = match head.iter().rposition(|b| *b == b'\n') {
+                Some(i) => i + 1,
+                None => head.len().saturating_sub(hold),
+            };
+            omitted += (head.len() - keep) as u64;
+            head.truncate(keep);
+            let skip = match tail.iter().position(|b| *b == b'\n') {
+                Some(i) => i + 1,
+                None => hold.min(tail.len()),
+            };
+            omitted += skip as u64;
+            tail.drain(..skip);
+            head.extend(
                 format!(
-                    "\n[... {} bytes of output omitted: Toryo keeps the first {} MB and the last {} MB of a gate's output ...]\n",
-                    self.omitted,
+                    "\n[... {omitted} bytes of output omitted: Toryo keeps the first {} MB and the last {} MB of a gate's output ...]\n",
                     OUTPUT_HEAD_KEEP / (1024 * 1024),
                     OUTPUT_TAIL_KEEP / (1024 * 1024)
                 )
                 .bytes(),
             );
         }
-        out.extend(self.tail);
-        out
+        head.extend(tail);
+        head
     }
 }
 
@@ -270,7 +293,7 @@ impl LocalRunner {
             let output = spec
                 .redact
                 .redact_str(&strip_ansi(&crate::process::decode_output(
-                    &out.into_bytes(),
+                    &out.into_bytes_cut(spec.redact.max_len().saturating_sub(1)),
                 )));
             // M12-16: the log holds exactly the text the result holds; a log that cannot be
             // written is not a failing gate
@@ -311,6 +334,45 @@ mod tests {
 
     /// M12-16: below the bound nothing is dropped; above it the first 1 MB and the last 8 MB
     /// stay with one marker between.
+    /// M13-04 (X27): once bytes are dropped, the head ends at a line break and the tail starts
+    /// after one; a side without any line break loses `hold` bytes at the cut.
+    #[test]
+    fn bounded_output_is_cut_on_line_boundaries() {
+        let line = "0123456789abcdefghijklmnopqrstuvwxyz\n"; // 37 bytes
+        let mut b = BoundedOutput::default();
+        let n = (OUTPUT_HEAD_KEEP + OUTPUT_TAIL_KEEP) / line.len() + 1000;
+        for _ in 0..n {
+            b.push(line.as_bytes());
+        }
+        let total = b.total();
+        let text = String::from_utf8(b.into_bytes_cut(19)).unwrap();
+        let (head, rest) = text.split_once("\n[... ").expect("the marker");
+        let (marker, tail) = rest.split_once(" ...]\n").expect("the marker's end");
+        assert!(head.len() % line.len() == 0, "the head ends on a line");
+        assert!(
+            tail.len() % line.len() == 0 && tail.starts_with("0123"),
+            "the tail starts on a line"
+        );
+        let omitted: u64 = marker.split(' ').next().unwrap().parse().unwrap();
+        assert_eq!(head.len() as u64 + tail.len() as u64 + omitted, total);
+        // a side with no line break: `hold` bytes go at the cut, nothing else
+        let mut b = BoundedOutput::default();
+        b.push(&vec![b'a'; OUTPUT_HEAD_KEEP]);
+        b.push(&vec![b'b'; OUTPUT_TAIL_KEEP + 5]);
+        let bytes = b.into_bytes_cut(19);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("\n[... 43 bytes of output omitted"),
+            "5 + 19 + 19"
+        );
+        assert!(bytes[..OUTPUT_HEAD_KEEP - 19].iter().all(|b| *b == b'a'));
+        assert_eq!(bytes[OUTPUT_HEAD_KEEP - 19], b'\n');
+        // nothing dropped: nothing is cut
+        let mut b = BoundedOutput::default();
+        b.push(b"no line break at all");
+        assert_eq!(b.into_bytes_cut(19), b"no line break at all");
+    }
+
     #[test]
     fn bounded_output_keeps_the_head_and_the_tail() {
         let mut small = BoundedOutput::default();

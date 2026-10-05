@@ -2263,8 +2263,8 @@ impl<'a> Engine<'a> {
                 .chain(m.args.iter().cloned())
                 .collect();
             let mut entry = json!({"name": name, "kind": "environment", "lock": lock_name, "machine": machine, "argv": argv, "exit": res.exit, "timed_out": res.timed_out, "ms": res.duration_ms, "output_tail": res.tail(40), "source": "export", "source_tree": export.tree});
-            if let Some(l) = &res.log {
-                entry["log"] = json!(l.display().to_string());
+            if let Some(l) = gate_log_rel(&res) {
+                entry["log"] = json!(l);
             }
             results.push(entry);
             // M11-R9: the gate must not have written into what it deploys from (E3 AC-8)
@@ -4394,6 +4394,15 @@ fn gate_log_path(run_store: &Path, name: &str) -> PathBuf {
     run_store.join("gate-logs").join(format!("{at}-{safe}.log"))
 }
 
+/// M13-04: the log of a gate run as `VERIFY_RESULT.json` names it — relative to the run store
+/// (`gate-logs/<file>`). The file is in the reviewer's and the fix-cycle implementer's pack: an
+/// absolute path under `%LOCALAPPDATA%` would send the Windows user name to the vendor. The
+/// console line `full output:` keeps the absolute path.
+pub fn gate_log_rel(res: &CommandResult) -> Option<String> {
+    let name = res.log.as_ref()?.file_name()?.to_string_lossy().to_string();
+    Some(format!("gate-logs/{name}"))
+}
+
 /// One verify command's entry in VERIFY_RESULT.json.
 fn command_result(c: &CommandSpec, res: &CommandResult) -> Value {
     let argv: Vec<String> = match c.kind() {
@@ -4408,8 +4417,8 @@ fn command_result(c: &CommandSpec, res: &CommandResult) -> Value {
         v["signal"] = json!(s);
     }
     // M12-16: the file with the whole (bounded, redacted) output
-    if let Some(l) = &res.log {
-        v["log"] = json!(l.display().to_string());
+    if let Some(l) = gate_log_rel(res) {
+        v["log"] = json!(l);
     }
     v
 }

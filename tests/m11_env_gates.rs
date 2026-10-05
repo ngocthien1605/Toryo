@@ -2576,12 +2576,10 @@ fn m12_16_the_gate_log_is_redacted() {
     let vr = verify_result(&env, "LG-1");
     let entry = &vr["commands"][1];
     assert_eq!(entry["name"], "dbsync");
-    let log = PathBuf::from(entry["log"].as_str().unwrap_or_else(|| panic!("{vr}")));
-    assert!(
-        log.starts_with(task(&env, "LG-1").run_store.join("gate-logs")),
-        "{}",
-        log.display()
-    );
+    // M13-04: relative to the run store (was the absolute path)
+    let rel = entry["log"].as_str().unwrap_or_else(|| panic!("{vr}"));
+    assert!(rel.starts_with("gate-logs/"), "{rel}");
+    let log = task(&env, "LG-1").run_store.join(rel);
     let text = std::fs::read_to_string(&log).unwrap();
     assert!(text.contains("using [REDACTED:D365_SYNC_SECRET]"), "{text}");
     assert!(!text.contains(SECRET), "{text}");
