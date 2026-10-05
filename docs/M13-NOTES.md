@@ -12,7 +12,7 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
 - [x] M13-04 Gate output is cut on line boundaries; the log path the vendor sees is relative (X27)
 - [x] M13-05 The deploy confirmation is a database row bound to gate, commit and digest (X26)
 - [x] M13-06 Read-only turns: the checks also run when the turn errors; the copy is safe
-- [ ] Review of M13-01…06 (acceptance criteria against code and tests)
+- [x] Review of M13-01…06 (acceptance criteria against code and tests)
 - [ ] M13-07 `task cleanup` that cannot look fails closed; `doctor` never loops on a link
 - [ ] M13-08 The gate resolver is one resolver; the timeout stop names every gate that re-runs
 - [ ] M13-09 `environment_gate_confirm` says what to type, and how to say no
@@ -95,6 +95,7 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
   line: it loses `hold` bytes at the cut instead, `hold` = the longest secret − 1 (`Redactions::max_len()`, new accessor), the most a fragment can be.
   Without secrets nothing extra is dropped, so the M12-16 bound test and `bounded_output_keeps_the_head_and_the_tail` pass unchanged (AC-2). In that
   no-line-break case a multi-byte character can still be torn at the cut (recorded in Open). Unit test `bounded_output_is_cut_on_line_boundaries`.
+  **Replaced by the review (see "Review of M13-01…06"):** the raw `hold` cut could split a whole secret; the cut is now `into_sides` + `bounded_text`.
 - **(b) `"log"` in `VERIFY_RESULT.json`** is `gate-logs/<file>` — relative to the run store (`runner::gate_log_rel`, used for check gates, environment gates
   and `tool: xpp` entries). The console line `full output:` keeps the absolute path.
 - **Earlier assertions changed (the M12-16 tests read `"log"` as an absolute path):** `m12_gates::m12_16_a_silent_gate_gets_a_heartbeat_line` and
@@ -168,5 +169,76 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
   `index.lock` is case 2).
 
 
+### Review of M13-01…06 (after M13-06, as the list asks)
+
+Every acceptance criterion was checked against the code and the tests, and one subagent read the diff in place (no worktree, no build). The criteria
+are met with the deviations already written under each task. What the review found inside the scope of the list was fixed, each with a test that
+failed first; the rest is under "Open".
+
+- **M13-01 — `resume --keep-partial` committed on an unchecked commit.** When the engine dies in an implementer turn that committed and left a merge
+  unfinished, recovery does not reset (no reset during an unfinished operation) and escalates with HEAD at the agent's commit. `keep_partial` then
+  checked the policy on tree-against-HEAD only, committed the recovery checkpoint **on** that commit, and the checkpoint became the anchor.
+  Now `keep_partial` starts at the commit the attempt began at: a commit on top of it on the task branch is soft-reset into the tree first (its
+  changes meet the policy check that follows); a HEAD anywhere else is refused. Test: `regress_recovery::m13_01_keep_partial_never_commits_on_a_commit_the_attempt_left`
+  (before: "the denied file is in a commit").
+- **M13-04 — the cut made a fragment out of a whole secret.** The first version dropped "longest secret − 1" **raw** bytes at the cut of a side
+  without a line break: a whole secret lying there was cut in two; and a secret of several lines that straddled a line-boundary cut kept its first
+  lines. Now `BoundedOutput::into_sides` only cuts on line boundaries (a side with no line break is kept whole, less a torn UTF-8 character), and
+  `runner::bounded_text` decodes, strips and **redacts each side first**, then takes "longest secret + 2" bytes at the cut edge of each side (and
+  the rest of that line): a whole secret is already `[REDACTED:…]` by then, a straddling one has less than its length there. With no secret
+  configured nothing more is dropped. Unit test `runner::tests::a_secret_next_to_the_cut_is_whole_or_gone` (three positions; before: "a fragment is
+  left: SECRET-V"). `bounded_output_is_cut_on_line_boundaries` (this milestone's own test) now covers the torn character instead of the `hold` bytes.
+- **M13-05 — "the task's configuration changed since your last yes" was said for good.** After one reload, every later stop of an `always` gate said
+  it. `store::deploy_confirmed_under_another_config` now also needs "no yes under the configuration in force". Unit test
+  `store::tests::the_changed_configuration_note_ends_with_a_yes_under_the_new_one`.
+- **M13-01/-02 — the two "by hand" texts:** the path after `git -C` is quoted (a worktree path with a space), and both say that an unfinished Git
+  operation is finished or aborted first (`reset --soft` fails in the middle of a merge). No assertion pinned these texts.
+- **M13-06:** three findings, fixed inside the M13-06 commit (see there).
+
+
 ## Open
+
+What does not match the list, was not fixed, or is left for a later milestone. (Collected from the task paragraphs above; M13-15 carries the
+items that are plans into `docs/STATUS.md`.)
+
+**Where the code or the test differs from the list**
+
+1. **M13-01 AC-1, M13-02 AC-2 use `resume --note`, not a plain `resume`.** A plain `resume` does not leave a `policy_violation` escalation (only the
+   machine-caused classes and a restored protected change do): the HEAD-guard text now names `--note`, and the tests follow the text.
+2. **M13-02 AC-1 does not fail before the fix.** A commit forged from the worktree index never reached a checkpoint (a plain `resume` does not re-enter
+   Checkpointing). The test is kept as a guard; the fresh-path hole has its own failing test (`m13_02_a_fresh_checkpoint_refuses_what_the_fence_forbids`).
+3. **M13-02:** the fresh checkpoint runs the anchor test before `Protected::violates` (stricter order than the list writes; both run).
+4. **M13-04 AC-3** is asserted on `VERIFY_RESULT.json`, not on the rendered context (which names its pack files by their run-store path on purpose).
+5. **M13-05:** no earlier assertion had to change (the list expected one). Do-3: no separate machine class for a failing write — the question is a
+   database write like every state change. A pre-M13 `toryo.exe` refuses a database this binary has opened (schema version 2).
+6. **M13-06 Do-1:** the before-state is saved before every read-only **turn** as an artifact (`tree-before/<stage>-<attempt>`), not as
+   `attempts/<id>/tree-before.json`; an attempt that died before its first turn has none and keeps the old "any dirty file escalates".
+
+**Not tested (no way found to provoke it in a test)**
+
+7. M13-06: the `Err` from `hub.turn_with` / `usage()` path of `read_only_turn`; recovery's "undo before the attempt is closed" order.
+8. M13-01/-02: the branches of `start_at_anchor` for "another branch" and "an unfinished operation", and the found-commit branch "cannot be reset —
+   do it by hand" (the "does not descend" branch and the reset branches are tested).
+
+**Known holes, not in this list's scope (→ `docs/STATUS.md`)**
+
+9. **`VERIFY_RESULT.json` still carries `verify_checkout` as an absolute path** under `verify_root` (default `%LOCALAPPDATA%\toryo-verify`: the
+   Windows user name). M13-04 asked for `"log"` only.
+10. **HEAD equal to the anchor but detached** (or in an unfinished operation) is not looked at by `start_at_anchor`: an implementer turn is stopped by
+    the HEAD guard after the turn, but a fresh checkpoint would commit off the task branch. Needs the owner to detach HEAD by hand between stages.
+11. **Recovery's early returns** (a protected change, or a missing/tampered artifact, found first) escalate without the read-only put-back.
+12. **"Was the link there before the turn"** is judged by "was a path below it already changed before the turn". An owner's link with only clean
+    content behind it, into which the role writes, is removed (the link only — named in the reason) and the role's file stays in the target.
+    `TreeState::read` hashes (reads) the files Git lists behind a junction.
+13. **`Worktree::restore` passes paths to Git as pathspecs** (a file name with `[`…`]` is a pattern), and for an **implementer's** junction it has the
+    exposure M13-06 closed for read-only roles. `restore` is also used for the path policy of writing turns: not touched here.
+14. **What the owner changes in the worktree between a crash and the `resume`** is taken for the read-only role's write (put back, a copy kept).
+15. **The anchor uses the order of `started_at`** (as every "last attempt" query does): a clock set back between attempts would pick an older commit.
+16. **A cp932 character torn by the 1 MB bound in a line with no line break** is still decoded as a wrong character at the cut (UTF-8 is handled).
+
+**Tests that depend on the speed of the machine**
+
+17. `m11_env_gates::a_timed_out_environment_gate_is_recorded_as_interrupted` (a 6 s gate timeout that must hold two `pwsh` start-ups) and
+    `m12_06_an_environment_gate_that_times_out_stops_for_the_owner` (3 s) failed in single runs on this machine while it was slow (the whole file took
+    120–137 s instead of 70 s) — the first one also at the commit of M13-05, without the change under test. Both pass when run again. Not changed.
 

@@ -717,15 +717,41 @@ impl<'a> Recovery<'a> {
         let t = self.task(id)?;
         let a = self.escalated_writing_attempt(&t)?;
         let wt = Worktree::new(self.g, &t.worktree);
+        if let Some(op) = wt.unfinished_operation()? {
+            bail!("an unfinished Git operation ({op}) is still in the worktree — finish or abort it first");
+        }
+        // M13-01 (X24), review: the recovery checkpoint goes on the commit the attempt began
+        // at. A commit left on top of it (recovery's HEAD guard does not reset during an
+        // unfinished operation) is undone into the tree first, so that its changes meet the
+        // policy below — who made it is not asked. A HEAD anywhere else: nothing is committed.
+        let before = a
+            .git_head_before
+            .clone()
+            .context("the attempt has no git_head_before")?;
+        let head = wt.head()?;
+        if head != before {
+            let on_branch = wt.head_ref()? == Some(format!("refs/heads/{}", t.branch));
+            if !(on_branch && wt.contains(&before)?) {
+                bail!(
+                    "HEAD is at {}, which is not the task branch {} on top of the commit the attempt began at ({}) — put the branch back by hand first, or `--discard-partial`",
+                    short(&head),
+                    t.branch,
+                    short(&before)
+                );
+            }
+            wt.soft_reset(&before)?;
+            eprintln!(
+                "note: commits {}..{} made during the attempt were undone; their changes stay in the tree and are checked",
+                short(&before),
+                short(&head)
+            );
+        }
         let prot: Vec<String> = wt
             .changed()?
             .into_iter()
             .map(|c| c.1)
             .filter(|p| self.protect.violates(p))
             .collect();
-        if let Some(op) = wt.unfinished_operation()? {
-            bail!("an unfinished Git operation ({op}) is still in the worktree — finish or abort it first");
-        }
         if !prot.is_empty() {
             bail!("protected paths still changed: {prot:?} — restore them first (or `--discard-partial`)");
         }

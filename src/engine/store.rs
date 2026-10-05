@@ -178,8 +178,8 @@ pub fn deploy_confirmed(
     Ok(n > 0)
 }
 
-/// M13-05: a yes to `gate` exists for this task under **another** configuration digest (the
-/// stop then says why it asks again).
+/// M13-05: a yes to `gate` exists for this task under **another** configuration digest and
+/// none under this one (the stop then says why it asks again).
 pub fn deploy_confirmed_under_another_config(
     tx: &Transaction,
     task: &str,
@@ -187,7 +187,8 @@ pub fn deploy_confirmed_under_another_config(
     config_sha256: &str,
 ) -> Result<bool> {
     let n: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM deploy_confirmations WHERE task = ?1 AND gate = ?2 AND config_sha256 <> ?3 AND confirmed_at IS NOT NULL",
+        "SELECT COUNT(*) FROM deploy_confirmations WHERE task = ?1 AND gate = ?2 AND config_sha256 <> ?3 AND confirmed_at IS NOT NULL \
+         AND NOT EXISTS (SELECT 1 FROM deploy_confirmations d WHERE d.task = ?1 AND d.gate = ?2 AND d.config_sha256 = ?3 AND d.confirmed_at IS NOT NULL)",
         params![task, gate, config_sha256],
         |r| r.get(0),
     )?;
@@ -1746,6 +1747,40 @@ mod tests {
         assert!(
             e.contains("schema version 3") && e.contains("expects 2"),
             "{e}"
+        );
+    }
+
+    /// Review of M13-05: "asked again: the configuration changed since your last yes" is said
+    /// only while the configuration in force has no yes of its own. Was: one yes under an
+    /// earlier digest made every later stop of an `always` gate say it, for good.
+    #[test]
+    fn the_changed_configuration_note_ends_with_a_yes_under_the_new_one() {
+        let d = tempfile::tempdir().unwrap();
+        let st = Store::open(&d.path().join("toryo.db")).unwrap();
+        st.call(|tx| insert_task(tx, &new_task("T-1"))).unwrap();
+        let yes = |digest: &'static str, commit: &'static str| {
+            st.call(move |tx| {
+                let asks = [DeployAsk {
+                    gate: "dbsync".into(),
+                    commit: commit.into(),
+                    mode: "always".into(),
+                }];
+                ask_deploys(tx, "T-1", digest, &asks)?;
+                confirm_deploys(tx, "T-1").map(|_| ())
+            })
+            .unwrap()
+        };
+        let changed = |digest: &'static str| {
+            st.call(move |tx| deploy_confirmed_under_another_config(tx, "T-1", "dbsync", digest))
+                .unwrap()
+        };
+        yes("old", "c1");
+        assert!(!changed("old"));
+        assert!(changed("new"), "a yes under the old configuration only");
+        yes("new", "c2");
+        assert!(
+            !changed("new"),
+            "the last yes was under this configuration: the next commit is asked for, but not because the configuration changed"
         );
     }
 

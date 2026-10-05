@@ -1455,3 +1455,92 @@ fn m13_02_a_found_commit_under_another_commit_is_undone_not_refused_forever() {
     let log = git(&w, &["log", "--format=%H", "main..HEAD"]);
     assert!(!log.contains(&top) && !log.contains(&genuine), "{log}");
 }
+
+// ── Review of M13-01…06: `--keep-partial` starts at the commit the attempt began at ────────
+
+/// The anchor (X24) for `resume --keep-partial`. The engine dies during an implementer turn
+/// that committed a **denied** file on the task branch and left a merge unfinished: recovery
+/// does not reset during an unfinished operation and escalates with HEAD still at the agent's
+/// commit. The owner ends the merge and keeps the partial work. Was: the path policy looked
+/// only at tree-against-HEAD, the recovery checkpoint was committed **on** the agent's commit
+/// and became the anchor — the denied file reached the checkpoint, Verify and the review
+/// unchecked. Now the commit is undone into the tree first and its file meets the policy.
+#[test]
+fn m13_01_keep_partial_never_commits_on_a_commit_the_attempt_left() {
+    let env = setup_with("codex-openai", DENY_ZZZ);
+    let id = "A-4";
+    create(&env, id);
+    let w = wt(&env, id);
+    let base = rev(&w, "HEAD");
+    let branch = env.repo.join(format!(".git/refs/heads/toryo/{id}"));
+    let gd = git_dir(&w);
+    let x = commit_of(
+        &env,
+        &w,
+        &base,
+        Some(&base),
+        &[
+            ("src/Calculator.psm1", &with_divide(&w, &base)),
+            ("src/ZZZ/secret.ps1", "evil\n"),
+        ],
+        "agent commit",
+    );
+    crash_after_the_turn(
+        &env,
+        id,
+        vec![
+            write("src/Calculator.psm1", DIVIDE),
+            write("src/ZZZ/secret.ps1", "evil\n"),
+            write("notes.txt", "work in progress\n"),
+            put(&branch, &format!("{x}\n")),
+            put(&gd.join("MERGE_HEAD"), &format!("{base}\n")),
+            implementation(),
+        ],
+    );
+    let (code, err) = run_after_the_crash(&env, id);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        reason(&env, id).starts_with("recovery_policy_violation:"),
+        "{}",
+        reason(&env, id)
+    );
+    assert_eq!(rev(&w, "HEAD"), x, "no reset during the merge");
+    // the owner ends the merge; the index is the commit's, as after the agent's `git commit`
+    std::fs::remove_file(gd.join("MERGE_HEAD")).unwrap();
+    git(&w, &["reset", "-q"]);
+    let s = script(
+        &env,
+        "keep.json",
+        json!({
+            "implementer": [turn(vec![implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["resume", id, "--keep-partial", "--yes", "--fake-agents", &s],
+        &[],
+    );
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(
+        !files.contains("ZZZ"),
+        "the denied file is in a commit: {files}\n{err}"
+    );
+    let log = git(&w, &["log", "--format=%H", "main..HEAD"]);
+    assert!(
+        !log.contains(&x),
+        "the agent's commit is on the branch: {log}"
+    );
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains("protected paths still changed") && err.contains("src/ZZZ/secret.ps1"),
+        "{err}"
+    );
+    assert_eq!(task(&env, id).state, St::Escalated, "{err}");
+    assert_eq!(
+        rev(&w, "HEAD"),
+        base,
+        "back at the commit the attempt began at"
+    );
+    assert!(w.join("notes.txt").exists() && w.join("src/ZZZ/secret.ps1").exists());
+}

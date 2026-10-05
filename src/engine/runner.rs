@@ -981,8 +981,13 @@ impl<'a> Engine<'a> {
             (None, true) => "it does not descend from that commit".to_string(),
         };
         let w = t.worktree.display();
+        let first = if unfinished.is_some() {
+            "finish or abort that operation, then "
+        } else {
+            ""
+        };
         let reason = format!(
-            "policy_violation: HEAD is at {at}, not at the last commit Toryo recorded for this task ({}), and {why}; nothing was reset or committed — put the task branch back by hand (`git -C {w} checkout {}`, then `git -C {w} reset --soft {}`: what the branch held stays in the tree and is checked), then `toryo resume {} --note \"…\"`",
+            "policy_violation: HEAD is at {at}, not at the last commit Toryo recorded for this task ({}), and {why}; nothing was reset or committed — put the task branch back by hand ({first}`git -C \"{w}\" checkout {}`, then `git -C \"{w}\" reset --soft {}`: what the branch held stays in the tree and is checked), then `toryo resume {} --note \"…\"`",
             short(&anchor),
             t.branch,
             short(&anchor),
@@ -1434,7 +1439,7 @@ impl<'a> Engine<'a> {
                             )
                         }
                         before => format!(
-                            "; nothing was reset (HEAD is {}{}) — put the task branch back by hand (`git -C {} checkout {}`, then `git -C {} reset --soft {}`), then `toryo resume {} --note \"…\"`",
+                            "; nothing was reset (HEAD is {}{}) — put the task branch back by hand (after any unfinished Git operation is finished or aborted: `git -C \"{}\" checkout {}`, then `git -C \"{}\" reset --soft {}`), then `toryo resume {} --note \"…\"`",
                             short(&head),
                             if on_branch { "" } else { ", not on the task branch" },
                             t.worktree.display(),
