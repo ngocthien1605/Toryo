@@ -1139,20 +1139,29 @@ fn resume_before_drive(st: &Store, t: &TaskRow, r: &ResumeArgs, protected: bool)
         // the machine cannot run) — a plain `toryo resume` goes back into the stage, which
         // checks its precondition again. No fix cycle, no implementer turn for nothing.
         let class = t.machine.reason_class().unwrap_or_default().to_string();
-        // M12-07 (X17): this resume is the owner's "yes" to the deploy the stop asked about
-        if class == toryo::engine::gates::ENV_CONFIRM {
-            let said = toryo::engine::gates::record_confirmation(&t.run_store)?;
+        // M12-07 (X17): this resume is the owner's "yes" to the deploy the stop asked about.
+        // M13-05 (X26): the yes is written in the same transaction as the transition
+        let confirms = class == toryo::engine::gates::ENV_CONFIRM;
+        let i = t.id.clone();
+        let said = st.call(move |tx| {
+            let said = if confirms {
+                store::confirm_deploys(tx, &i)?
+            } else {
+                Vec::new()
+            };
+            store::transition(tx, &i, PipelineEvent::ResumeStage)?;
+            Ok(said)
+        })?;
+        if confirms {
             eprintln!(
                 "{}: deploy confirmed ({})",
                 t.id,
                 said.iter()
-                    .map(|a| format!("{} @ {}", a.gate, short(&a.commit)))
+                    .map(|(gate, commit)| format!("{gate} @ {}", short(commit)))
                     .collect::<Vec<_>>()
                     .join(", ")
             );
         }
-        let i = t.id.clone();
-        st.call(move |tx| store::transition(tx, &i, PipelineEvent::ResumeStage).map(|_| ()))?;
         toryo::engine::decisions::append(
             st,
             t,

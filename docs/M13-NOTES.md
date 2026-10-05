@@ -10,7 +10,7 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
 - [x] M13-02 A fresh checkpoint runs the full path policy; a refused found commit does not loop (X25)
 - [x] M13-03 The redactor: a line break may only be the last byte of a secret
 - [x] M13-04 Gate output is cut on line boundaries; the log path the vendor sees is relative (X27)
-- [ ] M13-05 The deploy confirmation is a database row bound to gate, commit and digest (X26)
+- [x] M13-05 The deploy confirmation is a database row bound to gate, commit and digest (X26)
 - [ ] M13-06 Read-only turns: the checks also run when the turn errors; the copy is safe
 - [ ] Review of M13-01…06 (acceptance criteria against code and tests)
 - [ ] M13-07 `task cleanup` that cannot look fails closed; `doctor` never loops on a link
@@ -101,6 +101,32 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
   `m11_env_gates::m12_16_the_gate_log_is_redacted` now join it to the run store and assert the `gate-logs/` prefix.
 - **AC-3:** the heartbeat test also asserts that `VERIFY_RESULT.json` names nothing under the data directory. Not asserted on the *rendered context*: the
   reviewer's context names its pack files by their run-store path on purpose (it reads them there), so an absolute run-store path is in every context.
+
+
+### M13-05 — The deploy confirmation is a database row bound to gate, commit and digest (X26)
+
+- **Failing tests first** (`tests/m11_env_gates.rs`): `m13_05_a_confirmation_file_in_the_run_store_confirms_nothing` (AC-1 — before: a hand-written
+  `confirmations.json` naming the gate let the deploy run unasked) and `m13_05_a_reload_that_changes_the_configuration_asks_again` (AC-2 — before: after a
+  reload that changed the gate's `args` the next checkpoint was deployed without a question).
+- **The table** `deploy_confirmations (task, gate, commit_sha, config_sha256, mode, asked_at, confirmed_at)`, primary key the first four; `confirmed_at`
+  empty = asked, no yes yet (this is the "pending": no file, no second table). `store::ask_deploys` (the stop: replaces what an earlier stop asked and got
+  no yes for), `store::confirm_deploys` (the yes), `store::deploy_confirmed` (`first`: a yes for this task + gate + **the current frozen digest**;
+  `always`: also this commit), `store::deploy_confirmed_under_another_config` (the stop then says "asked again: the task's configuration changed since your
+  last yes").
+- **The yes is one transaction with the resume:** `engine_cli::resume_before_drive` calls `confirm_deploys` and the `ResumeStage` transition in the same
+  `store.call`.
+- **Schema version 2 — the first raise ever.** `SCHEMA` gained one `CREATE TABLE IF NOT EXISTS`; `Store::open` accepts a database of version 1 and writes
+  2 into `meta` (nothing is altered or dropped); a higher version is refused ("a newer toryo wrote it"). **Consequence:** once this binary has opened the
+  owner's database, a pre-M13 `toryo.exe` refuses it ("has schema version 2; this toryo expects 1") — keep one binary.
+- **`confirmations.json` handling is deleted** (`gates::Confirmations`, `is_confirmed`, `set_pending`, `record_confirmation`). **No migration:** M12 was merged
+  on 2026-10-05 and no owner task has asked for a confirmation yet (the first real D365FO task has not run); a task that did would simply be asked once more.
+- **Do-3** (a failing `set_pending` left the task `Verifying`): there is no file write left; the question is a database write like every state change.
+  A failing database stops every command the same way and the verify attempt is re-run by the next `resume` — no separate machine class was added.
+- **Earlier assertion expected to change:** none had to. The M12-07 tests (`resume` is the yes, `--yes` never confirms, `first` once per task, `always` once
+  per checkpoint) pass unchanged (AC-3); no test pinned the schema version or read the file.
+- **Unit test (AC-4):** `store::tests::an_older_database_opens_and_is_raised` (version 1 → 2 with its task kept; the functions above; version 3 refused).
+- **Threat model (goes to STATUS N-11):** an agent started with the owner's token can write the database as well as the run store; the row is the same
+  trust level as every other record there, not a new boundary.
 
 
 ## Open

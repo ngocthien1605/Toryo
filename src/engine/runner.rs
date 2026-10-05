@@ -1801,31 +1801,65 @@ impl<'a> Engine<'a> {
     /// commit) and that was not confirmed yet — or `None`. Writes what a plain `resume` will
     /// confirm. Nothing is run.
     fn confirm_preflight(&self, t: &TaskRow, head: &str) -> Result<Option<String>> {
-        use super::gates::{is_confirmed, set_pending, Asked};
+        use crate::config::Confirm;
         let Some(team) = self.cfg.team.as_ref() else {
             return Ok(None);
         };
-        let done = super::gates::confirmations(&t.run_store);
-        let asked: Vec<(&str, &crate::config::EnvGate)> = team
+        // M13-05 (X26): the yes is a database row bound to the gate, the commit and the task's
+        // frozen configuration digest — `first`: any commit under this digest; `always`: this
+        // commit. A reload that changes the digest asks again.
+        let gates: Vec<(&str, &crate::config::EnvGate)> = team
             .handoff_gates()
             .into_iter()
             .filter(|(_, g)| g.decl.kind == crate::team::GateType::Environment)
             .filter_map(|(name, g)| g.machine.as_ref().map(|m| (name, m)))
-            .filter(|(name, m)| !is_confirmed(&done, m.confirm, name, head))
+            .filter(|(_, m)| m.confirm != Confirm::Never)
+            .collect();
+        if gates.is_empty() {
+            return Ok(None);
+        }
+        let ask: Vec<(String, bool)> = gates
+            .iter()
+            .map(|(name, m)| (name.to_string(), m.confirm == Confirm::Always))
+            .collect();
+        let (i, digest, h) = (self.id.clone(), t.config_sha256.clone(), head.to_string());
+        // (confirmed, a yes exists under another configuration) per gate
+        let state: Vec<(bool, bool)> = self.store.call(move |tx| {
+            ask.iter()
+                .map(|(gate, always)| {
+                    Ok((
+                        store::deploy_confirmed(
+                            tx,
+                            &i,
+                            gate,
+                            &digest,
+                            always.then_some(h.as_str()),
+                        )?,
+                        store::deploy_confirmed_under_another_config(tx, &i, gate, &digest)?,
+                    ))
+                })
+                .collect()
+        })?;
+        let asked: Vec<(&str, &crate::config::EnvGate, bool)> = gates
+            .into_iter()
+            .zip(state)
+            .filter(|(_, (confirmed, _))| !confirmed)
+            .map(|((name, m), (_, changed))| (name, m, changed))
             .collect();
         if asked.is_empty() {
             return Ok(None);
         }
-        set_pending(
-            &t.run_store,
-            asked
-                .iter()
-                .map(|(name, _)| Asked {
-                    gate: name.to_string(),
-                    commit: head.to_string(),
-                })
-                .collect(),
-        )?;
+        let asks: Vec<store::DeployAsk> = asked
+            .iter()
+            .map(|(name, m, _)| store::DeployAsk {
+                gate: name.to_string(),
+                commit: head.to_string(),
+                mode: m.confirm.as_str().to_string(),
+            })
+            .collect();
+        let (i, digest) = (self.id.clone(), t.config_sha256.clone());
+        self.store
+            .call(move |tx| store::ask_deploys(tx, &i, &digest, &asks))?;
         let wt = Worktree::new(&self.g, &t.worktree);
         let stat = self
             .g
@@ -1841,15 +1875,20 @@ impl<'a> Engine<'a> {
             super::gates::ENV_CONFIRM,
             short(head)
         );
-        for (name, m) in &asked {
+        for (name, m, changed) in &asked {
             let argv: Vec<&str> = std::iter::once(m.program.as_str())
                 .chain(m.args.iter().map(String::as_str))
                 .collect();
             s.push_str(&format!(
-                "  gate `{name}` (lock {}, confirm: {}) runs: {}\n",
+                "  gate `{name}` (lock {}, confirm: {}) runs: {}{}\n",
                 super::lock::lock_key(&m.lock),
                 m.confirm.as_str(),
-                argv.join(" ")
+                argv.join(" "),
+                if *changed {
+                    " — asked again: the task's configuration changed since your last yes (`task config --reload`)"
+                } else {
+                    ""
+                }
             ));
         }
         s.push_str(&format!(

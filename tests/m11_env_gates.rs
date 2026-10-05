@@ -2586,3 +2586,140 @@ fn m12_16_the_gate_log_is_redacted() {
     // the check gate has its log too
     assert!(vr["commands"][0]["log"].as_str().is_some(), "{vr}");
 }
+
+// ── M13-05 (X26): the deploy confirmation is a database row ───────────────────────────────
+
+/// AC-1: a `confirmations.json` in the run store that names the gate as confirmed — what any
+/// process that can write the run store could leave there — confirms nothing. (Was: with
+/// `confirm: first` only the gate name was compared, and the deploy ran unasked.)
+#[test]
+fn m13_05_a_confirmation_file_in_the_run_store_confirms_nothing() {
+    let (env, marker, probe) = confirm_fixture("first");
+    create(&env, "CD-1");
+    let forged = task(&env, "CD-1").run_store.join("confirmations.json");
+    std::fs::write(
+        &forged,
+        r#"{"confirmed":[{"gate":"dbsync","commit":"x"}],"pending":[{"gate":"dbsync","commit":"x"}]}"#,
+    )
+    .unwrap();
+    let s = script(
+        &env,
+        "cd1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "CD-1", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "CD-1");
+    assert!(!marker.exists(), "deployed without the owner's yes: {err}");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_confirm"),
+        "{err}"
+    );
+    assert!(!probe.exists(), "no gate ran");
+    // the yes is a row: the resume confirms, and the file is still not what decides
+    let s2 = script(
+        &env,
+        "cd1b.json",
+        json!({ "reviewer": [turn(vec![approved()])] }),
+    );
+    let (_, err) = toryo(&env, &["resume", "CD-1", "--fake-agents", &s2], &[]);
+    assert!(err.contains("deploy confirmed (dbsync @ "), "{err}");
+    assert_eq!(task(&env, "CD-1").state, St::WaitingFinalApproval, "{err}");
+    assert!(marker.exists());
+}
+
+/// Send the task at its final gate into another fix cycle whose implementer writes `file`,
+/// and drive it until it waits again.
+fn another_checkpoint(env: &Env, id: &str, file: &str) -> String {
+    let (code, err) = toryo(
+        env,
+        &["reject", id, "--gate", "final", "--reason", "one more"],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let s = script(
+        env,
+        &format!("{id}-{}.json", file.replace('/', "-")),
+        json!({
+            "implementer": [turn(vec![write(file, "more\n"), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(env, &["run", id, "--fake-agents", &s], &[]);
+    err
+}
+
+/// AC-2: the yes is bound to the task's frozen configuration. `task config --reload` with
+/// nothing changed keeps it; a reload that changes the gate's command makes the next Verify
+/// ask again, and the reason says why. (Was: keyed by the gate's name — the yes given for the
+/// printed command was good for any later one.)
+#[test]
+fn m13_05_a_reload_that_changes_the_configuration_asks_again() {
+    let (env, _marker, _probe) = confirm_fixture("first");
+    create(&env, "CD-2");
+    let s = script(
+        &env,
+        "cd2.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "CD-2", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "CD-2").state, St::Escalated, "{err}");
+    let s2 = script(
+        &env,
+        "cd2b.json",
+        json!({ "reviewer": [turn(vec![approved()])] }),
+    );
+    let (_, err) = toryo(&env, &["resume", "CD-2", "--fake-agents", &s2], &[]);
+    assert_eq!(task(&env, "CD-2").state, St::WaitingFinalApproval, "{err}");
+    assert_eq!(confirm_stops(&env, "CD-2"), 1);
+    // a reload that changes nothing: the next checkpoint is deployed without a question
+    let (code, err) = toryo(&env, &["task", "config", "CD-2", "--reload"], &[]);
+    assert_eq!(code, 0, "{err}");
+    let err = another_checkpoint(&env, "CD-2", "src/Notes.txt");
+    assert_eq!(task(&env, "CD-2").state, St::WaitingFinalApproval, "{err}");
+    assert_eq!(confirm_stops(&env, "CD-2"), 1, "{err}");
+    // the gate's command changes: one more argument
+    let m = std::fs::read_to_string(&env.machine).unwrap();
+    assert!(m.contains("']\n    lock: d365-env\n"), "{m}");
+    std::fs::write(
+        &env.machine,
+        m.replace(
+            "']\n    lock: d365-env\n",
+            "', again]\n    lock: d365-env\n",
+        ),
+    )
+    .unwrap();
+    let digest = task(&env, "CD-2").config_sha256;
+    let (code, err) = toryo(&env, &["task", "config", "CD-2", "--reload"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_ne!(task(&env, "CD-2").config_sha256, digest, "{err}");
+    let err = if task(&env, "CD-2").state == St::WaitingFinalApproval {
+        another_checkpoint(&env, "CD-2", "src/More.txt")
+    } else {
+        // the reload withdrew the final gate: the checkpoint is verified again
+        toryo(&env, &["run", "CD-2", "--fake-agents", &s2], &[]).1
+    };
+    let t = task(&env, "CD-2");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("environment_gate_confirm"),
+        "{err}"
+    );
+    let why = t.machine.reason().unwrap_or_default().to_string();
+    assert!(
+        why.contains("asked again: the task's configuration changed since your last yes")
+            && why.contains("again"),
+        "{why}"
+    );
+    assert_eq!(confirm_stops(&env, "CD-2"), 2);
+}
