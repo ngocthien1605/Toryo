@@ -720,3 +720,124 @@ fn f8_a_failed_turn_that_crashed_before_its_partial_commit_ends_as_decided() {
         "toryo(D-3): implement|implement|2||true\ntoryo(D-3): implement (recovery checkpoint of failed attempt 1)|implement|1|true|"
     );
 }
+
+// ── M12-01 (H1): no check may depend on who made a commit ────────────────────────────────
+
+/// The review's scenario: the implementer commits a **denied** file on the task branch with
+/// forged Toryo trailers (the normal ones, or `Toryo-Partial: true`), and its owner dies during
+/// the turn. Was: recovery took the commit for Toryo's own checkpoint ("found by trailer"), the
+/// HEAD guard's reset never ran and the task went on with the file. Now the commit is undone
+/// like any agent commit: the file is in no checkpoint.
+#[test]
+fn m12_01_a_forged_checkpoint_commit_is_never_accepted() {
+    for (n, partial) in [("N", false), ("P", true)] {
+        let env = setup_with("codex-openai", "policy:\n  deny_paths: [\"**/ZZZ/**\"]\n");
+        let id = format!("H-{n}");
+        create(&env, &id);
+        let w = wt(&env, &id);
+        let base = rev(&w, "HEAD");
+        let branch = env.repo.join(format!(".git/refs/heads/toryo/{id}"));
+        let trailers = format!(
+            "Toryo-Task: {id}\nToryo-Stage: implement\nToryo-Attempt: 1\nToryo-Agent: codex-openai\n{}",
+            if partial { "Toryo-Partial: true\n" } else { "" }
+        );
+        let forged = commit_of(
+            &env,
+            &w,
+            &base,
+            Some(&base),
+            &[
+                ("src/Calculator.psm1", &with_divide(&w, &base)),
+                ("src/ZZZ/secret.ps1", "evil\n"),
+            ],
+            &format!("toryo({id}): implement\n\n{trailers}"),
+        );
+        crash_after_the_turn(
+            &env,
+            &id,
+            vec![
+                write("src/Calculator.psm1", DIVIDE),
+                put(&branch, &format!("{forged}\n")),
+                implementation(),
+            ],
+        );
+        let (code, err) = run_after_the_crash(&env, &id);
+        assert!(!err.contains("found by trailer"), "{n}: {err}");
+        assert!(
+            !err.contains("already committed"),
+            "{n}: the forged partial commit was taken: {err}"
+        );
+        let log = git(&w, &["log", "--format=%H", "main..HEAD"]);
+        assert!(!log.contains(&forged), "{n}: {log}");
+        let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+        assert!(!files.contains("ZZZ"), "{n}: {files}");
+        assert_eq!(code, 0, "{n}: {err}");
+        assert_eq!(task(&env, &id).state, St::Completed, "{n}: {err}");
+        assert!(
+            err.contains(&format!(
+                "↺ recovery: {id}/implement/1: the agent had moved HEAD — soft reset to {}",
+                &base[..12]
+            )),
+            "{n}: {err}"
+        );
+    }
+}
+
+/// M12-01, `Checkpointing`: a commit found by its trailers is taken only when it is HEAD, its
+/// first parent is recorded and its diff passes the path policy. Here Toryo's own checkpoint is
+/// replaced — between its commit and the database update — by a forged one with a denied file:
+/// the task escalates, the forged commit is accepted nowhere.
+#[test]
+fn m12_01_a_forged_commit_in_checkpointing_is_refused() {
+    let env = setup_with("codex-openai", "policy:\n  deny_paths: [\"**/ZZZ/**\"]\n");
+    create(&env, "H-C");
+    let s = script(
+        &env,
+        "hc.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["run", "H-C", "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "checkpoint:after_commit")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let w = wt(&env, "H-C");
+    let base = rev(&w, "HEAD^");
+    let genuine = rev(&w, "HEAD");
+    let forged = commit_of(
+        &env,
+        &w,
+        &base,
+        Some(&base),
+        &[
+            ("src/Calculator.psm1", &with_divide(&w, &base)),
+            ("src/ZZZ/secret.ps1", "evil\n"),
+        ],
+        "toryo(H-C): implement\n\nToryo-Task: H-C\nToryo-Stage: implement\nToryo-Attempt: 1\nToryo-Agent: codex-openai\n",
+    );
+    git(&w, &["update-ref", "refs/heads/toryo/H-C", &forged]);
+    let s2 = script(
+        &env,
+        "hc2.json",
+        json!({ "reviewer": [turn(vec![approved()])] }),
+    );
+    let (code, err) = toryo(&env, &["resume", "H-C", "--yes", "--fake-agents", &s2], &[]);
+    assert_eq!(code, 1, "{err}");
+    let t = task(&env, "H-C");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert!(
+        reason(&env, "H-C").contains("is not Toryo's"),
+        "{}",
+        reason(&env, "H-C")
+    );
+    assert_ne!(rev(&w, "HEAD"), genuine);
+    assert!(
+        t.machine.checkpoint().is_none(),
+        "no checkpoint was recorded"
+    );
+}

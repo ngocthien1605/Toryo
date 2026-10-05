@@ -1331,11 +1331,28 @@ impl<'a> Engine<'a> {
             &stage,
             a.attempt,
         )? {
-            Some(c) if !c.partial => (
-                c.sha,
-                if c.no_change { "no_change" } else { "normal" },
-                true,
-            ),
+            Some(c) if !c.partial => {
+                // M12-01 (H1): a commit found by its trailers is taken only when it is HEAD,
+                // its first parent is a commit Toryo recorded for this task, and its diff
+                // passes the same path policy a fresh commit gets — who made it is never asked
+                let i = t.id.clone();
+                let atts = self.store.call(move |tx| store::attempts(tx, &i))?;
+                let why = if wt.head()? != c.sha {
+                    Some("it is not HEAD".to_string())
+                } else {
+                    super::recovery::foreign_commit(&wt, &self.protect, &atts, &a, &c.sha)?
+                };
+                if let Some(why) = why {
+                    let reason = format!("policy_violation: commit {} carries the trailers of this checkpoint but is not Toryo's ({why}); nothing was accepted", short(&c.sha));
+                    self.escalate("policy_violation", reason)?;
+                    return Ok(Flow::Next);
+                }
+                (
+                    c.sha,
+                    if c.no_change { "no_change" } else { "normal" },
+                    true,
+                )
+            }
             _ => {
                 // §8: deny paths are checked again right before the commit
                 let denied: Vec<String> = wt

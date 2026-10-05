@@ -28,6 +28,49 @@ use crate::git::GitCmd;
 /// `recovery_policy_violation` prefix of the escalation reason (§11).
 pub const POLICY_VIOLATION: &str = "recovery_policy_violation";
 
+/// M12-01 (H1): why `commit`, which carries Toryo's trailers, is **not** a commit Toryo made for
+/// this task — `None` when it may be taken. No check here asks who made it; two things must hold:
+/// its first parent is a commit Toryo recorded (this attempt's `git_head_before`, or the
+/// checkpoint or partial commit of an attempt of the task), and its diff against that parent
+/// passes the path policy (protected, denied, fence) — the same test a fresh commit gets. The
+/// diff is the defence; the parent only keeps strangers out early.
+pub(super) fn foreign_commit(
+    wt: &Worktree,
+    protect: &Protected,
+    atts: &[AttemptRow],
+    a: &AttemptRow,
+    commit: &str,
+) -> Result<Option<String>> {
+    let Some(parent) = wt.first_parent(commit)? else {
+        return Ok(Some("it has no parent".into()));
+    };
+    let recorded = a.git_head_before.as_deref() == Some(parent.as_str())
+        || atts.iter().any(|x| {
+            [x.git_head_after.as_deref(), x.partial_commit.as_deref()]
+                .contains(&Some(parent.as_str()))
+        });
+    if !recorded {
+        return Ok(Some(format!(
+            "its parent {} is no commit Toryo recorded for this task",
+            short(&parent)
+        )));
+    }
+    let bad: Vec<String> = wt
+        .changed_between(&parent, commit)?
+        .into_iter()
+        .map(|c| c.1)
+        .filter(|p| protect.violates(p))
+        .collect();
+    if bad.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "it changes {} — which the path policy forbids",
+            protect.violation_words(&bad)
+        )))
+    }
+}
+
 pub struct Recovery<'a> {
     pub store: &'a Store,
     pub g: &'a GitCmd,
@@ -292,48 +335,50 @@ impl<'a> Recovery<'a> {
             return self.git_violation(a, kind, reason, notes);
         }
         let failed = FailedTurn::recorded(self.store, &t.id, &a.id)?;
-        // i. trailer search: the crash may have come after the commit, before the DB update
-        if let Some(c) = wt.find_checkpoint(&t.base_commit, &t.id, &a.stage, a.attempt)? {
+        // i. trailer search: the crash may have come after the commit, before the DB update.
+        // M12-01 (H1): no check may depend on who made a commit. Toryo makes a normal
+        // checkpoint only in `Checkpointing`, after this attempt has ended — while it is still
+        // running a normal trailer match is an agent's and is undone below like any agent
+        // commit; a partial one is Toryo's only when its first parent is a commit Toryo recorded
+        // and its diff passes the path policy.
+        let found = match wt.find_checkpoint(&t.base_commit, &t.id, &a.stage, a.attempt)? {
+            Some(c) if c.partial => {
+                let i = t.id.clone();
+                let atts = self.store.call(move |tx| store::attempts(tx, &i))?;
+                match foreign_commit(wt, self.protect, &atts, a, &c.sha)? {
+                    None => Some(c),
+                    Some(why) => {
+                        notes.push(format!(
+                            "{}: commit {} with Toryo-Partial trailers is not Toryo's ({why}) — undone",
+                            a.id,
+                            short(&c.sha)
+                        ));
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Some(c) = found {
             if let (true, Some(f)) = (c.partial, &failed) {
                 // the failed turn's work was committed, the attempt not yet ended (F8)
                 return self.failed_turn(a, f, &c.sha, None, notes);
             }
-            if c.partial {
-                self.finish(
-                    a,
-                    AttemptStatus::Interrupted,
-                    AttemptEnd {
-                        partial_commit: Some(c.sha.clone()),
-                        ..Default::default()
-                    },
-                    None,
-                    Some(recovery_note(a, Some(&c.sha))),
-                )?;
-                notes.push(format!(
-                    "{}: partial checkpoint {} already committed",
-                    a.id,
-                    short(&c.sha)
-                ));
-            } else {
-                self.finish(
-                    a,
-                    AttemptStatus::Succeeded,
-                    AttemptEnd {
-                        head_after: Some(c.sha.clone()),
-                        checkpoint_kind: Some(
-                            if c.no_change { "no_change" } else { "normal" }.into(),
-                        ),
-                        ..Default::default()
-                    },
-                    Some(Ev::ImplementationDone),
-                    None,
-                )?;
-                notes.push(format!(
-                    "{}: checkpoint {} found by trailer — succeeded",
-                    a.id,
-                    short(&c.sha)
-                ));
-            }
+            self.finish(
+                a,
+                AttemptStatus::Interrupted,
+                AttemptEnd {
+                    partial_commit: Some(c.sha.clone()),
+                    ..Default::default()
+                },
+                None,
+                Some(recovery_note(a, Some(&c.sha))),
+            )?;
+            notes.push(format!(
+                "{}: partial checkpoint {} already committed",
+                a.id,
+                short(&c.sha)
+            ));
             return Ok(());
         }
         // HEAD guard: an agent commit on the task branch is undone (its changes stay in the

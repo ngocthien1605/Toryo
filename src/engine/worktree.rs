@@ -42,6 +42,18 @@ impl<'a> Worktree<'a> {
         self.g.run_str(&self.loc, true, &["rev-parse", "HEAD"])
     }
 
+    /// The first parent of `commit` (M12-01), or `None` for a root commit.
+    pub fn first_parent(&self, commit: &str) -> Result<Option<String>> {
+        let o = self.g.output(
+            &self.loc,
+            true,
+            &["rev-parse", "--verify", "--quiet", &format!("{commit}^")],
+        )?;
+        Ok(o.status
+            .success()
+            .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string()))
+    }
+
     /// Every changed path (tracked and untracked, not ignored): `(status, path)`. Rename
     /// detection is off (`--no-renames`), so a rename is the deletion of its source plus the
     /// addition of its destination: both paths reach the path policy with their own status,
