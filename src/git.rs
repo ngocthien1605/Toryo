@@ -95,6 +95,11 @@ impl GitCmd {
         c("diff.mnemonicPrefix", "false");
         c("diff.relative", "false");
         c("core.quotePath", "false");
+        // M12-13: a D365FO metadata path plus the worktree or the verify root passes 260
+        // characters; without this Git refuses ("Filename too long") on every checkout
+        if cfg!(windows) {
+            c("core.longpaths", "true");
+        }
         for (name, t) in &self.filters.drivers {
             let (p, cl, sm, req) = match t {
                 Some(t) => (

@@ -379,6 +379,7 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
         ),
     }
     verify_root_check(&mut r, cfg);
+    path_length_check(&mut r, cfg);
     r.0.extend(origin_checks(cfg));
     r.0.extend(policy_checks(cfg));
     // M12-08 (X20): keys that are accepted and do nothing
@@ -614,6 +615,38 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
         ),
     }
     finish(r, json)
+}
+
+/// Above this many characters a root leaves too little of the 260 a Windows tool allows for the
+/// repository's own paths (D365FO metadata paths reach 200).
+const LONG_ROOT: usize = 70;
+
+/// M12-13: the lengths of `worktrees_root` and `verify_root` — every file of a task lives
+/// under `<worktrees_root>\<task id>\` and its verify checkout under `<verify_root>\…`, which
+/// adds about 60 characters. Toryo's own Git calls allow long paths on Windows; the build tools
+/// and the agents' tools may not.
+fn path_length_check(r: &mut Report, cfg: &Effective) {
+    let area = "paths";
+    let (Ok(wt), Ok(vr)) = (
+        expand_vars(&cfg.repo.project.worktrees_root),
+        expand_vars(crate::engine::verify::verify_root_setting(cfg)),
+    ) else {
+        return;
+    };
+    let (w, v) = (wt.chars().count(), vr.chars().count());
+    let long = w.max(v) > LONG_ROOT;
+    r.add(
+        if long && cfg!(windows) { Level::Warn } else { Level::Info },
+        area,
+        format!(
+            "worktrees_root is {w} characters ({wt}), verify_root is {v} ({vr}); every file of a task sits under them and Windows tools stop at 260 characters — {}",
+            if long {
+                r"keep them short (for example D:\w and D:\v): a root of more than 70 characters leaves too little room for D365FO metadata paths"
+            } else {
+                "short enough"
+            }
+        ),
+    );
 }
 
 /// R36 precondition (M0 finding F7): the Low-IL verify boundary needs a `verify_root`

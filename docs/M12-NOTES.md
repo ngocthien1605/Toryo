@@ -20,7 +20,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] M12-10 Text files: BOM ignored, non-UTF-8 refused by name (X22)
 - [x] M12-11 Acceptance criteria are never dropped silently
 - [x] M12-12 Three CLI traps
-- [ ] M12-13 Long paths on Windows
+- [x] M12-13 Long paths on Windows
 - [ ] M12-14 An agent CLI that dies without a result shows its error text
 - [ ] M12-15 Gate output: OEM code page; one UI language for every gate (X23)
 - [ ] M12-16 Gate output for the owner: full log, heartbeat, bounded memory
@@ -326,6 +326,28 @@ No Critical or High; three Medium, fixed here.
   `m12_12_cleanup_of_a_clean_escalated_task_needs_no_force`, `m12_12_resume_without_an_id` (the failing task is one whose
   worktree was deleted), `m12_12_a_task_id_is_never_a_path` (`../victim-x`, `a/b`, `..`, `a..b`, `_x`, `x y`; no lock file
   outside `locks/`).
+
+
+### M12-13 — Long paths on Windows (read → reproduced here)
+
+- **Reproduced first** (`tests/m12_paths.rs::m12_13_a_path_over_260_characters_goes_through_create_and_verify`, run
+  before the fix) on this machine (Git for Windows 2.55, `core.longpaths` unset, a fixture repository whose commit —
+  made with `-c core.longpaths=true` — holds `deep-folder-of-thirty-chars-00/…-08/Model.xml`, 9 × 31 characters):
+  ```
+  warning: unable to access 'deep-folder-of-thirty-chars-00/…/deep-folder-of-thirty-chars-06/.gitattributes': Filename too long
+  base: main @ f6aceabe21d9
+  error: git worktree add -q -b toryo/L-1 C:/Users/…/wts/L-1 f6aceabe… failed (exit code: 128):
+  fatal: cannot create directory at 'deep-folder-of-thirty-chars-00/…/deep-folder-of-thirty-chars-06': Filename too long
+  ```
+  `task create` exits 2.
+- **Fix:** `GitCmd::prefix` (`src/git.rs`) adds `-c core.longpaths=true` on Windows — for every Git call Toryo makes (the
+  worktree, checkpoints, the export into the verify root). After it the same test goes through `task create` and a whole
+  run to `Completed` (the verify gate runs on a checkout with the long path).
+- **Doctor:** a new `paths` line prints the lengths of `worktrees_root` and `verify_root`; more than 70 characters is a WARN
+  on Windows with the way out ("keep them short, for example D:\w and D:\v"). The build tools and the agents' tools may
+  still stop at 260 — that is outside Toryo's Git. (M12-17 lists this line among its doctor lines: done here.)
+- **Tests:** the reproduction above (now green; it is not Windows-only, a Linux Git has no such limit) and
+  `m12_13_doctor_prints_the_root_lengths`.
 
 
 ## Open
