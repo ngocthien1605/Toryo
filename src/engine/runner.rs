@@ -1335,15 +1335,23 @@ impl<'a> Engine<'a> {
                 // M12-01 (H1): a commit found by its trailers is taken only when it is HEAD,
                 // its first parent is a commit Toryo recorded for this task, and its diff
                 // passes the same path policy a fresh commit gets — who made it is never asked
-                let i = t.id.clone();
-                let atts = self.store.call(move |tx| store::attempts(tx, &i))?;
-                let why = if wt.head()? != c.sha {
-                    Some("it is not HEAD".to_string())
-                } else {
-                    super::recovery::foreign_commit(&wt, &self.protect, &atts, &a, &c.sha)?
-                };
+                let why = super::recovery::foreign_commit(
+                    &wt,
+                    &self.protect,
+                    a.git_head_before.as_deref(),
+                    &c.sha,
+                )?;
                 if let Some(why) = why {
-                    let reason = format!("policy_violation: commit {} carries the trailers of this checkpoint but is not Toryo's ({why}); nothing was accepted", short(&c.sha));
+                    // undone like an agent commit: the changes stay in the tree, HEAD is where
+                    // the attempt began (the next turn's policy checks see them)
+                    let undone = match (&a.git_head_before, wt.head()? == c.sha) {
+                        (Some(before), true) => {
+                            wt.soft_reset(before)?;
+                            format!("; the commit was undone (soft reset to {})", short(before))
+                        }
+                        _ => String::new(),
+                    };
+                    let reason = format!("policy_violation: commit {} carries the trailers of this checkpoint but is not Toryo's ({why}); nothing was accepted{undone}", short(&c.sha));
                     self.escalate("policy_violation", reason)?;
                     return Ok(Flow::Next);
                 }
@@ -2475,8 +2483,42 @@ impl<'a> Engine<'a> {
             )?;
             return Ok(Some(Flow::Next));
         }
-        let after = TreeState::read(&Worktree::new(&self.g, &t.worktree))?;
+        let wt = Worktree::new(&self.g, &t.worktree);
+        let after = TreeState::read(&wt)?;
         if let Some(reason) = read_only_write(before, &after) {
+            // M12-03 review: what the role wrote must not wait in the tree for the next
+            // checkpoint — `git add -A` of a fix cycle would commit it under the implementer's
+            // name. Paths that were clean or absent before the turn are put back (tracked →
+            // HEAD, new → removed); what a human had changed before stays.
+            if before.head == after.head {
+                let written: Vec<String> = after
+                    .changed_since(before)
+                    .into_iter()
+                    .filter(|p| !ide_state(p) && !before.entries.contains_key(p))
+                    .collect();
+                if !written.is_empty() {
+                    // a copy first (best effort): the human may want to see what it wrote
+                    let keep = t
+                        .run_store
+                        .join("read-only-writes")
+                        .join(a.id.replace('/', "-"));
+                    for p in &written {
+                        let from = t.worktree.join(p);
+                        let to = keep.join(p);
+                        if from.is_file() {
+                            if let Some(dir) = to.parent() {
+                                let _ = std::fs::create_dir_all(dir);
+                            }
+                            let _ = std::fs::copy(&from, &to);
+                        }
+                    }
+                    wt.restore(&written)?;
+                    eprintln!(
+                        "   put back (written by the read-only role): {written:?} — a copy is in {}",
+                        keep.display()
+                    );
+                }
+            }
             self.end_and(
                 a,
                 AttemptStatus::Failed,

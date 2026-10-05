@@ -60,6 +60,33 @@ fn m12_03_a_reviewer_that_wrote_and_then_hit_its_quota_is_a_policy_violation() {
         reason(&env, "S-1")
     );
     assert!(in_no_checkpoint(&env, "S-1", "src/Reviewed.txt"));
+    // (review) the write is put back, not left in the tree for the next checkpoint
+    assert!(!wt(&env, "S-1").join("src/Reviewed.txt").exists());
+    // … so after `resume --note` (a fix cycle, a new checkpoint) it is in no checkpoint
+    let s2 = script(
+        &env,
+        "s1b.json",
+        json!({
+            "implementer": [turn(vec![implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "S-1",
+            "--note",
+            "go on",
+            "--yes",
+            "--fake-agents",
+            &s2,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "S-1").state, St::Completed, "{err}");
+    assert!(in_no_checkpoint(&env, "S-1", "src/Reviewed.txt"));
     let a = attempts(&env, "S-1")
         .into_iter()
         .find(|a| a.stage == "review")

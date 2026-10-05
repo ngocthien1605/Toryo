@@ -163,9 +163,12 @@ fn walk(
     };
     for e in rd {
         let e = e.map_err(|x| unreadable(dir, "list", &x))?;
-        let ft = e
-            .file_type()
-            .map_err(|x| unreadable(&e.path(), "read", &x))?;
+        let ft = match e.file_type() {
+            Ok(ft) => ft,
+            // gone between the listing and now: nothing to protect
+            Err(x) if x.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(x) => return Err(unreadable(&e.path(), "read", &x)),
+        };
         let p = e.path();
         let rel = p
             .strip_prefix(root)
@@ -194,7 +197,7 @@ fn walk(
 /// (never followed); a FIFO, socket or device is recorded without being opened — reading
 /// one could block forever.
 fn hash_file(p: &Path) -> Result<(u64, String, Option<String>)> {
-    let md = std::fs::symlink_metadata(p)?;
+    let md = std::fs::symlink_metadata(p).map_err(|e| unreadable(p, "read", &e))?;
     if md.file_type().is_symlink() {
         let t = std::fs::read_link(p)
             .map(|t| t.display().to_string())
@@ -238,7 +241,14 @@ pub fn scan(g: &GitCmd, wt: &Path, protect: &Protected) -> Result<Scan> {
         );
     }
     for (k, p) in git_meta(g, wt)? {
-        if p.is_file() {
+        // (M12-02 review) `is_file()` is false on any error: a Git folder that cannot be
+        // listed would hide its `info/exclude`. Only "not there" (or not a file) is quiet.
+        let is_file = match std::fs::metadata(&p) {
+            Ok(m) => m.is_file(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(unreadable(&p, "read", &e)),
+        };
+        if is_file {
             let (size, sha256, link) = hash_file(&p)?;
             entries.insert(
                 k,
@@ -529,6 +539,18 @@ impl Check {
 
 /// The `Escalated` reason for a list of changes (§11 `protected_config_changed`).
 pub fn escalation_reason(task: &str, bad: &[&Change], diff: Option<&Path>) -> String {
+    // M12-02: a path the scan could not read is no change to restore or accept — the rights on
+    // it (or the folder itself) are the problem
+    if bad.iter().any(|x| x.kind.starts_with("cannot ")) {
+        let list: Vec<String> = bad
+            .iter()
+            .map(|x| format!("{} {}", x.kind, x.path))
+            .collect();
+        return format!(
+            "{REASON}: {} — fix the permissions on it (or remove the folder from the worktree), then `toryo resume {task}`",
+            list.join(", ")
+        );
+    }
     let list: Vec<String> = bad
         .iter()
         .map(|x| {

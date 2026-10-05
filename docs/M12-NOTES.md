@@ -94,6 +94,39 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
   profile has `secret_env`, a silent command longer than the stall limit: **Unix-only, never run here**; compiled on
   Windows once by switching its `cfg(unix)` off for one `cargo check` (only the `std::os::unix` lines failed).
 
+### Review of M12-01…04 (independent subagent, in place, no build) — follow-up commit
+
+One High, four Medium, four Low; the High and the Mediums fixed here.
+- **High (M12-01):** a forged *partial* commit under a further agent commit was accepted (it passed `foreign_commit`
+  without being HEAD; recovery then stopped before the HEAD guard and the second commit's denied file reached the
+  next attempt). `foreign_commit` now also requires **the commit to be HEAD**, and its first parent to be **the
+  commit the attempt began at** (`git_head_before`) — every genuine checkpoint or partial commit of an attempt sits
+  right on it; the "any recorded sha" parent test is gone (a forger could reset soft to an older recorded sha).
+  `checkpoint()` calls the same function and, when it refuses, soft-resets to `git_head_before` (the commit is
+  undone, its changes stay in the tree) before it escalates. Test: `m12_01_a_forged_partial_commit_under_another_
+  commit_is_not_taken`.
+- **Medium (M12-03):** the write was only reported, it stayed in the tree and the next checkpoint (`git add -A` of a
+  fix cycle) committed it. `read_only_checks` now puts back what the role wrote (paths that were clean or absent
+  before the turn: tracked → HEAD, new → removed; what a human had changed before the turn stays) when HEAD did not
+  move. The quota test now goes on with `resume --note` and asserts the file is in no checkpoint (the acceptance
+  wording "after resume"). A copy of what it wrote is kept first (`<run store>/read-only-writes/<attempt>/<path>`).
+  **Earlier assertion changed:** `regress_engine::ec31_a_reviewer_write_is_a_policy_violation` ended with "left in
+  place for the human, uncommitted"; it now says the file is put back (not in `git status`) and the copy is in the
+  run store — the earlier decision was exactly the hole (the next fix cycle's checkpoint committed it). The reason
+  text is unchanged (the other EC-31 tests assert it).
+- **Medium (M12-02):** the printed way out (`--accept-protected-change <path>`) cannot work for a path that cannot be
+  read; the reason now says "fix the permissions on it (or remove the folder from the worktree), then `toryo resume`".
+  The walk descends into every folder of the worktree, not only protected ones, so any unlistable folder (a
+  root-owned Docker data folder) escalates — by design of "fails closed"; recorded in Open. `git_meta` entries and
+  `hash_file` no longer fail open or abort the run with a plain error; a file that vanishes between the listing and
+  the stat is ignored.
+- **Low (M12-04):** a secret with only a **trailing** line break (read from a file) no longer keeps the old
+  hold-back (`multiline` ignores trailing `\n`).
+- **Not changed (recorded in Open):** AC-2 of M12-01 is tested with `deny_paths`, not a role's `writes` / `never`
+  fence (same `Protected::violates`); the Unix AC-3 test sets a process-wide variable (unique name); an error from
+  `hub.turn_with` skips the read-only checks as before; after a stop that came with a write, the loop prints "stopped
+  at a stage boundary" although the task escalated.
+
 ## Open
 
 (filled as the work goes)

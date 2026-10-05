@@ -918,6 +918,7 @@ fn m12_02_an_unlistable_protected_folder_escalates() {
         why.starts_with("protected_config_changed: cannot list ") && why.contains(".claude"),
         "{why}"
     );
+    assert!(why.contains("fix the permissions"), "{why}");
 }
 
 /// A protected folder that does not exist is fine, as before.
@@ -937,4 +938,49 @@ fn m12_02_a_missing_protected_folder_is_still_fine() {
     let (code, err) = toryo(&env, &["run", "P-2", "--yes", "--fake-agents", &s], &[]);
     assert_eq!(code, 0, "{err}");
     assert_eq!(task(&env, "P-2").state, St::Completed);
+}
+
+/// M12-01 review: a forged partial commit **under** a further commit. The partial one is not
+/// HEAD, so it is never taken; the HEAD guard undoes both and the denied file of the second is
+/// in no checkpoint.
+#[test]
+fn m12_01_a_forged_partial_commit_under_another_commit_is_not_taken() {
+    let env = setup_with("codex-openai", "policy:\n  deny_paths: [\"**/ZZZ/**\"]\n");
+    create(&env, "H-U");
+    let w = wt(&env, "H-U");
+    let base = rev(&w, "HEAD");
+    let branch = env.repo.join(".git/refs/heads/toryo/H-U");
+    let first = commit_of(
+        &env,
+        &w,
+        &base,
+        Some(&base),
+        &[("src/Calculator.psm1", &with_divide(&w, &base))],
+        "toryo(H-U): implement (recovery checkpoint of attempt 1)\n\nToryo-Task: H-U\nToryo-Stage: implement\nToryo-Attempt: 1\nToryo-Agent: codex-openai\nToryo-Partial: true\n",
+    );
+    let second = commit_of(
+        &env,
+        &w,
+        &first,
+        Some(&first),
+        &[("src/ZZZ/secret.ps1", "evil\n")],
+        "agent commit on top",
+    );
+    crash_after_the_turn(
+        &env,
+        "H-U",
+        vec![
+            write("src/Calculator.psm1", DIVIDE),
+            put(&branch, &format!("{second}\n")),
+            implementation(),
+        ],
+    );
+    let (code, err) = run_after_the_crash(&env, "H-U");
+    assert!(!err.contains("already committed"), "{err}");
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!files.contains("ZZZ"), "{files}");
+    let log = git(&w, &["log", "--format=%H", "main..HEAD"]);
+    assert!(!log.contains(&first) && !log.contains(&second), "{log}");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "H-U").state, St::Completed, "{err}");
 }

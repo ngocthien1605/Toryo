@@ -86,7 +86,11 @@ impl Redactions {
             };
         }
         let max_len = patterns.iter().map(|p| p.len()).max().unwrap_or(0);
-        let multiline = patterns.iter().any(|p| p.contains(&b'\n'));
+        // a trailing line break (a secret read from a file) ends a line, it does not span lines
+        let multiline = patterns.iter().any(|p| {
+            let end = p.iter().rposition(|b| *b != b'\n').map_or(0, |i| i + 1);
+            p[..end].contains(&b'\n')
+        });
         let ac = AhoCorasickBuilder::new()
             .match_kind(MatchKind::Standard) // overlapping search; spans are unioned below
             .build(&patterns)
@@ -456,6 +460,21 @@ mod tests {
             let out = run_chunks(&r, &[&sample[..cut], &sample[cut..]]);
             assert_clean(&out);
         }
+    }
+
+    /// M12-04 review: a trailing line break (a secret read from a file) ends a line, it does
+    /// not span lines — the stream is still released at a line end.
+    #[test]
+    fn a_trailing_newline_in_a_secret_does_not_hold_the_stream() {
+        let r = Redactions::new(&[sec("FILE", "file-secret-value\n")]);
+        let mut s = StreamRedactor::new(r);
+        let out = s.push(b"{\"type\":\"command_started\"}\n");
+        assert_eq!(s.retained(), 0, "{out:?}");
+        let out = run_chunks(
+            &Redactions::new(&[sec("FILE", "file-secret-value\n")]),
+            &[b"x file-secret-va", b"lue\ny\n"],
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), "x [REDACTED:FILE]y\n");
     }
 
     /// M12-04: a secret that contains a line break can span lines, so the stream is not

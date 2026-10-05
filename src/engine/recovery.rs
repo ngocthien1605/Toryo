@@ -29,30 +29,29 @@ use crate::git::GitCmd;
 pub const POLICY_VIOLATION: &str = "recovery_policy_violation";
 
 /// M12-01 (H1): why `commit`, which carries Toryo's trailers, is **not** a commit Toryo made for
-/// this task — `None` when it may be taken. No check here asks who made it; two things must hold:
-/// its first parent is a commit Toryo recorded (this attempt's `git_head_before`, or the
-/// checkpoint or partial commit of an attempt of the task), and its diff against that parent
-/// passes the path policy (protected, denied, fence) — the same test a fresh commit gets. The
-/// diff is the defence; the parent only keeps strangers out early.
+/// this task — `None` when it may be taken. No check here asks who made it; three things must
+/// hold: it is `HEAD` (a commit under further commits is never taken), its first parent is the
+/// commit the attempt began at (`head_before`: what Toryo recorded — every genuine checkpoint
+/// and partial commit of an attempt sits right on it), and its diff against that parent passes
+/// the path policy (protected, denied, fence) — the same test a fresh commit gets. The diff is
+/// the defence; the other two only keep strangers out early.
 pub(super) fn foreign_commit(
     wt: &Worktree,
     protect: &Protected,
-    atts: &[AttemptRow],
-    a: &AttemptRow,
+    head_before: Option<&str>,
     commit: &str,
 ) -> Result<Option<String>> {
+    if wt.head()? != commit {
+        return Ok(Some("it is not HEAD".into()));
+    }
     let Some(parent) = wt.first_parent(commit)? else {
         return Ok(Some("it has no parent".into()));
     };
-    let recorded = a.git_head_before.as_deref() == Some(parent.as_str())
-        || atts.iter().any(|x| {
-            [x.git_head_after.as_deref(), x.partial_commit.as_deref()]
-                .contains(&Some(parent.as_str()))
-        });
-    if !recorded {
+    if head_before != Some(parent.as_str()) {
         return Ok(Some(format!(
-            "its parent {} is no commit Toryo recorded for this task",
-            short(&parent)
+            "its parent {} is not the commit the attempt began at ({})",
+            short(&parent),
+            head_before.map(short).unwrap_or("not recorded")
         )));
     }
     let bad: Vec<String> = wt
@@ -343,9 +342,7 @@ impl<'a> Recovery<'a> {
         // and its diff passes the path policy.
         let found = match wt.find_checkpoint(&t.base_commit, &t.id, &a.stage, a.attempt)? {
             Some(c) if c.partial => {
-                let i = t.id.clone();
-                let atts = self.store.call(move |tx| store::attempts(tx, &i))?;
-                match foreign_commit(wt, self.protect, &atts, a, &c.sha)? {
+                match foreign_commit(wt, self.protect, a.git_head_before.as_deref(), &c.sha)? {
                     None => Some(c),
                     Some(why) => {
                         notes.push(format!(
