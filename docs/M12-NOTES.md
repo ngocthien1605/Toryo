@@ -22,7 +22,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] M12-12 Three CLI traps
 - [x] M12-13 Long paths on Windows
 - [x] M12-14 An agent CLI that dies without a result shows its error text
-- [ ] M12-15 Gate output: OEM code page; one UI language for every gate (X23)
+- [x] M12-15 Gate output: OEM code page; one UI language for every gate (X23)
 - [ ] M12-16 Gate output for the owner: full log, heartbeat, bounded memory
 - [ ] M12-17 `doctor` checks what a first run needs
 - [ ] M12-18 The D365FO template loads as shipped; example gate scripts
@@ -364,6 +364,31 @@ No Critical or High; three Medium, fixed here.
   agent CLI — it is an executable on every platform, a `.cmd` fake is refused by Rust's batch-file argument check — and
   rejects the Claude flags: the escalation reason and the console hold `error: unexpected argument …`, no escape
   codes), and the unit test `agents::exec::tests::the_stderr_tail_is_the_last_ten_lines_without_colour_codes`.
+
+
+### M12-15 — Gate output: OEM code page; one UI language for every gate (X23, review M13)
+
+- **`process::decode_output(bytes)`** (`src/process/decode.rs`, new): line by line, a line that is valid UTF-8 stays; any
+  other line is decoded on Windows with `MultiByteToWideChar` and the OEM code page (`GetOEMCP`), elsewhere lossily as
+  before. `decode_output_with(bytes, code_page)` takes the code page (for the tests); a UTF-8 buffer as a whole returns
+  unchanged without a per-line pass. Order at the gate sink: decode → `strip_ansi` → redact (`runner.rs`, final and live
+  chunks).
+- **Used for:** `LocalRunner` output (every check gate, environment gate and `tool: xpp` run, and with it the
+  diagnostics parser and the fix prompt), `evidence::run_version`, `evidence::git_version`, the agent `health` probe
+  (`agents/cli.rs`), `doctor`'s `git --version` and `vswhere` output, and the stderr tail of M12-14. Git's own output
+  (`core.quotePath=false`, UTF-8) is left as it was.
+- **UI language:** `xpp::ENV` (`DOTNET_CLI_UI_LANGUAGE=en-US`, `VSLANG=1033`) now goes to every check gate
+  (`run_verify_commands`: replaces what the process inherited) and every environment gate (replaces the inherited value
+  except a name the gate's own `env:` in the machine config sets — the owner's explicit value wins). The comment in
+  `xpp.rs` is corrected. Children still get a hidden console, so the owner's `chcp 65001` never reached them: this is
+  why the decode exists.
+- **Tests:** `process::decode::tests::cp932_gives_the_text_back` (AC-1, Windows; the test prints "skipped" and checks nothing
+  if code page 932 is not installed — here it is), `the_xpp_parser_finds_the_file_in_a_decoded_cp932_line` (AC-1: the file
+  `ソース/能力表.xml`, 12:5, `XPP0001`), `utf8_and_cp932_lines_mix` (AC-2), `utf8_is_unchanged` (AC-3, every
+  platform; the existing redaction tests pass unchanged), `m11_env_gates::m12_15_every_gate_gets_the_ui_language` (a check
+  gate and an environment gate under an inherited Japanese `VSLANG`).
+- **Not tested end to end:** a gate that really prints cp932 through the pipeline — this machine's OEM code page is not 932,
+  and `decode_output` reads the machine's, so only the inner function is pinned.
 
 
 ## Open

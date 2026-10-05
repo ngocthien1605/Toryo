@@ -2476,3 +2476,66 @@ fn m12_07_first_asks_once_per_task_and_always_once_per_checkpoint() {
         );
     }
 }
+
+/// M12-15 (X23): every check gate and every environment gate gets the UI language of `tool: xpp`
+/// (`DOTNET_CLI_UI_LANGUAGE`, `VSLANG`), replacing what the process inherited — except a name
+/// the environment gate's own `env:` sets. (Was: MSBuild runs only.)
+#[test]
+fn m12_15_every_gate_gets_the_ui_language() {
+    let probe_ps1 = "\"UI=$env:VSLANG/$env:DOTNET_CLI_UI_LANGUAGE\"\nexit 0\n";
+    let probe_sh = "echo \"UI=$VSLANG/$DOTNET_CLI_UI_LANGUAGE\"\nexit 0\n";
+    let (env, _marker) = probe_then_dbsync(probe_ps1, probe_sh);
+    // the environment gate prints the same two values (its script replaced; the owner's `env:`
+    // puts VSLANG to 1042 for it)
+    let gate = env.root.join("gates").join(if cfg!(windows) {
+        "dbsync.ps1"
+    } else {
+        "dbsync.sh"
+    });
+    std::fs::write(&gate, if cfg!(windows) { probe_ps1 } else { probe_sh }).unwrap();
+    let m = std::fs::read_to_string(&env.machine).unwrap();
+    assert!(m.contains("    lock: d365-env\n"), "{m}");
+    std::fs::write(
+        &env.machine,
+        m.replace(
+            "    lock: d365-env\n",
+            "    lock: d365-env\n    env: { VSLANG: '1042' }\n",
+        ),
+    )
+    .unwrap();
+    create(&env, "UI-1");
+    let s = script(
+        &env,
+        "ui1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    // the owner's shell has a Japanese Visual Studio
+    let (_, err) = toryo(
+        &env,
+        &["run", "UI-1", "--yes", "--fake-agents", &s],
+        &[("VSLANG", "1041"), ("DOTNET_CLI_UI_LANGUAGE", "ja-JP")],
+    );
+    assert_eq!(task(&env, "UI-1").state, St::Completed, "{err}");
+    let vr = verify_result(&env, "UI-1");
+    let tail = |n: &str| {
+        vr["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == n)
+            .unwrap_or_else(|| panic!("{n} in {vr}"))["output_tail"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert!(tail("probe").contains("UI=1033/en-US"), "{}", tail("probe"));
+    assert!(
+        tail("dbsync").contains("UI=1042/en-US"),
+        "{}",
+        tail("dbsync")
+    );
+}

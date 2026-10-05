@@ -41,11 +41,28 @@ pub const DEFAULT_TIMEOUT_MIN: u64 = 90;
 /// The error class of a toolchain that cannot be used (a missing MSBuild or package).
 pub const UNAVAILABLE: &str = "xpp_toolchain_unavailable";
 
-/// Added to the verify environment of an MSBuild run: English messages whatever language pack
-/// Visual Studio has — the diagnostics parser and the fixer read them. `DOTNET_CLI_UI_LANGUAGE`
-/// is the variable msbuild.exe documents (17.7+; it also switches the console output to UTF-8,
-/// which toryo decodes); `VSLANG` covers older builds.
+/// Added to the environment of every check gate and environment gate (M12-15, X23; it was an
+/// MSBuild run only): English messages whatever language pack Visual Studio has — the
+/// diagnostics parser and the fixer read them. `DOTNET_CLI_UI_LANGUAGE` is the variable
+/// msbuild.exe documents (17.7+; it also switches the console output to UTF-8); `VSLANG` covers
+/// older builds. A tool that still prints in the OEM code page is decoded as such
+/// (`process::decode_output`).
 pub const ENV: [(&str, &str); 2] = [("DOTNET_CLI_UI_LANGUAGE", "en-US"), ("VSLANG", "1033")];
+
+/// Set [`ENV`] in `env`, replacing a value the process inherited — except a name the owner set
+/// on purpose in `keep` (an environment gate's `env:` in the machine config).
+pub fn set_ui_language(
+    env: &mut std::collections::BTreeMap<String, String>,
+    keep: &std::collections::BTreeMap<String, String>,
+) {
+    for (k, v) in ENV {
+        if keep.keys().any(|e| e.eq_ignore_ascii_case(k)) {
+            continue;
+        }
+        env.retain(|e, _| !e.eq_ignore_ascii_case(k));
+        env.insert(k.to_string(), v.to_string());
+    }
+}
 
 /// What `status`, `task show` and the final gate say about a compile-only verify (R59).
 pub const COMPILE_ONLY: &str = "verify: compile only (X++: no DB sync, no unit tests)";

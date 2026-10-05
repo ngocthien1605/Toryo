@@ -163,7 +163,7 @@ impl CommandRunner for LocalRunner {
                         // M11-R8: colour codes go first, so a secret split by one is found
                         let _ = tx.send(
                             spec.redact
-                                .redact_str(&strip_ansi(&String::from_utf8_lossy(&b))),
+                                .redact_str(&strip_ansi(&crate::process::decode_output(&b))),
                         );
                     }
                     out.extend(b);
@@ -180,9 +180,10 @@ impl CommandRunner for LocalRunner {
                 cancelled: info.cancelled,
                 duration_ms: info.duration_ms,
                 // M11-R8: strip the colour codes, then redact: a secret split by a colour code is found
+                // M12-15 (X23): decode (a cp932 line is not `�`), then colour codes, then redact
                 output: spec
                     .redact
-                    .redact_str(&strip_ansi(&String::from_utf8_lossy(&out))),
+                    .redact_str(&strip_ansi(&crate::process::decode_output(&out))),
                 signal: info.signal,
             })
         })

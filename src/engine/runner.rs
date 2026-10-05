@@ -1863,6 +1863,8 @@ impl<'a> Engine<'a> {
         let mut env = verify::env(co);
         // M11-E1: TORYO_TASK, TORYO_SHA, TORYO_VERIFY_CHECKOUT for every command
         verify::set_gate_vars(&mut env, &self.id, head, co, &co.dir);
+        // M12-15 (X23): English messages from every check gate, not only MSBuild
+        xpp::set_ui_language(&mut env, &BTreeMap::new());
         let t = self.task()?;
         let at = VerifyAt {
             co,
@@ -2061,6 +2063,8 @@ impl<'a> Engine<'a> {
             // CreateProcess honour this; DLL loading does not (documented in the script contract)
             env.insert("NoDefaultCurrentDirectoryInExePath".into(), "1".into());
             verify::set_gate_vars(&mut env, &t.id, head, co, &export.dir);
+            // M12-15 (X23): and from every environment gate, unless its `env:` says otherwise
+            xpp::set_ui_language(&mut env, &m.env);
             let mut redact = super::flight::task_secrets(&self.cfg, t);
             redact.extend(secrets.iter().map(|(k, v)| crate::process::redact::Secret {
                 name: k.clone(),

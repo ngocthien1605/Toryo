@@ -333,7 +333,7 @@ const STDERR_LINES: usize = 10;
 /// The last `n` non-empty lines of `bytes` as text — colour codes stripped, each line cut at
 /// 300 characters; `None` when there is none.
 fn stderr_last_lines(bytes: &[u8], n: usize) -> Option<String> {
-    let text = crate::process::strip_ansi(&String::from_utf8_lossy(bytes));
+    let text = crate::process::strip_ansi(&crate::process::decode_output(bytes));
     let lines: Vec<String> = text
         .lines()
         .map(|l| l.trim_end().chars().take(300).collect::<String>())

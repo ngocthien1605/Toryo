@@ -169,7 +169,7 @@ pub fn run_version(
     if info.timed_out {
         anyhow::bail!("--version timed out");
     }
-    Ok(String::from_utf8_lossy(&out)
+    Ok(crate::process::decode_output(&out)
         .trim()
         .lines()
         .next()
@@ -189,7 +189,7 @@ pub fn git_version() -> Option<String> {
         .arg("--version")
         .output()
         .ok()?;
-    parse_version(&String::from_utf8_lossy(&o.stdout))
+    parse_version(&crate::process::decode_output(&o.stdout))
 }
 
 /// The canary that verifies a profile's isolation (R18 / R44b).

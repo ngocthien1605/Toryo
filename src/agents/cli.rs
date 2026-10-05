@@ -100,7 +100,9 @@ impl AgentAdapter for CliAdapter {
             std::process::Command::new(&exe2).arg("--version").output()
         })
         .await??;
-        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let text = crate::process::decode_output(&out.stdout)
+            .trim()
+            .to_string();
         Ok(AgentHealth {
             exe,
             version: crate::evidence::parse_version(&text),

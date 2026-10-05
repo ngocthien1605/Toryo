@@ -332,7 +332,7 @@ pub fn run(cfg: Option<&Effective>, cfg_err: Option<String>, json: bool) -> Resu
         Ok(o) => r.add(
             Level::Ok,
             "git",
-            String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            crate::process::decode_output(&o.stdout).trim().to_string(),
         ),
         Err(e) => r.add(Level::Fail, "git", format!("{}: {e}", git.display())),
     }
@@ -927,7 +927,7 @@ fn vswhere_msbuild() -> Option<PathBuf> {
         ])
         .output()
         .ok()?;
-    String::from_utf8_lossy(&out.stdout)
+    crate::process::decode_output(&out.stdout)
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())

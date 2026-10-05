@@ -6,6 +6,7 @@
 //! for running the spike on Linux) a process group stands in for the Job: stop
 //! works the same way, crash-cleanup does not (documented, Windows-only).
 
+pub mod decode;
 pub mod env;
 pub mod redact;
 
@@ -22,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 
+pub use decode::decode_output;
 use redact::{Redactions, StreamRedactor};
 
 /// Execution boundary for the spawned tree (R36).
