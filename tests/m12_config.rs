@@ -346,3 +346,42 @@ fn m12_10_a_context_file_that_is_not_utf8_stops_the_turn_by_name() {
     );
     assert_eq!(t.fix_cycle, 0, "a machine stop costs no fix cycle");
 }
+
+// ── M12-11: acceptance criteria are never dropped silently ───────────────────────────────
+
+/// AC-1: a TASK.md with the six lines of the review — the first four are accepted (the dash
+/// forms and the `・` bullet), the last two (a full-width digit, a table row) make
+/// `task create` refuse with their line numbers and the form to use. (Was: `created …: 1
+/// acceptance criteria ["AC-1"]` and five criteria gone.)
+#[test]
+fn m12_11_an_acceptance_line_that_would_be_dropped_is_refused() {
+    let env = setup("codex-openai");
+    let write_task = |name: &str, tail: &str| {
+        let p = env.root.join(name);
+        std::fs::write(
+            &p,
+            format!(
+                "# AC-7 six lines\n\n## Acceptance criteria\n- AC-1: one\n- AC-2 — two\n- AC-3 - three\n・AC-4：four\n{tail}"
+            ),
+        )
+        .unwrap();
+        p.display().to_string()
+    };
+    let ok = write_task("four.md", "");
+    let (code, err) = toryo(&env, &["task", "create", "--file", &ok, "--id", "A-4"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("4 acceptance criteria"), "{err}");
+    let bad = write_task("six.md", "- AC-５: five\n| AC-6 | six |\n");
+    let (code, err) = toryo(
+        &env,
+        &["task", "create", "--file", &bad, "--id", "A-6"],
+        &[],
+    );
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("line 8: `- AC-５: five`")
+            && err.contains("line 9: `| AC-6 | six |`")
+            && err.contains("- AC-1: text"),
+        "{err}"
+    );
+}

@@ -1067,7 +1067,7 @@ CI chạy: `cargo fmt --check`, `clippy -D warnings` (có và không có M0 kit)
 | Triệu chứng | Cách xử lý |
 |---|---|
 | `worktree … already exists` / `branch toryo/<ID> already exists` | Dùng `--id BR-001b`, hoặc chạy 2 lệnh dọn dẹp in ở cuối lần trước |
-| `TASK.md has no AC-<n>: items` | Cần heading `## Acceptance criteria` và dòng `- AC-1: …` (hoặc `1. AC-1: …`). Heading con `###` trong mục này vẫn được; id nằm trong khối code bị bỏ qua. `AC-01` là lỗi — viết `AC-1` |
+| `TASK.md has no AC-<n>: items` | Cần heading `## Acceptance criteria` và dòng `- AC-1: …` (hoặc `1. AC-1: …`). Heading con `###` trong mục này vẫn được; id nằm trong khối code bị bỏ qua. `AC-01` là lỗi — viết `AC-1`. Sau id: `:`, `.`, `)`, `：` hoặc ` — ` / ` – ` / ` - `; bullet `-`, `*`, `+`, `•`, `・`. Dòng bắt đầu bằng `AC` + chữ số mà không đúng dạng (hàng bảng `\| AC-6 \| … \|`, chữ số full-width `AC-５`) bị từ chối kèm số dòng — không còn bị bỏ qua im lặng |
 | Lỗi khi load config: `unknown role …` / `not a valid value (valid: …)` | Sửa `toryo.yaml`: role chỉ gồm `planner`, `implementer`, `reviewer`; giá trị hợp lệ có trong thông báo |
 | `codex.overrides.<key> re-sets …` | Bỏ key đó khỏi `codex.overrides`: Toryo tự đặt sandbox, approval, môi trường và provider (dùng `codex.sandbox_mode`, `codex.windows_sandbox`, `codex.provider`) |
 | Lượt Codex bị từ chối: `PolicyRefusal` — `preflight: …` | Profile Codex thiếu `windows_sandbox: unelevated` (hoặc `sandbox_mode` không an toàn). Toryo không chạy Codex khi sandbox không được bật (trước đây chỉ cảnh báo); `toryo doctor` nêu cùng lỗi. Sửa profile trong config, rồi `toryo task config ID --reload` và `toryo resume ID --note "…"` (config của task bị đóng băng, nên chỉ sửa file thì chưa đủ) |

@@ -12,12 +12,22 @@ use serde_json::Value;
 use super::cmdline::Shell;
 use crate::config::{expand_vars, CommandKind, CommandSpec, Effective};
 
-/// An acceptance-criteria item: an optional bullet (`-`, `*`, `+`), number (`1.`, `1)`) or
-/// task-list box (`[ ]`), then the id (optionally bold) and `:`, `.` or `)` (or a full-width
-/// `：`). The id group is deliberately loose so a malformed id is reported, not skipped.
+/// An acceptance-criteria item: an optional bullet (`-`, `*`, `+`, `•`, `・`), number (`1.`,
+/// `1)`) or task-list box (`[ ]`), then the id (optionally bold) and `:`, `.` or `)` (or a
+/// full-width `：`), or a dash set off by spaces (` — `, ` – `, ` - ` — M12-11). The id group
+/// is deliberately loose so a malformed id is reported, not skipped.
 static AC_ITEM: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"^\s*(?:[-*+]\s*|[0-9]{1,9}[.)]\s*)?(?:\[[ xX]\]\s*)?\**(?P<id>(?i:ac)-[0-9A-Za-z_]*)\**\s*[:.)：]",
+        r"^\s*(?:[-*+•・]\s*|[0-9]{1,9}[.)]\s*)?(?:\[[ xX]\]\s*)?\**(?P<id>(?i:ac)-[0-9A-Za-z_]*)\**(?:\s*[:.)：]|\s+[—–-](?:\s|$))",
+    )
+    .expect("regex")
+});
+/// M12-11: a line that *starts like* an acceptance criterion (after an optional bullet, number,
+/// box or table bar: `AC` and a digit, ASCII or full-width) — when [`AC_ITEM`] does not accept
+/// it, `task create` refuses instead of dropping it.
+static AC_LIKE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^\s*(?:[-*+•・]\s*|[0-9]{1,9}[.)]\s*|\|\s*)?(?:\[[ xX]\]\s*)?\**(?i:ac)\s*[-_]?\s*[0-9０-９]",
     )
     .expect("regex")
 });
@@ -69,11 +79,14 @@ impl Fences {
 /// - items may be bulleted, numbered (`1. AC-2: …`) or task-list boxes, the id may be bold;
 /// - fenced code blocks are examples: ids (and `#` lines) inside them do not count;
 /// - an item with a malformed id (`AC-01`, `AC-0`, `ac-1`, `AC-1a`) is an error, never
-///   silently dropped.
+///   silently dropped;
+/// - a line that starts like one (`AC` and a digit, after a bullet or a table bar) and is not
+///   accepted is an error with its line number, never dropped (M12-11).
 pub fn parse_acceptance_ids(task: &str) -> Result<Vec<String>> {
     let mut section: Option<usize> = None;
     let mut fences = Fences::default();
     let mut ids = Vec::new();
+    let mut refused: Vec<(usize, &str)> = Vec::new();
     for (n, line) in task.lines().enumerate() {
         if fences.in_fence(line) {
             continue;
@@ -100,7 +113,21 @@ pub fn parse_acceptance_ids(task: &str) -> Result<Vec<String>> {
                 );
             }
             ids.push(id.to_string());
+        } else if AC_LIKE.is_match(line) {
+            refused.push((n + 1, line.trim()));
         }
+    }
+    if !refused.is_empty() {
+        let lines: Vec<String> = refused
+            .iter()
+            .map(|(n, l)| format!("line {n}: `{l}`"))
+            .collect();
+        bail!(
+            "TASK.md: {} under `## Acceptance criteria` look{} like acceptance criteria but would be dropped — {}. Write each as `- AC-1: text` (the id `AC-<n>` in ASCII digits, then `:`, `.`, `)`, `：` or ` — `); a table row or a sentence that only mentions an id does not count (R28)",
+            if refused.len() == 1 { "a line".to_string() } else { format!("{} lines", refused.len()) },
+            if refused.len() == 1 { "s" } else { "" },
+            lines.join("; ")
+        );
     }
     if ids.is_empty() {
         bail!("TASK.md has no `AC-<n>:` items under `## Acceptance criteria` (R28)");
@@ -1597,6 +1624,31 @@ mod tests {
                 "{bad}: {e}"
             );
         }
+        // M12-11: the dash forms and the bullets `・` and `•` are accepted; what looks like an
+        // item and is not accepted (a table row, a full-width digit) is refused by line number
+        assert_eq!(
+            ids("## Acceptance criteria\n- AC-1: a\n- AC-2 — b\n- AC-3 - c\n・AC-4：d\n• AC-5 – e\n"),
+            ["AC-1", "AC-2", "AC-3", "AC-4", "AC-5"]
+        );
+        let e = parse_acceptance_ids(
+            "## Acceptance criteria\n- AC-1: a\n- AC-2 — b\n- AC-3 - c\n・AC-4：d\n- AC-５: e\n| AC-6 | f |\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("2 lines")
+                && e.contains("line 6: `- AC-５: e`")
+                && e.contains("line 7: `| AC-6 | f |`")
+                && e.contains("- AC-1: text")
+                && !e.contains("line 3")
+                && !e.contains("line 5"),
+            "{e}"
+        );
+        // a sentence that merely mentions an id, or starts with other words, is text
+        assert_eq!(
+            ids("## Acceptance criteria\n- AC-1: a\n- Accept 5 items\n- See AC-2\nactual 3 rows\n"),
+            ["AC-1"]
+        );
         // outside the section a malformed id is just text
         assert_eq!(
             ids("## Notes\n- AC-01: x\n## Acceptance criteria\n- AC-1: a\n"),

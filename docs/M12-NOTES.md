@@ -18,7 +18,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] M12-08 `base_branch` is honoured; keys without effect say so (X19, X20)
 - [x] M12-09 `./toryo.yaml` before `$TORYO_CONFIG` (X21)
 - [x] M12-10 Text files: BOM ignored, non-UTF-8 refused by name (X22)
-- [ ] M12-11 Acceptance criteria are never dropped silently
+- [x] M12-11 Acceptance criteria are never dropped silently
 - [ ] M12-12 Three CLI traps
 - [ ] M12-13 Long paths on Windows
 - [ ] M12-14 An agent CLI that dies without a result shows its error text
@@ -285,7 +285,24 @@ No Critical or High; three Medium, fixed here.
   `from_utf8_lossy` is left on these paths (checked with grep).
 
 
+### M12-11 — Acceptance criteria are never dropped silently (review M12)
+
+- **Fix (`src/engine/checks.rs`, `AC_ITEM`/`AC_LIKE`/`parse_acceptance_ids` only — not the M18 rules):** after the id also
+  ` — `, ` – `, ` - ` (a dash with a space on both sides); bullets `•` and `・`. A new `AC_LIKE` (after an optional bullet,
+  number, box or table bar: `AC`, an optional `-`/`_`, a digit — ASCII or full-width) marks lines under the acceptance
+  heading that `AC_ITEM` did not accept; `task create` refuses them all at once: "TASK.md: 2 lines under `## Acceptance
+  criteria` look like acceptance criteria but would be dropped — line 6: `…`; line 7: `…`. Write each as `- AC-1: text`
+  …". Fenced blocks are still skipped; a sentence that only mentions an id, or "Accept 5 items", is still text.
+- **Decision:** the id stays ASCII (`AC-５` is refused, not normalised): the reviewer must return exactly these ids and
+  the review check compares strings.
+- **Tests:** `engine::checks::tests::ac_parser_sections_numbered_fenced_and_malformed` extended (the existing assertions
+  are unchanged); `m12_11_an_acceptance_line_that_would_be_dropped_is_refused` (AC-1: the review's six lines through the
+  binary, 1–4 accepted, 5 and 6 refused with their line numbers). AC-2: every existing TASK fixture loads unchanged (the
+  whole suite, including the template `TASK.example.md` test). HUONG-DAN troubleshooting row updated.
+
+
 ## Open
 
 - M12-09: `scripts/m3-stop-test.ps1`, `m4-m7-check.ps1`, `m8-check.ps1` and the other M-check scripts set `$env:TORYO_CONFIG` and then run `toryo` in whatever folder they were started from. Run from a folder that has its own `toryo.yaml`, they now use that file, not the variable. Not changed (scripts are the owner's; the fix is `--config` in each call). Conservative choice: left as is, recorded here.
+- Observed once while running the four checks (M12-11), not reproduced in two reruns: `m11_env_gates::an_environment_gate_runs_when_the_blobs_keep_crlf_under_eol_crlf` failed at its `marker.exists()` or state assertion; its own comment names racy-git timing. Not touched.
 (filled as the work goes)
