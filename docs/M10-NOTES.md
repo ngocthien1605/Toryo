@@ -2,6 +2,9 @@
 
 Every entry: what was decided, why, and where. The owner folds these into plan v0.9.
 
+> Open items of this milestone are kept in one list, with priorities, in [`STATUS.md`](STATUS.md) (§4); the decisions in
+> [`DECISIONS.md`](DECISIONS.md). The "Open" list below is the record as it stood at the time.
+
 ## Morning summary (2026-09-30, after three rounds of review fixes)
 
 **M10, review fixes R1–R6, round 2 (R7, R8) and round 3 (R9) are DONE; nothing PARTIAL.** Branch
@@ -57,7 +60,7 @@ review item 5 — the new `!! reason` lines stay, as a uniform rule (R5).
    when nobody drives the task, whatever the state (R7); `totals.est_complete` is `false` when any billed
    group is unpriced, also without an estimate (R8).
 
-**Open:**
+**Open** (moved to [`STATUS.md`](STATUS.md) — O-15, O-60 … O-63; kept here with the procedure of the elevated-`status` check):
 - **Elevated-`status` check (R9.1), not done unattended:** this session is not elevated and UAC prompts for
   consent. To check by hand: in an **elevated** PowerShell, with a temp `TORYO_DATA_DIR` and temp
   `--config`/`--machine-config` (e.g. the ones `tests/common` writes), `toryo task create …` and `toryo run

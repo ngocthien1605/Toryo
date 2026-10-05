@@ -27,7 +27,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] M12-17 `doctor` checks what a first run needs
 - [x] M12-18 The D365FO template loads as shipped; example gate scripts
 - [x] M12-19 Guide: "First real task on D365FO", one escalation table, stale lines
-- [ ] M12-20 Notes: `STATUS.md`, `DECISIONS.md`, archive, the review in the repo
+- [x] M12-20 Notes: `STATUS.md`, `DECISIONS.md`, archive, the review in the repo
 - [ ] M12-21 Housekeeping
 - [ ] Finish, push, pull request, CI
 
@@ -496,10 +496,7 @@ function of `src/doctor.rs` with its own test in `tests/m12_config.rs` (`m12_17_
    `rate_limited`, `overloaded`, `quota_exceeded`, `bad_request`, `invalid_output`, `auth`, `permission_denied`, `policy_refusal`; and
    `other`. Not escalations but named in the table: the `Paused` reasons (`budget`, `implementer_quota`, `planner_quota`,
    `reviewer_quota`) and the refusals `task_active`, `verify_script_missing`, `xpp_project_missing`, `verify_boundary_below_floor`,
-   `untrusted_git_filter`, `subject_changed`, `snapshot_incomplete`. (The reviewer's 33 / 14 undocumented: the 14 now documented are
-   `gate_unavailable`, `environment_gate_timeout`, `environment_gate_confirm`, `context_unreadable` (the M12 classes), `max_fix_cycles`,
-   `max_gate_retries`, `max_review_rounds`, `review_blocked`, `plan_policy`, `implementer_failed`, `same_vendor_review`,
-   `recovery_policy_violation`, `process_crashed` family, `other`.) Wording check against the code: `environment_gate_confirm` is shown
+   `untrusted_git_filter`, `subject_changed`, `snapshot_incomplete`. (The reviewer counted 33 classes, 14 undocumented; I did not have their list, so which 14 is not recorded here.) Wording check against the code: `environment_gate_confirm` is shown
    with the machine-caused `next:` text; its reason says the plain `resume` is the yes.
 3. **README** "What the boundary does and does not buy" (six points, plain words) and the same content as HUONG-DAN §8.1.
 4. **HUONG-DAN level with README rounds 4–5:** it already carried X13 and `## Allow protected` (5.9); added `git add --renormalize .`
@@ -514,6 +511,27 @@ function of `src/doctor.rs` with its own test in `tests/m12_config.rs` (`m12_17_
    fallback note rewritten, the "ONE counter" paragraph already replaced in M12-18; 14, 15 (`docs/M11-NOTES.md`) → M12-20 (archive + stub).
    Also fixed: HUONG-DAN's "cp932 output … next thing to fix after M11" (done by M12-15).
 - **Not translated:** README and the template comments stay English; HUONG-DAN stays Vietnamese.
+
+
+### M12-20 — Notes: `STATUS.md`, `DECISIONS.md`, archive, the review in the repo
+
+- **`docs/STATUS.md`** (128 lines): the state, what ran for real and what never has (a real X++ build, a build at Low integrity, an
+  environment gate against a real environment, a real D365FO task), how to resume, and **the one open list** — §2 of the audit with what
+  M12 fixed removed (O-03, O-07–O-10, O-12, O-13, O-27, O-28, O-31, O-33, O-57 and the H5 part of O-06; **O-11** keeps M19), the rows
+  P2 bundled as in the audit, and new rows `N-01`…`N-10` ("Not in this milestone" of the list plus what M12 recorded as open: the
+  review-of-M12-05..07 leftovers, the protected scan's width, the check-scripts and `$TORYO_CONFIG`, the gate log's bound). O-15 / O-60 …
+  keep the audit's ids so a reader can find the evidence.
+- **`docs/DECISIONS.md`:** X1–X23 one line each with "replaced by" marks (X2 → X6; X7 refined by X9, rule 1 replaced by X10; X8 extended
+  in M12; X12 extended by M12-05) and the code that carries each; one sentence on where the R-numbers come from (plan v0.8 and the review
+  rounds; not in the repository). X1–X16 were collected from `archive/M11-NOTES.md` by searching, not by reading it through.
+- **`git mv docs/M11-NOTES.md docs/archive/M11-NOTES.md`**, byte for byte unchanged (checked with `diff` against `HEAD`); a one-screen
+  `docs/M11-NOTES.md` stub: the two pull requests with their commit ranges, the test counts, "what changed for a repository without an
+  org chart" (merged from the four per-round versions), and links. The M9 and M10 notes point to `STATUS.md` (a note under the title; the
+  M10 "Open" list kept with the elevated-`status` procedure, which nothing else records).
+- **`docs/REVIEW-2026-10-01.md`** (untracked in the working tree, committed as it was) and **`docs/REVIEW-2026-10-01-status.md`**: §1 of the
+  audit with the status of every item, updated — H1, H4, H5, H6, M1, M8, M11, M12, M13, L1 are FIXED with their task and commit
+  (counts: 14 fixed, 2 partial, 46 open of 62). Rows keep the old evidence after "Was:".
+- Also: the sentence in the M12-19 paragraph that guessed which 14 classes the reviewer found undocumented was removed.
 
 
 ## Open

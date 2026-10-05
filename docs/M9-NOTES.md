@@ -2,6 +2,9 @@
 
 Every entry: what was decided, why, and where. The owner folds these into plan v0.9.
 
+> Open items of this milestone are kept in one list, with priorities, in [`STATUS.md`](STATUS.md) (§4); the decisions in
+> [`DECISIONS.md`](DECISIONS.md). What is written below is the record as it stood at the time.
+
 ## A — Trust boundaries (R60, R61)
 
 ### A1 — profiles only in the machine config (R60)
