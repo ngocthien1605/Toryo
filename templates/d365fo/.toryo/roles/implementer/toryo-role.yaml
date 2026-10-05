@@ -18,10 +18,9 @@
 #   this seat is decided in toryo-orgchart.yaml. If Codex runs out of quota and
 #   Claude takes over, this file does not change.
 #
-# HOW TO READ THIS FILE (for the implementer)
+# WHAT TORYO DOES WITH THIS FILE
 #   - The role name is the FOLDER name (roles/implementer/), not a field here.
-#   - Unknown fields must be a hard error (serde deny_unknown_fields), with a
-#     friendly message and a "did you mean ...?" hint.
+#   - An unknown field is an error, with a "did you mean ...?" hint.
 #   - Every path is relative to the repository root unless stated otherwise.
 # =============================================================================
 

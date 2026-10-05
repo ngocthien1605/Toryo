@@ -26,7 +26,7 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] M12-16 Gate output for the owner: full log, heartbeat, bounded memory
 - [x] M12-17 `doctor` checks what a first run needs
 - [x] M12-18 The D365FO template loads as shipped; example gate scripts
-- [ ] M12-19 Guide: "First real task on D365FO", one escalation table, stale lines
+- [x] M12-19 Guide: "First real task on D365FO", one escalation table, stale lines
 - [ ] M12-20 Notes: `STATUS.md`, `DECISIONS.md`, archive, the review in the repo
 - [ ] M12-21 Housekeeping
 - [ ] Finish, push, pull request, CI
@@ -472,6 +472,48 @@ function of `src/doctor.rs` with its own test in `tests/m12_config.rs` (`m12_17_
   `m12_18_the_template_reaches_the_final_gate_with_the_example_scripts` (AC-2: `task create`, a `--fake-agents` run — the build
   script gate passes, the machine's `confirm: first` stops before the deploy, a plain `resume` runs the example `dbsync` and the
   task waits at the final gate; skipped with a message where there is no `pwsh`).
+
+
+### M12-19 — Guide: "First real task on D365FO", one escalation table, stale lines
+
+1. **`docs/HUONG-DAN.md` §7.3** is replaced by "Task thật đầu tiên trên D365FO": one path (the org chart layout) in ten steps — before you
+   start (the real `toryo xpp build` by hand, `--print-only` and `--low`, which have never run; a normal shell, not Administrator; the
+   `dbsync` decision; `git add --renormalize .`) · machine config · repository files (copy, edit, commit) with the paragraph "`tool: xpp` or
+   a script?" · the two gate scripts and their contract · check (`config show`, `doctor`, `doctor --canaries`) · **dry run with
+   `--fake-agents`** (documented: a whole run without tokens; the gates run for real, so only with the print-only scripts) · `TASK.md`
+   (accepted AC forms, `## Allow protected`, **frozen at `task create`, the id is permanent**) · create / run / the two gates (plan gate,
+   heartbeat and logs, `confirm: first`, final gate) · when it stops · finish (merge yourself, `task cleanup`, the branch). The old
+   step 1 (copying `toryo.yaml.example` and `.toryo\` together) is gone.
+2. **`docs/HUONG-DAN.md` §9** is now 9.1 "one table: class → meaning → what to type" and 9.2 "other symptoms" (the rows the table covers
+   were moved, not duplicated). The table quotes the binary's five `next:` forms (machine-caused, protected, recovery, `policy_refusal`,
+   generic). **The list collected from the source** (searched for every `escalate(`, `escalate_attempt(`, class constant and typed error;
+   37 rows): machine-caused (9) `gate_unavailable`, `environment_gate_unavailable`, `environment_gate_timeout`,
+   `environment_gate_confirm`, `skill_unavailable`, `context_over_budget`, `context_unreadable`, `xpp_toolchain_unavailable`,
+   `verify_boundary_unavailable`; other typed classes (14) `verify_mutated_tree`, `max_fix_cycles`, `max_gate_retries`,
+   `max_review_rounds`, `review_blocked`, `same_vendor_review`, `plan_policy`, `policy_violation`, `protected_config_changed`,
+   `recovery_policy_violation`, `approval_mismatch`, `artifact_tampered`, `artifact_missing`, `implementer_failed`; the agent error
+   classes (13, snake_case of `ErrorClass`) `process_crashed`, `timeout`, `network`, `unknown`, `context_window_exceeded`,
+   `rate_limited`, `overloaded`, `quota_exceeded`, `bad_request`, `invalid_output`, `auth`, `permission_denied`, `policy_refusal`; and
+   `other`. Not escalations but named in the table: the `Paused` reasons (`budget`, `implementer_quota`, `planner_quota`,
+   `reviewer_quota`) and the refusals `task_active`, `verify_script_missing`, `xpp_project_missing`, `verify_boundary_below_floor`,
+   `untrusted_git_filter`, `subject_changed`, `snapshot_incomplete`. (The reviewer's 33 / 14 undocumented: the 14 now documented are
+   `gate_unavailable`, `environment_gate_timeout`, `environment_gate_confirm`, `context_unreadable` (the M12 classes), `max_fix_cycles`,
+   `max_gate_retries`, `max_review_rounds`, `review_blocked`, `plan_policy`, `implementer_failed`, `same_vendor_review`,
+   `recovery_policy_violation`, `process_crashed` family, `other`.) Wording check against the code: `environment_gate_confirm` is shown
+   with the machine-caused `next:` text; its reason says the plain `resume` is the yes.
+3. **README** "What the boundary does and does not buy" (six points, plain words) and the same content as HUONG-DAN §8.1.
+4. **HUONG-DAN level with README rounds 4–5:** it already carried X13 and `## Allow protected` (5.9); added `git add --renormalize .`
+   (§7.3 step 1), `approve --force` and `task cleanup --force` (two rows in the 5.4 table), the frozen `TASK.md` and the permanent id (§7.3
+   step 7). `if_missing` was in 5.9 already.
+5. **`toryo-audit-2026-10-05.md` §4.3, row by row:** 1 (`Cargo.toml`) → M12-21; 2–7 README head, binary, CI, "Next", canary, merged
+   branches → fixed (the README now says plan v0.8, M0–M12, builds with `cargo build --release --locked`, no tests without the kit, PR
+   numbers, and drops `M9_task.md`/`M10_task.md`/`M11_task.md`); 8 (the review is not in the repository) → M12-20 commits it and README
+   links it; 9 HUONG-DAN binary/alias (`target\release\toryo.exe`) and 10 the CLI version numbers → fixed; 11 §7.3 step 1 → replaced;
+   12 "compile only" statements → gone with §7.3 (the final gate says `compile + dbsync on <machine>` once a gate passed); 13 the draft
+   instructions in the template comments → "WHAT TORYO DOES WITH THIS FILE" in the org chart and the implementer role, the omitted-
+   fallback note rewritten, the "ONE counter" paragraph already replaced in M12-18; 14, 15 (`docs/M11-NOTES.md`) → M12-20 (archive + stub).
+   Also fixed: HUONG-DAN's "cp932 output … next thing to fix after M11" (done by M12-15).
+- **Not translated:** README and the template comments stay English; HUONG-DAN stays Vietnamese.
 
 
 ## Open

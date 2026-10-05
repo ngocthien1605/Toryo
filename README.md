@@ -5,10 +5,11 @@
 > Codex are the craftsmen; `toryo` plans the order of work, enforces the rules, checkpoints and verifies.
 > (Renamed from `thien` on 2026-09-28, plan v0.7 R55.)
 
-Rust implementation of the Toryo plan (**v0.7**). **M0 is done** (the spike kit and its evidence);
-**M1** adds the vendor-neutral core the engine (M2–M8) will build on:
+Rust implementation of the Toryo plan (**v0.8**). **M0–M12 are done in code**: the spike kit and its evidence (M0),
+the vendor-neutral core (M1) and the engine built on it (M2–M12). Where things stand and what is still open:
+[`docs/STATUS.md`](docs/STATUS.md); the rules decided on the way: [`docs/DECISIONS.md`](docs/DECISIONS.md). The modules:
 
-| M1 module | Plan | What it does |
+| Module | Plan | What it does |
 |---|---|---|
 | `domain` | §5.1, §6.1 | `Role`, `AgentEvent`, `OpenSession`/`TurnInput`/`TurnLimits`, `StageOutcome`, `TokenUsage`, `UsageCapabilities` |
 | `agents::adapter` | §6.1 | `AgentAdapter` / `AgentSession` traits; `run_to_completion` (stall/max limit → interrupt → `Timeout`) |
@@ -83,8 +84,10 @@ toryo spike claude|codex …        # single turns for the manual dry-run
 toryo spike init-fixture | render | diff | report
 ```
 
-**Quick start on Windows (no Rust needed):** `bin\toryo.exe` is a prebuilt binary (cross-compiled,
-x86_64-pc-windows-gnu, stripped). One command installs Claude Code if missing, checks the Claude/Codex
+**Quick start on Windows:** build the binary with `cargo build --release --locked` (or download the artifact
+`toryo-windows-x64` of the latest CI run); no binary is kept in the repository, and `toryo --version` prints the
+version and the commit it was built from. `scripts\m0-smoke.ps1` looks for `bin\toryo.exe` (git-ignored): copy
+`target\release\toryo.exe` there. One command installs Claude Code if missing, checks the Claude/Codex
 logins, writes `C:\.thien\m0\toryo.yaml` plus the profiles in `C:\.thien\m0\toryo.local.yaml`, and runs `doctor`, `job-test`, `git-canary` and the
 end-to-end `smoke` (Claude plans → Codex implements → toryo checkpoints + verifies → Claude reviews):
 
@@ -496,9 +499,15 @@ cargo test --release
 | `tests/m11_gates.rs` | Windows + Linux | M11-E1/E2: the gate variables, M18 admission, verify output redacted with the task's secrets, stdout/stderr order kept; round 3: build-output entry scripts (R14), a `cd` in a command string and `cmd` bare names (R15), a reload after a changed `verify_root` |
 | `tests/m11_env_gates.rs` | Windows + Linux (normal-token vs Low-IL test Windows only) | M11-E3: environment gates after the checks, the deployment record in every view, the shared lock with `stop`, secrets, `if_missing: skip`, a mutated checkout, an unavailable gate, a crash during the gate |
 | `tests/m11_skills.rs` | Windows + Linux | M11-D: the planner's menu, the plan's `skills` (off the menu, over the budget, none), skills per role in `context show`, a changed SKILL.md, the Claude implementer's context file |
+| `tests/m12_safety.rs` | Windows + Linux (mode-000 case Unix only) | M12-01..04: recovery refuses a commit Toryo did not make, the protected scan fails closed, read-only roles are checked on every way a turn ends, the redactor releases complete lines |
+| `tests/m12_gates.rs` | Windows + Linux | M12-05/16: a gate that cannot start is a machine stop, the 50 MB gate, the heartbeat, the failing gate's log |
+| `tests/m12_config.rs` | Windows + Linux | M12-08..11, 17: `base_branch`, keys without effect, `./toryo.yaml` before `$TORYO_CONFIG`, BOM and non-UTF-8 files, dropped acceptance criteria, the new `doctor` lines |
+| `tests/m12_cli.rs`, `m12_paths.rs`, `m12_agents.rs` | Windows + Linux | M12-12 (cleanup `--force`, `resume` without an id, task ids), M12-13 (a path over 260 characters), M12-14 (the CLI's stderr in the reason) |
+| `tests/m12_template.rs` | Windows + Linux (`pwsh` needed for the run) | M12-18: the D365FO template loads as shipped; a `--fake-agents` run of it with the example scripts reaches the final gate |
 
-CI (`.github/workflows/ci.yml`) runs `cargo test`, `clippy -D warnings` and the core without the kit
-(`--no-default-features`) on `windows-latest` and `ubuntu-latest`, then builds a release `toryo.exe`.
+CI (`.github/workflows/ci.yml`) runs `cargo test` and `clippy -D warnings` on `windows-latest` and `ubuntu-latest`,
+and `clippy -D warnings` on the core without the kit (`--no-default-features`) — **no tests run without the kit** —
+then builds a release `toryo.exe` (artifact `toryo-windows-x64`).
 
 ## Status
 
@@ -511,18 +520,18 @@ M8 (E2E MVP) is done: the demo flow runs with no copy/paste on the calculator fi
 BatchRename sample (BR-001, then BR-002 with a real fix cycle), and the real-CLI checks of V08-VERIFY 5
 pass — a live budget interrupt of a Claude turn (R64), the fail-closed Codex preflight (R62), and a silent
 Codex command that is not killed as stalled (R66). Acceptance on Windows: `scripts\m8-check.ps1`.
-Next: plan v0.8 §17 (D1–D3, M9). `spike pipeline` stays the behavioural reference (R52).
+`spike pipeline` stays the behavioural reference (R52).
 
-M9 (`M9_task.md`, branch `m9/d365-ready`) is done in code: trust boundaries — agent profiles and
+M9 (merged: pull request #1, `5adf204`) is done in code: trust boundaries — agent profiles and
 toolchains come only from the machine config (R60; `doctor` shows each source) and untrusted task-pack text
 reaches agents only as data (R61); X++ verify on the UDE toolchain — `toolchains.xpp`, `tool: xpp`, per-project
 MSBuild runs with parsed diagnostics, `scope: compile`, `doctor` X++ checks and `toryo xpp build` (R59, proposed
 R72); the D365FO starter kit (`templates/d365fo/`) and the dogfooding kit (`templates/dogfood/`,
-`scripts/verify.ps1`). Still to do by the owner on Windows and the UDE machine: section E of `M9_task.md` (the
-real-CLI canary `scripts\m9-check.ps1 -Canary`, V08-VERIFY 2–4 with `toryo xpp build`, the first real D365FO
-task). Decisions made on the way: `docs/M9-NOTES.md`.
+`scripts/verify.ps1`). The real-CLI canary passed on 2026-09-29 (`docs/M9-NOTES.md`). Still to do by the owner on the
+UDE machine: V08-VERIFY 2–4 with `toryo xpp build` (a real X++ build, also at Low integrity) and the first real D365FO
+task (`docs/HUONG-DAN.md` §7.3). Decisions made on the way: `docs/M9-NOTES.md`.
 
-M10 (`M10_task.md`, branch `m10/flight-recorder`) is done in code: the engine emits typed events (ARCH-02) —
+M10 (merged: pull request #2, `8dc9860`) is done in code: the engine emits typed events (ARCH-02) —
 recorded per task in `events.jsonl` (the flight recorder) and rendered as the engine's own stderr lines — the same
 text as before, except that every escalation and pause now prints its reason once, right before its `[state]` line
 (deviation 6 in `docs/M10-NOTES.md`); `status --json` / `task show --json` (DES-10); `toryo watch` follows a running task without its
@@ -530,12 +539,42 @@ lock; `toryo usage` with estimated cost from the machine's `prices.toml` (plan �
 records its model; scripted turns of a mixed fake/real run cost exact zero; an opt-in Windows toast when a task
 needs the owner. Decisions, deviations and open questions: `docs/M10-NOTES.md`.
 
-M11 (`M11_task.md`, branch `m11/orgchart`) is done in code: the trust floor (review C1 — repository files are
+M11 (merged: pull request #3, `df84b02`; its rounds 3–5 on `m11/review-3` as #4, `4ad97c3`) is done in code: the trust
+floor (review C1 — the review the "review C1 / H2 / M2 / M13" ids in this file and in the code come from is
+[`docs/REVIEW-2026-10-01.md`](docs/REVIEW-2026-10-01.md) — repository files are
 parsed without machine-only keys and YAML tags are refused; H2 — a machine floor for `verify.boundary` and the
 machine's `verify_root`); org chart mode (`.toryo/toryo-orgchart.yaml`, role files, `toryo config show`), layered
 role instructions and culture, the implementer's write fence, `reviewer-differs-from-builder`, split retry limits;
 check gates with gate variables, M18 entry points protected before they exist, verify output redacted with the
 task's secrets (review M2), environment gates with a machine-wide lock and a deployment record; skills (repository
-then machine, the planner's choice, delivered through the context loader). Decisions, deviations and open
-questions: `docs/M11-NOTES.md`. Next after M11: review M13 (cp932 output on Japanese Windows also garbles DB-sync
-output).
+then machine, the planner's choice, delivered through the context loader). The per-task record:
+`docs/archive/M11-NOTES.md`; the decisions X1–X16: `docs/DECISIONS.md`.
+
+M12 (`docs/M12-NOTES.md`) is done in code: the first real D365FO task must not pass by a known hole, get stuck, or
+spend paid agent turns on a machine problem. Safety: crash recovery accepts only a commit Toryo made (a first parent
+at the attempt's start, no protected path touched); the protected-state scan fails closed; read-only roles are
+checked on every way a turn ends; the stream redactor releases complete lines. Gates: a gate that cannot start, that
+timed out, or that waits for your yes (`confirm`) is a machine stop, not a failing gate; output goes to a log, a
+heartbeat, bounded memory; gate output is decoded with the OEM code page and every gate gets the English UI
+language. Config: `project.base_branch` is honoured, keys that do nothing say so, `./toryo.yaml` comes before
+`$TORYO_CONFIG`, a byte-order mark is ignored and non-UTF-8 text refused by name, acceptance criteria are never
+dropped silently, three CLI traps closed, long paths on Windows, an agent CLI's stderr in the reason. And
+`toryo doctor` checks what a first run needs, the D365FO template loads as shipped with print-only example gate
+scripts, and the guide has one path: `docs/HUONG-DAN.md` §7.3.
+
+## What the boundary does and does not buy
+
+In plain words, so that "Low integrity" is not read as "sandbox":
+
+- A **check gate** runs at Low integrity: it cannot write the profile, the repository, the task's worktree, Toryo's
+  database or the deploy folder. It **can read** everything you can read and it can use the network, including local
+  services that accept your Windows login. Keep secrets out of the verify environment.
+- Toryo protects a gate's **entry script**, not what that script loads (dot-sourced, imported, called). Keep the
+  script in one file, or list its helpers under `policy.protected_paths` and the role's `never:`.
+- An **environment gate's** command comes only from the machine config, and it reads a byte-exact export of the
+  checkpoint commit — not the checkout the check gates used. That guards your own script: a contract, not a boundary.
+- What is deployed is **still agent-written** and runs in your environment **before the review and before the final
+  approval**, unless `environment_gates.<name>.confirm` is `first` or `always` (then Toryo asks first).
+- The last 40 lines of a gate's output go to the model vendors (as the implementer's fix feedback), and only
+  `secret_env` values are redacted. Print no connection string, key or token; the whole output is in
+  `<run store>\gate-logs\`.

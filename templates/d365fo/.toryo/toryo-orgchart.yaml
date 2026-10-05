@@ -25,14 +25,14 @@
 #   Analogy: the org chart assigns people to positions; the role file is the
 #   job card for each position. Swapping the person must not change the job.
 #
-# HOW TO READ THIS FILE (for the implementer)
-#   - Unknown fields must be a hard error (serde deny_unknown_fields), with a
-#     friendly message and a "did you mean ...?" hint, e.g.
+# WHAT TORYO DOES WITH THIS FILE
+#   - An unknown field is an error, with a "did you mean ...?" hint, e.g.
 #         seat 'reviwer' not found. Did you mean 'reviewer'?
-#   - Every cross-reference must be validated BEFORE anything is launched:
-#     seat -> role folder, role gate names -> gates below (or the machine's
-#     environment_gates), role skills -> repo .toryo/skills/ or the
-#     machine's skills_dir, seat profiles -> the machine's profiles.
+#   - Every cross-reference is checked BEFORE anything is launched (`toryo
+#     doctor`, `toryo config show`, `toryo task create`): seat -> role folder,
+#     role gate names -> gates below (or the machine's environment_gates), role
+#     skills -> repo .toryo/skills/ or the machine's skills_dir, seat profiles
+#     -> the machine's profiles.
 #   - Paths are relative to the repository root unless stated otherwise.
 #   - When this file exists, toryo.yaml must not also set `roles:`,
 #     `commands:` or `pipeline.max_fix_cycles` -- they live here now.
@@ -186,11 +186,11 @@ gates:
 #   model     optional. Overrides the profile's default model.
 #   fallback  optional ORDERED list of profile names to switch to when the
 #             primary cannot run (quota exhausted, rate limit after retries).
-#             The switch is sticky for the task. Omitted = no fallback.
-#             (Today's toryo.yaml treats omitted as "the planner's profile";
-#             the new loader maps omitted to `fallback: []`.)
-#             Today only the implementer may have a fallback; on the planner
-#             or reviewer it is a validation error until Toryo supports it.
+#             The switch is sticky for the task. Omitted = no fallback (a
+#             toryo.yaml-only repository, without an org chart, still uses the
+#             planner's profile when `fallback` is omitted).
+#             Only the implementer may have a fallback; on the planner or
+#             reviewer it is a validation error.
 #
 # The machine config may override a seat for that machine only (key `seats`,
 # same fields), e.g. the company laptop uses claude-foundry for the planner.
