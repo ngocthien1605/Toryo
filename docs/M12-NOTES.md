@@ -29,7 +29,8 @@ Branch `m12/first-run` from `main` @ `4ad97c3`. One commit per task. Baseline on
 - [x] M12-19 Guide: "First real task on D365FO", one escalation table, stale lines
 - [x] M12-20 Notes: `STATUS.md`, `DECISIONS.md`, archive, the review in the repo
 - [x] M12-21 Housekeeping
-- [ ] Finish, push, pull request, CI
+- [x] Task list done (M12-01…21)
+- [ ] Push, pull request, CI
 
 ## Tasks
 
@@ -550,8 +551,50 @@ function of `src/doctor.rs` with its own test in `tests/m12_config.rs` (`m12_17_
   `m11/review-3` (merged as #4). Never `-D`. No new worktree was created in this milestone. `git worktree list` shows only the main one.
 
 
+## Summary (end of the task list)
+
+- **Test counts, Windows:** 623 passed / 0 failed / 6 ignored at `4ad97c3` → **683 passed / 0 failed / 6 ignored** at the last task commit
+  (`cargo test --locked`; all four checks green before every commit). Linux was not built here.
+- **Windows-specific tests, by name, all `ok` here:** `process::decode::tests::cp932_gives_the_text_back`, `::utf8_and_cp932_lines_mix`,
+  `::the_xpp_parser_finds_the_file_in_a_decoded_cp932_line` (code page 932 is installed here, so none was skipped); the Windows `icacls`
+  deny-ACL case of M12-02; the `pwsh` branches of `m12_gates::m12_16_*`, `m11_env_gates::m12_15_every_gate_gets_the_ui_language`,
+  `m12_template::m12_18_the_template_reaches_the_final_gate_with_the_example_scripts` (needs `pwsh`; skips with a message without it) and the
+  `token` line of `m12_config::m12_17_doctor_says_whether_toryo_runs_elevated` (the not-elevated branch ran; the elevated one cannot be run
+  from a test). `m12_paths::m12_13_*` and the other new tests run on both platforms.
+- **Unix-only code that was read, never run here** (CI on `ubuntu-latest` is its first build): the mode-000 case of M12-02 (AC-1), the fake-Codex
+  test of M12-04 (AC-3, `regress_agents`), the `sh` variants of the new gate tests (`m12_gates::m12_16_*`, `m11_env_gates::m12_15_*` /
+  `m12_16_*`), `process::decode::tests::elsewhere_invalid_bytes_are_lossy` and `decode_line` for non-Windows.
+- **Earlier assertions changed (named in the commit bodies):** M12-01 one assertion in `regress_engine`; the `ec31_*` reason kept ("put back" goes
+  to stderr); M12-12 `engine_e2e::lock_first_recovery` and `m10_events::an_escalation_carries_its_typed_reason_class`; M12-18
+  `config::tests::templates_keep_their_m10_hash` and `::d365fo_templates_load`.
+- **What changes for an existing configuration:** M12-08 — `project.base_branch` is now read (a repository file that has it set to a branch other
+  than the checked-out one starts tasks from it; one that does not exist is an error); `runs_root` / `final_clean` / `budget_usd_est` set to a
+  non-default value print "has no effect" notes (no behaviour change). M12-09 — `./toryo.yaml` beats `$TORYO_CONFIG`. M12-11 — a TASK.md with an
+  AC-looking line that is not accepted is refused instead of silently losing it. M12-12 — `task cleanup` needs `--force` when it would delete
+  unsaved work; `resume` without an id no longer starts `New` tasks. Also M12-10 (a BOM is ignored; non-UTF-8 files are refused) and M12-05 (a gate
+  program that is not on the machine stops the run with `gate_unavailable`; `task create` refuses an environment gate whose script is missing).
+  The frozen configuration and the digest of an existing task are unchanged.
+
 ## Open
 
-- M12-09: `scripts/m3-stop-test.ps1`, `m4-m7-check.ps1`, `m8-check.ps1` and the other M-check scripts set `$env:TORYO_CONFIG` and then run `toryo` in whatever folder they were started from. Run from a folder that has its own `toryo.yaml`, they now use that file, not the variable. Not changed (scripts are the owner's; the fix is `--config` in each call). Conservative choice: left as is, recorded here.
-- Observed once while running the four checks (M12-11), not reproduced in two reruns: `m11_env_gates::an_environment_gate_runs_when_the_blobs_keep_crlf_under_eol_crlf` failed at its `marker.exists()` or state assertion; its own comment names racy-git timing. Not touched.
-(filled as the work goes)
+What M12 recorded and did not change (the repository-wide list, with priorities, is [`STATUS.md`](STATUS.md); these are in it as N-01…N-10):
+
+- **M12-01..04:** the protected scan descends into every folder and fails closed (a root-owned unlistable folder escalates); AC-2 of M12-01 is
+  tested with `deny_paths`, not a role's `writes`/`never` fence (same `Protected::violates`); the Unix AC-3 test sets a process-wide variable
+  (unique name); an error from `hub.turn_with` skips the read-only checks as before; after a stop that came with a write the loop prints "stopped
+  at a stage boundary" although the task escalated.
+- **M12-05..07:** a gate that exits 0 while a descendant keeps the pipe open past the limit is reported as timed out; a stop that lands after a
+  timeout hides the timeout warning (the next resume re-runs the gate); `doctor` shows `confirm:` only on OK lines; the `git -C <worktree> show`
+  hint does not quote a path with spaces; a lost pending-confirmation file prints "deploy confirmed ()" and Verify asks once more;
+  `script_problems` would refuse an absolute non-existent output path ending in `.js` / `.py` / `.exe`; UNC `is_file` is unchecked.
+- **M12-09:** `scripts/m3-stop-test.ps1`, `m4-m7-check.ps1`, `m8-check.ps1` and the other check scripts set `$env:TORYO_CONFIG` and run `toryo` where
+  they were started: from a folder with its own `toryo.yaml` they now use that file. Left as is (the fix is `--config` in each call).
+- **M12-10:** a `SKILL.md` that is not UTF-8 stops a turn as `skill_unavailable`, not `context_unreadable`.
+- **M12-14:** only the "no result" crash carries the stderr; other failure classes do not.
+- **M12-15:** the cp932 decode is not tested through a real pipeline (this machine's OEM code page is not 932).
+- **M12-16:** the gate log is the bounded text, not the whole 50 MB (the list's (a) and (c) disagree; (c) was followed); gate-log names use the
+  clock in milliseconds; a secret split by the cut is not redacted; `TORYO_GATE_HEARTBEAT_SECS` is an undocumented test knob.
+- **M12-19:** the reviewer's list of 33 escalation classes was not available; the table has 37 rows from searching the code.
+- **Observed once, not reproduced in two reruns (M12-11):** `m11_env_gates::an_environment_gate_runs_when_the_blobs_keep_crlf_under_eol_crlf` failed during
+  a full run (its own comment names racy-git timing).
+- **Not done because the list excluded it:** live streaming of gate output (M12-16); `verify.final_clean`; the "Not in this milestone" items (in `STATUS.md`).
