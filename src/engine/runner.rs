@@ -1409,13 +1409,40 @@ impl<'a> Engine<'a> {
                 )?;
                 if let Some(why) = why {
                     // undone like an agent commit: the changes stay in the tree, HEAD is where
-                    // the attempt began (the next turn's policy checks see them)
-                    let undone = match (&a.git_head_before, wt.head()? == c.sha) {
-                        (Some(before), true) => {
+                    // the attempt began (the next turn's policy checks see them). M13-02: also
+                    // when the commit lies under further commits ("it is not HEAD") — the
+                    // whole stack is undone, or every resume would find and refuse it again.
+                    // Where a soft reset cannot repair it, the reason says what to do by hand.
+                    let head = wt.head()?;
+                    let on_branch = wt.head_ref()? == Some(format!("refs/heads/{}", t.branch));
+                    let undone = match &a.git_head_before {
+                        Some(before)
+                            if on_branch
+                                && wt.contains(before)?
+                                && wt.unfinished_operation()?.is_none() =>
+                        {
                             wt.soft_reset(before)?;
-                            format!("; the commit was undone (soft reset to {})", short(before))
+                            format!(
+                                "; {} undone (soft reset to {}): the changes stay in the tree and the next turn's checks see them — `toryo resume {} --note \"…\"`",
+                                if head == c.sha {
+                                    "the commit was".to_string()
+                                } else {
+                                    format!("it and the commits on top of it (HEAD was {}) were", short(&head))
+                                },
+                                short(before),
+                                t.id
+                            )
                         }
-                        _ => String::new(),
+                        before => format!(
+                            "; nothing was reset (HEAD is {}{}) — put the task branch back by hand (`git -C {} checkout {}`, then `git -C {} reset --soft {}`), then `toryo resume {} --note \"…\"`",
+                            short(&head),
+                            if on_branch { "" } else { ", not on the task branch" },
+                            t.worktree.display(),
+                            t.branch,
+                            t.worktree.display(),
+                            before.as_deref().map(short).unwrap_or("<the commit the attempt began at>"),
+                            t.id
+                        ),
                     };
                     let reason = format!("policy_violation: commit {} carries the trailers of this checkpoint but is not Toryo's ({why}); nothing was accepted{undone}", short(&c.sha));
                     self.escalate("policy_violation", reason)?;
@@ -1432,15 +1459,24 @@ impl<'a> Engine<'a> {
                 if !self.start_at_anchor(t, &wt)? {
                     return Ok(Flow::Next);
                 }
-                // §8: deny paths are checked again right before the commit
-                let denied: Vec<String> = wt
+                // §8, M13-02 (X25): the path policy is asked again right before the commit —
+                // the same question a found commit gets (`violates`: protected, denied, the
+                // write fence), not `deny_paths` alone. What the turn's own checks saw can have
+                // changed since: the stage is entered again after a crash or an escalation.
+                let mut bad: Vec<String> = wt
                     .changed()?
                     .into_iter()
                     .map(|c| c.1)
-                    .filter(|p| self.protect.is_denied(p))
+                    .filter(|p| self.protect.violates(p))
                     .collect();
-                if !denied.is_empty() {
-                    let reason = format!("policy_violation: denied paths {denied:?} would be committed (policy.deny_paths); nothing was committed");
+                bad.sort();
+                bad.dedup();
+                if !bad.is_empty() {
+                    let reason = format!(
+                        "policy_violation: {} would be committed — the path policy forbids it; nothing was committed. `toryo resume {} --note \"…\"` gives the implementer a turn whose checks put them back (or restore them by hand first)",
+                        self.protect.violation_words(&bad),
+                        t.id
+                    );
                     self.escalate("policy_violation", reason)?;
                     return Ok(Flow::Next);
                 }

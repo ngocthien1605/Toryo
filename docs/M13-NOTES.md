@@ -7,7 +7,7 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
 ## Progress
 
 - [x] M13-01 The anchor: a writing attempt starts at the last commit Toryo recorded (X24)
-- [ ] M13-02 A fresh checkpoint runs the full path policy; a refused found commit does not loop (X25)
+- [x] M13-02 A fresh checkpoint runs the full path policy; a refused found commit does not loop (X25)
 - [ ] M13-03 The redactor: a line break may only be the last byte of a secret
 - [ ] M13-04 Gate output is cut on line boundaries; the log path the vendor sees is relative (X27)
 - [ ] M13-05 The deploy confirmation is a database row bound to gate, commit and digest (X26)
@@ -53,6 +53,26 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
   **AC-4 (added assertion, not a changed one):** `engine_e2e::gates_persist_and_the_task_completes` now also asserts that `fix-1/1` began at the checkpoint
   of `implement/1`; the F8 and `checkpoint:after_commit` tests pass unchanged.
 - **Consequence to know:** a commit the *owner* makes on the task branch between two stages is treated the same way — undone into the tree and checked.
+
+
+### M13-02 — A fresh checkpoint runs the full path policy; a refused found commit does not loop (X25)
+
+- **Fresh path of `checkpoint()`:** after the anchor test of M13-01 (first, so that commits undone into the tree are part of what is checked — the list
+  has the two in the other order; this one is the stricter), every changed path is asked `Protected::violates` (protected, denied, the write fence) —
+  the function `foreign_commit` uses on a found commit — not `is_denied` alone. A violation: `Escalated` (`policy_violation`), "… would be committed —
+  the path policy forbids it; nothing was committed", and the way out (`resume --note`: the next turn's checks put the paths back).
+- **"It is not HEAD":** when a found commit is refused, the branch is soft-reset to the attempt's `git_head_before` whenever HEAD is on the task branch,
+  contains that commit and no operation is unfinished — also when the found commit lies under further commits ("it and the commits on top of it … were
+  undone"). Otherwise nothing is reset and the reason gives HEAD and the two commands to put the branch back by hand.
+- **Failing tests first** (`tests/regress_recovery.rs`): `m13_02_a_fresh_checkpoint_refuses_what_the_fence_forbids` (a role `never: ZZZ` fence; `Checkpointing`
+  entered again after a crash with the fenced file staged — **failed before: the file was committed**) and
+  `m13_02_a_found_commit_under_another_commit_is_undone_not_refused_forever` (AC-2 — **failed before: nothing was reset**).
+- **AC-1 does not fail at `685aa45` the way the list says (Open):** `m13_02_a_forged_commit_from_the_worktree_index_never_reaches_a_checkpoint` builds the
+  list's scenario (a forged commit from the worktree's own index, a `never` fence) and **passed before the fix**: the refusal escalates `policy_violation`,
+  and a plain `resume` does not leave that class — it never "enters Checkpointing" again; the only way on is `resume --note`, whose turn checks restore
+  the staged file. The test stays as a guard (it also asserts that a plain `resume` leaves the task `Escalated` and commits nothing). The fresh-path hole
+  is real through another door — `Checkpointing` entered again after a crash (the first test) or after `protected_config_changed` is restored.
+- **AC-3:** the M12-01 tests pass unchanged. No earlier assertion changed (no test pinned the old "denied paths … (policy.deny_paths)" sentence).
 
 
 ## Open

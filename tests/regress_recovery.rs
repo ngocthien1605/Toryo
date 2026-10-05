@@ -1229,3 +1229,229 @@ fn m13_01_a_head_that_does_not_descend_from_the_anchor_escalates() {
         "plan/1, implement/1: no further attempt began"
     );
 }
+
+// ── M13-02 (X25): a fresh checkpoint runs the full path policy ────────────────────────────
+
+/// The fixture in org chart mode with an implementer role whose fence says `never: ZZZ`.
+fn setup_never_zzz() -> Env {
+    setup_orgchart(
+        "codex-openai",
+        "",
+        &[(
+            ".toryo/roles/implementer/toryo-role.yaml",
+            "toryo: 1\npurpose: Change the code.\nnever: [\"**/ZZZ/**\"]\nbefore_handoff: [divide-present]\n",
+        )],
+    )
+}
+
+/// Run `id` until Toryo has committed its checkpoint and dies before the database knows
+/// (`checkpoint:after_commit`): the task is in `Checkpointing`. Returns (worktree, the commit
+/// the attempt began at, Toryo's own checkpoint).
+fn crash_in_checkpointing(env: &Env, id: &str) -> (PathBuf, String, String) {
+    let s = script(
+        env,
+        "cp.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+        }),
+    );
+    let (code, err) = toryo(
+        env,
+        &["run", id, "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "checkpoint:after_commit")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let w = wt(env, id);
+    (w.clone(), rev(&w, "HEAD^"), rev(&w, "HEAD"))
+}
+
+fn agents_that_finish(env: &Env, name: &str) -> String {
+    script(
+        env,
+        name,
+        json!({
+            "implementer": [turn(vec![implementation()]), turn(vec![implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    )
+}
+
+const CHECKPOINT_TRAILERS: &str =
+    "Toryo-Task: {id}\nToryo-Stage: implement\nToryo-Attempt: 1\nToryo-Agent: codex-openai\n";
+
+/// Do-1. `Checkpointing` is entered again (here: after a crash) with a file in the tree that
+/// the role's fence forbids. Was: the fresh path asked `policy.deny_paths` only and `git add -A`
+/// committed the file. Now it asks the same question a found commit gets (protected, denied,
+/// fence): nothing is committed and the task escalates.
+#[test]
+fn m13_02_a_fresh_checkpoint_refuses_what_the_fence_forbids() {
+    let env = setup_never_zzz();
+    create(&env, "K-1");
+    let (w, began, _genuine) = crash_in_checkpointing(&env, "K-1");
+    // the checkpoint is gone again, and a fenced file is staged next to the turn's work
+    git(&w, &["reset", "-q", "--soft", &began]);
+    std::fs::create_dir_all(w.join("src/ZZZ")).unwrap();
+    std::fs::write(w.join("src/ZZZ/secret.ps1"), "evil\n").unwrap();
+    git(&w, &["add", "-A"]);
+    let s = agents_that_finish(&env, "k1.json");
+    let (code, err) = toryo(&env, &["resume", "K-1", "--yes", "--fake-agents", &s], &[]);
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(
+        !files.contains("ZZZ"),
+        "the fenced file was committed: {files}\n{err}"
+    );
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "K-1").state, St::Escalated, "{err}");
+    let why = reason(&env, "K-1");
+    assert!(
+        why.starts_with("policy_violation:")
+            && why.contains("src/ZZZ/secret.ps1")
+            && why.contains("nothing was committed"),
+        "{why}"
+    );
+    assert_eq!(rev(&w, "HEAD"), began, "nothing was committed");
+    // the way out the reason names: the next turn's checks put the file back
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "K-1",
+            "--note",
+            "go on",
+            "--yes",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "K-1").state, St::Completed, "{err}");
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!files.contains("ZZZ"), "{files}");
+}
+
+/// AC-1. A forged commit made with the worktree's own index (`git add` + `git commit`, no
+/// private index) carries the checkpoint's trailers and a file the fence forbids: found in
+/// `Checkpointing`, it is refused and undone (the file stays staged). The task then waits
+/// (`Escalated`); the resume that leaves it runs a turn whose checks put the file back — the
+/// checkpoint holds no `ZZZ`.
+#[test]
+fn m13_02_a_forged_commit_from_the_worktree_index_never_reaches_a_checkpoint() {
+    let env = setup_never_zzz();
+    create(&env, "K-2");
+    let (w, began, genuine) = crash_in_checkpointing(&env, "K-2");
+    git(&w, &["reset", "-q", "--soft", &began]);
+    std::fs::create_dir_all(w.join("src/ZZZ")).unwrap();
+    std::fs::write(w.join("src/ZZZ/secret.ps1"), "evil\n").unwrap();
+    git(&w, &["add", "-A"]);
+    git(
+        &w,
+        &[
+            "-c",
+            "user.name=agent",
+            "-c",
+            "user.email=a@a",
+            "commit",
+            "-q",
+            "-m",
+            &format!(
+                "toryo(K-2): implement\n\n{}",
+                CHECKPOINT_TRAILERS.replace("{id}", "K-2")
+            ),
+        ],
+    );
+    let forged = rev(&w, "HEAD");
+    assert_ne!(forged, genuine);
+    let s = agents_that_finish(&env, "k2.json");
+    let (code, err) = toryo(&env, &["resume", "K-2", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "K-2").state, St::Escalated, "{err}");
+    assert!(reason(&env, "K-2").contains("is not Toryo's"), "{err}");
+    assert_eq!(rev(&w, "HEAD"), began, "the forged commit is undone");
+    // a plain resume does not leave a policy escalation; nothing is committed meanwhile
+    let (_, err) = toryo(&env, &["resume", "K-2", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "K-2").state, St::Escalated, "{err}");
+    assert_eq!(rev(&w, "HEAD"), began);
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "K-2",
+            "--note",
+            "go on",
+            "--yes",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "K-2").state, St::Completed, "{err}");
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!files.contains("ZZZ"), "{files}");
+    let log = git(&w, &["log", "--format=%H", "main..HEAD"]);
+    assert!(!log.contains(&forged), "{log}");
+}
+
+/// AC-2. The found commit lies **under** another commit ("it is not HEAD"). Was: nothing was
+/// reset, every `resume` found and refused the same commit again, and the reason gave no way
+/// out. Now the stack is undone into the tree (soft reset to where the attempt began) and the
+/// next turn's checks see the changes.
+#[test]
+fn m13_02_a_found_commit_under_another_commit_is_undone_not_refused_forever() {
+    let env = setup_with("codex-openai", DENY_ZZZ);
+    create(&env, "K-3");
+    let (w, began, genuine) = crash_in_checkpointing(&env, "K-3");
+    std::fs::create_dir_all(w.join("src/ZZZ")).unwrap();
+    std::fs::write(w.join("src/ZZZ/secret.ps1"), "evil\n").unwrap();
+    git(&w, &["add", "-A"]);
+    git(
+        &w,
+        &[
+            "-c",
+            "user.name=agent",
+            "-c",
+            "user.email=a@a",
+            "commit",
+            "-q",
+            "-m",
+            "on top",
+        ],
+    );
+    let top = rev(&w, "HEAD");
+    assert_eq!(rev(&w, "HEAD^"), genuine);
+    let s = agents_that_finish(&env, "k3.json");
+    let (code, err) = toryo(&env, &["resume", "K-3", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "K-3").state, St::Escalated, "{err}");
+    let why = reason(&env, "K-3");
+    assert!(
+        why.contains("it is not HEAD") && why.contains("undone"),
+        "{why}"
+    );
+    assert_eq!(rev(&w, "HEAD"), began, "the stack is undone: {err}");
+    assert!(
+        w.join("src/ZZZ/secret.ps1").exists(),
+        "its changes stay in the tree"
+    );
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "K-3",
+            "--note",
+            "go on",
+            "--yes",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "K-3").state, St::Completed, "{err}");
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!files.contains("ZZZ"), "{files}");
+    let log = git(&w, &["log", "--format=%H", "main..HEAD"]);
+    assert!(!log.contains(&top) && !log.contains(&genuine), "{log}");
+}
