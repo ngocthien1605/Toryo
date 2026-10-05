@@ -427,3 +427,89 @@ fn m13_04_a_secret_at_the_cut_leaves_no_fragment() {
         }
     }
 }
+
+// ── M13-14 (7): cp932 through the whole pipeline ──────────────────────────────────────────
+
+/// A check gate prints a line in **cp932** (what a tool prints on a Japanese Windows) and
+/// fails. With the machine's OEM code page said to be 932 (`TORYO_OEM_CODE_PAGE`, tests only)
+/// the line goes sink → decode → strip → redact → `output_tail` → the implementer's fix prompt
+/// as the text it is: no `�`, and the `0x5C` trail bytes of 能 and ソ are not backslashes.
+/// Skipped when code page 932 is not installed.
+#[cfg(windows)]
+#[test]
+fn m13_14_a_cp932_line_of_a_gate_reaches_the_fix_prompt_as_text() {
+    if !toryo::process::decode::code_page_installed(932) {
+        eprintln!("skipped: code page 932 is not installed");
+        return;
+    }
+    const TEXT: &str = "エラー: 機能ソース";
+    // TEXT in cp932, then CR LF
+    let bytes = "0x83,0x47,0x83,0x89,0x81,0x5B,0x3A,0x20,0x8B,0x40,0x94,0x5C,0x83,0x5C,0x81,0x5B,0x83,0x58,0x0D,0x0A";
+    let probe = "  probe: { kind: check, program: pwsh, args: [-NoProfile, -NonInteractive, -File, scripts/probe.ps1], timeout: 2m }\n";
+    let org = ORGCHART.replace("IMPLEMENTER", "codex-openai").replacen(
+        "gates:\n",
+        &format!("gates:\n{probe}"),
+        1,
+    );
+    // the first run prints the line and fails; the next one passes (a marker beside the repo)
+    let marker_dir = tempfile::tempdir().unwrap();
+    let marker = marker_dir
+        .path()
+        .join("ran")
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    let ps1 = format!(
+        "if (Test-Path '{marker}') {{ exit 0 }}\nSet-Content -Path '{marker}' -Value x\n$b = [byte[]]({bytes})\n$o = [Console]::OpenStandardOutput()\n$o.Write($b, 0, $b.Length)\n$o.Flush()\nexit 1\n"
+    );
+    let env = setup_orgchart(
+        "codex-openai",
+        "",
+        &[
+            (".toryo/toryo-orgchart.yaml", &org),
+            (
+                ".toryo/roles/implementer/toryo-role.yaml",
+                "toryo: 1\npurpose: Change the code.\nbefore_handoff: [divide-present, probe]\n",
+            ),
+            ("scripts/probe.ps1", &ps1),
+        ],
+    );
+    create(&env, "JP-1");
+    let s = script(
+        &env,
+        "jp1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()]),
+                turn(vec![implementation()]),
+            ],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["run", "JP-1", "--yes", "--fake-agents", &s],
+        &[("TORYO_OEM_CODE_PAGE", "932")],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "JP-1").state, St::Completed, "{err}");
+    let prompts: Vec<String> = calls(&env, "JP-1")
+        .iter()
+        .filter_map(|c| c["prompt"].as_str().map(str::to_string))
+        .collect();
+    let fix = prompts
+        .iter()
+        .find(|p| p.contains("VERIFY FAILED"))
+        .unwrap_or_else(|| panic!("no fix prompt in {prompts:#?}"));
+    assert!(fix.contains(TEXT), "the line as text: {fix}");
+    assert!(!fix.contains('\u{FFFD}'), "{fix}");
+    // the gate log of the failed run holds the same text
+    let logs = task(&env, "JP-1").run_store.join("gate-logs");
+    let logged = std::fs::read_dir(&logs)
+        .unwrap()
+        .flatten()
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .any(|t| t.contains(TEXT));
+    assert!(logged, "no gate log in {} holds the line", logs.display());
+}

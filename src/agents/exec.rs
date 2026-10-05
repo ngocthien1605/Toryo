@@ -309,9 +309,7 @@ pub fn run_turn_with(
     // are redacted already; the derived text is redacted again below)
     if !outcome.success && outcome.error_class == Some(crate::domain::ErrorClass::ProcessCrashed) {
         if let Some(lines) = stderr_last_lines(&stderr_tail, STDERR_LINES) {
-            let detail = outcome.error_detail.take().unwrap_or_default();
-            outcome.error_detail =
-                Some(format!("{detail}; the CLI's stderr (last lines):\n{lines}"));
+            outcome.error_detail = Some(with_stderr(outcome.error_detail.take(), &lines));
         }
     }
     fail_on_capture_errors(
@@ -344,6 +342,17 @@ pub fn run_turn_with(
         argv: argv_view,
         argv_sha256,
     })
+}
+
+/// M12-14: the detail of a turn that died without a result, with what the CLI printed to
+/// stderr. M13-14: also when the turn had no detail of its own — then the stderr lines are the
+/// detail (was: the text began with a stray "; ").
+fn with_stderr(detail: Option<String>, lines: &str) -> String {
+    let tail = format!("the CLI's stderr (last lines):\n{lines}");
+    match detail {
+        Some(d) if !d.trim().is_empty() => format!("{d}; {tail}"),
+        _ => tail,
+    }
 }
 
 /// How much stderr is kept for [`stderr_last_lines`].
@@ -460,5 +469,22 @@ mod tests {
         assert!(!got.contains('\u{1b}'));
         assert_eq!(stderr_last_lines(b"  \n\n", 10), None);
         assert_eq!(stderr_last_lines(b"", 10), None);
+    }
+
+    /// M13-14 (9): the stderr tail is attached also when the turn has no detail of its own —
+    /// as the detail, not after a stray separator.
+    #[test]
+    fn the_stderr_tail_is_the_detail_when_there_is_none() {
+        let lines = "  | error: unknown option --x";
+        assert_eq!(
+            with_stderr(Some("exit code 2 without a result".into()), lines),
+            "exit code 2 without a result; the CLI's stderr (last lines):\n  | error: unknown option --x"
+        );
+        for none in [None, Some(String::new()), Some("  ".to_string())] {
+            assert_eq!(
+                with_stderr(none, lines),
+                "the CLI's stderr (last lines):\n  | error: unknown option --x"
+            );
+        }
     }
 }

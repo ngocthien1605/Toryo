@@ -24,6 +24,8 @@ pub struct CreateArgs {
 
 /// M12-12 (c): a task id is a file name (the lock file, the run store): `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`
 /// and never `..` — checked before any file is touched, on every command that takes an id.
+/// M13-14: and a file name on Windows too — not a device name (`con`, `nul`, `com1`, … also
+/// before a dot, in any case) and not ending in a dot.
 pub fn valid_task_id(id: &str) -> Result<()> {
     let mut chars = id.chars();
     let ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
@@ -31,10 +33,12 @@ pub fn valid_task_id(id: &str) -> Result<()> {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        && !id.contains("..");
+        && !id.contains("..")
+        && !id.ends_with('.')
+        && !super::lock::is_device_name(id);
     if !ok {
         bail!(
-            "`{id}` is not a task id — letters, digits, `.`, `_` and `-`, starting with a letter or digit, at most 64 characters, never `..`"
+            "`{id}` is not a task id — letters, digits, `.`, `_` and `-`, starting with a letter or digit, at most 64 characters, never `..`, not ending in `.`, and not a Windows device name (con, prn, aux, nul, com1–com9, lpt1–lpt9)"
         );
     }
     Ok(())

@@ -2416,6 +2416,97 @@ commands:
         );
     }
 
+    /// M13-14 (4): a configuration **without** `project.base_branch` (M12-08 made the key
+    /// optional) freezes to the digest it had before M12. The value is the one the pre-M12
+    /// source pins for this template in `templates_keep_their_m10_hash` (computed with `main` @
+    /// aa0be03, unchanged at 4ad97c3): before M12 the key defaulted to `main`, so the template
+    /// with its `base_branch: main` line and without it were the same configuration.
+    #[test]
+    fn a_configuration_without_base_branch_keeps_its_pre_m12_digest() {
+        let t = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
+        let text = std::fs::read_to_string(t.join("toryo.yaml.example"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        assert!(
+            text.contains("\n  base_branch: main\n"),
+            "the template sets the key"
+        );
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("toryo.yaml");
+        std::fs::write(&p, text.replace("\n  base_branch: main\n", "\n")).unwrap();
+        let cfg = Effective::load(&p, Some(&t.join("toryo.local.yaml.example"))).unwrap();
+        assert_eq!(cfg.repo.project.base_branch, None);
+        assert_eq!(
+            cfg.sha256(),
+            "7e2e52195e51597e2b220e46c99dc6fa8aa2c6b9e08e4707da102b4bcf087e0f",
+            "{}",
+            cfg.canonical_json()
+        );
+    }
+
+    /// M13-14 (6): `keys_without_effect` in the other direction — every key of the repository
+    /// file (the last name of every path of a loaded configuration; `profiles` is the machine's)
+    /// is read by engine code outside `config.rs`, or is on the no-effect list. A key that is
+    /// accepted, does nothing and is not announced fails here.
+    #[test]
+    fn every_key_of_the_repository_file_is_read_or_announced() {
+        fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    rs_files(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        fn leaves(at: &str, v: &serde_json::Value, out: &mut Vec<(String, String)>) {
+            match v.as_object().filter(|o| !o.is_empty()) {
+                Some(o) => {
+                    for (k, v) in o {
+                        leaves(&format!("{at}.{k}"), v, out);
+                    }
+                }
+                None => {
+                    let name = at.rsplit('.').next().unwrap_or(at).to_string();
+                    out.push((at.trim_start_matches('.').to_string(), name));
+                }
+            }
+        }
+        let mut files = Vec::new();
+        rs_files(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let sources: String = files
+            .iter()
+            .filter(|f| f.file_name().is_some_and(|n| n != "config.rs"))
+            .map(|f| std::fs::read_to_string(f).unwrap())
+            .collect();
+        let t = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
+        let e = Effective::load(
+            &t.join("toryo.yaml.example"),
+            Some(&t.join("toryo.local.yaml.example")),
+        )
+        .unwrap();
+        let mut repo = serde_json::to_value(&e.repo).unwrap();
+        repo.as_object_mut().unwrap().remove("profiles");
+        let mut keys = Vec::new();
+        leaves("", &repo, &mut keys);
+        assert!(keys.len() > 20, "{keys:?}");
+        let no_effect = ["runs_root", "final_clean", "budget_usd_est"];
+        let unread: Vec<&str> = keys
+            .iter()
+            .filter(|(_, name)| !no_effect.contains(&name.as_str()))
+            .filter(|(_, name)| !sources.contains(&format!(".{name}")))
+            .map(|(path, _)| path.as_str())
+            .collect();
+        assert!(
+            unread.is_empty(),
+            "accepted, read by no engine code and not announced as `has no effect`: {unread:?}"
+        );
+    }
+
     /// M12-07 (X17): `confirm` is `never`, `first` or `always`; `never` is the default and is
     /// left out of the frozen configuration, so an existing configuration keeps its hash.
     #[test]

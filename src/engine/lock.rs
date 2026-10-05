@@ -379,7 +379,17 @@ pub fn lock_name_problem(lock: &str) -> Option<&'static str> {
     if !chars {
         return Some("use letters, digits, `-`, `_` and `.` only (e.g. d365-env)");
     }
-    let stem = lock
+    if is_device_name(lock) {
+        return Some("is a Windows device name (con, prn, aux, nul, com1–com9, lpt1–lpt9) — choose another (e.g. d365-env)");
+    }
+    None
+}
+
+/// Whether `name` is a Windows device name — `con`, `prn`, `aux`, `nul`, `com1`–`com9`,
+/// `lpt1`–`lpt9`, in any case, also before a dot (`nul.lock` is the device): no file or
+/// folder can have it (M11-R8 for a lock name, M13-14 for a task id).
+pub fn is_device_name(name: &str) -> bool {
+    let stem = name
         .split('.')
         .next()
         .unwrap_or_default()
@@ -388,10 +398,7 @@ pub fn lock_name_problem(lock: &str) -> Option<&'static str> {
         stem.strip_prefix(p)
             .is_some_and(|n| n.len() == 1 && ('1'..='9').contains(&n.chars().next().unwrap()))
     };
-    if ["con", "prn", "aux", "nul"].contains(&stem.as_str()) || numbered("com") || numbered("lpt") {
-        return Some("is a Windows device name (con, prn, aux, nul, com1–com9, lpt1–lpt9) — choose another (e.g. d365-env)");
-    }
-    None
+    ["con", "prn", "aux", "nul"].contains(&stem.as_str()) || numbered("com") || numbered("lpt")
 }
 
 /// The stored form of a lock name (M11-R8): lower case, so `D365-Env` and `d365-env` are one

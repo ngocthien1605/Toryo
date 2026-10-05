@@ -424,3 +424,65 @@ fn m13_13_a_launch_error_reserves_nothing_and_says_what_is_wrong() {
         .unwrap();
     assert_eq!(reserved, 0, "no usage row holds a reservation: {err}");
 }
+
+// ── M13-14 (8): a task id is checked on every command; device names are no ids ────────────
+
+/// `status`, `task show`, `task cleanup` and `approve` refuse an id that is no id before they
+/// touch anything; an id from a `TASK.md` title that is longer than 64 characters is refused;
+/// a Windows device name (`CON`, `NUL`, `COM1`, … — also before a dot, in any case) and a
+/// name that ends in a dot are no task ids (they are no file names on Windows: the lock file,
+/// the run store and the worktree are named after the id).
+#[test]
+fn m13_14_every_command_refuses_what_is_not_a_task_id() {
+    let env = setup("codex-openai");
+    for bad in ["../victim-x", "a/b", "..", "x y"] {
+        for args in [
+            vec!["status", bad],
+            vec!["task", "show", bad],
+            vec!["task", "cleanup", bad],
+            vec!["approve", bad, "--gate", "plan"],
+        ] {
+            let (code, err) = toryo(&env, &args, &[]);
+            assert_ne!(code, 0, "{args:?}: {err}");
+            assert!(err.contains("is not a task id"), "{args:?}: {err}");
+        }
+    }
+    assert!(!env.data.join("victim-x.lock").exists());
+    // the id taken from the title (`# <ID> — …`): 67 characters
+    let long = format!("T{}-12345", "a".repeat(60));
+    let file = env.root.join("long.md");
+    std::fs::write(
+        &file,
+        format!("# {long} — a long id\n\n## Acceptance criteria\n- AC-1: one\n"),
+    )
+    .unwrap();
+    let (code, err) = toryo(
+        &env,
+        &["task", "create", "--file", file.to_str().unwrap()],
+        &[],
+    );
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains("is not a task id") && err.contains("at most 64"),
+        "{err}"
+    );
+    // device names, and a trailing dot
+    for bad in [
+        "CON", "nul", "Aux", "prn", "COM1", "lpt9", "con.task", "NUL.1", "T-1.",
+    ] {
+        assert!(
+            toryo::engine::task::valid_task_id(bad).is_err(),
+            "`{bad}` was taken for a task id"
+        );
+        let (code, err) = toryo(
+            &env,
+            &["task", "create", "--file", "TASK.md", "--id", bad],
+            &[],
+        );
+        assert_ne!(code, 0, "{bad}: {err}");
+        assert!(err.contains("is not a task id"), "{bad}: {err}");
+    }
+    for ok in ["CONSOLE-1", "com10", "T-1.2", "nullable", "a"] {
+        assert!(toryo::engine::task::valid_task_id(ok).is_ok(), "{ok}");
+    }
+}

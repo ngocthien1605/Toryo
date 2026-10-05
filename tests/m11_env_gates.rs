@@ -2995,3 +2995,42 @@ fn m13_09_the_readme_and_the_guide_say_which_class_and_how_to_say_no() {
         "the guide: how to say no — {confirm}"
     );
 }
+
+// ── M13-14 (3): `task config --reload` refuses a missing environment-gate script ──────────
+
+/// The refusal of `task create` (M12-05) holds for a reload too: with the gate's script gone,
+/// `task config --reload` stops with `environment_gate_unavailable` and changes nothing.
+#[test]
+fn m13_14_a_reload_refuses_a_missing_environment_gate_script() {
+    let env = env_gate_setup("codex-openai", "error", "");
+    define_gates(
+        &env,
+        &machine_gate(&env, "dbsync", "d365-env", "exit 0\n", "exit 0\n", ""),
+    );
+    create(&env, "RL-1");
+    // a waiting state: the plan gate (no `--yes`)
+    let s = script(&env, "rl1.json", json!({ "planner": [turn(vec![plan()])] }));
+    let (_, err) = toryo(&env, &["run", "RL-1", "--fake-agents", &s], &[]);
+    let before = task(&env, "RL-1");
+    assert_eq!(before.state, St::WaitingPlanApproval, "{err}");
+    std::fs::remove_file(env.root.join("gates").join(if cfg!(windows) {
+        "dbsync.ps1"
+    } else {
+        "dbsync.sh"
+    }))
+    .unwrap();
+    let (code, err) = toryo(&env, &["task", "config", "RL-1", "--reload"], &[]);
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains(
+            "environment_gate_unavailable: environment gate `dbsync` cannot start on this machine"
+        ) && err.contains("does not exist"),
+        "{err}"
+    );
+    let after = task(&env, "RL-1");
+    assert_eq!(
+        after.config_sha256, before.config_sha256,
+        "nothing was changed"
+    );
+    assert_eq!(after.state, St::WaitingPlanApproval);
+}

@@ -20,7 +20,7 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
 - [x] M13-11 `task create` is all or nothing (X28)
 - [x] M13-12 Ctrl+C on `toryo run` is a stop request (X29)
 - [x] M13-13 A launch error before the agent starts does not reserve a budget
-- [ ] M13-14 Tests the review asked for
+- [x] M13-14 Tests the review asked for
 - [ ] M13-15 Notes, guide, `STATUS.md`
 - [ ] Finish, push, pull request, CI
 
@@ -342,6 +342,38 @@ failed first; the rest is under "Open".
   usage before the `TurnFailed` (as a preflight refusal already did, `CliSession::refuse`): a turn that never started holds no reservation. The class
   stays `ProcessCrashed` with the OS error in the detail; the retries of plan §11 still happen (each without a reservation), then the task escalates.
 - **Not changed:** an error *after* the process started (waiting, the capture files) still has unknown usage and still reserves — that is R41.
+
+
+### M13-14 — Tests the review asked for
+
+Nine items, each its own test. "ok at once" = the test passed without a production change.
+
+1. **Class constants ↔ `MACHINE_CAUSED`** — `state::tests::every_machine_caused_class_is_one_of_the_engine_constants`: every constant the engine escalates
+   with is machine-caused, the list names nothing else, and five classes that must cost a fix cycle are not on it. Ok at once.
+2. **The environment-gate spawn-error branch** — `m11_env_gates::m13_08_an_environment_gate_program_that_cannot_start_is_a_machine_stop` (written with
+   M13-08, a text file as `program`). Ok at once.
+3. **`task config --reload` refuses a missing environment-gate script** — `m11_env_gates::m13_14_a_reload_refuses_a_missing_environment_gate_script`. Ok at once.
+4. **The frozen digest of a configuration without `base_branch`** — `config::tests::a_configuration_without_base_branch_keeps_its_pre_m12_digest`: the
+   root template with its `base_branch: main` line removed hashes to `7e2e5219…`. Ok at once.
+   **How the value was obtained (not as the list says):** it was not recomputed by running the code of `4ad97c3` — exporting that commit into a scratch
+   folder to build it was refused by this session's permission layer, and no worktree may be made. The value is the one the source of `4ad97c3` itself
+   pins for this template (`templates_keep_their_m10_hash`, computed with `main` @ `aa0be03`; that test was green at `4ad97c3`). Before M12 the key
+   defaulted to `main`, so the template with the line and without it were one configuration with that digest. Open: the owner can confirm with one
+   run of the old code if wanted.
+5. **AC-2 of M12-01 with a role `never:` fence** — `regress_recovery::m13_14_a_forged_partial_commit_with_a_fenced_file_is_never_accepted`. Ok at once.
+6. **`keys_without_effect`, the other direction** — `config::tests::every_key_of_the_repository_file_is_read_or_announced`: the last name of every path of
+   a loaded repository configuration (`profiles` left out: the machine's) appears as a field access in a source file other than `config.rs`, or is on
+   the no-effect list. Ok at once. (`RepoConfig` has no `Default`: the test loads the shipped template, which fills every default.)
+7. **`TORYO_OEM_CODE_PAGE`** (tests only; read in `process::decode::oem_code_page` on Windows — **the production change the item asks for**) and
+   `m12_gates::m13_14_a_cp932_line_of_a_gate_reaches_the_fix_prompt_as_text` (Windows-only; skipped when code page 932 is not installed): a check gate
+   writes "エラー: 機能ソース" in cp932 and fails; the implementer's fix prompt and the gate log hold the text, no `�`. Failed before the variable was read
+   (this machine's code page is not 932).
+8. **Ids** — `m12_cli::m13_14_every_command_refuses_what_is_not_a_task_id`: `status`, `task show`, `task cleanup`, `approve` refuse an invalid id and a
+   title id of 67 characters is refused — ok at once. **Finding:** `valid_task_id` took Windows device names (`CON`, `nul`, `COM1`, `con.task`, …) and an
+   id ending in a dot. **Fixed** (the item names the behaviour): `valid_task_id` refuses both; the device-name test of the lock names is now
+   `lock::is_device_name`, used by both. An existing task with such an id (none can have been created on Windows) would be refused by every command.
+9. **M12-14, the stderr tail without a detail** — `exec::tests::the_stderr_tail_is_the_detail_when_there_is_none`: the tail was attached, but after a
+   stray "; " when the turn had no detail of its own; `exec::with_stderr` makes the tail the detail then (the one line the review called free).
 
 
 ## Open
