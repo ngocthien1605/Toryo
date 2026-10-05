@@ -8,7 +8,7 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
 
 - [x] M13-01 The anchor: a writing attempt starts at the last commit Toryo recorded (X24)
 - [x] M13-02 A fresh checkpoint runs the full path policy; a refused found commit does not loop (X25)
-- [ ] M13-03 The redactor: a line break may only be the last byte of a secret
+- [x] M13-03 The redactor: a line break may only be the last byte of a secret
 - [ ] M13-04 Gate output is cut on line boundaries; the log path the vendor sees is relative (X27)
 - [ ] M13-05 The deploy confirmation is a database row bound to gate, commit and digest (X26)
 - [ ] M13-06 Read-only turns: the checks also run when the turn errors; the copy is safe
@@ -73,6 +73,16 @@ Branch `m13/review-fixes` from `main` @ `685aa45` (the merge of M12, pull reques
   the staged file. The test stays as a guard (it also asserts that a plain `resume` leaves the task `Escalated` and commits nothing). The fresh-path hole
   is real through another door — `Checkpointing` entered again after a crash (the first test) or after `protected_config_changed` is restored.
 - **AC-3:** the M12-01 tests pass unchanged. No earlier assertion changed (no test pinned the old "denied paths … (policy.deny_paths)" sentence).
+
+
+### M13-03 — The redactor: a line break may only be the last byte of a secret
+
+- **Failing test first:** `process::redact::tests::a_secret_ending_in_two_line_breaks_is_not_released_in_halves` — secret `ab\n\n`, chunks `zab\n` then `\n`:
+  the output was `zab\n\n`, the secret whole and in clear (AC-1).
+- **Fix (`Redactions::new`):** `multiline = p[..p.len() - 1].contains(&b'\n')` — exactly one trailing byte is set aside, so `ab\n\n` is multi-line and keeps
+  the `max_len − 1` hold-back; `ab\n` is still a line end (`retained() == 0` after a full line). A secret that holds only line breaks is dropped from the
+  patterns with one `note:` (as a pattern it would redact every line end).
+- **AC-2:** the M12-04 tests, the split tests and the fuzz test pass unchanged.
 
 
 ## Open

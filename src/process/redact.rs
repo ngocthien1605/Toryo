@@ -64,6 +64,15 @@ impl Redactions {
             if s.value.is_empty() {
                 continue;
             }
+            // M13-03: a value of line breaks only is not a secret — as a pattern it would
+            // redact every line end
+            if s.value.bytes().all(|b| b == b'\n') {
+                eprintln!(
+                    "note: the secret `{}` holds only line breaks — it is not redacted",
+                    sanitize_name(&s.name)
+                );
+                continue;
+            }
             let repl = format!("[REDACTED:{}]", sanitize_name(&s.name)).into_bytes();
             let literal = s.value.as_bytes().to_vec();
             let escaped_full = serde_json::to_string(&s.value).expect("string serialises");
@@ -86,11 +95,10 @@ impl Redactions {
             };
         }
         let max_len = patterns.iter().map(|p| p.len()).max().unwrap_or(0);
-        // a trailing line break (a secret read from a file) ends a line, it does not span lines
-        let multiline = patterns.iter().any(|p| {
-            let end = p.iter().rposition(|b| *b != b'\n').map_or(0, |i| i + 1);
-            p[..end].contains(&b'\n')
-        });
+        // a trailing line break (a secret read from a file) ends a line, it does not span lines.
+        // M13-03: exactly one — the "a complete line is final" rule holds only when a line
+        // break can be nothing but the last byte of a pattern (`ab\n\n` has one inside)
+        let multiline = patterns.iter().any(|p| p[..p.len() - 1].contains(&b'\n'));
         let ac = AhoCorasickBuilder::new()
             .match_kind(MatchKind::Standard) // overlapping search; spans are unioned below
             .build(&patterns)
@@ -493,6 +501,32 @@ mod tests {
             String::from_utf8(all_out).unwrap(),
             "x\n[REDACTED:PEM]\ndone\n"
         );
+    }
+
+    /// M13-03: a line break may only be the **last** byte of a secret for the "a complete line
+    /// is final" rule to hold. A value that ends in two line breaks has one inside it: with the
+    /// first chunk ending at that inner break the secret used to leave in clear.
+    #[test]
+    fn a_secret_ending_in_two_line_breaks_is_not_released_in_halves() {
+        let r = Redactions::new(&[sec("K", "ab\n\n")]);
+        let mut s = StreamRedactor::new(r);
+        let mut out = s.push(b"zab\n");
+        out.extend(s.push(b"\n"));
+        out.extend(s.finish());
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("ab"), "{text:?}");
+        assert_eq!(text, "z[REDACTED:K]");
+        // a single trailing break is still a line end, not a line span (M12-04 review)
+        let one = Redactions::new(&[sec("K", "ab\n")]);
+        assert!(!one.multiline);
+        let mut s = StreamRedactor::new(one);
+        let out = s.push(b"zab\nnext\n");
+        assert_eq!(s.retained(), 0);
+        assert_eq!(String::from_utf8(out).unwrap(), "z[REDACTED:K]next\n");
+        // a secret of line breaks only is not a secret: dropped, nothing is redacted
+        let only = Redactions::new(&[sec("N", "\n\n"), sec("M", "\n")]);
+        assert!(only.is_empty());
+        assert_eq!(only.redact_str("a\n\nb\n"), "a\n\nb\n");
     }
 
     #[test]
