@@ -491,7 +491,7 @@ few holes are left. Eight commits `(M13-R1 … R8)` on the same branch. Test cou
 ### Progress (review fixes)
 
 - [x] R1 Replace refs defeat every diff-based check (X30)
-- [ ] R2 `m13_11_…_after_the_worktree…` fails on Linux (Git 2.43)
+- [x] R2 `m13_11_…_after_the_worktree…` fails on Linux (Git 2.43)
 - [ ] R3 The output cut holds post-redaction bytes
 - [ ] R4 A read-only write is left in the tree when HEAD was off the branch or recovery stopped first (X32)
 - [ ] R5 `start_at_anchor` trusts a detached or mid-merge HEAD; `foreign_commit` accepts a merge commit (X31)
@@ -513,3 +513,12 @@ few holes are left. Eight commits `(M13-R1 … R8)` on the same branch. Test cou
   second line, not the first).
 - The e2e test goes through whichever check meets the replace first (the protected scan at the loop top or the refused found commit): the reason must
   name `refs/replace` or "is not Toryo's".
+
+### R2 — The Linux test of M13-11 (Git 2.43)
+
+- `m13_11_a_create_that_fails_after_the_worktree_removes_branch_and_worktree` made `.git/info/exclude` a folder. Git 2.43 refuses that at the
+  first `ls-files --exclude-standard` (before anything is created), Git 2.55 only warns: the test depended on the Git version. **Test changed** (named
+  in the commit body): the failure is now the test hook `TORYO_TEST_FAIL_AT=create:after_worktree`, checked at the one site after `git worktree add`
+  in `task::create` (`bail!` with the path of `info/exclude`); the folder trick and its clean-up are gone, the assertions are the same. It failed first
+  (the create succeeded without the hook), then passed. The other M13-11 test is unchanged. Documented in STATUS O-39. Whether it also passes on
+  Linux is for the `test (ubuntu-latest)` job of the pull request to say (not buildable here).

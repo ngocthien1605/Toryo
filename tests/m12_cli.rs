@@ -220,18 +220,17 @@ fn m13_11_a_create_that_fails_at_the_worktree_leaves_nothing() {
 }
 
 /// The same after the **branch and the worktree** exist: the step after `git worktree add`
-/// fails (Git's `info/exclude` cannot be written — here it is a folder). Was: branch, worktree
-/// and run store stayed; the retry was refused. Now all three are removed, one line each.
+/// fails (Git's `info/exclude` cannot be written). Was: branch, worktree and run store stayed;
+/// the retry was refused. Now all three are removed, one line each. (M13-R2: the failure is the
+/// test hook `TORYO_TEST_FAIL_AT=create:after_worktree`, not a folder at `info/exclude` —
+/// Git 2.43 refuses such a folder before anything is created, Git 2.55 only warns.)
 #[test]
 fn m13_11_a_create_that_fails_after_the_worktree_removes_branch_and_worktree() {
     let env = setup("codex-openai");
-    let exclude = env.repo.join(".git").join("info").join("exclude");
-    let _ = std::fs::remove_file(&exclude);
-    std::fs::create_dir_all(&exclude).unwrap();
     let (code, err) = toryo(
         &env,
         &["task", "create", "--file", "TASK.md", "--id", "N-2"],
-        &[],
+        &[("TORYO_TEST_FAIL_AT", "create:after_worktree")],
     );
     assert_ne!(code, 0, "{err}");
     assert!(
@@ -245,7 +244,6 @@ fn m13_11_a_create_that_fails_after_the_worktree_removes_branch_and_worktree() {
         "the original error is the one reported: {err}"
     );
     assert_nothing_left(&env, "N-2", &err);
-    std::fs::remove_dir(&exclude).unwrap();
     create(&env, "N-2");
     assert_eq!(task(&env, "N-2").state, St::New);
 }

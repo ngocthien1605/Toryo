@@ -587,6 +587,15 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
     let excl = PathBuf::from(common.trim()).join("info").join("exclude");
+    // M13-R2 test hook (STATUS O-39): the step after `git worktree add` fails the same way on
+    // every Git version (a folder at `info/exclude` is refused before anything is created by
+    // Git 2.43 and only warned about by 2.55)
+    if std::env::var("TORYO_TEST_FAIL_AT").is_ok_and(|v| v == "create:after_worktree") {
+        bail!(
+            "TORYO_TEST_FAIL_AT=create:after_worktree: cannot write {}",
+            excl.display()
+        );
+    }
     let cur = std::fs::read_to_string(&excl).unwrap_or_default();
     if !cur.lines().any(|l| l.trim() == "/.toryo-tmp/") {
         std::fs::create_dir_all(excl.parent().expect("parent"))?;
