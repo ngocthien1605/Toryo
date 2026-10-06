@@ -44,6 +44,11 @@ pub(super) fn foreign_commit(
     if wt.head()? != commit {
         return Ok(Some("it is not HEAD".into()));
     }
+    // M13-R5 (X31): a merge commit is never a checkpoint — the history of its second parent
+    // would enter the task branch unseen by every review of the first-parent diff
+    if wt.has_second_parent(commit)? {
+        return Ok(Some("it is a merge commit".into()));
+    }
     let Some(parent) = wt.first_parent(commit)? else {
         return Ok(Some("it has no parent".into()));
     };

@@ -54,6 +54,16 @@ impl<'a> Worktree<'a> {
             .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string()))
     }
 
+    /// Whether `commit` is a merge commit (has a second parent) — M13-R5.
+    pub fn has_second_parent(&self, commit: &str) -> Result<bool> {
+        let o = self.g.output(
+            &self.loc,
+            true,
+            &["rev-parse", "--verify", "--quiet", &format!("{commit}^2")],
+        )?;
+        Ok(o.status.success())
+    }
+
     /// Every changed path (tracked and untracked, not ignored): `(status, path)`. Rename
     /// detection is off (`--no-renames`), so a rename is the deletion of its source plus the
     /// addition of its destination: both paths reach the path policy with their own status,

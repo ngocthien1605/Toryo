@@ -494,7 +494,7 @@ few holes are left. Eight commits `(M13-R1 … R8)` on the same branch. Test cou
 - [x] R2 `m13_11_…_after_the_worktree…` fails on Linux (Git 2.43)
 - [x] R3 The output cut holds post-redaction bytes
 - [x] R4 A read-only write is left in the tree when HEAD was off the branch or recovery stopped first (X32)
-- [ ] R5 `start_at_anchor` trusts a detached or mid-merge HEAD; `foreign_commit` accepts a merge commit (X31)
+- [x] R5 `start_at_anchor` trusts a detached or mid-merge HEAD; `foreign_commit` accepts a merge commit (X31)
 - [ ] R6 Toryo's own `git` children share the console
 - [ ] R7 Safety-adjacent Lows
 - [ ] R8 Texts, tests and doctor Lows
@@ -557,3 +557,23 @@ few holes are left. Eight commits `(M13-R1 … R8)` on the same branch. Test cou
   file — the event and the diff stay.
 - **The normal path** (`read_only_checks`): the protected check runs first, then the undo runs all the same; the escalation carries both.
   Closes Open #11. `anchor()` (unused after this) was removed.
+
+### R5 — HEAD at the anchor is not enough; a merge commit is never a checkpoint (X31)
+
+- **Failing tests first** (all three failed at the commit before): `regress_recovery::m13_r5_a_detached_head_at_the_anchor_is_not_a_place_to_checkpoint`
+  (AC-1: crash at `checkpoint:after_commit`, `reset --soft <began>`, `checkout --detach` → the fresh checkpoint was committed on the detached HEAD and
+  only the final gate noticed: `approval_mismatch`), `m13_r5_a_merge_in_progress_is_not_committed_as_a_checkpoint` (AC-2: `MERGE_HEAD` in the worktree's
+  Git dir → a merge commit was made), `m13_r5_a_forged_merge_commit_is_never_a_checkpoint` (AC-3: `commit-tree <tree> -p <began> -p <other>` with the
+  trailers at HEAD was accepted).
+- `start_at_anchor(…, fresh_checkpoint)`: for a **fresh checkpoint** `HEAD == anchor` also needs `on_branch` and no unfinished operation; otherwise the
+  existing escalation, whose text now says "HEAD is at X, the last commit Toryo recorded for this task, but <why>" when HEAD *is* the anchor. Do-c is
+  covered by AC-2 (the fresh path of `checkpoint()` goes through it). `foreign_commit` refuses "it is a merge commit" (`Worktree::has_second_parent`:
+  `rev-parse --verify --quiet <commit>^2`), before the first-parent test — for found checkpoint commits and for found partial commits alike.
+- **Deviation from the list (Open):** the list also asks the strict test of the *start of a writing attempt*. I first did, and
+  `regress_implement::ec18_an_unrepairable_git_state_escalates_whatever_ends_the_turn` and `…_after_a_stopped_turn` failed: they break the Git state
+  (MERGE_HEAD, another branch, a detached HEAD, a rebase) **before** the turn and assert that the HEAD guard escalates **after** it ("after the Implementer
+  turn …", the attempt `Failed`, one implementer prompt). Escalating before the turn would have changed those assertions in four cases, so — the most
+  conservative option — the attempt start keeps today's behaviour: the turn runs and the HEAD guard stops it (a wasted turn, no history is touched). A
+  fresh checkpoint is the place where it would cost history.
+- Closes Open #10 for the fresh checkpoint (HEAD equal to the anchor but detached; the attempt start is as before). Test detail: after `git reset --soft <began>` on the attached branch the **branch** is at
+  `<began>` too, so AC-1 asserts the branch is still there and nothing was committed.

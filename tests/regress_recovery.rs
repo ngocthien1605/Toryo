@@ -1971,3 +1971,159 @@ fn m13_r4_recovery_that_finds_head_off_the_branch_leaves_the_undo_to_the_next_at
     assert_eq!(code, 0, "{err}");
     assert_eq!(task(&env, "R-7").state, St::Completed, "{err}");
 }
+
+// ── M13-R5 (X31): HEAD == the anchor is not enough; a merge commit is never a checkpoint ─────
+
+/// Run `id` to a crash right after Toryo's checkpoint commit (`checkpoint:after_commit`): the
+/// attempt is still `Running`, the commit is on the branch. Returns the worktree, the commit the
+/// attempt began at and the checkpoint commit.
+fn crash_after_the_checkpoint(env: &Env, id: &str) -> (PathBuf, String, String) {
+    create(env, id);
+    let s = script(
+        env,
+        "r5.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        env,
+        &["run", id, "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "checkpoint:after_commit")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let w = wt(env, id);
+    (w.clone(), rev(&w, "HEAD^"), rev(&w, "HEAD"))
+}
+
+/// AC-1. Crash after the checkpoint commit; the owner (or an agent) soft-resets to where the
+/// attempt began and detaches HEAD there. HEAD *is* the anchor — but not on the task branch. Was:
+/// the fresh checkpoint committed on the detached HEAD, off the branch, and only the final gate
+/// noticed. Now the task escalates and nothing is committed.
+#[test]
+fn m13_r5_a_detached_head_at_the_anchor_is_not_a_place_to_checkpoint() {
+    let env = setup("codex-openai");
+    let (w, base, _) = crash_after_the_checkpoint(&env, "R-8");
+    git(&w, &["reset", "--soft", &base]);
+    git(&w, &["checkout", "-q", "--detach"]);
+    assert_eq!(rev(&w, "HEAD"), base);
+    let s = script(
+        &env,
+        "r8.json",
+        json!({"reviewer": [turn(vec![approved()])]}),
+    );
+    let (code, err) = toryo(&env, &["resume", "R-8", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "R-8").state, St::Escalated, "{err}");
+    let why = reason(&env, "R-8");
+    assert!(
+        why.starts_with("policy_violation:") && why.contains("not on the task branch"),
+        "{why}"
+    );
+    assert!(task(&env, "R-8").machine.checkpoint().is_none(), "{err}");
+    assert_eq!(
+        rev(&w, "HEAD"),
+        base,
+        "nothing was committed on HEAD: {err}"
+    );
+    assert_eq!(
+        rev(&w, "toryo/R-8"),
+        base,
+        "nothing was committed on the branch either: {err}"
+    );
+}
+
+/// AC-2 (and Do-c). A `MERGE_HEAD` left in the worktree with HEAD at the anchor: `git commit`
+/// would make a merge commit whose second parent is whatever `MERGE_HEAD` names. Was: the fresh
+/// checkpoint did exactly that. Now the task escalates (an unfinished Git operation) and no
+/// merge commit is made.
+#[test]
+fn m13_r5_a_merge_in_progress_is_not_committed_as_a_checkpoint() {
+    let env = setup("codex-openai");
+    let (w, base, _) = crash_after_the_checkpoint(&env, "R-9");
+    let other = commit_of(
+        &env,
+        &w,
+        &base,
+        Some(&base),
+        &[("README-other.md", "from elsewhere\n")],
+        "foreign history",
+    );
+    git(&w, &["reset", "--soft", &base]);
+    std::fs::write(git_dir(&w).join("MERGE_HEAD"), format!("{other}\n")).unwrap();
+    let s = script(
+        &env,
+        "r9.json",
+        json!({"reviewer": [turn(vec![approved()])]}),
+    );
+    let (code, err) = toryo(&env, &["resume", "R-9", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "R-9").state, St::Escalated, "{err}");
+    assert!(
+        reason(&env, "R-9").contains("an unfinished Git operation"),
+        "{}",
+        reason(&env, "R-9")
+    );
+    let merges = git(&w, &["rev-list", "--merges", "--all"]);
+    assert!(
+        merges.trim().is_empty(),
+        "a merge commit was made: {merges}"
+    );
+    assert!(task(&env, "R-9").machine.checkpoint().is_none(), "{err}");
+}
+
+/// AC-3. A forged checkpoint that is a **merge commit** at HEAD: first parent the commit the
+/// attempt began at, a clean first-parent diff, Toryo's trailers — and a second parent whose
+/// whole history would enter the task branch unseen by every diff-based review. Was: accepted.
+#[test]
+fn m13_r5_a_forged_merge_commit_is_never_a_checkpoint() {
+    let env = setup("codex-openai");
+    let (w, base, genuine) = crash_after_the_checkpoint(&env, "R-10");
+    let other = commit_of(
+        &env,
+        &w,
+        &base,
+        Some(&base),
+        &[("README-other.md", "from elsewhere\n")],
+        "foreign history",
+    );
+    let tree = git(&w, &["rev-parse", &format!("{genuine}^{{tree}}")])
+        .trim()
+        .to_string();
+    let merge = git(
+        &w,
+        &[
+            "-c",
+            "user.name=agent",
+            "-c",
+            "user.email=a@a",
+            "commit-tree",
+            &tree,
+            "-p",
+            &base,
+            "-p",
+            &other,
+            "-m",
+            "toryo(R-10): implement\n\nToryo-Task: R-10\nToryo-Stage: implement\nToryo-Attempt: 1\nToryo-Agent: codex-openai\n",
+        ],
+    )
+    .trim()
+    .to_string();
+    git(&w, &["update-ref", "refs/heads/toryo/R-10", &merge]);
+    let s = script(
+        &env,
+        "r10.json",
+        json!({"reviewer": [turn(vec![approved()])]}),
+    );
+    let (code, err) = toryo(&env, &["resume", "R-10", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "R-10").state, St::Escalated, "{err}");
+    assert!(
+        reason(&env, "R-10").contains("it is a merge commit"),
+        "{}",
+        reason(&env, "R-10")
+    );
+    assert!(task(&env, "R-10").machine.checkpoint().is_none(), "{err}");
+}

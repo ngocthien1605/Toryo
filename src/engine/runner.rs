@@ -875,7 +875,7 @@ impl<'a> Engine<'a> {
             return Ok(None);
         }
         // M13-01 (X24): the attempt begins at the anchor, never at whatever HEAD happens to be
-        if !self.start_at_anchor(t, wt)? {
+        if !self.start_at_anchor(t, wt, false)? {
             return Ok(None);
         }
         let head_before = wt.head()?;
@@ -944,7 +944,7 @@ impl<'a> Engine<'a> {
     /// commits stay in the tree and go through the checks every turn's changes get. Otherwise
     /// (another branch, a detached HEAD, an unfinished operation, a history that does not
     /// descend from the anchor) nothing is reset and the task escalates. `false`: escalated.
-    fn start_at_anchor(&self, t: &TaskRow, wt: &Worktree) -> Result<bool> {
+    fn start_at_anchor(&self, t: &TaskRow, wt: &Worktree, fresh_checkpoint: bool) -> Result<bool> {
         let i = self.id.clone();
         let atts = self.store.call(move |tx| store::attempts(tx, &i))?;
         // M13-R4 (X32): what a read-only role wrote while HEAD was off the task branch could not
@@ -954,12 +954,19 @@ impl<'a> Engine<'a> {
         }
         let anchor = anchor_of(t, &atts);
         let head = wt.head().ok();
-        if head.as_deref() == Some(anchor.as_str()) {
+        let on_branch = wt.head_ref()? == Some(format!("refs/heads/{}", t.branch));
+        let unfinished = wt.unfinished_operation()?;
+        // M13-R5 (X31): for a fresh checkpoint HEAD at the anchor is not enough — it must be on
+        // the task branch with no Git operation unfinished (a detached HEAD checkpoints off the
+        // branch; `git commit` during a merge makes a merge commit whose second parent is
+        // whatever MERGE_HEAD names). At the start of a writing attempt the HEAD guard after the
+        // turn judges that state, as before (the ec18 tests: a state broken before the turn is
+        // escalated after it): there it only costs a turn, here it would cost the history.
+        let at_anchor = head.as_deref() == Some(anchor.as_str());
+        if at_anchor && (!fresh_checkpoint || (on_branch && unfinished.is_none())) {
             return Ok(true);
         }
         let at = head.as_deref().map(short).unwrap_or("?").to_string();
-        let on_branch = wt.head_ref()? == Some(format!("refs/heads/{}", t.branch));
-        let unfinished = wt.unfinished_operation()?;
         let descends = head.is_some() && wt.contains(&anchor)?;
         if on_branch && descends && unfinished.is_none() {
             wt.soft_reset(&anchor)?;
@@ -986,9 +993,16 @@ impl<'a> Engine<'a> {
         } else {
             ""
         };
+        let place = if at_anchor {
+            format!("HEAD is at {at}, the last commit Toryo recorded for this task, but {why}")
+        } else {
+            format!(
+                "HEAD is at {at}, not at the last commit Toryo recorded for this task ({}), and {why}",
+                short(&anchor)
+            )
+        };
         let reason = format!(
-            "policy_violation: HEAD is at {at}, not at the last commit Toryo recorded for this task ({}), and {why}; nothing was reset or committed — put the task branch back by hand ({first}`git -C \"{w}\" checkout {}`, then `git -C \"{w}\" reset --soft {}`: what the branch held stays in the tree and is checked), then `toryo resume {} --note \"…\"`",
-            short(&anchor),
+            "policy_violation: {place}; nothing was reset or committed — put the task branch back by hand ({first}`git -C \"{w}\" checkout {}`, then `git -C \"{w}\" reset --soft {}`: what the branch held stays in the tree and is checked), then `toryo resume {} --note \"…\"`",
             t.branch,
             short(&anchor),
             t.id
@@ -1461,7 +1475,7 @@ impl<'a> Engine<'a> {
             }
             _ => {
                 // M13-01 (X24): a fresh checkpoint is made on the anchor, nowhere else
-                if !self.start_at_anchor(t, &wt)? {
+                if !self.start_at_anchor(t, &wt, true)? {
                     return Ok(Flow::Next);
                 }
                 // §8, M13-02 (X25): the path policy is asked again right before the commit —
