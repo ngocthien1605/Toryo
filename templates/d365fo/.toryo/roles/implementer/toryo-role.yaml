@@ -113,8 +113,8 @@ never:  ["**/Descriptor/*.xml"]    # model descriptors: only when the task says 
 # A gate is a NAME, not a file. It is declared in toryo-orgchart.yaml under
 # `gates:`, with a kind:
 #     build   kind: check         clean checkout, Low integrity, no side effects
-#     dbsync  kind: environment   changes this machine's D365FO environment;
-#                                 its command lives in the machine config
+# (An `environment` gate such as `dbsync`, which changes this machine's D365FO environment and
+#  whose command lives in the machine config, is optional and off by default: see the org chart.)
 #
 # Behaviour:
 #   - TORYO runs the gates itself, on the checkpoint commit, in the order
@@ -127,4 +127,4 @@ never:  ["**/Descriptor/*.xml"]    # model descriptors: only when the task says 
 #   - A gate name with no declaration in the orgchart is a validation error.
 #   - Only the implementer role may list gates (planner and reviewer are
 #     read-only, so there is nothing to check); elsewhere it is an error.
-before_handoff: [build, dbsync]    # check first, then environment
+before_handoff: [build]            # checks first (then environment gates, if you add any)

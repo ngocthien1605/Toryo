@@ -8,9 +8,11 @@
 #      scripts/build-model.ps1 and write your build into it (it must be committed before a task is
 #      created, M18), or switch to the built-in `tool: xpp` alternative shown below. WHICH ONE: see
 #      "tool: xpp or a script?" at `gates.build`.
-#   3. gates.dbsync — define `environment_gates.dbsync` in the machine config (the machine example
-#      has the entry; copy templates/d365fo/machine/dbsync.ps1.example next to it and write your
-#      deploy into it), or set `if_missing: skip` on machines without a D365FO environment.
+#   3. Deploy and database sync are NOT a gate of this template: on a UDE the owner deploys from
+#      Visual Studio (Dynamics 365 > Deploy, with "synchronize database" for the connected online
+#      environment) after the final approval. A green `build` therefore proves "compiles", nothing more.
+#      A machine that wants Toryo to deploy as well can add an `environment` gate: see the
+#      commented `dbsync` block under `gates:`.
 #   4. limits / checks — the defaults proposed on 2026-10-01.
 #   5. culture — CULTURE.md at the repository root, or remove the key.
 #
@@ -74,7 +76,7 @@ culture: ./CULTURE.md              # optional team-wide norms
 # -----------------------------------------------------------------------------
 # GATES  --  named checks that Toryo runs ITSELF (never the agent)
 # -----------------------------------------------------------------------------
-# A role's `before_handoff: [build, dbsync]` refers to the names below.
+# A role's `before_handoff: [build]` refers to the names below.
 # When: after build, once Toryo has committed the checkpoint, before review.
 # Every gate works on the CHECKPOINT COMMIT -- the exact code the reviewer will
 # read -- never on your main repository folder.
@@ -92,11 +94,12 @@ culture: ./CULTURE.md              # optional team-wide norms
 #                      it. No secrets. Fully defined HERE, in the repository.
 #                      Typical: X++ compile, tests that need no database.
 #
-#   kind: environment  CHANGES this machine's D365FO environment (deploys the
-#                      package, syncs AxDB). Runs with your normal user
-#                      rights, so its command must be out of every agent's
-#                      reach: the command is defined ONLY in the machine
-#                      config (%USERPROFILE%\.toryo\toryo.local.yaml, key
+#   kind: environment  CHANGES this machine's environment (deploys the package,
+#                      syncs a database). Not used by this template (see
+#                      TODO 3). Runs with your normal user rights, so its
+#                      command must be out of every agent's reach: the
+#                      command is defined ONLY in the machine config
+#                      (%USERPROFILE%\.toryo\toryo.local.yaml, key
 #                      `environment_gates`). Here the team only declares that
 #                      the gate is required.
 #
@@ -114,6 +117,12 @@ culture: ./CULTURE.md              # optional team-wide norms
 #   tool        check only, instead of program/args: a built-in kind.
 #               `xpp` = headless X++ compile with this machine's toolchain
 #               (needs `metadata` and `projects`).
+#   diagnostics check only, with `program`: how the gate's output is read.
+#               `msbuild` = parse MSBuild error lines (`file(line,col): error
+#               CODE: message`, what MSBuild, `dotnet build` and a script that
+#               wraps them print) so the implementer is sent file, line and
+#               code ahead of the output tail. `none` (default) = the tail only.
+#               (`tool: xpp` always does this.)
 #   timeout     give up after this long and kill the whole process tree.
 #               Format: 30s, 20m, 1h. Required.
 #   if_missing  environment only. What to do on a machine whose config does
@@ -138,13 +147,15 @@ culture: ./CULTURE.md              # optional team-wide norms
 #   gate when you need something the built-in cannot do — a different build call, a model's own
 #   tests, a package step: the script is yours to maintain, Toryo protects it from agents, and it
 #   runs under the same Low-integrity limits (it cannot write PackagesLocalDirectory). Neither
-#   changes the environment: that is what the `dbsync` environment gate, below, is for.
+#   changes the environment: deploying is the owner's step after the final approval (or an
+#   `environment` gate, see the commented `dbsync` block below).
 gates:
   build:
     kind: check
     program: pwsh
     args: [-NoProfile, -NonInteractive, -File, scripts/build-model.ps1]
     timeout: 20m
+    diagnostics: msbuild    # the script wraps MSBuild/xppc: its error lines reach the implementer as file, line, code
     # build-model.ps1 must write its output under $env:TORYO_VERIFY_BUILD.
     # At Low integrity it CANNOT write to PackagesLocalDirectory. If your
     # script can only build in place, declare it `kind: environment` instead
@@ -157,13 +168,17 @@ gates:
     #   projects: [Projects/Build/ContosoCore.Build.rnrproj]
     #   timeout: 90m
 
-  dbsync:
-    kind: environment     # command: toryo.local.yaml -> environment_gates.dbsync (confirm: first there)
-    timeout: 30m
-    if_missing: error
-    # This gate DEPLOYS the checkpoint to the dev environment before the review and before you have
-    # read the code. `confirm: first` on the machine entry makes the first run of a task stop and
-    # ask you; `toryo resume <id>` is the yes.
+  # OPTIONAL, off by default: let Toryo deploy the checkpoint too. To use it, uncomment this gate, add
+  # `dbsync` to the implementer's `before_handoff` (after `build`), and define `environment_gates.dbsync`
+  # in the machine config (templates/d365fo/toryo.local.yaml.example, templates/d365fo/machine/dbsync.ps1.example).
+  # The gate DEPLOYS the checkpoint to the dev environment before the review and before you have read
+  # the code; `confirm: first` on the machine entry makes the first run of a task stop and ask you
+  # (`toryo resume <id>` is the yes).
+  #
+  # dbsync:
+  #   kind: environment   # command: toryo.local.yaml -> environment_gates.dbsync
+  #   timeout: 30m
+  #   if_missing: error
 
 # -----------------------------------------------------------------------------
 # SEATS  --  who sits where

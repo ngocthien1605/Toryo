@@ -78,6 +78,8 @@ toryo budget set ID --tokens N | --none   · toryo usage ID [--json] [--prices F
 toryo context show ID --stage plan|implement|review    # what the agent actually receives
 toryo config show [--json]                # which files were read, where every setting comes from
 toryo doctor [--canaries [--profile P …]] # re-verify profiles after a CLI upgrade
+toryo gate list                           # the check gates Verify runs (and the environment gates it does not run here)
+toryo gate run NAME [--print-only]        # one check gate outside a task, in the repository, with your own rights
 toryo xpp build --repo R --project P [--print-only] [--low]    # the `tool: xpp` build outside a task
 toryo partial export ID --attempt N --into DIR · toryo secrets set <target> · toryo notify-test
 ```
@@ -110,6 +112,13 @@ A task runs on the configuration **frozen** at `task create`; after you change a
 `commands.verify` entries are `{ name, program, args }` or, for Dynamics 365 F&O, `{ name, tool: xpp, metadata,
 projects, timeout_min }`: MSBuild on the build project of each package with the machine's toolchain, parsed
 diagnostics sent back to the implementer as file, line and code. `toryo xpp build` runs the same build by hand.
+
+A `program` entry can set `diagnostics: msbuild` (default `none`): its output is read for MSBuild error lines
+(`file(line,col): error CODE: message` — MSBuild, `dotnet build`, a script wrapping them) and the implementer gets
+file, line and code ahead of the output tail. Any other stack needs nothing more than `program` + `args`.
+`toryo gate list` shows the check gates; `toryo gate run NAME [--print-only]` runs one outside a task, in the
+repository folder with your own rights (`TORYO_SHA` is `working-tree`). It never runs an environment gate, and
+`--low` is for `tool: xpp` gates only.
 
 ### Org chart mode
 

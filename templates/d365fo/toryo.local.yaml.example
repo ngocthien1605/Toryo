@@ -17,8 +17,10 @@
 #   8. seats — which Claude profile plans and reviews on this machine (the org chart seats
 #      claude-max for both, codex-openai for the implementer).
 #   9. git.trusted_filters — only if the repository uses Git LFS (Open decision 14).
-#  10. environment_gates.dbsync — copy templates/d365fo/machine/dbsync.ps1.example OUTSIDE every
-#      repository and point `args` at it; put your real deploy and sync into it.
+#  10. environment_gates.dbsync — OPTIONAL, off by default (deploy and DB sync are done by the owner
+#      from Visual Studio on a UDE). Only if you add the `dbsync` gate to the org chart: uncomment
+#      the block below, copy templates/d365fo/machine/dbsync.ps1.example OUTSIDE every repository,
+#      point `args` at it and put your real deploy and sync into it.
 #  11. verify.verify_root — a SHORT folder on a drive with room (Windows tools stop at 260
 #      characters; `toryo doctor` prints the length). It replaces the repository's.
 profiles:
@@ -98,19 +100,19 @@ verify:
   min_boundary: low_integrity
   verify_root: 'D:\toryo-verify'            # TODO(owner) 11
 
-# The environment gate the org chart's `dbsync` gate runs on this machine (M11-E3). Without this
-# entry `task create` refuses the org chart (`if_missing: error`); a machine without a D365FO
-# environment sets `if_missing: skip` on the gate in toryo-orgchart.yaml instead.
+# OPTIONAL — the environment gate the org chart's `dbsync` gate runs on this machine (M11-E3), only if
+# you uncommented that gate. With the gate declared and no entry here `task create` refuses the org
+# chart (`if_missing: error`); `if_missing: skip` on the gate lets a machine without an environment run.
 # (After `environment_gate_unavailable`: a secret or program added on the machine → `toryo resume
 # <id>`; this entry changed → `toryo task config <id> --reload`, then `toryo resume <id>`.)
-environment_gates:
-  dbsync:
-    program: powershell                     # Windows PowerShell 5.1; pwsh for 7
-    args: [-NoProfile, -NonInteractive, -File, 'C:\toryo-gates\dbsync.ps1']   # TODO(owner) 10 — outside every repository
-    lock: d365-env
-    confirm: first                          # stop and ask before the first deploy of each task
-    # env:    { D365_PACKAGES: 'K:\AosService\PackagesLocalDirectory' }
-    # secret_env: { D365_SYNC_SECRET: 'credman:toryo/d365-sync' }
+# environment_gates:
+#   dbsync:
+#     program: powershell                   # Windows PowerShell 5.1; pwsh for 7
+#     args: [-NoProfile, -NonInteractive, -File, 'C:\toryo-gates\dbsync.ps1']   # TODO(owner) 10 — outside every repository
+#     lock: d365-env
+#     confirm: first                        # stop and ask before the first deploy of each task
+#     # env:    { D365_PACKAGES: 'K:\AosService\PackagesLocalDirectory' }
+#     # secret_env: { D365_SYNC_SECRET: 'credman:toryo/d365-sync' }
 
 # M10: a Windows toast when a task needs you (a gate, an escalation, a pause, the end of a run).
 # Off by default; `toryo notify-test` shows a sample.

@@ -705,12 +705,18 @@ pub fn diagnostics(output: &str, checkout: &Path) -> Diagnostics {
 /// The fix feedback of a failed X++ build (inside the `verify` data block): its errors first,
 /// then the command's usual "last output" part.
 pub fn feedback_errors(d: &Diagnostics) -> String {
+    feedback_errors_as(d, "X++ build")
+}
+
+/// [`feedback_errors`] under another heading: a `program` command with `diagnostics: msbuild`
+/// says `Build errors (…)`.
+pub fn feedback_errors_as(d: &Diagnostics, what: &str) -> String {
     if d.errors.is_empty() {
         return String::new();
     }
     let more = d.errors_total - d.errors.len();
     format!(
-        "X++ build errors ({} of {}{}):\n{}\n",
+        "{what} errors ({} of {}{}):\n{}\n",
         d.errors.len(),
         d.errors_total,
         if d.warnings_total > 0 {

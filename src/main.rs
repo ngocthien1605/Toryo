@@ -1,6 +1,6 @@
 //! `toryo` CLI (plan v0.7 §15): the engine commands (`task`, `run`, `approve`, `reject`,
-//! `resume`, `stop`, `status`, `partial`), `doctor`, `secrets`, `xpp build` (M9-B4), and the M0
-//! kit (`spike`, feature `m0-kit`).
+//! `resume`, `stop`, `status`, `partial`), `doctor`, `secrets`, `gate list|run` (M14), `xpp build`
+//! (M9-B4), and the M0 kit (`spike`, feature `m0-kit`).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -12,6 +12,7 @@ use toryo::agents::claude::LaunchMode;
 use toryo::config::{default_machine_config_path, Effective};
 
 mod engine_cli;
+mod gate_cli;
 #[cfg(feature = "m0-kit")]
 mod spike_cli;
 mod xpp_cli;
@@ -170,6 +171,12 @@ enum Cmd {
     Partial {
         #[command(subcommand)]
         cmd: PartialCmd,
+    },
+    /// Check gates outside a task: `toryo gate list`, `toryo gate run NAME [--print-only]`
+    /// proves a build or test script before a task depends on it.
+    Gate {
+        #[command(subcommand)]
+        cmd: gate_cli::GateCmd,
     },
     /// X++ (D365FO) builds outside a task: `toryo xpp build --print-only` shows what Verify runs.
     Xpp {
@@ -394,6 +401,7 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Partial { cmd } => engine_cli::partial(cmd),
         Cmd::Context { cmd } => engine_cli::context(cmd),
         Cmd::Budget { cmd } => engine_cli::budget(cmd),
+        Cmd::Gate { cmd } => gate_cli::run(&cli, cmd),
         Cmd::Xpp { cmd } => xpp_cli::run(&cli, cmd),
         Cmd::NotifyTest { dry_run } => {
             let code = toryo::notify::test_toast(*dry_run)?;
