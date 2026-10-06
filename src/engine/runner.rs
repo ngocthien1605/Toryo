@@ -2723,23 +2723,33 @@ impl<'a> Engine<'a> {
         let r = match r {
             Ok(r) => r,
             Err(e) => {
-                let wt = Worktree::new(&self.g, &t.worktree);
-                if let Some(reason) = undo_read_only_write(&wt, t, &a.id, &before)? {
-                    let (i, aid) = (self.id.clone(), a.id.clone());
-                    let detail = format!("{reason} (the turn itself ended in an error: {e:#})");
-                    self.store.call(move |tx| {
-                        store::finish_attempt(
-                            tx,
-                            &aid,
-                            AttemptStatus::Failed,
-                            &AttemptEnd {
-                                error_class: Some("policy_violation".into()),
-                                error_detail: Some(detail),
-                                ..Default::default()
-                            },
-                        )?;
-                        store::transition(tx, &i, Ev::Escalate { reason }).map(|_| ())
-                    })?;
+                // M13-R7: the same findings as after a turn that ended normally — the protected
+                // check first, so that an untracked protected file the role edited is seen
+                // before the undo removes it — and a failure of the checks themselves must not
+                // mask the error of the turn: it is logged, the turn's own error goes up
+                match self.read_only_findings(t, &a.id, &before) {
+                    Ok(Some((reason, class, _))) => {
+                        let (i, aid) = (self.id.clone(), a.id.clone());
+                        let detail = format!("{reason} (the turn itself ended in an error: {e:#})");
+                        let class = class.to_string();
+                        self.store.call(move |tx| {
+                            store::finish_attempt(
+                                tx,
+                                &aid,
+                                AttemptStatus::Failed,
+                                &AttemptEnd {
+                                    error_class: Some(class),
+                                    error_detail: Some(detail),
+                                    ..Default::default()
+                                },
+                            )?;
+                            store::transition(tx, &i, Ev::Escalate { reason }).map(|_| ())
+                        })?;
+                    }
+                    Ok(None) => {}
+                    Err(x) => eprintln!(
+                        "!! the checks after the read-only turn failed too ({x:#}); the turn's own error follows"
+                    ),
                 }
                 return Err(e);
             }
@@ -2891,39 +2901,15 @@ impl<'a> Engine<'a> {
         r: &StageOutcome,
         before: &TreeState,
     ) -> Result<Option<Flow>> {
-        // M13-R4 (X32): the protected check runs first (it records what it found), and then the
-        // undo runs all the same — a protected change is no reason to leave the role's other
-        // writes in the tree, where the next fix cycle would commit them
-        let protected = self.protected_violation(t, false)?;
-        let wt = Worktree::new(&self.g, &t.worktree);
-        let undone = undo_read_only_write(&wt, t, &a.id, before)?;
-        if let Some(reason) = protected {
-            let reason = match &undone {
-                Some(u) => format!("{reason}; {u}"),
-                None => reason,
-            };
+        if let Some((reason, class, undone)) = self.read_only_findings(t, &a.id, before)? {
             self.end_and(
                 a,
                 AttemptStatus::Failed,
                 r,
                 AttemptEnd {
-                    error_class: Some(protect::REASON.into()),
-                    error_detail: undone.is_some().then(|| reason.clone()),
-                    ..Default::default()
-                },
-                Some(Ev::Escalate { reason }),
-                None,
-            )?;
-            return Ok(Some(Flow::Next));
-        }
-        if let Some(reason) = undone {
-            self.end_and(
-                a,
-                AttemptStatus::Failed,
-                r,
-                AttemptEnd {
-                    error_class: Some("policy_violation".into()),
-                    error_detail: Some(reason.clone()),
+                    error_class: Some(class.into()),
+                    // (a protected change alone has always ended the attempt without a detail)
+                    error_detail: (undone || class != protect::REASON).then(|| reason.clone()),
                     ..Default::default()
                 },
                 Some(Ev::Escalate { reason }),
@@ -2932,6 +2918,28 @@ impl<'a> Engine<'a> {
             return Ok(Some(Flow::Next));
         }
         Ok(None)
+    }
+
+    /// What the checks after a read-only turn found — `(reason, class, the undo found a write)`.
+    /// M13-R4 (X32): the protected check runs first (it records what it found), and then the
+    /// undo runs all the same — a protected change is no reason to leave the role's other
+    /// writes in the tree, where the next fix cycle would commit them. M13-R7: the same code
+    /// after a turn that ended in an error.
+    fn read_only_findings(
+        &self,
+        t: &TaskRow,
+        attempt: &str,
+        before: &TreeState,
+    ) -> Result<Option<(String, &'static str, bool)>> {
+        let protected = self.protected_violation(t, false)?;
+        let wt = Worktree::new(&self.g, &t.worktree);
+        let undone = undo_read_only_write(&wt, t, attempt, before)?;
+        Ok(match (protected, undone) {
+            (Some(p), Some(u)) => Some((format!("{p}; {u}"), protect::REASON, true)),
+            (Some(p), None) => Some((p, protect::REASON, false)),
+            (None, Some(u)) => Some((u, "policy_violation", true)),
+            (None, None) => None,
+        })
     }
 
     // ── attempt helpers ──────────────────────────────────────────────────────────────
@@ -4419,10 +4427,19 @@ pub(super) fn undo_read_only_write(
             ));
         }
     }
+    // (M13-R7: a file the role *deleted* has nothing to copy — the reason must not say it was)
+    let (again_gone, again): (Vec<String>, Vec<String>) = again
+        .into_iter()
+        .partition(|p| std::fs::symlink_metadata(t.worktree.join(p)).is_err());
     if !again.is_empty() {
         reason.push_str(&format!(
             "; not put back: {again:?} — changed already before the turn, so Toryo cannot tell your edit from the role's (what is there now is copied to {})",
             keep.display()
+        ));
+    }
+    if !again_gone.is_empty() {
+        reason.push_str(&format!(
+            "; not put back: {again_gone:?} — changed already before the turn and gone now, so Toryo cannot tell your edit from the role's; gone, nothing to copy"
         ));
     }
     if !not_copied.is_empty() {

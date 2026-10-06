@@ -204,7 +204,11 @@ pub fn run_turn_with(
         env.insert(k.clone(), v.clone());
     }
     let program = PathBuf::from(crate::config::expand_vars(&profile.exe).map_err(not_started)?);
-    std::fs::create_dir_all(run_dir)?;
+    // M13-R7: all of this runs before any process exists — a failure here is `NotStarted` too
+    // (no process ran, so no budget is held)
+    std::fs::create_dir_all(run_dir)
+        .with_context(|| format!("creating {}", run_dir.display()))
+        .map_err(not_started)?;
     let argv_view: Vec<String> = std::iter::once(program.display().to_string())
         .chain(args.iter().cloned())
         .collect();
@@ -215,7 +219,9 @@ pub fn run_turn_with(
         )?);
         hex::encode(h.finalize())
     };
-    std::fs::write(run_dir.join(format!("{label}.prompt.md")), prompt)?;
+    std::fs::write(run_dir.join(format!("{label}.prompt.md")), prompt)
+        .context("writing the prompt file")
+        .map_err(not_started)?;
     let meta = json!({
         "profile": profile_name,
         "kind": profile.kind,
@@ -228,7 +234,9 @@ pub fn run_turn_with(
     std::fs::write(
         run_dir.join(format!("{label}.meta.json")),
         serde_json::to_vec_pretty(&meta)?,
-    )?;
+    )
+    .context("writing the meta file")
+    .map_err(not_started)?;
 
     let spec = SpawnSpec {
         program: program.clone(),
@@ -238,8 +246,10 @@ pub fn run_turn_with(
         stdin: Some(prompt.as_bytes().to_vec()),
         boundary: Boundary::None,
     };
-    let mut out_file = Capture::create(&run_dir.join(format!("{label}.stdout.jsonl")))?;
-    let mut err_file = Capture::create(&run_dir.join(format!("{label}.stderr.txt")))?;
+    let mut out_file =
+        Capture::create(&run_dir.join(format!("{label}.stdout.jsonl"))).map_err(not_started)?;
+    let mut err_file =
+        Capture::create(&run_dir.join(format!("{label}.stderr.txt"))).map_err(not_started)?;
     let running = spawn(&spec, &red)
         .with_context(|| format!("starting {}", program.display()))
         .map_err(not_started)?;

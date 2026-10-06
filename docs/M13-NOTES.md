@@ -500,7 +500,7 @@ few holes are left. Eight commits `(M13-R1 … R8)` on the same branch. Test cou
 - [x] R4 A read-only write is left in the tree when HEAD was off the branch or recovery stopped first (X32)
 - [x] R5 `start_at_anchor` trusts a detached or mid-merge HEAD; `foreign_commit` accepts a merge commit (X31)
 - [x] R6 Toryo's own `git` children share the console
-- [ ] R7 Safety-adjacent Lows
+- [x] R7 Safety-adjacent Lows
 - [ ] R8 Texts, tests and doctor Lows
 - [ ] Finish: push, comment on the pull request, CI
 
@@ -590,3 +590,27 @@ few holes are left. Eight commits `(M13-R1 … R8)` on the same branch. Test cou
   test cannot time. The two M13-12 tests pass unchanged (they cannot see this: the event is self-sent while a fake agent hangs).
 - `GitCmd::command` (every Git call of Toryo): `creation_flags(CREATE_NO_WINDOW)` on Windows, `process_group(0)` on Unix. `git/canary.rs` (admission
   probes with their own `Command`) is not touched — it runs once, before any task. M13-12's notes paragraph says what changes.
+
+### R7 — Safety-adjacent Lows
+
+1. **`Made::Drop` and the branch** — `Made` carries the base SHA; the branch of a failed `task create` is deleted only when `refs/heads/<b>` is still at it,
+   otherwise a `WARNING:` line says it is left. Test (unit): `task::made_tests::a_branch_made_by_someone_else_in_between_is_not_deleted` (failed
+   with the guard taken out; `-D` stays — the SHA is the guard).
+2. **`git worktree prune`** — `Made::Drop` prunes only after `remove_dir_all` was used (the fallback). **`task cleanup --force` already did** (the call sits
+   inside the fallback after `remove_dir_all`, M13-07) — nothing to change there. *By reading.* (The prune in the fallback still forgets every stale
+   entry of the repository; the list asks for the fallback only.)
+3. **`read_only_turn`'s `Err` path** — it now runs `read_only_findings`, the helper `read_only_checks` uses (protected check first, then the undo; one code
+   path, so the R4 tests cover it: the `Err` itself cannot be provoked with the fake agent). An `Err` from the checks is printed ("the checks after the
+   read-only turn failed too") and the **turn's own error** goes up. New: that path now escalates also on a protected change (it only undid before).
+4. **Wording when the role deleted an owner-dirty file** — "changed already before the turn and gone now … gone, nothing to copy"; a present file keeps the
+   old sentence ("what is there now is copied to …"). *By reading.*
+5. **`Worktree::restore` takes paths literally** (`:(literal)<path>` for `reset`, `checkout`, `ls-files --error-unmatch`). Test:
+   `worktree::tests::restore_takes_a_file_name_with_brackets_literally` — `src/[x].ps1` and `src/a[1].txt` by the role next to the owner's edits of
+   `src/x.ps1` and `src/a1.txt`; failed before (the role's file stayed, `ls-files` matched the other one). This also narrows Open #13's pathspec point
+   (the `restore` of writing turns gets it too: same function).
+6. **`discard_partial`** refuses when HEAD is on a branch that is not the task's (`reset --hard` moves that branch); a detached HEAD is allowed (it
+   moves no branch, and a rebase in progress detaches HEAD — `--discard-partial` is what clears it). Test:
+   `regress_recovery::m13_r7_discard_partial_never_resets_another_branch` (failed without the check: the owner's branch lost its commit).
+7. **`NotStarted`** — `create_dir_all(run_dir)` and the two `Capture::create` calls are classed `NotStarted` as the list says; I also classed the two
+   small writes between them (the prompt and the meta file), which run before any process exists too. *By reading* (no test: a profile cannot be
+   made to fail there without a seam).

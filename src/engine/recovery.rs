@@ -724,6 +724,19 @@ impl<'a> Recovery<'a> {
         let t = self.task(id)?;
         let a = self.escalated_writing_attempt(&t)?;
         let wt = Worktree::new(self.g, &t.worktree);
+        // M13-R7: `reset --hard` moves the branch HEAD is on — never one that is not the task's
+        // (the owner checked another branch out). A detached HEAD moves no branch, and an
+        // unfinished operation (a rebase detaches HEAD) is what `--discard-partial` clears.
+        if let Some(on) = wt.head_ref()? {
+            if on != format!("refs/heads/{}", t.branch) {
+                bail!(
+                    "HEAD is on {on}, not on the task branch {} — `--discard-partial` would reset that branch; `git -C \"{}\" checkout {}` first",
+                    t.branch,
+                    t.worktree.display(),
+                    t.branch
+                );
+            }
+        }
         let first = self.snapshot_dir(&t, &a)?;
         snapshot::completion_check(&wt, &first)?; // snapshot_incomplete → no reset
         let before = a

@@ -2127,3 +2127,75 @@ fn m13_r5_a_forged_merge_commit_is_never_a_checkpoint() {
     );
     assert!(task(&env, "R-10").machine.checkpoint().is_none(), "{err}");
 }
+
+// ── M13-R7: `--discard-partial` never resets a branch that is not the task's ─────────────────
+
+/// As the `keep_partial` test above: the attempt left a commit and a merge in progress, the
+/// run escalates `recovery_policy_violation`. The owner then ends the merge — and checks
+/// **another branch** out. `resume --discard-partial` ran `reset --hard` on whatever branch HEAD
+/// was on: the owner's branch lost its commit. Now it refuses and nothing moves.
+#[test]
+fn m13_r7_discard_partial_never_resets_another_branch() {
+    let env = setup_with("codex-openai", DENY_ZZZ);
+    let id = "A-5";
+    create(&env, id);
+    let w = wt(&env, id);
+    let base = rev(&w, "HEAD");
+    let branch = env.repo.join(format!(".git/refs/heads/toryo/{id}"));
+    let gd = git_dir(&w);
+    let x = commit_of(
+        &env,
+        &w,
+        &base,
+        Some(&base),
+        &[("src/Calculator.psm1", &with_divide(&w, &base))],
+        "agent commit",
+    );
+    crash_after_the_turn(
+        &env,
+        id,
+        vec![
+            write("src/Calculator.psm1", DIVIDE),
+            put(&branch, &format!("{x}\n")),
+            put(&gd.join("MERGE_HEAD"), &format!("{base}\n")),
+            implementation(),
+        ],
+    );
+    let (code, err) = run_after_the_crash(&env, id);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        reason(&env, id).starts_with("recovery_policy_violation:"),
+        "{}",
+        reason(&env, id)
+    );
+    // the owner ends the merge and moves to a branch of their own, at the agent's commit
+    std::fs::remove_file(gd.join("MERGE_HEAD")).unwrap();
+    git(&w, &["reset", "-q"]);
+    git(&w, &["checkout", "-q", "-b", "owner-work"]);
+    assert_eq!(rev(&w, "owner-work"), x);
+    let s = script(
+        &env,
+        "discard.json",
+        json!({"implementer": [turn(vec![implementation()])]}),
+    );
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            id,
+            "--discard-partial",
+            "--yes",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_ne!(code, 0, "{err}");
+    assert!(err.contains("not on the task branch"), "{err}");
+    assert_eq!(
+        rev(&w, "owner-work"),
+        x,
+        "the owner's branch did not move: {err}"
+    );
+    assert_eq!(task(&env, id).state, St::Escalated, "{err}");
+}

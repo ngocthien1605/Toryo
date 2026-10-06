@@ -309,6 +309,8 @@ struct Made<'a> {
     run_store: Option<PathBuf>,
     worktree: Option<PathBuf>,
     branch: Option<String>,
+    /// The commit the branch is made at (M13-R7): only a branch still there is deleted.
+    base: String,
     row: bool,
     kept: bool,
 }
@@ -348,9 +350,10 @@ impl Drop for Made<'_> {
                     .is_err()
             {
                 let _ = std::fs::remove_dir_all(wt);
+                // M13-R7: only here — `prune` forgets every stale entry of the repository (a
+                // worktree on a drive that is not mounted now), not just ours
+                let _ = self.g.run(&repo, false, &["worktree", "prune"]);
             }
-            // (also an entry Git made for a worktree whose folder it never finished)
-            let _ = self.g.run(&repo, false, &["worktree", "prune"]);
             match (existed, wt.exists()) {
                 (true, false) => eprintln!("removed: the worktree {}", wt.display()),
                 (_, true) => eprintln!(
@@ -361,8 +364,9 @@ impl Drop for Made<'_> {
             }
         }
         if let Some(b) = &self.branch {
-            // it did not exist before this `task create` (checked there): it is ours, at the base
-            let there = self
+            // it did not exist before this `task create` (checked there) — but another process
+            // can have made it since: it is ours only while it is still at the base (M13-R7)
+            let at = self
                 .g
                 .output(
                     &repo,
@@ -374,12 +378,22 @@ impl Drop for Made<'_> {
                         &format!("refs/heads/{b}"),
                     ],
                 )
-                .is_ok_and(|o| o.status.success());
-            if there {
-                match self.g.run(&repo, false, &["branch", "-D", b]) {
-                    Ok(_) => eprintln!("removed: the branch {b}"),
-                    Err(e) => eprintln!("WARNING: could not remove the branch {b}: {e:#}"),
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+            match at {
+                Some(sha) if sha == self.base => {
+                    match self.g.run(&repo, false, &["branch", "-D", b]) {
+                        Ok(_) => eprintln!("removed: the branch {b}"),
+                        Err(e) => eprintln!("WARNING: could not remove the branch {b}: {e:#}"),
+                    }
                 }
+                Some(sha) => eprintln!(
+                    "WARNING: the branch {b} is at {} now, not at the base it was made at ({}) — it is not ours any more and is left",
+                    crate::git::short(&sha),
+                    crate::git::short(&self.base)
+                ),
+                None => {}
             }
         }
         if let Some(rs) = &self.run_store {
@@ -559,6 +573,7 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         run_store: Some(rs.clone()),
         worktree: None,
         branch: None,
+        base: base.clone(),
         row: false,
         kept: false,
     };
@@ -692,4 +707,76 @@ pub fn frozen_config_text(t: &TaskRow) -> Result<(PathBuf, String)> {
     let text = String::from_utf8(bytes)
         .with_context(|| format!("the frozen config of {} is not UTF-8", t.id))?;
     Ok((path, text))
+}
+
+#[cfg(test)]
+mod made_tests {
+    use super::*;
+
+    /// A repository with two commits; returns it, the first commit and the second.
+    fn repo(d: &Path) -> (GitCmd, PathBuf, String, String) {
+        let g = GitCmd::new("git", d.join("hooks")).unwrap();
+        let r = d.join("repo");
+        std::fs::create_dir_all(&r).unwrap();
+        let loc = Loc::Discover(r.clone());
+        g.run(&loc, false, &["init", "-q", "-b", "main"]).unwrap();
+        let mut shas = Vec::new();
+        for n in ["a", "b"] {
+            std::fs::write(r.join(format!("{n}.txt")), "x\n").unwrap();
+            g.run(&loc, false, &["add", "-A"]).unwrap();
+            g.run(&loc, false, &["commit", "-q", "-m", n]).unwrap();
+            shas.push(g.run_str(&loc, true, &["rev-parse", "HEAD"]).unwrap());
+        }
+        (g, r, shas[0].trim().into(), shas[1].trim().into())
+    }
+
+    /// M13-R7: `Made` deletes the branch of a failed `task create` only while it is still at the
+    /// commit it was made at. Another process that made `toryo/<id>` in between (the check at
+    /// the top of `create` had passed) owns it.
+    #[test]
+    fn a_branch_made_by_someone_else_in_between_is_not_deleted() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, r, first, second) = repo(d.path());
+        let store = Store::open(&d.path().join("t.db")).unwrap();
+        let loc = Loc::Discover(r.clone());
+        let made = |branch: &str, base: &str| {
+            drop(Made {
+                g: &g,
+                store: &store,
+                repo: r.clone(),
+                id: "x".into(),
+                run_store: None,
+                worktree: None,
+                branch: Some(branch.into()),
+                base: base.into(),
+                row: false,
+                kept: false,
+            })
+        };
+        let there = |b: &str| {
+            g.output(
+                &loc,
+                true,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{b}"),
+                ],
+            )
+            .unwrap()
+            .status
+            .success()
+        };
+        // someone else's branch, at another commit than the base we made ours at
+        g.run(&loc, false, &["branch", "toryo/theirs", &second])
+            .unwrap();
+        made("toryo/theirs", &first);
+        assert!(there("toryo/theirs"), "not ours: it must stay");
+        // ours: at the base
+        g.run(&loc, false, &["branch", "toryo/ours", &first])
+            .unwrap();
+        made("toryo/ours", &first);
+        assert!(!there("toryo/ours"), "ours: removed");
+    }
 }
