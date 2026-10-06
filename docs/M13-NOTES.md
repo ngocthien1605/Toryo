@@ -492,7 +492,7 @@ few holes are left. Eight commits `(M13-R1 … R8)` on the same branch. Test cou
 
 - [x] R1 Replace refs defeat every diff-based check (X30)
 - [x] R2 `m13_11_…_after_the_worktree…` fails on Linux (Git 2.43)
-- [ ] R3 The output cut holds post-redaction bytes
+- [x] R3 The output cut holds post-redaction bytes
 - [ ] R4 A read-only write is left in the tree when HEAD was off the branch or recovery stopped first (X32)
 - [ ] R5 `start_at_anchor` trusts a detached or mid-merge HEAD; `foreign_commit` accepts a merge commit (X31)
 - [ ] R6 Toryo's own `git` children share the console
@@ -522,3 +522,14 @@ few holes are left. Eight commits `(M13-R1 … R8)` on the same branch. Test cou
   in `task::create` (`bail!` with the path of `info/exclude`); the folder trick and its clean-up are gone, the assertions are the same. It failed first
   (the create succeeded without the hook), then passed. The other M13-11 test is unchanged. Documented in STATUS O-39. Whether it also passes on
   Linux is for the `test (ubuntu-latest)` job of the pull request to say (not buildable here).
+
+### R3 — The output cut holds post-redaction bytes
+
+- **Failing test first:** `runner::tests::a_secret_inside_the_fragment_of_another_is_no_reason_to_keep_the_fragment` — A = `AAAAAAAAAAbbCCCCCCCCCC`,
+  B = `bb` named `VERY_LONG_SECRET_NAME`; once with the cut after A's first 18 bytes (head) and once with the tail starting inside A. Before: `AAAAAAAA`
+  of A was left (the redacted fragment is 48 bytes, the hold 24). Now no 8-byte window of A is in the text, head or tail.
+- `Redactions::cut_hold()` replaces `max_len + 2` in `bounded_text`: `max(max_len + 2 + Σ markers, (max_len + 2) × the most a replacement adds per
+  byte)` — the first is the formula of the list (bounded by the number of secrets, never less than before); the second covers a short secret that
+  **repeats** inside the fragment (`bbbb…`), where one marker per secret is not a bound: `ceil(longest marker / shortest pattern)`. Unit test
+  `the_cut_hold_covers_a_fragment_full_of_markers` (twenty markers). `a_secret_next_to_the_cut_is_whole_or_gone` and the M13-04 e2e test pass unchanged.
+  Cost: with no secret configured the hold is 0 as before; with secrets a few hundred bytes to ~2 KB are dropped at each cut.

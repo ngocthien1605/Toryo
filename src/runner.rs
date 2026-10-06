@@ -182,8 +182,9 @@ pub fn bounded_text(out: BoundedOutput, redact: &Redactions) -> String {
     };
     let mut tail = clean(&tail);
     if redact.max_len() > 0 {
-        // (two bytes more than the longest secret: a torn character decodes to a longer mark)
-        let hold = redact.max_len() + 2;
+        // (two bytes more than the longest secret: a torn character decodes to a longer mark;
+        // M13-R3: and what the replacements of shorter secrets inside the fragment add)
+        let hold = redact.cut_hold();
         let mut keep = head.len().saturating_sub(hold);
         while !head.is_char_boundary(keep) {
             keep -= 1;
@@ -499,6 +500,51 @@ mod tests {
         let mut b = BoundedOutput::default();
         b.push(format!("before {SECRET} after").as_bytes());
         assert_eq!(bounded_text(b, &one), "before [REDACTED:S] after");
+    }
+
+    /// M13-R3: a shorter secret B inside the fragment of a longer secret A that straddles the
+    /// cut (a password inside a connection string). Redacting B grows the fragment past the
+    /// bytes that were held at the cut: the start (head) or the end (tail) of A's fragment
+    /// survived. The hold is measured in raw terms: it grows with what a replacement adds.
+    #[test]
+    fn a_secret_inside_the_fragment_of_another_is_no_reason_to_keep_the_fragment() {
+        use crate::process::redact::Secret;
+        const A: &str = "AAAAAAAAAAbbCCCCCCCCCC";
+        let r = Redactions::new(&[
+            Secret {
+                name: "A".into(),
+                value: A.into(),
+            },
+            Secret {
+                name: "VERY_LONG_SECRET_NAME".into(),
+                value: "bb".into(),
+            },
+        ]);
+        let no_window = |text: &str| {
+            assert!(
+                text.contains("bytes of output omitted"),
+                "the output was cut"
+            );
+            for i in 0..=A.len() - 8 {
+                assert!(
+                    !text.contains(&A[i..i + 8]),
+                    "a fragment of A is left: {:?}",
+                    &A[i..i + 8]
+                );
+            }
+        };
+        // the cut falls after `AAAAAAAAAAbbCCCCCC`: the head holds the first 18 bytes of A
+        let mut b = BoundedOutput::default();
+        b.push(&vec![b'x'; OUTPUT_HEAD_KEEP - 18]);
+        b.push(A.as_bytes());
+        b.push(&vec![b'y'; OUTPUT_TAIL_KEEP + 5]);
+        no_window(&bounded_text(b, &r));
+        // the tail starts inside A: its first 10 bytes were dropped, `bbCCCCCCCCCC` is kept
+        let mut b = BoundedOutput::default();
+        b.push(&vec![b'x'; OUTPUT_HEAD_KEEP]);
+        b.push(A.as_bytes());
+        b.push(&vec![b'y'; OUTPUT_TAIL_KEEP - 12]);
+        no_window(&bounded_text(b, &r));
     }
 
     #[test]
