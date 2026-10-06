@@ -277,7 +277,10 @@ fn f4_recovery_never_resets_or_commits_on_the_branch_the_agent_switched_to() {
         "B-1",
         code,
         &err,
-        "policy_violation: after the Implementer turn HEAD is on refs/heads/other, not on the task branch toryo/B-1 (R12); nothing was reset or committed — check out toryo/B-1 again first",
+        // (M13-01: the way out no longer says "again first"; M13-R8: with HEAD on another branch
+        // the task branch was not touched — after the owner checks it out the resume starts at the
+        // anchor, and what was committed on the other branch stays there)
+        &format!("policy_violation: after the Implementer turn HEAD is on refs/heads/other, not on the task branch toryo/B-1 (R12); nothing was reset or committed — check out toryo/B-1 again; `toryo resume B-1 --note \"…\"` then starts at {} (what was committed on the other branch stays there)", &base[..12]),
     );
     // … which is true: the teammate's branch holds the teammate's and the agent's commits,
     // the task branch its base, the worktree the agent's edit
@@ -313,7 +316,7 @@ fn f4_recovery_escalates_an_unrepairable_git_state_with_nothing_reset() {
             // land on the task branch (was: committed on the detached HEAD)
             "detached" => (
                 vec![put(&gd.join("HEAD"), &format!("{base}\n"))],
-                format!("HEAD is detached at {}, not on the task branch toryo/{id} (R12); nothing was reset or committed — check out toryo/{id} again first", &base[..12]),
+                format!("HEAD is detached at {}, not on the task branch toryo/{id} (R12); nothing was reset or committed — check out toryo/{id} again; `toryo resume {id} --note \"…\"` then undoes the commits made since {} into the tree and checks them", &base[..12], &base[..12]),
                 base.clone(),
             ),
             // the task branch at a commit that does not descend from the base (was: a
@@ -842,6 +845,72 @@ fn m12_01_a_forged_commit_in_checkpointing_is_refused() {
     );
 }
 
+/// M13-R1 (X30): the shape of the test above, plus `git replace <base> <commit with the forged
+/// tree and base's parents>` made by the agent. A replace-aware `diff base..forged` is empty, so
+/// the forged commit used to be accepted as Toryo's checkpoint. Toryo's Git ignores replace refs
+/// (and the ref itself is protected Git metadata): the commit is refused, nothing is checkpointed.
+#[test]
+fn m13_r1_a_replace_ref_does_not_hide_a_forged_commit() {
+    let env = setup_with("codex-openai", "policy:\n  deny_paths: [\"**/ZZZ/**\"]\n");
+    create(&env, "R-1");
+    let s = script(
+        &env,
+        "r1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["run", "R-1", "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "checkpoint:after_commit")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let w = wt(&env, "R-1");
+    let base = rev(&w, "HEAD^");
+    let genuine = rev(&w, "HEAD");
+    let files = [
+        ("src/Calculator.psm1", with_divide(&w, &base)),
+        ("src/ZZZ/secret.ps1", "evil\n".to_string()),
+    ];
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, c)| (*p, c.as_str())).collect();
+    let forged = commit_of(
+        &env,
+        &w,
+        &base,
+        Some(&base),
+        &files,
+        "toryo(R-1): implement\n\nToryo-Task: R-1\nToryo-Stage: implement\nToryo-Attempt: 1\nToryo-Agent: codex-openai\n",
+    );
+    // the replacement: the forged tree under the parents of `base`
+    let parents = git(&w, &["rev-list", "--parents", "-n", "1", &base]);
+    let parent = parents.split_whitespace().nth(1).map(str::to_string);
+    let stand_in = commit_of(&env, &w, &base, parent.as_deref(), &files, "stand-in\n");
+    git(&w, &["replace", &base, &stand_in]);
+    git(&w, &["update-ref", "refs/heads/toryo/R-1", &forged]);
+    let s2 = script(
+        &env,
+        "r1b.json",
+        json!({ "reviewer": [turn(vec![approved()])] }),
+    );
+    let (code, err) = toryo(&env, &["resume", "R-1", "--yes", "--fake-agents", &s2], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "R-1").state, St::Escalated, "{err}");
+    assert_ne!(rev(&w, "HEAD"), genuine);
+    let t = task(&env, "R-1");
+    assert!(
+        t.machine.checkpoint().is_none(),
+        "no checkpoint was recorded: {}",
+        reason(&env, "R-1")
+    );
+    let why = reason(&env, "R-1");
+    assert!(
+        why.contains("refs/replace") || why.contains("is not Toryo's"),
+        "{why}"
+    );
+}
 // ── M12-02 (H4): the protected scan fails closed ─────────────────────────────────────────
 
 /// Take away the right to list `dir` (Unix: mode 000; Windows: a deny ACL for the current
@@ -983,4 +1052,1151 @@ fn m12_01_a_forged_partial_commit_under_another_commit_is_not_taken() {
     assert!(!log.contains(&first) && !log.contains(&second), "{log}");
     assert_eq!(code, 0, "{err}");
     assert_eq!(task(&env, "H-U").state, St::Completed, "{err}");
+}
+
+// ── M13-01 (X24): every writing attempt starts at the anchor ──────────────────────────────
+
+const DENY_ZZZ: &str = "policy:\n  deny_paths: [\"**/ZZZ/**\"]\n";
+
+/// AC-1. The implementer commits a **denied** file on the task branch and detaches HEAD; the
+/// HEAD guard escalates ("check out the branch again …"). The owner does that and resumes. Was:
+/// the next attempt began at the agent's commit, saw a clean tree, and the task completed with
+/// the file on its branch. Now the attempt starts at the anchor — the last commit Toryo
+/// recorded: the commit is undone into the tree and its file meets the path policy.
+#[test]
+fn m13_01_a_commit_left_at_the_branch_tip_is_undone_before_the_next_attempt() {
+    let env = setup_with("codex-openai", DENY_ZZZ);
+    create(&env, "A-1");
+    let w = wt(&env, "A-1");
+    let base = rev(&w, "HEAD");
+    let branch = env.repo.join(".git/refs/heads/toryo/A-1");
+    let x = commit_of(
+        &env,
+        &w,
+        &base,
+        Some(&base),
+        &[
+            ("src/Calculator.psm1", &with_divide(&w, &base)),
+            ("src/ZZZ/secret.ps1", "evil\n"),
+        ],
+        "agent commit",
+    );
+    let s = script(
+        &env,
+        "a1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![
+                write("src/Calculator.psm1", DIVIDE),
+                write("src/ZZZ/secret.ps1", "evil\n"),
+                put(&branch, &format!("{x}\n")),
+                put(&git_dir(&w).join("HEAD"), &format!("{x}\n")),
+                implementation(),
+            ])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "A-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "A-1").state, St::Escalated, "{err}");
+    let why = reason(&env, "A-1");
+    assert!(
+        why.contains("HEAD is detached")
+            && why.contains("check out toryo/A-1 again;")
+            && why.contains(&format!("undoes the commits made since {}", &base[..12])),
+        "the text must not walk the owner past the check: {why}"
+    );
+    // the owner does what the text says
+    git(&w, &["checkout", "-q", "toryo/A-1"]);
+    assert_eq!(rev(&w, "HEAD"), x);
+    let s2 = script(
+        &env,
+        "a1b.json",
+        json!({
+            "implementer": [turn(vec![implementation()]), turn(vec![implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "A-1",
+            "--note",
+            "go on",
+            "--yes",
+            "--fake-agents",
+            &s2,
+        ],
+        &[],
+    );
+    let log = git(&w, &["log", "--format=%H", "main..HEAD"]);
+    assert!(
+        !log.contains(&x),
+        "the agent's commit is on the branch: {log}\n{err}"
+    );
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!files.contains("ZZZ"), "{files}\n{err}");
+    assert!(
+        err.contains("on top of the anchor") && err.contains(&base[..12]),
+        "{err}"
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "A-1").state, St::Completed, "{err}");
+    // every writing attempt after the first began at the anchor
+    let second = attempt(&env, "A-1/fix-1/1");
+    assert_eq!(second.git_head_before.as_deref(), Some(base.as_str()));
+}
+
+/// AC-2. The **reviewer** commits. Was: "HEAD moved" was reported, nothing was reset, and the
+/// fix cycle after `resume --note` checkpointed on top of the reviewer's commit. Now HEAD is
+/// soft-reset to where the turn began and what the role wrote is put back.
+#[test]
+fn m13_01_a_commit_by_the_reviewer_is_undone_and_its_file_put_back() {
+    let env = setup_with("codex-openai", DENY_ZZZ);
+    create(&env, "A-2");
+    let s = script(
+        &env,
+        "a2.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["run", "A-2", "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "review:after_begin")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let w = wt(&env, "A-2");
+    let c1 = rev(&w, "HEAD");
+    let branch = env.repo.join(".git/refs/heads/toryo/A-2");
+    let x = commit_of(
+        &env,
+        &w,
+        &c1,
+        Some(&c1),
+        &[("src/ZZZ/secret.ps1", "evil\n")],
+        "reviewer commit",
+    );
+    let s2 = script(
+        &env,
+        "a2b.json",
+        json!({ "reviewer": [turn(vec![
+            write("src/ZZZ/secret.ps1", "evil\n"),
+            put(&branch, &format!("{x}\n")),
+            approved(),
+        ])] }),
+    );
+    let (_, err) = toryo(&env, &["resume", "A-2", "--yes", "--fake-agents", &s2], &[]);
+    assert_eq!(task(&env, "A-2").state, St::Escalated, "{err}");
+    assert!(
+        reason(&env, "A-2").starts_with("policy_violation:"),
+        "{err}"
+    );
+    assert_eq!(
+        rev(&w, "HEAD"),
+        c1,
+        "the reviewer's commit is undone: {err}"
+    );
+    assert!(!w.join("src/ZZZ/secret.ps1").exists(), "put back: {err}");
+    let s3 = script(
+        &env,
+        "a2c.json",
+        json!({
+            "implementer": [turn(vec![implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "A-2",
+            "--note",
+            "again",
+            "--yes",
+            "--fake-agents",
+            &s3,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "A-2").state, St::Completed, "{err}");
+    let log = git(&w, &["log", "--format=%H", "main..HEAD"]);
+    assert!(!log.contains(&x), "{log}");
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!files.contains("ZZZ"), "{files}");
+}
+
+/// AC-3. HEAD at a commit that does not descend from the anchor (an orphan on the task branch):
+/// nothing is reset — a soft reset would not undo it — and the task escalates naming both
+/// commits. Was: after `resume --note` the next attempt began at the orphan and checkpointed on it.
+#[test]
+fn m13_01_a_head_that_does_not_descend_from_the_anchor_escalates() {
+    let env = setup("codex-openai");
+    create(&env, "A-3");
+    let w = wt(&env, "A-3");
+    let base = rev(&w, "HEAD");
+    let branch = env.repo.join(".git/refs/heads/toryo/A-3");
+    let orphan = commit_of(
+        &env,
+        &w,
+        &base,
+        None,
+        &[("src/Calculator.psm1", &with_divide(&w, &base))],
+        "rewritten",
+    );
+    crash_after_the_turn(
+        &env,
+        "A-3",
+        vec![
+            write("src/Calculator.psm1", DIVIDE),
+            put(&branch, &format!("{orphan}\n")),
+            implementation(),
+        ],
+    );
+    let (code, err) = run_after_the_crash(&env, "A-3");
+    assert_eq!(code, 1, "{err}");
+    assert!(reason(&env, "A-3").contains("history rewritten"), "{err}");
+    let s = script(
+        &env,
+        "a3.json",
+        json!({
+            "implementer": [turn(vec![implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "A-3",
+            "--note",
+            "go on",
+            "--yes",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "A-3").state, St::Escalated, "{err}");
+    let why = reason(&env, "A-3");
+    assert!(
+        why.starts_with("policy_violation:")
+            && why.contains(&orphan[..12])
+            && why.contains(&base[..12])
+            && why.contains("nothing was reset"),
+        "{why}"
+    );
+    assert_eq!(rev(&w, "refs/heads/toryo/A-3"), orphan, "not reset");
+    assert_eq!(
+        attempts(&env, "A-3").len(),
+        2,
+        "plan/1, implement/1: no further attempt began"
+    );
+}
+
+// ── M13-02 (X25): a fresh checkpoint runs the full path policy ────────────────────────────
+
+/// The fixture in org chart mode with an implementer role whose fence says `never: ZZZ`.
+fn setup_never_zzz() -> Env {
+    setup_orgchart(
+        "codex-openai",
+        "",
+        &[(
+            ".toryo/roles/implementer/toryo-role.yaml",
+            "toryo: 1\npurpose: Change the code.\nnever: [\"**/ZZZ/**\"]\nbefore_handoff: [divide-present]\n",
+        )],
+    )
+}
+
+/// Run `id` until Toryo has committed its checkpoint and dies before the database knows
+/// (`checkpoint:after_commit`): the task is in `Checkpointing`. Returns (worktree, the commit
+/// the attempt began at, Toryo's own checkpoint).
+fn crash_in_checkpointing(env: &Env, id: &str) -> (PathBuf, String, String) {
+    let s = script(
+        env,
+        "cp.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+        }),
+    );
+    let (code, err) = toryo(
+        env,
+        &["run", id, "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "checkpoint:after_commit")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let w = wt(env, id);
+    (w.clone(), rev(&w, "HEAD^"), rev(&w, "HEAD"))
+}
+
+fn agents_that_finish(env: &Env, name: &str) -> String {
+    script(
+        env,
+        name,
+        json!({
+            "implementer": [turn(vec![implementation()]), turn(vec![implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    )
+}
+
+const CHECKPOINT_TRAILERS: &str =
+    "Toryo-Task: {id}\nToryo-Stage: implement\nToryo-Attempt: 1\nToryo-Agent: codex-openai\n";
+
+/// Do-1. `Checkpointing` is entered again (here: after a crash) with a file in the tree that
+/// the role's fence forbids. Was: the fresh path asked `policy.deny_paths` only and `git add -A`
+/// committed the file. Now it asks the same question a found commit gets (protected, denied,
+/// fence): nothing is committed and the task escalates.
+#[test]
+fn m13_02_a_fresh_checkpoint_refuses_what_the_fence_forbids() {
+    let env = setup_never_zzz();
+    create(&env, "K-1");
+    let (w, began, _genuine) = crash_in_checkpointing(&env, "K-1");
+    // the checkpoint is gone again, and a fenced file is staged next to the turn's work
+    git(&w, &["reset", "-q", "--soft", &began]);
+    std::fs::create_dir_all(w.join("src/ZZZ")).unwrap();
+    std::fs::write(w.join("src/ZZZ/secret.ps1"), "evil\n").unwrap();
+    git(&w, &["add", "-A"]);
+    let s = agents_that_finish(&env, "k1.json");
+    let (code, err) = toryo(&env, &["resume", "K-1", "--yes", "--fake-agents", &s], &[]);
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(
+        !files.contains("ZZZ"),
+        "the fenced file was committed: {files}\n{err}"
+    );
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "K-1").state, St::Escalated, "{err}");
+    let why = reason(&env, "K-1");
+    assert!(
+        why.starts_with("policy_violation:")
+            && why.contains("src/ZZZ/secret.ps1")
+            && why.contains("nothing was committed"),
+        "{why}"
+    );
+    assert_eq!(rev(&w, "HEAD"), began, "nothing was committed");
+    // the way out the reason names: the next turn's checks put the file back
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "K-1",
+            "--note",
+            "go on",
+            "--yes",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "K-1").state, St::Completed, "{err}");
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!files.contains("ZZZ"), "{files}");
+}
+
+/// AC-1. A forged commit made with the worktree's own index (`git add` + `git commit`, no
+/// private index) carries the checkpoint's trailers and a file the fence forbids: found in
+/// `Checkpointing`, it is refused and undone (the file stays staged). The task then waits
+/// (`Escalated`); the resume that leaves it runs a turn whose checks put the file back — the
+/// checkpoint holds no `ZZZ`.
+#[test]
+fn m13_02_a_forged_commit_from_the_worktree_index_never_reaches_a_checkpoint() {
+    let env = setup_never_zzz();
+    create(&env, "K-2");
+    let (w, began, genuine) = crash_in_checkpointing(&env, "K-2");
+    git(&w, &["reset", "-q", "--soft", &began]);
+    std::fs::create_dir_all(w.join("src/ZZZ")).unwrap();
+    std::fs::write(w.join("src/ZZZ/secret.ps1"), "evil\n").unwrap();
+    git(&w, &["add", "-A"]);
+    git(
+        &w,
+        &[
+            "-c",
+            "user.name=agent",
+            "-c",
+            "user.email=a@a",
+            "commit",
+            "-q",
+            "-m",
+            &format!(
+                "toryo(K-2): implement\n\n{}",
+                CHECKPOINT_TRAILERS.replace("{id}", "K-2")
+            ),
+        ],
+    );
+    let forged = rev(&w, "HEAD");
+    assert_ne!(forged, genuine);
+    let s = agents_that_finish(&env, "k2.json");
+    let (code, err) = toryo(&env, &["resume", "K-2", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "K-2").state, St::Escalated, "{err}");
+    assert!(reason(&env, "K-2").contains("is not Toryo's"), "{err}");
+    assert_eq!(rev(&w, "HEAD"), began, "the forged commit is undone");
+    // a plain resume does not leave a policy escalation; nothing is committed meanwhile
+    let (_, err) = toryo(&env, &["resume", "K-2", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "K-2").state, St::Escalated, "{err}");
+    assert_eq!(rev(&w, "HEAD"), began);
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "K-2",
+            "--note",
+            "go on",
+            "--yes",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "K-2").state, St::Completed, "{err}");
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!files.contains("ZZZ"), "{files}");
+    let log = git(&w, &["log", "--format=%H", "main..HEAD"]);
+    assert!(!log.contains(&forged), "{log}");
+}
+
+/// AC-2. The found commit lies **under** another commit ("it is not HEAD"). Was: nothing was
+/// reset, every `resume` found and refused the same commit again, and the reason gave no way
+/// out. Now the stack is undone into the tree (soft reset to where the attempt began) and the
+/// next turn's checks see the changes.
+#[test]
+fn m13_02_a_found_commit_under_another_commit_is_undone_not_refused_forever() {
+    let env = setup_with("codex-openai", DENY_ZZZ);
+    create(&env, "K-3");
+    let (w, began, genuine) = crash_in_checkpointing(&env, "K-3");
+    std::fs::create_dir_all(w.join("src/ZZZ")).unwrap();
+    std::fs::write(w.join("src/ZZZ/secret.ps1"), "evil\n").unwrap();
+    git(&w, &["add", "-A"]);
+    git(
+        &w,
+        &[
+            "-c",
+            "user.name=agent",
+            "-c",
+            "user.email=a@a",
+            "commit",
+            "-q",
+            "-m",
+            "on top",
+        ],
+    );
+    let top = rev(&w, "HEAD");
+    assert_eq!(rev(&w, "HEAD^"), genuine);
+    let s = agents_that_finish(&env, "k3.json");
+    let (code, err) = toryo(&env, &["resume", "K-3", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "K-3").state, St::Escalated, "{err}");
+    let why = reason(&env, "K-3");
+    assert!(
+        why.contains("it is not HEAD") && why.contains("undone"),
+        "{why}"
+    );
+    assert_eq!(rev(&w, "HEAD"), began, "the stack is undone: {err}");
+    assert!(
+        w.join("src/ZZZ/secret.ps1").exists(),
+        "its changes stay in the tree"
+    );
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "K-3",
+            "--note",
+            "go on",
+            "--yes",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "K-3").state, St::Completed, "{err}");
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!files.contains("ZZZ"), "{files}");
+    let log = git(&w, &["log", "--format=%H", "main..HEAD"]);
+    assert!(!log.contains(&top) && !log.contains(&genuine), "{log}");
+}
+
+// ── Review of M13-01…06: `--keep-partial` starts at the commit the attempt began at ────────
+
+/// The anchor (X24) for `resume --keep-partial`. The engine dies during an implementer turn
+/// that committed a **denied** file on the task branch and left a merge unfinished: recovery
+/// does not reset during an unfinished operation and escalates with HEAD still at the agent's
+/// commit. The owner ends the merge and keeps the partial work. Was: the path policy looked
+/// only at tree-against-HEAD, the recovery checkpoint was committed **on** the agent's commit
+/// and became the anchor — the denied file reached the checkpoint, Verify and the review
+/// unchecked. Now the commit is undone into the tree first and its file meets the policy.
+#[test]
+fn m13_01_keep_partial_never_commits_on_a_commit_the_attempt_left() {
+    let env = setup_with("codex-openai", DENY_ZZZ);
+    let id = "A-4";
+    create(&env, id);
+    let w = wt(&env, id);
+    let base = rev(&w, "HEAD");
+    let branch = env.repo.join(format!(".git/refs/heads/toryo/{id}"));
+    let gd = git_dir(&w);
+    let x = commit_of(
+        &env,
+        &w,
+        &base,
+        Some(&base),
+        &[
+            ("src/Calculator.psm1", &with_divide(&w, &base)),
+            ("src/ZZZ/secret.ps1", "evil\n"),
+        ],
+        "agent commit",
+    );
+    crash_after_the_turn(
+        &env,
+        id,
+        vec![
+            write("src/Calculator.psm1", DIVIDE),
+            write("src/ZZZ/secret.ps1", "evil\n"),
+            write("notes.txt", "work in progress\n"),
+            put(&branch, &format!("{x}\n")),
+            put(&gd.join("MERGE_HEAD"), &format!("{base}\n")),
+            implementation(),
+        ],
+    );
+    let (code, err) = run_after_the_crash(&env, id);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        reason(&env, id).starts_with("recovery_policy_violation:"),
+        "{}",
+        reason(&env, id)
+    );
+    assert_eq!(rev(&w, "HEAD"), x, "no reset during the merge");
+    // the owner ends the merge; the index is the commit's, as after the agent's `git commit`
+    std::fs::remove_file(gd.join("MERGE_HEAD")).unwrap();
+    git(&w, &["reset", "-q"]);
+    let s = script(
+        &env,
+        "keep.json",
+        json!({
+            "implementer": [turn(vec![implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["resume", id, "--keep-partial", "--yes", "--fake-agents", &s],
+        &[],
+    );
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(
+        !files.contains("ZZZ"),
+        "the denied file is in a commit: {files}\n{err}"
+    );
+    let log = git(&w, &["log", "--format=%H", "main..HEAD"]);
+    assert!(
+        !log.contains(&x),
+        "the agent's commit is on the branch: {log}"
+    );
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains("protected paths still changed") && err.contains("src/ZZZ/secret.ps1"),
+        "{err}"
+    );
+    assert_eq!(task(&env, id).state, St::Escalated, "{err}");
+    assert_eq!(
+        rev(&w, "HEAD"),
+        base,
+        "back at the commit the attempt began at"
+    );
+    assert!(w.join("notes.txt").exists() && w.join("src/ZZZ/secret.ps1").exists());
+}
+
+// ── M13-14 (5): AC-2 of M12-01 with a role's `never:` fence ───────────────────────────────
+
+/// `m12_01_a_forged_checkpoint_commit_is_never_accepted`, its `Toryo-Partial` half, with the
+/// forbidden file named by the implementer role's **fence** (`never:`) instead of
+/// `policy.deny_paths`: the forged partial commit is not taken, the file is in no checkpoint,
+/// the task completes without it.
+#[test]
+fn m13_14_a_forged_partial_commit_with_a_fenced_file_is_never_accepted() {
+    let env = setup_never_zzz();
+    let id = "H-F";
+    create(&env, id);
+    let w = wt(&env, id);
+    let base = rev(&w, "HEAD");
+    let branch = env.repo.join(format!(".git/refs/heads/toryo/{id}"));
+    let forged = commit_of(
+        &env,
+        &w,
+        &base,
+        Some(&base),
+        &[
+            ("src/Calculator.psm1", &with_divide(&w, &base)),
+            ("src/ZZZ/secret.ps1", "evil\n"),
+        ],
+        &format!(
+            "toryo({id}): implement\n\nToryo-Task: {id}\nToryo-Stage: implement\nToryo-Attempt: 1\nToryo-Agent: codex-openai\nToryo-Partial: true\n"
+        ),
+    );
+    crash_after_the_turn(
+        &env,
+        id,
+        vec![
+            write("src/Calculator.psm1", DIVIDE),
+            put(&branch, &format!("{forged}\n")),
+            implementation(),
+        ],
+    );
+    let (code, err) = run_after_the_crash(&env, id);
+    assert!(
+        !err.contains("already committed"),
+        "the forged partial commit was taken: {err}"
+    );
+    let log = git(&w, &["log", "--format=%H", "main..HEAD"]);
+    assert!(!log.contains(&forged), "{log}");
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!files.contains("ZZZ"), "{files}");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, id).state, St::Completed, "{err}");
+    assert!(
+        err.contains(&format!(
+            "↺ recovery: {id}/implement/1: the agent had moved HEAD — soft reset to {}",
+            &base[..12]
+        )),
+        "{err}"
+    );
+}
+
+// ── M13-R4 (X32): what a read-only role wrote is put back, however the turn ended ────────────
+
+/// Run `id` to a review turn made of `steps` and let the engine die right after the turn
+/// (`read_only:after_turn`): the checks of the turn never ran. Returns the worktree.
+fn die_after_the_review(env: &Env, id: &str, steps: Vec<Value>) -> PathBuf {
+    create(env, id);
+    let s = script(
+        env,
+        "r4-to-checkpoint.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+        }),
+    );
+    let (code, err) = toryo(
+        env,
+        &["run", id, "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "checkpoint:after_commit")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let s2 = script(
+        env,
+        "r4-review-dies.json",
+        json!({ "reviewer": [turn(steps)] }),
+    );
+    let (code, err) = toryo(
+        env,
+        &["resume", id, "--yes", "--fake-agents", &s2],
+        &[("TORYO_TEST_CRASH_AT", "read_only:after_turn")],
+    );
+    assert_eq!(code, 86, "{err}");
+    wt(env, id)
+}
+/// AC-1. The reviewer commits `src/Evil.psm1` on the task branch and detaches HEAD there. Was:
+/// the soft reset was skipped, nothing was put back or copied, and after the owner checked the
+/// branch out again the fix cycle took the file for an ordinary change and committed it under
+/// the implementer's name (the EC-31 outcome). Now the reason says what could not be put back and
+/// why, and the next attempt first undoes the role's write.
+#[test]
+fn m13_r4_a_reviewer_that_left_the_branch_is_undone_once_the_branch_is_back() {
+    let env = setup("codex-openai");
+    create(&env, "R-4");
+    let s = script(
+        &env,
+        "r4a.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["run", "R-4", "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "review:after_begin")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let w = wt(&env, "R-4");
+    let c1 = rev(&w, "HEAD");
+    let branch = env.repo.join(".git/refs/heads/toryo/R-4");
+    let x = commit_of(
+        &env,
+        &w,
+        &c1,
+        Some(&c1),
+        &[("src/Evil.psm1", "evil\n")],
+        "reviewer commit",
+    );
+    let s2 = script(
+        &env,
+        "r4b.json",
+        json!({ "reviewer": [turn(vec![
+            write("src/Evil.psm1", "evil\n"),
+            put(&branch, &format!("{x}\n")),
+            put(&git_dir(&w).join("HEAD"), &format!("{x}\n")),
+            approved(),
+        ])] }),
+    );
+    let (_, err) = toryo(&env, &["resume", "R-4", "--yes", "--fake-agents", &s2], &[]);
+    assert_eq!(task(&env, "R-4").state, St::Escalated, "{err}");
+    let why = reason(&env, "R-4");
+    assert!(
+        why.contains("could NOT be put back (HEAD is not on toryo/R-4)")
+            && why.contains("git checkout toryo/R-4"),
+        "{why}"
+    );
+    // the owner does what the text says
+    git(&w, &["checkout", "-q", "toryo/R-4"]);
+    assert_eq!(rev(&w, "HEAD"), x);
+    let s3 = script(
+        &env,
+        "r4c.json",
+        json!({
+            "implementer": [turn(vec![implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "R-4",
+            "--note",
+            "go on",
+            "--yes",
+            "--fake-agents",
+            &s3,
+        ],
+        &[],
+    );
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!files.contains("Evil"), "{files}\n{err}");
+    let log = git(&w, &["log", "--format=%H", "main..HEAD"]);
+    assert!(!log.contains(&x), "{log}");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "R-4").state, St::Completed, "{err}");
+    // a copy for the owner, in the folder of whichever review attempt it was
+    let kept = task(&env, "R-4").run_store.join("read-only-writes");
+    let copies: Vec<PathBuf> = std::fs::read_dir(&kept)
+        .unwrap()
+        .flatten()
+        .map(|d| d.path().join("src").join("Evil.psm1"))
+        .filter(|p| p.exists())
+        .collect();
+    assert_eq!(copies.len(), 1, "{}", kept.display());
+}
+
+/// AC-2. The reviewer runs with the owner's token: it writes a file and a **protected** one
+/// (`.claude/settings.local.json`) and the engine dies after the turn. Was: recovery found the
+/// protected change first and escalated without the undo; `resume --note` then committed the
+/// reviewer's file. Now the escalation is still `protected_config_changed`, and the reviewer's
+/// file is put back, with a copy in the run store.
+#[test]
+fn m13_r4_a_protected_change_does_not_keep_the_reviewers_write_in_the_tree() {
+    let env = setup("codex-openai");
+    let w = die_after_the_review(
+        &env,
+        "R-5",
+        vec![
+            write("src/Evil.psm1", "evil\n"),
+            write(".claude/settings.local.json", "{\"hooks\": {}}\n"),
+            approved(),
+        ],
+    );
+    assert!(w.join("src/Evil.psm1").exists(), "not undone yet");
+    let s = script(
+        &env,
+        "r5.json",
+        json!({"reviewer": [turn(vec![approved()])]}),
+    );
+    let (code, err) = toryo(&env, &["resume", "R-5", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "R-5").state, St::Escalated, "{err}");
+    assert!(
+        reason(&env, "R-5").starts_with("protected_config_changed"),
+        "{}",
+        reason(&env, "R-5")
+    );
+    let status = git(&w, &["status", "--porcelain"]);
+    assert!(!status.contains("Evil"), "put back: {status}\n{err}");
+    let copy = task(&env, "R-5")
+        .run_store
+        .join("read-only-writes")
+        .join("R-5-review-1")
+        .join("src/Evil.psm1");
+    assert_eq!(std::fs::read_to_string(&copy).unwrap(), "evil\n");
+}
+
+/// AC-2, the other early return: the record of the tree before the turn (`tree-before`) is the
+/// artifact that is gone. Nothing can be put back safely, and the reason says which paths are
+/// dirty and that they were **not** put back.
+#[test]
+fn m13_r4_without_the_record_of_the_tree_the_reason_names_what_was_not_put_back() {
+    let env = setup("codex-openai");
+    let w = die_after_the_review(
+        &env,
+        "R-6",
+        vec![write("src/Evil.psm1", "evil\n"), approved()],
+    );
+    // the record is removed from the run store
+    let mut gone = 0;
+    let mut stack = vec![task(&env, "R-6").run_store.join("runstore")];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.to_string_lossy().contains("tree-before") {
+                std::fs::remove_file(&p).unwrap();
+                gone += 1;
+            }
+        }
+    }
+    assert!(gone > 0, "the record of the tree was found and removed");
+    let s = script(
+        &env,
+        "r6.json",
+        json!({"reviewer": [turn(vec![approved()])]}),
+    );
+    let (code, err) = toryo(&env, &["resume", "R-6", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "R-6").state, St::Escalated, "{err}");
+    let why = reason(&env, "R-6");
+    assert!(
+        why.starts_with("artifact_missing")
+            && why.contains("src/Evil.psm1")
+            && why.contains("not put back"),
+        "{why}"
+    );
+    assert!(
+        w.join("src/Evil.psm1").exists(),
+        "nothing is put back without the record"
+    );
+}
+
+/// AC-1 in recovery: the same, but the engine dies after the reviewer's turn, so it is recovery
+/// that finds HEAD off the branch. The attempt ends `Failed` with the "could NOT be put back"
+/// reason (not `Interrupted`), and the next writing attempt finishes the undo.
+#[test]
+fn m13_r4_recovery_that_finds_head_off_the_branch_leaves_the_undo_to_the_next_attempt() {
+    let env = setup("codex-openai");
+    create(&env, "R-7");
+    let s = script(
+        &env,
+        "r7a.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["run", "R-7", "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "checkpoint:after_commit")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let w = wt(&env, "R-7");
+    let c1 = rev(&w, "HEAD");
+    let branch = env.repo.join(".git/refs/heads/toryo/R-7");
+    let x = commit_of(
+        &env,
+        &w,
+        &c1,
+        Some(&c1),
+        &[("src/Evil.psm1", "evil\n")],
+        "reviewer commit",
+    );
+    let s2 = script(
+        &env,
+        "r7b.json",
+        json!({ "reviewer": [turn(vec![
+            write("src/Evil.psm1", "evil\n"),
+            put(&branch, &format!("{x}\n")),
+            put(&git_dir(&w).join("HEAD"), &format!("{x}\n")),
+            approved(),
+        ])] }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["resume", "R-7", "--yes", "--fake-agents", &s2],
+        &[("TORYO_TEST_CRASH_AT", "read_only:after_turn")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let s3 = script(
+        &env,
+        "r7c.json",
+        json!({"reviewer": [turn(vec![approved()])]}),
+    );
+    let (code, err) = toryo(&env, &["resume", "R-7", "--yes", "--fake-agents", &s3], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "R-7").state, St::Escalated, "{err}");
+    assert!(
+        reason(&env, "R-7").contains("could NOT be put back (HEAD is not on toryo/R-7)"),
+        "{}",
+        reason(&env, "R-7")
+    );
+    let last = attempts(&env, "R-7").pop().unwrap();
+    assert_eq!(last.status, AttemptStatus::Failed, "{last:?}");
+    git(&w, &["checkout", "-q", "toryo/R-7"]);
+    let s4 = script(
+        &env,
+        "r7d.json",
+        json!({
+            "implementer": [turn(vec![implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "R-7",
+            "--note",
+            "go on",
+            "--yes",
+            "--fake-agents",
+            &s4,
+        ],
+        &[],
+    );
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!files.contains("Evil"), "{files}\n{err}");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "R-7").state, St::Completed, "{err}");
+}
+
+// ── M13-R5 (X31): HEAD == the anchor is not enough; a merge commit is never a checkpoint ─────
+
+/// Run `id` to a crash right after Toryo's checkpoint commit (`checkpoint:after_commit`): the
+/// attempt is still `Running`, the commit is on the branch. Returns the worktree, the commit the
+/// attempt began at and the checkpoint commit.
+fn crash_after_the_checkpoint(env: &Env, id: &str) -> (PathBuf, String, String) {
+    create(env, id);
+    let s = script(
+        env,
+        "r5.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        env,
+        &["run", id, "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "checkpoint:after_commit")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let w = wt(env, id);
+    (w.clone(), rev(&w, "HEAD^"), rev(&w, "HEAD"))
+}
+
+/// AC-1. Crash after the checkpoint commit; the owner (or an agent) soft-resets to where the
+/// attempt began and detaches HEAD there. HEAD *is* the anchor — but not on the task branch. Was:
+/// the fresh checkpoint committed on the detached HEAD, off the branch, and only the final gate
+/// noticed. Now the task escalates and nothing is committed.
+#[test]
+fn m13_r5_a_detached_head_at_the_anchor_is_not_a_place_to_checkpoint() {
+    let env = setup("codex-openai");
+    let (w, base, _) = crash_after_the_checkpoint(&env, "R-8");
+    git(&w, &["reset", "--soft", &base]);
+    git(&w, &["checkout", "-q", "--detach"]);
+    assert_eq!(rev(&w, "HEAD"), base);
+    let s = script(
+        &env,
+        "r8.json",
+        json!({"reviewer": [turn(vec![approved()])]}),
+    );
+    let (code, err) = toryo(&env, &["resume", "R-8", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "R-8").state, St::Escalated, "{err}");
+    let why = reason(&env, "R-8");
+    assert!(
+        why.starts_with("policy_violation:") && why.contains("not on the task branch"),
+        "{why}"
+    );
+    assert!(task(&env, "R-8").machine.checkpoint().is_none(), "{err}");
+    assert_eq!(
+        rev(&w, "HEAD"),
+        base,
+        "nothing was committed on HEAD: {err}"
+    );
+    assert_eq!(
+        rev(&w, "toryo/R-8"),
+        base,
+        "nothing was committed on the branch either: {err}"
+    );
+}
+
+/// AC-2 (and Do-c). A `MERGE_HEAD` left in the worktree with HEAD at the anchor: `git commit`
+/// would make a merge commit whose second parent is whatever `MERGE_HEAD` names. Was: the fresh
+/// checkpoint did exactly that. Now the task escalates (an unfinished Git operation) and no
+/// merge commit is made.
+#[test]
+fn m13_r5_a_merge_in_progress_is_not_committed_as_a_checkpoint() {
+    let env = setup("codex-openai");
+    let (w, base, _) = crash_after_the_checkpoint(&env, "R-9");
+    let other = commit_of(
+        &env,
+        &w,
+        &base,
+        Some(&base),
+        &[("README-other.md", "from elsewhere\n")],
+        "foreign history",
+    );
+    git(&w, &["reset", "--soft", &base]);
+    std::fs::write(git_dir(&w).join("MERGE_HEAD"), format!("{other}\n")).unwrap();
+    let s = script(
+        &env,
+        "r9.json",
+        json!({"reviewer": [turn(vec![approved()])]}),
+    );
+    let (code, err) = toryo(&env, &["resume", "R-9", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "R-9").state, St::Escalated, "{err}");
+    assert!(
+        reason(&env, "R-9").contains("an unfinished Git operation"),
+        "{}",
+        reason(&env, "R-9")
+    );
+    let merges = git(&w, &["rev-list", "--merges", "--all"]);
+    assert!(
+        merges.trim().is_empty(),
+        "a merge commit was made: {merges}"
+    );
+    assert!(task(&env, "R-9").machine.checkpoint().is_none(), "{err}");
+}
+
+/// AC-3. A forged checkpoint that is a **merge commit** at HEAD: first parent the commit the
+/// attempt began at, a clean first-parent diff, Toryo's trailers — and a second parent whose
+/// whole history would enter the task branch unseen by every diff-based review. Was: accepted.
+#[test]
+fn m13_r5_a_forged_merge_commit_is_never_a_checkpoint() {
+    let env = setup("codex-openai");
+    let (w, base, genuine) = crash_after_the_checkpoint(&env, "R-10");
+    let other = commit_of(
+        &env,
+        &w,
+        &base,
+        Some(&base),
+        &[("README-other.md", "from elsewhere\n")],
+        "foreign history",
+    );
+    let tree = git(&w, &["rev-parse", &format!("{genuine}^{{tree}}")])
+        .trim()
+        .to_string();
+    let merge = git(
+        &w,
+        &[
+            "-c",
+            "user.name=agent",
+            "-c",
+            "user.email=a@a",
+            "commit-tree",
+            &tree,
+            "-p",
+            &base,
+            "-p",
+            &other,
+            "-m",
+            "toryo(R-10): implement\n\nToryo-Task: R-10\nToryo-Stage: implement\nToryo-Attempt: 1\nToryo-Agent: codex-openai\n",
+        ],
+    )
+    .trim()
+    .to_string();
+    git(&w, &["update-ref", "refs/heads/toryo/R-10", &merge]);
+    let s = script(
+        &env,
+        "r10.json",
+        json!({"reviewer": [turn(vec![approved()])]}),
+    );
+    let (code, err) = toryo(&env, &["resume", "R-10", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "R-10").state, St::Escalated, "{err}");
+    assert!(
+        reason(&env, "R-10").contains("it is a merge commit"),
+        "{}",
+        reason(&env, "R-10")
+    );
+    assert!(task(&env, "R-10").machine.checkpoint().is_none(), "{err}");
+}
+
+// ── M13-R7: `--discard-partial` never resets a branch that is not the task's ─────────────────
+
+/// As the `keep_partial` test above: the attempt left a commit and a merge in progress, the
+/// run escalates `recovery_policy_violation`. The owner then ends the merge — and checks
+/// **another branch** out. `resume --discard-partial` ran `reset --hard` on whatever branch HEAD
+/// was on: the owner's branch lost its commit. Now it refuses and nothing moves.
+#[test]
+fn m13_r7_discard_partial_never_resets_another_branch() {
+    let env = setup_with("codex-openai", DENY_ZZZ);
+    let id = "A-5";
+    create(&env, id);
+    let w = wt(&env, id);
+    let base = rev(&w, "HEAD");
+    let branch = env.repo.join(format!(".git/refs/heads/toryo/{id}"));
+    let gd = git_dir(&w);
+    let x = commit_of(
+        &env,
+        &w,
+        &base,
+        Some(&base),
+        &[("src/Calculator.psm1", &with_divide(&w, &base))],
+        "agent commit",
+    );
+    crash_after_the_turn(
+        &env,
+        id,
+        vec![
+            write("src/Calculator.psm1", DIVIDE),
+            put(&branch, &format!("{x}\n")),
+            put(&gd.join("MERGE_HEAD"), &format!("{base}\n")),
+            implementation(),
+        ],
+    );
+    let (code, err) = run_after_the_crash(&env, id);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        reason(&env, id).starts_with("recovery_policy_violation:"),
+        "{}",
+        reason(&env, id)
+    );
+    // the owner ends the merge and moves to a branch of their own, at the agent's commit
+    std::fs::remove_file(gd.join("MERGE_HEAD")).unwrap();
+    git(&w, &["reset", "-q"]);
+    git(&w, &["checkout", "-q", "-b", "owner-work"]);
+    assert_eq!(rev(&w, "owner-work"), x);
+    let s = script(
+        &env,
+        "discard.json",
+        json!({"implementer": [turn(vec![implementation()])]}),
+    );
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            id,
+            "--discard-partial",
+            "--yes",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_ne!(code, 0, "{err}");
+    assert!(err.contains("not on the task branch"), "{err}");
+    assert_eq!(
+        rev(&w, "owner-work"),
+        x,
+        "the owner's branch did not move: {err}"
+    );
+    assert_eq!(task(&env, id).state, St::Escalated, "{err}");
 }

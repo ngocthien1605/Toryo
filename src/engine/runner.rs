@@ -874,6 +874,10 @@ impl<'a> Engine<'a> {
         if self.turn_blocked(t, &turn.stage, &turn.profile)? {
             return Ok(None);
         }
+        // M13-01 (X24): the attempt begins at the anchor, never at whatever HEAD happens to be
+        if !self.start_at_anchor(t, wt, false)? {
+            return Ok(None);
+        }
         let head_before = wt.head()?;
         let tmp = t.worktree.join(".toryo-tmp");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -932,6 +936,79 @@ impl<'a> Engine<'a> {
             head_before,
             stop,
         }))
+    }
+
+    /// M13-01 (X24): a writing attempt and a fresh checkpoint start at the anchor. HEAD at another
+    /// commit is never trusted — and who made that commit is never asked. When HEAD descends
+    /// from the anchor on the task branch it is soft-reset to the anchor: the changes of the
+    /// commits stay in the tree and go through the checks every turn's changes get. Otherwise
+    /// (another branch, a detached HEAD, an unfinished operation, a history that does not
+    /// descend from the anchor) nothing is reset and the task escalates. `false`: escalated.
+    fn start_at_anchor(&self, t: &TaskRow, wt: &Worktree, fresh_checkpoint: bool) -> Result<bool> {
+        let i = self.id.clone();
+        let atts = self.store.call(move |tx| store::attempts(tx, &i))?;
+        // M13-R4 (X32): what a read-only role wrote while HEAD was off the task branch could not
+        // be put back then; the branch is back now, so it is first — before the anchor test
+        if let Some(reason) = finish_pending_undo(self.store, t, &atts, wt)? {
+            eprintln!("note: the read-only role's earlier write is undone now: {reason}");
+        }
+        let anchor = anchor_of(t, &atts);
+        let head = wt.head().ok();
+        let on_branch = wt.head_ref()? == Some(format!("refs/heads/{}", t.branch));
+        let unfinished = wt.unfinished_operation()?;
+        // M13-R5 (X31): for a fresh checkpoint HEAD at the anchor is not enough — it must be on
+        // the task branch with no Git operation unfinished (a detached HEAD checkpoints off the
+        // branch; `git commit` during a merge makes a merge commit whose second parent is
+        // whatever MERGE_HEAD names). At the start of a writing attempt the HEAD guard after the
+        // turn judges that state, as before (the ec18 tests: a state broken before the turn is
+        // escalated after it): there it only costs a turn, here it would cost the history.
+        let at_anchor = head.as_deref() == Some(anchor.as_str());
+        if at_anchor && (!fresh_checkpoint || (on_branch && unfinished.is_none())) {
+            return Ok(true);
+        }
+        let at = head.as_deref().map(short).unwrap_or("?").to_string();
+        let descends = head.is_some() && wt.contains(&anchor)?;
+        if on_branch && descends && unfinished.is_none() {
+            wt.soft_reset(&anchor)?;
+            eprintln!(
+                "note: commits {}..{at} on top of the anchor were undone; their changes stay in the tree and are checked like any turn's",
+                short(&anchor)
+            );
+            let (i, payload) = (
+                self.id.clone(),
+                json!({"kind": "commits on the anchor", "action": "soft reset", "head": head, "reset_to": anchor}),
+            );
+            self.store
+                .call(move |tx| store::event(tx, Some(&i), None, "policy_violation", &payload))?;
+            return Ok(true);
+        }
+        let why = match (&unfinished, on_branch) {
+            (Some(op), _) => format!("an unfinished Git operation ({op}) is in the task worktree"),
+            (None, false) => format!("HEAD is not on the task branch {}", t.branch),
+            (None, true) => "it does not descend from that commit".to_string(),
+        };
+        let w = t.worktree.display();
+        let first = if unfinished.is_some() {
+            "finish or abort that operation, then "
+        } else {
+            ""
+        };
+        let place = if at_anchor {
+            format!("HEAD is at {at}, the last commit Toryo recorded for this task, but {why}")
+        } else {
+            format!(
+                "HEAD is at {at}, not at the last commit Toryo recorded for this task ({}), and {why}",
+                short(&anchor)
+            )
+        };
+        let reason = format!(
+            "policy_violation: {place}; nothing was reset or committed — put the task branch back by hand ({first}`git -C \"{w}\" checkout {}`, then `git -C \"{w}\" reset --soft {}`: what the branch held stays in the tree and is checked), then `toryo resume {} --note \"…\"`",
+            t.branch,
+            short(&anchor),
+            t.id
+        );
+        self.escalate("policy_violation", reason)?;
+        Ok(false)
     }
 
     /// What the finished turn leads to, in this order: the HEAD guard, whatever the turn's
@@ -1351,13 +1428,40 @@ impl<'a> Engine<'a> {
                 )?;
                 if let Some(why) = why {
                     // undone like an agent commit: the changes stay in the tree, HEAD is where
-                    // the attempt began (the next turn's policy checks see them)
-                    let undone = match (&a.git_head_before, wt.head()? == c.sha) {
-                        (Some(before), true) => {
+                    // the attempt began (the next turn's policy checks see them). M13-02: also
+                    // when the commit lies under further commits ("it is not HEAD") — the
+                    // whole stack is undone, or every resume would find and refuse it again.
+                    // Where a soft reset cannot repair it, the reason says what to do by hand.
+                    let head = wt.head()?;
+                    let on_branch = wt.head_ref()? == Some(format!("refs/heads/{}", t.branch));
+                    let undone = match &a.git_head_before {
+                        Some(before)
+                            if on_branch
+                                && wt.contains(before)?
+                                && wt.unfinished_operation()?.is_none() =>
+                        {
                             wt.soft_reset(before)?;
-                            format!("; the commit was undone (soft reset to {})", short(before))
+                            format!(
+                                "; {} undone (soft reset to {}): the changes stay in the tree and the next turn's checks see them — `toryo resume {} --note \"…\"`",
+                                if head == c.sha {
+                                    "the commit was".to_string()
+                                } else {
+                                    format!("it and the commits on top of it (HEAD was {}) were", short(&head))
+                                },
+                                short(before),
+                                t.id
+                            )
                         }
-                        _ => String::new(),
+                        before => format!(
+                            "; nothing was reset (HEAD is {}{}) — put the task branch back by hand (after any unfinished Git operation is finished or aborted: `git -C \"{}\" checkout {}`, then `git -C \"{}\" reset --soft {}`), then `toryo resume {} --note \"…\"`",
+                            short(&head),
+                            if on_branch { "" } else { ", not on the task branch" },
+                            t.worktree.display(),
+                            t.branch,
+                            t.worktree.display(),
+                            before.as_deref().map(short).unwrap_or("<the commit the attempt began at>"),
+                            t.id
+                        ),
                     };
                     let reason = format!("policy_violation: commit {} carries the trailers of this checkpoint but is not Toryo's ({why}); nothing was accepted{undone}", short(&c.sha));
                     self.escalate("policy_violation", reason)?;
@@ -1370,15 +1474,28 @@ impl<'a> Engine<'a> {
                 )
             }
             _ => {
-                // §8: deny paths are checked again right before the commit
-                let denied: Vec<String> = wt
+                // M13-01 (X24): a fresh checkpoint is made on the anchor, nowhere else
+                if !self.start_at_anchor(t, &wt, true)? {
+                    return Ok(Flow::Next);
+                }
+                // §8, M13-02 (X25): the path policy is asked again right before the commit —
+                // the same question a found commit gets (`violates`: protected, denied, the
+                // write fence), not `deny_paths` alone. What the turn's own checks saw can have
+                // changed since: the stage is entered again after a crash or an escalation.
+                let mut bad: Vec<String> = wt
                     .changed()?
                     .into_iter()
                     .map(|c| c.1)
-                    .filter(|p| self.protect.is_denied(p))
+                    .filter(|p| self.protect.violates(p))
                     .collect();
-                if !denied.is_empty() {
-                    let reason = format!("policy_violation: denied paths {denied:?} would be committed (policy.deny_paths); nothing was committed");
+                bad.sort();
+                bad.dedup();
+                if !bad.is_empty() {
+                    let reason = format!(
+                        "policy_violation: {} would be committed — the path policy forbids it; nothing was committed. `toryo resume {} --note \"…\"` gives the implementer a turn whose checks put them back (or restore them by hand first)",
+                        self.protect.violation_words(&bad),
+                        t.id
+                    );
                     self.escalate("policy_violation", reason)?;
                     return Ok(Flow::Next);
                 }
@@ -1703,31 +1820,65 @@ impl<'a> Engine<'a> {
     /// commit) and that was not confirmed yet — or `None`. Writes what a plain `resume` will
     /// confirm. Nothing is run.
     fn confirm_preflight(&self, t: &TaskRow, head: &str) -> Result<Option<String>> {
-        use super::gates::{is_confirmed, set_pending, Asked};
+        use crate::config::Confirm;
         let Some(team) = self.cfg.team.as_ref() else {
             return Ok(None);
         };
-        let done = super::gates::confirmations(&t.run_store);
-        let asked: Vec<(&str, &crate::config::EnvGate)> = team
+        // M13-05 (X26): the yes is a database row bound to the gate, the commit and the task's
+        // frozen configuration digest — `first`: any commit under this digest; `always`: this
+        // commit. A reload that changes the digest asks again.
+        let gates: Vec<(&str, &crate::config::EnvGate)> = team
             .handoff_gates()
             .into_iter()
             .filter(|(_, g)| g.decl.kind == crate::team::GateType::Environment)
             .filter_map(|(name, g)| g.machine.as_ref().map(|m| (name, m)))
-            .filter(|(name, m)| !is_confirmed(&done, m.confirm, name, head))
+            .filter(|(_, m)| m.confirm != Confirm::Never)
+            .collect();
+        if gates.is_empty() {
+            return Ok(None);
+        }
+        let ask: Vec<(String, bool)> = gates
+            .iter()
+            .map(|(name, m)| (name.to_string(), m.confirm == Confirm::Always))
+            .collect();
+        let (i, digest, h) = (self.id.clone(), t.config_sha256.clone(), head.to_string());
+        // (confirmed, a yes exists under another configuration) per gate
+        let state: Vec<(bool, bool)> = self.store.call(move |tx| {
+            ask.iter()
+                .map(|(gate, always)| {
+                    Ok((
+                        store::deploy_confirmed(
+                            tx,
+                            &i,
+                            gate,
+                            &digest,
+                            always.then_some(h.as_str()),
+                        )?,
+                        store::deploy_confirmed_under_another_config(tx, &i, gate, &digest)?,
+                    ))
+                })
+                .collect()
+        })?;
+        let asked: Vec<(&str, &crate::config::EnvGate, bool)> = gates
+            .into_iter()
+            .zip(state)
+            .filter(|(_, (confirmed, _))| !confirmed)
+            .map(|((name, m), (_, changed))| (name, m, changed))
             .collect();
         if asked.is_empty() {
             return Ok(None);
         }
-        set_pending(
-            &t.run_store,
-            asked
-                .iter()
-                .map(|(name, _)| Asked {
-                    gate: name.to_string(),
-                    commit: head.to_string(),
-                })
-                .collect(),
-        )?;
+        let asks: Vec<store::DeployAsk> = asked
+            .iter()
+            .map(|(name, m, _)| store::DeployAsk {
+                gate: name.to_string(),
+                commit: head.to_string(),
+                mode: m.confirm.as_str().to_string(),
+            })
+            .collect();
+        let (i, digest) = (self.id.clone(), t.config_sha256.clone());
+        self.store
+            .call(move |tx| store::ask_deploys(tx, &i, &digest, &asks))?;
         let wt = Worktree::new(&self.g, &t.worktree);
         let stat = self
             .g
@@ -1743,15 +1894,20 @@ impl<'a> Engine<'a> {
             super::gates::ENV_CONFIRM,
             short(head)
         );
-        for (name, m) in &asked {
+        for (name, m, changed) in &asked {
             let argv: Vec<&str> = std::iter::once(m.program.as_str())
                 .chain(m.args.iter().map(String::as_str))
                 .collect();
             s.push_str(&format!(
-                "  gate `{name}` (lock {}, confirm: {}) runs: {}\n",
+                "  gate `{name}` (lock {}, confirm: {}) runs: {}{}\n",
                 super::lock::lock_key(&m.lock),
                 m.confirm.as_str(),
-                argv.join(" ")
+                argv.join(" "),
+                if *changed {
+                    " — asked again: the task's configuration changed since your last yes (`task config --reload`)"
+                } else {
+                    ""
+                }
             ));
         }
         s.push_str(&format!(
@@ -1938,11 +2094,13 @@ impl<'a> Engine<'a> {
             results.push(xpp::entry(&r, tc, &res, &diags));
             if !res.ok() {
                 let errors = xpp::feedback_errors(&diags);
-                return Ok(Some(Some(verify_feedback_in(
-                    &res,
-                    &errors,
-                    Some(xpp::command_timeout(c)),
-                ))));
+                // M13-08: a timeout names the limit this project was given, not the command's
+                let how = if res.timed_out {
+                    xpp_timeout_words(left, xpp::command_timeout(c))
+                } else {
+                    ended(&res)
+                };
+                return Ok(Some(Some(feedback_text(&res, &errors, &how))));
             }
         }
         Ok(Some(None))
@@ -2035,7 +2193,9 @@ impl<'a> Engine<'a> {
             .into_iter()
             .filter(|(_, g)| g.decl.kind == crate::team::GateType::Environment)
             .collect();
-        for (name, g) in gates {
+        // M13-08: the gates of this run that finished — a later stop names them: they run again
+        let mut ran: Vec<&str> = Vec::new();
+        for (at, &(name, g)) in gates.iter().enumerate() {
             let Some(m) = &g.machine else {
                 eprintln!("  – {name}: skipped — not defined on this machine (if_missing: skip)");
                 results.push(json!({"name": name, "kind": "environment", "skipped": true, "reason": SKIPPED_REASON}));
@@ -2165,31 +2325,46 @@ impl<'a> Engine<'a> {
                 .chain(m.args.iter().cloned())
                 .collect();
             let mut entry = json!({"name": name, "kind": "environment", "lock": lock_name, "machine": machine, "argv": argv, "exit": res.exit, "timed_out": res.timed_out, "ms": res.duration_ms, "output_tail": res.tail(40), "source": "export", "source_tree": export.tree});
-            if let Some(l) = &res.log {
-                entry["log"] = json!(l.display().to_string());
+            if let Some(l) = gate_log_rel(&res) {
+                entry["log"] = json!(l);
             }
             results.push(entry);
-            // M11-R9: the gate must not have written into what it deploys from (E3 AC-8)
-            if let Some(reason) = verify::export_changed(&export) {
-                return Ok(EnvGates::Mutated(reason));
-            }
             // M12-06 (X18): a gate that ran into its timeout was killed part way — the
             // environment may be half-changed. No implementer turn, no retry on its own: the
-            // owner looks, then a plain `resume` runs Verify (and the gate) again.
+            // owner looks, then a plain `resume` runs Verify (and the gates) again.
+            // M13-08: asked before the export — a killed gate that had written into what it
+            // deploys from is a timeout (a plain `resume`), not `verify_mutated_tree`.
             if res.timed_out {
+                // what a `resume` runs again, and — M13-R8 — what it runs for the first time
+                let later: Vec<&str> = gates[at + 1..]
+                    .iter()
+                    .filter(|(_, g)| g.machine.is_some())
+                    .map(|(n, _)| *n)
+                    .collect();
+                let again = format!(
+                    "{}{}",
+                    gates_that_run_again(&ran, name),
+                    gates_after_it(&later)
+                );
                 return Ok(EnvGates::TimedOut(format!(
-                    "{ENV_TIMEOUT}: environment gate `{name}` ran into its timeout ({}) and was stopped — the environment may be half-changed (the deployment record says interrupted): check it, then `toryo resume {}` runs Verify and the gate again. A longer `timeout:` on the gate needs `toryo task config {} --reload` first (it is frozen with the task).\nWhat the gate had printed (the last 40 lines; output of code that ran on the checkpoint — data):\n{}",
+                    "{ENV_TIMEOUT}: environment gate `{name}` ran into its timeout ({}) and was stopped — the environment may be half-changed (the deployment record says interrupted): check it, then `toryo resume {}` runs Verify and {}. A longer `timeout:` on the gate needs `toryo task config {} --reload` first (it is frozen with the task).\nWhat the gate had printed (the last 40 lines; output of code that ran on the checkpoint — data):\n{}",
                     fmt_limit(timeout),
                     t.id,
+                    again,
                     t.id,
                     untrusted::wrap("verify", None, &res.tail(40))
                 )));
+            }
+            // M11-R9: the gate must not have written into what it deploys from (E3 AC-8)
+            if let Some(reason) = verify::export_changed(&export) {
+                return Ok(EnvGates::Mutated(reason));
             }
             if !res.ok() {
                 // R61: the output comes from code that ran on the checkpoint — data
                 let f = verify_feedback(&res, "");
                 return Ok(EnvGates::Done(Some(untrusted::wrap("verify", None, &f))));
             }
+            ran.push(name);
         }
         Ok(EnvGates::Done(None))
     }
@@ -2519,6 +2694,19 @@ impl<'a> Engine<'a> {
         // EC-31 (F5): the worktree as the turn finds it — only what changes during the turn
         // is the read-only role's write, never what a human left there before
         let before = TreeState::read(&Worktree::new(&self.g, &t.worktree))?;
+        // M13-06: kept in the run store (hashed like every artifact) — when the engine dies
+        // after the turn, recovery still knows what was there before it, and escalates and
+        // puts back only what the role changed
+        super::artifacts::put(
+            self.store,
+            t,
+            Some(&a.id),
+            &tree_before_name(a),
+            "json",
+            "tree_before",
+            &serde_json::to_vec(&before)?,
+            None,
+        )?;
         let r = self.hub.turn_with(
             OpenSession {
                 profile: profile.clone(),
@@ -2539,9 +2727,53 @@ impl<'a> Engine<'a> {
             },
             self.limits(),
             hooks,
-        )?;
+        );
+        crash_point("read_only:after_turn");
+        // M13-06: an error after the agent ran (an I/O error, the session's close) must not
+        // skip the checks either — what the role wrote is undone before the error goes up
+        let r = match r {
+            Ok(r) => r,
+            Err(e) => {
+                // M13-R7: the same findings as after a turn that ended normally — the protected
+                // check first, so that an untracked protected file the role edited is seen
+                // before the undo removes it — and a failure of the checks themselves must not
+                // mask the error of the turn: it is logged, the turn's own error goes up
+                match self.read_only_findings(t, &a.id, &before) {
+                    Ok(Some((reason, class, _))) => {
+                        let (i, aid) = (self.id.clone(), a.id.clone());
+                        let detail = format!("{reason} (the turn itself ended in an error: {e:#})");
+                        let class = class.to_string();
+                        self.store.call(move |tx| {
+                            store::finish_attempt(
+                                tx,
+                                &aid,
+                                AttemptStatus::Failed,
+                                &AttemptEnd {
+                                    error_class: Some(class),
+                                    error_detail: Some(detail),
+                                    ..Default::default()
+                                },
+                            )?;
+                            store::transition(tx, &i, Ev::Escalate { reason }).map(|_| ())
+                        })?;
+                    }
+                    Ok(None) => {}
+                    Err(x) => eprintln!(
+                        "!! the checks after the read-only turn failed too ({x:#}); the turn's own error follows"
+                    ),
+                }
+                return Err(e);
+            }
+        };
         let model = self.role_model(role.as_str());
-        self.usage(a, profile, &r, model.as_deref())?;
+        if let Err(e) = self.usage(a, profile, &r, model.as_deref()) {
+            // the same for an error while the usage is recorded: checks first
+            if let Some(flow) = self.read_only_checks(t, a, &r, &before)? {
+                eprintln!("!! the turn's usage could not be recorded: {e:#}");
+                return Ok(Err(flow));
+            }
+            return Err(e);
+        }
         // M12-03 (H6): the protected-state and "a read-only role wrote" checks come first, on
         // every way the turn ended — a stop, the live budget and a quota pause must not hide a
         // write (it would stay in the tree and go on under the implementer's name)
@@ -2680,63 +2912,15 @@ impl<'a> Engine<'a> {
         r: &StageOutcome,
         before: &TreeState,
     ) -> Result<Option<Flow>> {
-        if let Some(reason) = self.protected_violation(t, false)? {
+        if let Some((reason, class, undone)) = self.read_only_findings(t, &a.id, before)? {
             self.end_and(
                 a,
                 AttemptStatus::Failed,
                 r,
                 AttemptEnd {
-                    error_class: Some(protect::REASON.into()),
-                    ..Default::default()
-                },
-                Some(Ev::Escalate { reason }),
-                None,
-            )?;
-            return Ok(Some(Flow::Next));
-        }
-        let wt = Worktree::new(&self.g, &t.worktree);
-        let after = TreeState::read(&wt)?;
-        if let Some(reason) = read_only_write(before, &after) {
-            // M12-03 review: what the role wrote must not wait in the tree for the next
-            // checkpoint — `git add -A` of a fix cycle would commit it under the implementer's
-            // name. Paths that were clean or absent before the turn are put back (tracked →
-            // HEAD, new → removed); what a human had changed before stays.
-            if before.head == after.head {
-                let written: Vec<String> = after
-                    .changed_since(before)
-                    .into_iter()
-                    .filter(|p| !ide_state(p) && !before.entries.contains_key(p))
-                    .collect();
-                if !written.is_empty() {
-                    // a copy first (best effort): the human may want to see what it wrote
-                    let keep = t
-                        .run_store
-                        .join("read-only-writes")
-                        .join(a.id.replace('/', "-"));
-                    for p in &written {
-                        let from = t.worktree.join(p);
-                        let to = keep.join(p);
-                        if from.is_file() {
-                            if let Some(dir) = to.parent() {
-                                let _ = std::fs::create_dir_all(dir);
-                            }
-                            let _ = std::fs::copy(&from, &to);
-                        }
-                    }
-                    wt.restore(&written)?;
-                    eprintln!(
-                        "   put back (written by the read-only role): {written:?} — a copy is in {}",
-                        keep.display()
-                    );
-                }
-            }
-            self.end_and(
-                a,
-                AttemptStatus::Failed,
-                r,
-                AttemptEnd {
-                    error_class: Some("policy_violation".into()),
-                    error_detail: Some(reason.clone()),
+                    error_class: Some(class.into()),
+                    // (a protected change alone has always ended the attempt without a detail)
+                    error_detail: (undone || class != protect::REASON).then(|| reason.clone()),
                     ..Default::default()
                 },
                 Some(Ev::Escalate { reason }),
@@ -2745,6 +2929,28 @@ impl<'a> Engine<'a> {
             return Ok(Some(Flow::Next));
         }
         Ok(None)
+    }
+
+    /// What the checks after a read-only turn found — `(reason, class, the undo found a write)`.
+    /// M13-R4 (X32): the protected check runs first (it records what it found), and then the
+    /// undo runs all the same — a protected change is no reason to leave the role's other
+    /// writes in the tree, where the next fix cycle would commit them. M13-R7: the same code
+    /// after a turn that ended in an error.
+    fn read_only_findings(
+        &self,
+        t: &TaskRow,
+        attempt: &str,
+        before: &TreeState,
+    ) -> Result<Option<(String, &'static str, bool)>> {
+        let protected = self.protected_violation(t, false)?;
+        let wt = Worktree::new(&self.g, &t.worktree);
+        let undone = undo_read_only_write(&wt, t, attempt, before)?;
+        Ok(match (protected, undone) {
+            (Some(p), Some(u)) => Some((format!("{p}; {u}"), protect::REASON, true)),
+            (Some(p), None) => Some((p, protect::REASON, false)),
+            (None, Some(u)) => Some((u, "policy_violation", true)),
+            (None, None) => None,
+        })
     }
 
     // ── attempt helpers ──────────────────────────────────────────────────────────────
@@ -3706,6 +3912,20 @@ impl GitAfterTurn {
     }
 }
 
+/// M13-01 (X24): the anchor of a task — the newest attempt's checkpoint (`git_head_after`) or
+/// recovery checkpoint (`partial_commit`), else the task's base commit.
+pub(super) fn anchor_of(t: &TaskRow, attempts: &[AttemptRow]) -> String {
+    attempts
+        .iter()
+        .rev()
+        .find_map(|a| {
+            a.git_head_after
+                .clone()
+                .or_else(|| a.partial_commit.clone())
+        })
+        .unwrap_or_else(|| t.base_commit.clone())
+}
+
 /// What the HEAD guard does about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum HeadGuard {
@@ -3758,7 +3978,20 @@ impl HeadGuard {
             ),
         }
         };
-        let checkout = format!(" — check out {branch} again first");
+        // M13-01 (X24): the way out must not walk the owner past the check — the commits an
+        // agent left on the branch are undone into the tree at the next writing attempt
+        let checkout = format!(
+            " — check out {branch} again; `toryo resume {} --note \"…\"` then undoes the commits made since {} into the tree and checks them",
+            branch.strip_prefix("toryo/").unwrap_or("<id>"),
+            short(head_before)
+        );
+        // (HEAD on another branch: the task branch was not touched — when the owner checks it
+        // out again HEAD is at the anchor and nothing is undone; M13-R8)
+        let other = format!(
+            " — check out {branch} again; `toryo resume {} --note \"…\"` then starts at {} (what was committed on the other branch stays there)",
+            branch.strip_prefix("toryo/").unwrap_or("<id>"),
+            short(head_before)
+        );
         if let Some(op) = &g.unfinished {
             return violation(
                 "unfinished git operation",
@@ -3772,7 +4005,7 @@ impl HeadGuard {
                 return violation(
                     "branch changed",
                     format!("HEAD is on {r}, not on the task branch {branch} (R12)"),
-                    &checkout,
+                    &other,
                 )
             }
             None => {
@@ -4017,17 +4250,317 @@ fn read_only_failure(role: &str, class: ErrorClass, detail: Option<&str>, retrie
 }
 
 /// The task worktree around a read-only turn (EC-31, F5): HEAD, and every changed path —
-/// tracked or untracked, not ignored — with its status and a hash of its content.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct TreeState {
+/// tracked or untracked, not ignored — with its status and a hash of its content. Saved in the
+/// run store before every read-only turn (M13-06) so that recovery has it too.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct TreeState {
     /// `None`: HEAD does not resolve.
     head: Option<String>,
     /// path → (`git status` code, content hash).
     entries: BTreeMap<String, (String, String)>,
 }
 
+/// M13-06: the artifact that holds the [`TreeState`] before the latest turn of the read-only
+/// attempt `a`.
+fn tree_before_name(a: &AttemptRow) -> String {
+    format!("tree-before/{}-{}", a.stage, a.attempt)
+}
+
+/// M13-06: the worktree as the latest turn of the read-only attempt `a` found it — `None` for
+/// an attempt from before M13, or one that died before its first turn.
+pub(super) fn tree_before(store: &Store, t: &TaskRow, a: &AttemptRow) -> Result<Option<TreeState>> {
+    Ok(
+        match super::artifacts::read_head(store, t, &tree_before_name(a))? {
+            Some((_, bytes)) => serde_json::from_slice(&bytes).ok(),
+            None => None,
+        },
+    )
+}
+
+/// The largest file a copy of a read-only role's write keeps (M13-06).
+const READ_ONLY_COPY_MAX: u64 = 8 * 1024 * 1024;
+
+/// A copy of what a read-only role wrote at `from`, for the human to look at (M13-06): never
+/// through a link (the link itself is neither copied nor followed), never more than
+/// [`READ_ONLY_COPY_MAX`]. `Some(why)`: not copied.
+fn keep_copy(from: &Path, to: &Path) -> Option<String> {
+    let md = std::fs::symlink_metadata(from).ok()?; // gone: nothing to copy
+    if md.file_type().is_symlink() {
+        return Some("a link: not followed".into());
+    }
+    if !md.is_file() {
+        return Some("not a regular file".into());
+    }
+    if md.len() > READ_ONLY_COPY_MAX {
+        return Some(format!("{} bytes, over the 8 MB a copy keeps", md.len()));
+    }
+    if let Some(dir) = to.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::copy(from, to)
+        .err()
+        .map(|e| format!("the copy failed: {e}"))
+}
+
+/// The first folder on the way to `rel` (below `root`) that is a link or a junction, as a
+/// `/`-separated relative path — the path itself is not asked (`git status` lists a link as a
+/// path of its own, and `restore` removes that as a link).
+fn link_on_the_way(root: &Path, rel: &str) -> Option<String> {
+    let parts: Vec<&str> = rel.split('/').collect();
+    let mut at = root.to_path_buf();
+    for (i, part) in parts.iter().enumerate().take(parts.len().saturating_sub(1)) {
+        at.push(part);
+        if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Some(parts[..=i].join("/"));
+        }
+    }
+    None
+}
+
+/// What a read-only role (Planner, Reviewer) did to the task worktree since `before`, undone —
+/// after its turn, however that ended, and in recovery when the engine died after it (M12-03,
+/// M13-01, M13-06). `None`: it changed nothing. Otherwise the escalation reason, after:
+/// - a commit it made on the task branch is undone (soft reset to where the turn began, X24);
+/// - every path that was clean or absent before the turn is put back (tracked → HEAD, new →
+///   removed; a link is removed as a link), after a copy for the human;
+/// - a path that was **already changed before** the turn and changed again is copied and left
+///   as it is — Toryo cannot tell the owner's edit from the role's — and the reason says so.
+///
+/// What the owner had in the tree before the turn and the role did not touch is not looked at.
+pub(super) fn undo_read_only_write(
+    wt: &Worktree,
+    t: &TaskRow,
+    attempt: &str,
+    before: &TreeState,
+) -> Result<Option<String>> {
+    let mut after = TreeState::read(wt)?;
+    let Some(mut reason) = read_only_write(before, &after) else {
+        return Ok(None);
+    };
+    if let (Some(began), true) = (&before.head, before.head != after.head) {
+        let on_branch = wt.head_ref().ok().flatten() == Some(format!("refs/heads/{}", t.branch));
+        if on_branch && wt.unfinished_operation()?.is_none() {
+            wt.soft_reset(began)?;
+            eprintln!(
+                "   the read-only role had moved HEAD — soft reset to {}",
+                short(began)
+            );
+            after = TreeState::read(wt)?;
+        }
+    }
+    if before.head != after.head {
+        return Ok(Some(could_not_undo(wt, t, attempt, before, &after, reason)));
+    }
+    // (again, written): changed before the turn and changed again / clean or absent before it
+    let split = |after: &TreeState| -> (Vec<String>, Vec<String>) {
+        after
+            .changed_since(before)
+            .into_iter()
+            .filter(|p| !ide_state(p))
+            .partition(|p| before.entries.contains_key(p))
+    };
+    let (again, written) = split(&after);
+    if written.is_empty() && again.is_empty() {
+        return Ok(Some(reason));
+    }
+    // AC-3: nothing is copied, put back or deleted through a link or junction — Git lists the
+    // files behind a junction like any folder's. A link the role made is removed as a link; one
+    // that was there before the turn (a path below it was already changed then) is left alone,
+    // and the reason says so.
+    let mut links: std::collections::BTreeSet<String> = Default::default();
+    for p in written.iter().chain(&again) {
+        if let Some(link) = link_on_the_way(&t.worktree, p) {
+            let under = format!("{link}/");
+            if !before.entries.keys().any(|k| k.starts_with(&under)) {
+                links.insert(link);
+            }
+        }
+    }
+    for link in &links {
+        let p = t.worktree.join(link);
+        if std::fs::remove_file(&p).is_err() {
+            let _ = std::fs::remove_dir(&p); // a directory link or junction: the link only
+        }
+    }
+    // what a removed link stood in place of — a tracked folder the role deleted first — shows
+    // only now: read the tree again
+    let (again, written) = if links.is_empty() {
+        (again, written)
+    } else {
+        split(&TreeState::read(wt)?)
+    };
+    let mut behind: Vec<String> = Vec::new();
+    let mut direct = |paths: Vec<String>| -> Vec<String> {
+        paths
+            .into_iter()
+            .filter(|p| {
+                let link = link_on_the_way(&t.worktree, p).is_some();
+                if link {
+                    behind.push(p.clone());
+                }
+                !link
+            })
+            .collect()
+    };
+    let (written, again) = (direct(written), direct(again));
+    if !links.is_empty() {
+        reason.push_str(&format!(
+            "; removed as links, not followed: {:?}",
+            links.iter().collect::<Vec<_>>()
+        ));
+    }
+    if !behind.is_empty() {
+        reason.push_str(&format!(
+            "; not touched (behind a link Toryo left in place: it was there before the turn, or could not be removed): {behind:?}"
+        ));
+    }
+    // a copy first: the human may want to see what it wrote
+    let keep = t
+        .run_store
+        .join("read-only-writes")
+        .join(attempt.replace('/', "-"));
+    let not_copied: Vec<String> = written
+        .iter()
+        .chain(&again)
+        .filter_map(|p| {
+            keep_copy(&t.worktree.join(p), &keep.join(p)).map(|why| format!("{p} ({why})"))
+        })
+        .collect();
+    if !written.is_empty() {
+        wt.restore(&written)?;
+        // `restore` does not say when Git refused (a stale `index.lock`, a file in use): look
+        let now = split(&TreeState::read(wt)?).1;
+        let (left, back): (Vec<String>, Vec<String>) =
+            written.into_iter().partition(|p| now.contains(p));
+        if !back.is_empty() {
+            eprintln!(
+                "   put back (written by the read-only role): {back:?} — a copy is in {}",
+                keep.display()
+            );
+        }
+        if !left.is_empty() {
+            reason.push_str(&format!(
+                "; could NOT be put back: {left:?} — Git refused (look at `git -C \"{}\" status`); put them back by hand, or they go into the next checkpoint",
+                t.worktree.display()
+            ));
+        }
+    }
+    // (M13-R7: a file the role *deleted* has nothing to copy — the reason must not say it was)
+    let (again_gone, again): (Vec<String>, Vec<String>) = again
+        .into_iter()
+        .partition(|p| std::fs::symlink_metadata(t.worktree.join(p)).is_err());
+    if !again.is_empty() {
+        reason.push_str(&format!(
+            "; not put back: {again:?} — changed already before the turn, so Toryo cannot tell your edit from the role's (what is there now is copied to {})",
+            keep.display()
+        ));
+    }
+    if !again_gone.is_empty() {
+        reason.push_str(&format!(
+            "; not put back: {again_gone:?} — changed already before the turn and gone now, so Toryo cannot tell your edit from the role's; gone, nothing to copy"
+        ));
+    }
+    if !not_copied.is_empty() {
+        reason.push_str(&format!("; no copy kept of: {}", not_copied.join(", ")));
+    }
+    Ok(Some(reason))
+}
+
+/// M13-R4 (X32): the newest attempt is a read-only one that ended with "could not be put back
+/// yet" ([`UNDO_PENDING`] in its detail), and HEAD is on the task branch again with no Git
+/// operation unfinished: run the undo with the state that attempt saved before its turn.
+/// `None`: nothing was pending (or it cannot be done yet).
+pub(super) fn finish_pending_undo(
+    store: &Store,
+    t: &TaskRow,
+    attempts: &[AttemptRow],
+    wt: &Worktree,
+) -> Result<Option<String>> {
+    let Some(a) = attempts.last() else {
+        return Ok(None);
+    };
+    if a.status != AttemptStatus::Failed
+        || !a
+            .error_detail
+            .as_deref()
+            .is_some_and(|d| d.contains(UNDO_PENDING))
+    {
+        return Ok(None);
+    }
+    let on_branch = wt.head_ref().ok().flatten() == Some(format!("refs/heads/{}", t.branch));
+    if !on_branch || wt.unfinished_operation()?.is_some() {
+        return Ok(None);
+    }
+    match tree_before(store, t, a)? {
+        Some(before) => undo_read_only_write(wt, t, &a.id, &before),
+        None => Ok(None),
+    }
+}
+
+/// The tail of a reason that says a read-only role's write could not be undone yet (M13-R4,
+/// X32): the next writing attempt, and recovery, look for it and run the undo first.
+pub(super) const UNDO_PENDING: &str =
+    "the next `toryo resume` undoes what the role committed and puts back what it wrote first";
+
+/// M13-R4 (X32): the role moved HEAD and it cannot be reset now (HEAD is off the task branch, or
+/// a Git operation is unfinished). Nothing is reset or put back — a reset would move another
+/// branch — but the reason says so, what is in the tree is copied for the owner, and the
+/// attempt's record ([`UNDO_PENDING`]) makes the next resume undo it once the branch is back.
+fn could_not_undo(
+    wt: &Worktree,
+    t: &TaskRow,
+    attempt: &str,
+    before: &TreeState,
+    after: &TreeState,
+    mut reason: String,
+) -> String {
+    if before.head.is_none() {
+        return reason; // no commit to go back to, ever
+    }
+    let on_branch = wt.head_ref().ok().flatten() == Some(format!("refs/heads/{}", t.branch));
+    let (why, way_out) = if on_branch {
+        (
+            "a Git operation is unfinished in the worktree".to_string(),
+            "after that operation is finished or aborted".to_string(),
+        )
+    } else {
+        (
+            format!("HEAD is not on {}", t.branch),
+            format!("after `git checkout {}`", t.branch),
+        )
+    };
+    // never through a link: a path behind one is not copied
+    let paths: Vec<String> = after
+        .changed_since(before)
+        .into_iter()
+        .filter(|p| !ide_state(p) && link_on_the_way(&t.worktree, p).is_none())
+        .collect();
+    let keep = t
+        .run_store
+        .join("read-only-writes")
+        .join(attempt.replace('/', "-"));
+    let not_copied: Vec<String> = paths
+        .iter()
+        .filter_map(|p| {
+            keep_copy(&t.worktree.join(p), &keep.join(p)).map(|why| format!("{p} ({why})"))
+        })
+        .collect();
+    let in_tree = if paths.is_empty() {
+        String::new()
+    } else {
+        format!(" — in the tree: {paths:?}, copied to {}", keep.display())
+    };
+    reason.push_str(&format!(
+        "; could NOT be put back ({why}){in_tree}: {way_out} {UNDO_PENDING}"
+    ));
+    if !not_copied.is_empty() {
+        reason.push_str(&format!("; no copy kept of: {}", not_copied.join(", ")));
+    }
+    reason
+}
+
 impl TreeState {
-    fn read(wt: &Worktree) -> Result<Self> {
+    pub(super) fn read(wt: &Worktree) -> Result<Self> {
         let entries = wt
             .changed()?
             .into_iter()
@@ -4260,6 +4793,15 @@ fn gate_log_path(run_store: &Path, name: &str) -> PathBuf {
     run_store.join("gate-logs").join(format!("{at}-{safe}.log"))
 }
 
+/// M13-04: the log of a gate run as `VERIFY_RESULT.json` names it — relative to the run store
+/// (`gate-logs/<file>`). The file is in the reviewer's and the fix-cycle implementer's pack: an
+/// absolute path under `%LOCALAPPDATA%` would send the Windows user name to the vendor. The
+/// console line `full output:` keeps the absolute path.
+pub fn gate_log_rel(res: &CommandResult) -> Option<String> {
+    let name = res.log.as_ref()?.file_name()?.to_string_lossy().to_string();
+    Some(format!("gate-logs/{name}"))
+}
+
 /// One verify command's entry in VERIFY_RESULT.json.
 fn command_result(c: &CommandSpec, res: &CommandResult) -> Value {
     let argv: Vec<String> = match c.kind() {
@@ -4274,8 +4816,8 @@ fn command_result(c: &CommandSpec, res: &CommandResult) -> Value {
         v["signal"] = json!(s);
     }
     // M12-16: the file with the whole (bounded, redacted) output
-    if let Some(l) = &res.log {
-        v["log"] = json!(l.display().to_string());
+    if let Some(l) = gate_log_rel(res) {
+        v["log"] = json!(l);
     }
     v
 }
@@ -4294,11 +4836,59 @@ fn verify_feedback_in(res: &CommandResult, errors: &str, limit: Option<Duration>
         Some(l) if res.timed_out => format!("timed out after {}", fmt_limit(l)),
         _ => ended(res),
     };
+    feedback_text(res, errors, &how)
+}
+
+/// The feedback line of a failed verify command that ended as `how` says.
+fn feedback_text(res: &CommandResult, errors: &str, how: &str) -> String {
     format!(
         "- VERIFY FAILED: `{}` {how}. {errors}Last output:\n```\n{}\n```",
         res.name,
         res.tail(40)
     )
+}
+
+/// M13-08: how a project of a `tool: xpp` command ran out of time — the limit **it** was given
+/// (`given`: what the projects before it left of the command's `timeout_min`, `total`).
+fn xpp_timeout_words(given: Duration, total: Duration) -> String {
+    let given = Duration::from_secs(given.as_secs_f64().ceil() as u64);
+    if given.is_zero() {
+        format!(
+            "was not started: the projects before it used up the command's {}",
+            fmt_limit(total)
+        )
+    } else if given >= total {
+        format!("timed out after {}", fmt_limit(total))
+    } else {
+        format!(
+            "timed out after {} (what the projects before it left of the command's {})",
+            fmt_limit(given),
+            fmt_limit(total)
+        )
+    }
+}
+
+/// M13-08: what a `resume` after the timeout of the environment gate `name` runs again, in
+/// words — `ran`: the environment gates of the same Verify run that had finished before it.
+fn gates_that_run_again(ran: &[&str], name: &str) -> String {
+    if ran.is_empty() {
+        return "the gate again".into();
+    }
+    let before: Vec<String> = ran.iter().map(|g| format!("`{g}`")).collect();
+    format!(
+        "every environment gate again: {} (finished — the deployment record says so — and deploys again), then `{name}`",
+        before.join(", ")
+    )
+}
+
+/// M13-R8: the environment gates of the task that come **after** the one that timed out — they
+/// run on `resume` too, for the first time.
+fn gates_after_it(after: &[&str]) -> String {
+    if after.is_empty() {
+        return String::new();
+    }
+    let names: Vec<String> = after.iter().map(|g| format!("`{g}`")).collect();
+    format!(", then, for the first time: {}", names.join(", "))
 }
 
 /// How a verify command ended, in words: `exited 1`, `timed out`, …
@@ -4462,15 +5052,20 @@ pub(crate) fn env_gate_program(
 ) -> std::result::Result<PathBuf, String> {
     let bare =
         !(program.contains('/') || program.contains('\\') || Path::new(program).is_absolute());
+    // M13-08: with the leniency of a check gate's program (`gates::startable`) — a file that
+    // `is_file()` cannot see through (an App Execution Alias) is not "not found" here; if
+    // it then cannot be started, the typed spawn error stops the gate with the same class
     let found = if bare {
-        path.and_then(|path| super::checks::which_in(program, path))
+        // M13-R8: the resolver the preflight of a check gate uses (PATH, then — on Windows — the
+        // folder of this program and the system folder, as `CreateProcess` would)
+        path.and_then(|path| super::gates::on_path(program, path))
             .ok_or_else(|| format!("program `{program}` not found on PATH"))?
     } else {
         PathBuf::from(program)
     };
     // a relative PATH entry would resolve against the working directory
     let found = std::path::absolute(&found).map_err(|e| format!("program `{program}`: {e}"))?;
-    if !found.is_file() {
+    if !super::gates::startable(&found) {
         return Err(format!("program `{program}` not found"));
     }
     if let Some((what, root)) = crate::team::reach(cfg, &found.display().to_string()) {
@@ -4968,7 +5563,15 @@ pub fn next_action(t: &TaskRow) -> String {
         St::WaitingFinalApproval => format!("review the branch {} (REVIEW.md in the run store), then `toryo approve {id} --gate final` or `toryo reject {id} --gate final --reason \"…\"`", t.branch),
         St::Escalated => {
             let why = t.machine.reason().unwrap_or("");
-            if t
+            if t.machine.reason_class() == Some(super::gates::ENV_CONFIRM) {
+                // M13-09: the question before a deploy — nothing to fix; what to look at, how
+                // to say yes, and how to say no
+                format!(
+                    "{why}\n  → look at the diff (`git -C \"{}\" show --stat {}`); yes: `toryo resume {id}`; no: `toryo resume {id} --note \"…\"` (one fix cycle) or `toryo task cleanup {id}`",
+                    t.worktree.display(),
+                    t.machine.checkpoint().map(short).unwrap_or("HEAD")
+                )
+            } else if t
                 .machine
                 .reason_class()
                 .is_some_and(crate::engine::state::is_machine_caused)
@@ -6120,6 +6723,39 @@ mod tests {
         );
     }
 
+    /// M13-08: a project of a `tool: xpp` command that ran out of time says the limit **it**
+    /// was given (was: always the command's `timeout_min`, also for the third project that got
+    /// what the first two left), and a timeout stop of an environment gate names every gate
+    /// that a `resume` runs again.
+    #[test]
+    fn a_timeout_says_what_the_run_was_given_and_what_runs_again() {
+        let min = |m: u64| Duration::from_secs(60 * m);
+        // the first project: the whole limit (less the microseconds it took to get there)
+        assert_eq!(
+            xpp_timeout_words(min(30) - Duration::from_micros(40), min(30)),
+            "timed out after 30 min"
+        );
+        assert_eq!(
+            xpp_timeout_words(Duration::from_secs(734), min(30)),
+            "timed out after 734 s (what the projects before it left of the command's 30 min)"
+        );
+        assert_eq!(
+            xpp_timeout_words(Duration::ZERO, min(30)),
+            "was not started: the projects before it used up the command's 30 min"
+        );
+        assert_eq!(gates_that_run_again(&[], "dbsync"), "the gate again");
+        // M13-R8: the gates after it run on `resume` too — for the first time
+        assert_eq!(gates_after_it(&[]), "");
+        assert_eq!(
+            gates_after_it(&["seed", "import"]),
+            ", then, for the first time: `seed`, `import`"
+        );
+        assert_eq!(
+            gates_that_run_again(&["seed", "import"], "dbsync"),
+            "every environment gate again: `seed`, `import` (finished — the deployment record says so — and deploys again), then `dbsync`"
+        );
+    }
+
     #[test]
     fn the_error_class_is_the_reason_up_to_the_first_colon() {
         let cases = [
@@ -6148,6 +6784,10 @@ mod tests {
     #[test]
     fn next_action_of_the_five_machine_caused_classes() {
         for class in crate::engine::state::MACHINE_CAUSED {
+            // M13-09: the question before a deploy has no cause to fix — its own text below
+            if class == crate::engine::gates::ENV_CONFIRM {
+                continue;
+            }
             let mut t = task_in(&[
                 Ev::Start,
                 Ev::Escalate {
@@ -6161,6 +6801,22 @@ mod tests {
                 "{class}"
             );
         }
+        // M13-09 AC-1: `environment_gate_confirm` — what to look at, how to say yes, how to say no
+        let mut t = task_in(&[
+            Ev::Start,
+            Ev::Escalate {
+                reason: "environment_gate_confirm: x".into(),
+            },
+        ]);
+        t.machine
+            .set_reason_class(crate::engine::gates::ENV_CONFIRM);
+        assert_eq!(
+            next_action(&t),
+            format!(
+                "environment_gate_confirm: x\n  → look at the diff (`git -C \"{}\" show --stat HEAD`); yes: `toryo resume T-1`; no: `toryo resume T-1 --note \"…\"` (one fix cycle) or `toryo task cleanup T-1`",
+                t.worktree.display()
+            )
+        );
         // the same reason without the typed class is an ordinary escalation: the text is never
         // parsed for it
         let t = task_in(&[

@@ -214,7 +214,15 @@ pub fn gate_checks(cfg: &Effective) -> Vec<Check> {
             {
                 problems.push(e);
             }
-            problems.extend(gates::script_problems(&m.args));
+            let scripts = gates::script_problems(&m.args);
+            // M13-09: only a missing script is refused by `task create` (`env_gates_refusal`);
+            // a missing program is admitted and stops the run at Verify
+            let refused = if scripts.is_empty() {
+                "`task create` admits the task, and"
+            } else {
+                "`task create` refuses it (the script is not there), and"
+            };
+            problems.extend(scripts);
             if problems.is_empty() {
                 add(
                     Level::Ok,
@@ -227,9 +235,10 @@ pub fn gate_checks(cfg: &Effective) -> Vec<Check> {
                 add(
                     Level::Fail,
                     format!(
-                        "environment gate `{name}`: {} — fix `environment_gates.{name}` in the machine config; `task create` refuses it and a run would stop with `{}` before any gate ran",
+                        "environment gate `{name}`: {} — fix `environment_gates.{name}` in the machine config; {refused} a run would stop with `{}` before any gate ran (confirm: {})",
                         problems.join("; "),
-                        crate::engine::runner::ENV_UNAVAILABLE
+                        crate::engine::runner::ENV_UNAVAILABLE,
+                        m.confirm.as_str()
                     ),
                 );
             }
@@ -415,8 +424,23 @@ pub fn encoding_checks(cfg: &Effective) -> Vec<Check> {
     while let Some(dir) = stack.pop() {
         for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             let p = e.path();
-            if p.is_dir() {
+            // M13-07: what the entry is, not what it points at — a link or junction to a folder
+            // is never walked into (one that points back at `.toryo` would never end)
+            let Ok(kind) = e.file_type() else { continue };
+            if kind.is_dir() {
                 stack.push(p);
+                continue;
+            }
+            if kind.is_symlink() && p.is_dir() {
+                out.push(Check {
+                    level: Level::Info,
+                    area: area.into(),
+                    message: format!(
+                        "{} is a link to a folder: not followed (the files behind it are not checked)",
+                        p.display()
+                    ),
+                    source: None,
+                });
                 continue;
             }
             let text = p
@@ -527,7 +551,7 @@ pub fn is_elevated() -> bool {
 /// and Codex started without its login.)
 pub fn profile_env_checks(cfg: &Effective) -> Vec<Check> {
     static VAR: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"%[A-Za-z_][A-Za-z0-9_]*%").expect("regex"));
+        std::sync::LazyLock::new(|| regex::Regex::new(crate::config::VAR_PATTERN).expect("regex"));
     let mut out = Vec::new();
     for (name, p) in &cfg.repo.profiles {
         for (k, v) in &p.env {
@@ -629,6 +653,7 @@ pub fn run(
     }
     verify_root_check(&mut r, cfg);
     path_length_check(&mut r, cfg);
+    r.0.extend(long_path_checks(cfg));
     r.0.extend(origin_checks(cfg));
     r.0.extend(policy_checks(cfg));
     // M12-08 (X20): keys that are accepted and do nothing
@@ -905,6 +930,107 @@ fn path_length_check(r: &mut Report, cfg: &Effective) {
             }
         ),
     );
+}
+
+/// The registry key that holds `LongPathsEnabled`.
+const LONG_PATHS_KEY: &str = r"HKLM\SYSTEM\CurrentControlSet\Control\FileSystem";
+
+/// M13-10: long paths where the first run meets them (Windows only; nothing elsewhere).
+/// M12-13 made **Toryo's** Git calls long-path safe. The agents run their own `git status` /
+/// `git diff` in the task worktree — those read `core.longpaths` from the repository's
+/// configuration — and MSBuild and PowerShell stop at 260 characters unless the machine's
+/// `LongPathsEnabled` is 1. `doctor` only reads both and says what to type: it changes nothing.
+pub fn long_path_checks(cfg: &Effective) -> Vec<Check> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if let Ok(root) = expand_vars(&cfg.repo.project.root) {
+        // the value a plain Git sees there (system, global and repository configuration)
+        let asked = std::process::Command::new(crate::git::git_exe())
+            .arg("-C")
+            .arg(&root)
+            .args(["config", "--type=bool", "--get", "core.longpaths"])
+            .stdin(std::process::Stdio::null())
+            .output();
+        out.push(git_long_paths_probe(&root, asked));
+    }
+    let reg = std::env::var_os("SystemRoot")
+        .map(|r| PathBuf::from(r).join("System32").join("reg.exe"))
+        .unwrap_or_else(|| PathBuf::from("reg"));
+    let value = std::process::Command::new(reg)
+        .args(["query", LONG_PATHS_KEY, "/v", "LongPathsEnabled"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .and_then(|o| long_paths_enabled(&String::from_utf8_lossy(&o.stdout)));
+    out.push(os_long_paths_check(value));
+    out
+}
+
+/// `LongPathsEnabled` in the output of `reg query … /v LongPathsEnabled` (`REG_DWORD 0x1`).
+fn long_paths_enabled(reg_output: &str) -> Option<u32> {
+    let line = reg_output
+        .lines()
+        .find(|l| l.contains("LongPathsEnabled") && l.contains("REG_DWORD"))?;
+    let v = line.split_whitespace().last()?;
+    u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()
+}
+
+/// The line for what `git config --get core.longpaths` answered — or, when Git could not be
+/// started, an info line that says so (M13-R8: silence looked like "nothing to say").
+fn git_long_paths_probe(root: &str, asked: std::io::Result<std::process::Output>) -> Check {
+    match asked {
+        Ok(o) => git_long_paths_check(root, String::from_utf8_lossy(&o.stdout).trim() == "true"),
+        Err(e) => Check {
+            level: Level::Info,
+            area: "paths".into(),
+            message: format!("could not ask git ({e})"),
+            source: None,
+        },
+    }
+}
+
+fn git_long_paths_check(root: &str, on: bool) -> Check {
+    let (level, message) = if on {
+        (
+            Level::Ok,
+            format!("core.longpaths is true for {root}: the agents' own Git reads paths over 260 characters in the task worktrees"),
+        )
+    } else {
+        (
+            Level::Warn,
+            format!("core.longpaths is not true for {root} — the agents' own `git status` / `git diff` in a task worktree stop at paths over 260 characters (Toryo's own Git calls do not need it): `git -C \"{root}\" config core.longpaths true`"),
+        )
+    };
+    Check {
+        level,
+        area: "paths".into(),
+        message,
+        source: None,
+    }
+}
+
+fn os_long_paths_check(value: Option<u32>) -> Check {
+    let (level, message) = match value {
+        Some(1) => (
+            Level::Ok,
+            format!("LongPathsEnabled is 1 ({LONG_PATHS_KEY}): MSBuild and PowerShell may use paths over 260 characters"),
+        ),
+        other => (
+            Level::Warn,
+            format!(
+                "LongPathsEnabled is {} ({LONG_PATHS_KEY}) — MSBuild and PowerShell stop at paths over 260 characters: `reg add {LONG_PATHS_KEY} /v LongPathsEnabled /t REG_DWORD /d 1 /f` (needs an administrator once; Toryo itself does not need it)",
+                other.map_or("not set".to_string(), |v| v.to_string())
+            ),
+        ),
+    };
+    Check {
+        level,
+        area: "paths".into(),
+        message,
+        source: None,
+    }
 }
 
 /// R36 precondition (M0 finding F7): the Low-IL verify boundary needs a `verify_root`
@@ -1381,6 +1507,57 @@ fn finish(r: Report, json: bool) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M13-10: `LongPathsEnabled` as `reg query` prints it, and the two lines in words.
+    #[test]
+    fn the_long_path_lines_say_what_was_read_and_what_to_type() {
+        let on = "\r\nHKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\FileSystem\r\n    LongPathsEnabled    REG_DWORD    0x1\r\n\r\n";
+        assert_eq!(long_paths_enabled(on), Some(1));
+        assert_eq!(long_paths_enabled(&on.replace("0x1", "0x0")), Some(0));
+        assert_eq!(
+            long_paths_enabled(
+                "ERROR: The system was unable to find the specified registry key or value."
+            ),
+            None
+        );
+        let c = os_long_paths_check(Some(1));
+        assert!(c.level == Level::Ok && c.area == "paths", "{}", c.message);
+        for (value, words) in [
+            (Some(0), "LongPathsEnabled is 0 "),
+            (None, "LongPathsEnabled is not set "),
+        ] {
+            let c = os_long_paths_check(value);
+            assert!(
+                c.level == Level::Warn
+                    && c.message.starts_with(words)
+                    && c.message
+                        .contains("/v LongPathsEnabled /t REG_DWORD /d 1 /f")
+                    && c.message
+                        .contains("needs an administrator once; Toryo itself does not need it"),
+                "{}",
+                c.message
+            );
+        }
+        let c = git_long_paths_check("D:\\repo", false);
+        assert!(
+            c.level == Level::Warn
+                && c.message
+                    .ends_with("`git -C \"D:\\repo\" config core.longpaths true`"),
+            "{}",
+            c.message
+        );
+        assert_eq!(git_long_paths_check("D:\\repo", true).level, Level::Ok);
+        // M13-R8: git that cannot be started is an info line, not silence
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let c = git_long_paths_probe("D:\\repo", Err(err));
+        assert!(
+            c.level == Level::Info
+                && c.area == "paths"
+                && c.message == "could not ask git (no such file)",
+            "{}",
+            c.message
+        );
+    }
 
     /// M11-A2 (group A review): the verify-root check probes the root in force — the machine's
     /// — not the repository's, which may not even expand on this machine.

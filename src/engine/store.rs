@@ -20,7 +20,9 @@ use crate::config::data_dir;
 use crate::domain::TokenUsage;
 use crate::usage::{Accounting, Buckets, Weights};
 
-pub const SCHEMA_VERSION: i64 = 1;
+/// 2 (M13-05): `deploy_confirmations`. A database of version 1 is opened and raised (the table is
+/// created, nothing else changes); one of a higher version is refused.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Plan §5.3, plus the columns the engine needs to rebuild a task after a crash
 /// (`machine`, `repo`, `implementers`, `feedback`, `handoff`, …).
@@ -142,7 +144,108 @@ CREATE TABLE IF NOT EXISTS environment_deployments (
 CREATE TABLE IF NOT EXISTS environment_waits (
   task TEXT PRIMARY KEY, lock TEXT NOT NULL, since TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS deploy_confirmations (
+  task TEXT NOT NULL, gate TEXT NOT NULL, commit_sha TEXT NOT NULL, config_sha256 TEXT NOT NULL,
+  mode TEXT NOT NULL, asked_at TEXT NOT NULL, confirmed_at TEXT,
+  PRIMARY KEY (task, gate, commit_sha, config_sha256)
+);
 "#;
+
+/// M13-05 (X26): a deploy the owner is asked about — the gate, the checkpoint commit and the
+/// gate's `confirm` mode. Evidence like a checkpoint: a row bound to the task's frozen
+/// configuration digest, never a file in the run store. `confirmed_at` empty: asked, no yes yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployAsk {
+    pub gate: String,
+    pub commit: String,
+    pub mode: String,
+}
+
+/// M13-05: has the owner said yes to a deploy by `gate` of this task under the frozen
+/// configuration `config_sha256` — of `commit` (`always`), or of any commit (`first`: `None`)?
+pub fn deploy_confirmed(
+    tx: &Transaction,
+    task: &str,
+    gate: &str,
+    config_sha256: &str,
+    commit: Option<&str>,
+) -> Result<bool> {
+    let n: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM deploy_confirmations WHERE task = ?1 AND gate = ?2 AND config_sha256 = ?3 AND confirmed_at IS NOT NULL AND (?4 IS NULL OR commit_sha = ?4)",
+        params![task, gate, config_sha256, commit],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// M13-05: a yes to `gate` exists for this task under **another** configuration digest and
+/// none under this one (the stop then says why it asks again).
+pub fn deploy_confirmed_under_another_config(
+    tx: &Transaction,
+    task: &str,
+    gate: &str,
+    config_sha256: &str,
+) -> Result<bool> {
+    let n: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM deploy_confirmations WHERE task = ?1 AND gate = ?2 AND config_sha256 <> ?3 AND confirmed_at IS NOT NULL \
+         AND NOT EXISTS (SELECT 1 FROM deploy_confirmations d WHERE d.task = ?1 AND d.gate = ?2 AND d.config_sha256 = ?3 AND d.confirmed_at IS NOT NULL)",
+        params![task, gate, config_sha256],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// M13-11 (X28): take back a task that `task create` could not finish — its row and what the
+/// creation had written for it (the first artifacts, their events). Only for a task that
+/// never ran: nothing else refers to it yet.
+pub fn remove_created_task(tx: &Transaction, id: &str) -> Result<()> {
+    for sql in [
+        "DELETE FROM artifact_heads WHERE task_id = ?1",
+        "DELETE FROM artifacts WHERE task_id = ?1",
+        "DELETE FROM events WHERE task_id = ?1",
+        "DELETE FROM tasks WHERE id = ?1",
+    ] {
+        tx.execute(sql, [id])?;
+    }
+    Ok(())
+}
+
+/// M13-05: the stop asks about `asks` (what an earlier stop asked and got no yes for is dropped).
+pub fn ask_deploys(
+    tx: &Transaction,
+    task: &str,
+    config_sha256: &str,
+    asks: &[DeployAsk],
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM deploy_confirmations WHERE task = ?1 AND confirmed_at IS NULL",
+        [task],
+    )?;
+    for a in asks {
+        tx.execute(
+            "INSERT OR IGNORE INTO deploy_confirmations(task, gate, commit_sha, config_sha256, mode, asked_at, confirmed_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            params![task, a.gate, a.commit, config_sha256, a.mode, now()],
+        )?;
+    }
+    Ok(())
+}
+
+/// M13-05: the owner's yes (a plain `toryo resume` after the stop, in the same transaction as
+/// its transition): what the stop asked about is confirmed. Returns `(gate, commit)` of each.
+pub fn confirm_deploys(tx: &Transaction, task: &str) -> Result<Vec<(String, String)>> {
+    let asked: Vec<(String, String)> = {
+        let mut st = tx.prepare(
+            "SELECT gate, commit_sha FROM deploy_confirmations WHERE task = ?1 AND confirmed_at IS NULL ORDER BY gate",
+        )?;
+        let rows = st.query_map([task], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    tx.execute(
+        "UPDATE deploy_confirmations SET confirmed_at = ?2 WHERE task = ?1 AND confirmed_at IS NULL",
+        params![task, now()],
+    )?;
+    Ok(asked)
+}
 
 /// M11-E3: what an environment lock's environment last received — written **before** the gate
 /// starts (a failed or killed sync may already have changed it) and updated at its end. Never
@@ -296,8 +399,16 @@ impl Store {
                     )?;
                 }
                 Some(v) if v == SCHEMA_VERSION.to_string() => {}
+                // M13-05: an older database is raised — every table of this version was just
+                // created by `SCHEMA` (`IF NOT EXISTS`), nothing is altered or dropped
+                Some(v) if v.parse::<i64>().is_ok_and(|n| (1..SCHEMA_VERSION).contains(&n)) => {
+                    tx.execute(
+                        "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                        [SCHEMA_VERSION.to_string()],
+                    )?;
+                }
                 Some(v) => bail!(
-                    "database {} has schema version {v}; this toryo expects {SCHEMA_VERSION}",
+                    "database {} has schema version {v}; this toryo expects {SCHEMA_VERSION} (a newer toryo wrote it: use that one)",
                     path.display()
                 ),
             }
@@ -1577,6 +1688,146 @@ mod tests {
             reviewer: "claude".into(),
             budget_tokens: None,
         }
+    }
+
+    /// M13-05 AC-4: the schema version is raised (2: `deploy_confirmations`), a database of
+    /// version 1 opens and is raised without losing a row, and one a newer toryo wrote is refused.
+    #[test]
+    fn an_older_database_opens_and_is_raised() {
+        assert_eq!(SCHEMA_VERSION, 2);
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("toryo.db");
+        // a version-1 database with a task in it: no `deploy_confirmations` table
+        {
+            let st = Store::open(&p).unwrap();
+            st.call(|tx| insert_task(tx, &new_task("OLD-1"))).unwrap();
+        }
+        let version = |p: &Path| -> String {
+            Connection::open(p)
+                .unwrap()
+                .query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        {
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch(
+                "DROP TABLE deploy_confirmations; UPDATE meta SET value='1' WHERE key='schema_version';",
+            )
+            .unwrap();
+        }
+        assert_eq!(version(&p), "1");
+        let st = Store::open(&p).unwrap();
+        assert_eq!(version(&p), "2");
+        assert_eq!(
+            st.call(|tx| get_task(tx, "OLD-1")).unwrap().id,
+            "OLD-1",
+            "nothing was lost"
+        );
+        // the new table works: asked, not confirmed; the yes; bound to the digest and the commit
+        let asks = vec![DeployAsk {
+            gate: "dbsync".into(),
+            commit: "c1".into(),
+            mode: "first".into(),
+        }];
+        st.call(move |tx| ask_deploys(tx, "OLD-1", "cfg", &asks))
+            .unwrap();
+        let confirmed = |digest: &'static str, commit: Option<&'static str>| {
+            st.call(move |tx| deploy_confirmed(tx, "OLD-1", "dbsync", digest, commit))
+                .unwrap()
+        };
+        assert!(!confirmed("cfg", None), "asked is not confirmed");
+        let said = st.call(|tx| confirm_deploys(tx, "OLD-1")).unwrap();
+        assert_eq!(said, [("dbsync".to_string(), "c1".to_string())]);
+        assert!(confirmed("cfg", None) && confirmed("cfg", Some("c1")));
+        assert!(!confirmed("cfg", Some("c2")), "`always`: another commit");
+        assert!(!confirmed("other-digest", None), "another configuration");
+        assert!(st
+            .call(|tx| deploy_confirmed_under_another_config(tx, "OLD-1", "dbsync", "other-digest"))
+            .unwrap());
+        assert!(st
+            .call(|tx| confirm_deploys(tx, "OLD-1"))
+            .unwrap()
+            .is_empty());
+        drop(st);
+        // a database a newer toryo wrote
+        Connection::open(&p)
+            .unwrap()
+            .execute_batch("UPDATE meta SET value='3' WHERE key='schema_version';")
+            .unwrap();
+        let e = Store::open(&p).err().expect("refused").to_string();
+        assert!(
+            e.contains("schema version 3") && e.contains("expects 2"),
+            "{e}"
+        );
+    }
+
+    /// Review of M13-05: "asked again: the configuration changed since your last yes" is said
+    /// only while the configuration in force has no yes of its own. Was: one yes under an
+    /// earlier digest made every later stop of an `always` gate say it, for good.
+    #[test]
+    fn the_changed_configuration_note_ends_with_a_yes_under_the_new_one() {
+        let d = tempfile::tempdir().unwrap();
+        let st = Store::open(&d.path().join("toryo.db")).unwrap();
+        st.call(|tx| insert_task(tx, &new_task("T-1"))).unwrap();
+        let yes = |digest: &'static str, commit: &'static str| {
+            st.call(move |tx| {
+                let asks = [DeployAsk {
+                    gate: "dbsync".into(),
+                    commit: commit.into(),
+                    mode: "always".into(),
+                }];
+                ask_deploys(tx, "T-1", digest, &asks)?;
+                confirm_deploys(tx, "T-1").map(|_| ())
+            })
+            .unwrap()
+        };
+        let changed = |digest: &'static str| {
+            st.call(move |tx| deploy_confirmed_under_another_config(tx, "T-1", "dbsync", digest))
+                .unwrap()
+        };
+        yes("old", "c1");
+        assert!(!changed("old"));
+        assert!(changed("new"), "a yes under the old configuration only");
+        yes("new", "c2");
+        assert!(
+            !changed("new"),
+            "the last yes was under this configuration: the next commit is asked for, but not because the configuration changed"
+        );
+    }
+
+    /// M13-11 (X28): a task `task create` could not finish is taken back — its row and its
+    /// events — and the id is free again.
+    #[test]
+    fn a_task_that_was_never_finished_is_taken_back() {
+        let d = tempfile::tempdir().unwrap();
+        let st = Store::open(&d.path().join("toryo.db")).unwrap();
+        st.call(|tx| {
+            insert_task(tx, &new_task("N-1"))?;
+            event(tx, Some("N-1"), None, "note", &serde_json::json!({})).map(|_| ())
+        })
+        .unwrap();
+        st.call(|tx| insert_task(tx, &new_task("N-2"))).unwrap();
+        st.call(|tx| remove_created_task(tx, "N-1")).unwrap();
+        let left = st
+            .call(|tx| {
+                let events: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM events WHERE task_id = 'N-1'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok((
+                    get_task(tx, "N-1").is_ok(),
+                    get_task(tx, "N-2").is_ok(),
+                    events,
+                ))
+            })
+            .unwrap();
+        assert_eq!(left, (false, true, 0), "only N-1 is gone");
+        st.call(|tx| insert_task(tx, &new_task("N-1"))).unwrap();
     }
 
     /// M11-R16 AC-3: an escalation and its typed class are written in one transaction — both

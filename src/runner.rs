@@ -107,23 +107,106 @@ impl BoundedOutput {
         self.total
     }
 
-    /// The kept bytes, with the marker line where bytes were dropped.
+    /// The kept bytes, with the marker line where bytes were dropped (cut as
+    /// [`Self::into_sides`] cuts them).
     pub fn into_bytes(self) -> Vec<u8> {
-        let mut out = self.head;
-        if self.omitted > 0 {
-            out.extend(
-                format!(
-                    "\n[... {} bytes of output omitted: Toryo keeps the first {} MB and the last {} MB of a gate's output ...]\n",
-                    self.omitted,
-                    OUTPUT_HEAD_KEEP / (1024 * 1024),
-                    OUTPUT_TAIL_KEEP / (1024 * 1024)
-                )
-                .bytes(),
-            );
+        let (mut head, cut) = self.into_sides();
+        if let Some((omitted, tail)) = cut {
+            head.extend(omitted_marker(omitted).bytes());
+            head.extend(tail);
         }
-        out.extend(self.tail);
-        out
+        head
     }
+
+    /// The kept bytes as the head and — when bytes were dropped — `(omitted, tail)`, cut on line
+    /// boundaries (M13-04, X27): the head ends at its last line break and the tail starts after
+    /// its first one, so no line and no multi-byte character is torn. A side with no line
+    /// break at all (one line longer than the bound) is kept whole, less a torn UTF-8
+    /// character at the cut. What is dropped counts as omitted. Nothing here knows the
+    /// secrets: [`bounded_text`] redacts each side and takes the bytes a secret that straddled
+    /// the cut could have left.
+    pub fn into_sides(self) -> (Vec<u8>, Option<(u64, Vec<u8>)>) {
+        let mut head = self.head;
+        let mut tail: Vec<u8> = self.tail.into();
+        let mut omitted = self.omitted;
+        if omitted == 0 {
+            head.extend(tail);
+            return (head, None);
+        }
+        let keep = match head.iter().rposition(|b| *b == b'\n') {
+            Some(i) => i + 1,
+            // an unfinished UTF-8 character at the very end, or nothing
+            None => match std::str::from_utf8(&head) {
+                Err(e) if e.error_len().is_none() => e.valid_up_to(),
+                _ => head.len(),
+            },
+        };
+        omitted += (head.len() - keep) as u64;
+        head.truncate(keep);
+        let skip = match tail.iter().position(|b| *b == b'\n') {
+            Some(i) => i + 1,
+            // the rest of a UTF-8 character whose start was dropped, or nothing
+            None => tail
+                .iter()
+                .take(3)
+                .take_while(|b| **b & 0xC0 == 0x80)
+                .count(),
+        };
+        omitted += skip as u64;
+        tail.drain(..skip);
+        (head, Some((omitted, tail)))
+    }
+}
+
+/// The line that stands where output was dropped.
+fn omitted_marker(omitted: u64) -> String {
+    format!(
+        "\n[... {omitted} bytes of output omitted: Toryo keeps the first {} MB and the last {} MB of a gate's output ...]\n",
+        OUTPUT_HEAD_KEEP / (1024 * 1024),
+        OUTPUT_TAIL_KEEP / (1024 * 1024)
+    )
+}
+
+/// The text of a gate's bounded output: decode → strip the colour codes → redact (M11-R8,
+/// M12-15) — each kept side on its own, and **then** the cut (M13-04, X27: a secret is whole or
+/// gone, never a fragment). A secret that lay whole in a side is redacted before anything is
+/// taken from it. A secret that straddled the cut left less than its length at the cut edge of
+/// each side: that much goes (and the rest of that line, when the side has other lines) —
+/// whether the secret is one line or several. With no secret configured nothing more goes.
+pub fn bounded_text(out: BoundedOutput, redact: &Redactions) -> String {
+    let clean = |b: &[u8]| redact.redact_str(&strip_ansi(&crate::process::decode_output(b)));
+    let (head, cut) = out.into_sides();
+    let mut head = clean(&head);
+    let Some((mut omitted, tail)) = cut else {
+        return head;
+    };
+    let mut tail = clean(&tail);
+    if redact.max_len() > 0 {
+        // (two bytes more than the longest secret: a torn character decodes to a longer mark;
+        // M13-R3: and what the replacements of shorter secrets inside the fragment add)
+        let hold = redact.cut_hold();
+        let mut keep = head.len().saturating_sub(hold);
+        while !head.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        if let Some(i) = head[..keep].rfind('\n') {
+            keep = i + 1;
+        }
+        omitted += (head.len() - keep) as u64;
+        head.truncate(keep);
+        let mut skip = hold.min(tail.len());
+        while !tail.is_char_boundary(skip) {
+            skip += 1;
+        }
+        if let Some(i) = tail[skip..].find('\n') {
+            skip += i + 1;
+        }
+        omitted += skip as u64;
+        tail.drain(..skip);
+    }
+    head.push_str(&omitted_marker(omitted));
+    head.push_str(&tail);
+    head
 }
 
 /// M12-16: what the engine asks of a gate run besides [`RunSpec`]. Nothing by default.
@@ -267,11 +350,7 @@ impl LocalRunner {
             )?;
             // M11-R8: strip the colour codes, then redact: a secret split by a colour code is found
             // M12-15 (X23): decode (a cp932 line is not `�`), then colour codes, then redact
-            let output = spec
-                .redact
-                .redact_str(&strip_ansi(&crate::process::decode_output(
-                    &out.into_bytes(),
-                )));
+            let output = bounded_text(out, &spec.redact);
             // M12-16: the log holds exactly the text the result holds; a log that cannot be
             // written is not a failing gate
             let log = io.log.as_ref().and_then(|p| {
@@ -311,6 +390,163 @@ mod tests {
 
     /// M12-16: below the bound nothing is dropped; above it the first 1 MB and the last 8 MB
     /// stay with one marker between.
+    /// M13-04 (X27): once bytes are dropped, the head ends at a line break and the tail starts
+    /// after one; a side without any line break is kept whole, less a torn UTF-8 character.
+    #[test]
+    fn bounded_output_is_cut_on_line_boundaries() {
+        let line = "0123456789abcdefghijklmnopqrstuvwxyz\n"; // 37 bytes
+        let mut b = BoundedOutput::default();
+        let n = (OUTPUT_HEAD_KEEP + OUTPUT_TAIL_KEEP) / line.len() + 1000;
+        for _ in 0..n {
+            b.push(line.as_bytes());
+        }
+        let total = b.total();
+        let text = String::from_utf8(b.into_bytes()).unwrap();
+        let (head, rest) = text.split_once("\n[... ").expect("the marker");
+        let (marker, tail) = rest.split_once(" ...]\n").expect("the marker's end");
+        assert!(head.len() % line.len() == 0, "the head ends on a line");
+        assert!(
+            tail.len() % line.len() == 0 && tail.starts_with("0123"),
+            "the tail starts on a line"
+        );
+        let omitted: u64 = marker.split(' ').next().unwrap().parse().unwrap();
+        assert_eq!(head.len() as u64 + tail.len() as u64 + omitted, total);
+        // a side with no line break: a character torn by the bound goes, nothing else
+        let mut b = BoundedOutput::default();
+        b.push(&vec![b'a'; OUTPUT_HEAD_KEEP - 1]);
+        b.push("é".as_bytes()); // its first byte is the last of the head
+        b.push(b"bbb");
+        b.push("é".as_bytes()); // its second byte is the first of the tail
+        b.push(&vec![b'b'; OUTPUT_TAIL_KEEP - 1]);
+        let bytes = b.into_bytes();
+        let text = String::from_utf8(bytes.clone()).expect("no torn character");
+        assert!(
+            text.contains("\n[... 7 bytes of output omitted"),
+            "5 dropped by the bound, and the half of a character left on each side"
+        );
+        assert!(bytes[..OUTPUT_HEAD_KEEP - 1].iter().all(|b| *b == b'a'));
+        assert_eq!(bytes[OUTPUT_HEAD_KEEP - 1], b'\n');
+        // nothing dropped: nothing is cut
+        let mut b = BoundedOutput::default();
+        b.push(b"no line break at all");
+        assert_eq!(b.into_bytes(), b"no line break at all");
+    }
+
+    /// Review of M13-04: the cut must not make a fragment out of a **whole** secret either. Was
+    /// (the first version of M13-04): a side without a line break lost "the longest secret minus
+    /// one" raw bytes at the cut — which cut a whole secret lying there in two; and a secret of
+    /// several lines that straddled a line-boundary cut kept its first lines. Now each side is
+    /// redacted first and only then loses the bytes a straddling secret could have left.
+    #[test]
+    fn a_secret_next_to_the_cut_is_whole_or_gone() {
+        use crate::process::redact::Secret;
+        const SECRET: &str = "SECRET-VALUE-20CHARS";
+        let one = Redactions::new(&[Secret {
+            name: "S".into(),
+            value: SECRET.into(),
+        }]);
+        let no_fragment = |text: &str, secret: &str| {
+            assert!(
+                text.contains("bytes of output omitted"),
+                "the output was cut"
+            );
+            for i in 0..=secret.len() - 8 {
+                assert!(
+                    !text.contains(&secret[i..i + 8]),
+                    "a fragment is left: {:?}",
+                    &secret[i..i + 8]
+                );
+            }
+        };
+        // a whole secret that ends 10 bytes before the end of a head with no line break
+        let mut b = BoundedOutput::default();
+        b.push(&vec![b'a'; OUTPUT_HEAD_KEEP - 30]);
+        b.push(SECRET.as_bytes());
+        b.push(&[b'a'; 10]);
+        b.push(&vec![b'b'; OUTPUT_TAIL_KEEP + 5]);
+        no_fragment(&bounded_text(b, &one), SECRET);
+        // a whole secret that starts 10 bytes into a tail with no line break
+        let mut b = BoundedOutput::default();
+        b.push(&vec![b'a'; OUTPUT_HEAD_KEEP + 5]);
+        b.push(&[b'b'; 10]);
+        b.push(SECRET.as_bytes());
+        b.push(&vec![b'b'; OUTPUT_TAIL_KEEP - 30]);
+        no_fragment(&bounded_text(b, &one), SECRET);
+        // a secret of three lines; the head's bound falls into its third line
+        const LINES: &str = "LINE-ONE-AAAA\nLINE-TWO-BBBB\nLINE-THREE-CC";
+        let many = Redactions::new(&[Secret {
+            name: "KEY".into(),
+            value: LINES.into(),
+        }]);
+        let mut b = BoundedOutput::default();
+        let filler = "0123456789abcdef\n".repeat(OUTPUT_HEAD_KEEP / 17);
+        b.push(&filler.as_bytes()[..OUTPUT_HEAD_KEEP - 34]);
+        b.push(LINES.as_bytes());
+        b.push(b"\n");
+        b.push(
+            "0123456789abcdef\n"
+                .repeat(OUTPUT_TAIL_KEEP / 17 + 10)
+                .as_bytes(),
+        );
+        let text = bounded_text(b, &many);
+        assert!(
+            text.contains("bytes of output omitted"),
+            "the output was cut"
+        );
+        for line in LINES.lines() {
+            assert!(!text.contains(line), "a line of the secret is left: {line}");
+        }
+        // nothing dropped: nothing is cut, and the secret is redacted as ever
+        let mut b = BoundedOutput::default();
+        b.push(format!("before {SECRET} after").as_bytes());
+        assert_eq!(bounded_text(b, &one), "before [REDACTED:S] after");
+    }
+
+    /// M13-R3: a shorter secret B inside the fragment of a longer secret A that straddles the
+    /// cut (a password inside a connection string). Redacting B grows the fragment past the
+    /// bytes that were held at the cut: the start (head) or the end (tail) of A's fragment
+    /// survived. The hold is measured in raw terms: it grows with what a replacement adds.
+    #[test]
+    fn a_secret_inside_the_fragment_of_another_is_no_reason_to_keep_the_fragment() {
+        use crate::process::redact::Secret;
+        const A: &str = "AAAAAAAAAAbbCCCCCCCCCC";
+        let r = Redactions::new(&[
+            Secret {
+                name: "A".into(),
+                value: A.into(),
+            },
+            Secret {
+                name: "VERY_LONG_SECRET_NAME".into(),
+                value: "bb".into(),
+            },
+        ]);
+        let no_window = |text: &str| {
+            assert!(
+                text.contains("bytes of output omitted"),
+                "the output was cut"
+            );
+            for i in 0..=A.len() - 8 {
+                assert!(
+                    !text.contains(&A[i..i + 8]),
+                    "a fragment of A is left: {:?}",
+                    &A[i..i + 8]
+                );
+            }
+        };
+        // the cut falls after `AAAAAAAAAAbbCCCCCC`: the head holds the first 18 bytes of A
+        let mut b = BoundedOutput::default();
+        b.push(&vec![b'x'; OUTPUT_HEAD_KEEP - 18]);
+        b.push(A.as_bytes());
+        b.push(&vec![b'y'; OUTPUT_TAIL_KEEP + 5]);
+        no_window(&bounded_text(b, &r));
+        // the tail starts inside A: its first 10 bytes were dropped, `bbCCCCCCCCCC` is kept
+        let mut b = BoundedOutput::default();
+        b.push(&vec![b'x'; OUTPUT_HEAD_KEEP]);
+        b.push(A.as_bytes());
+        b.push(&vec![b'y'; OUTPUT_TAIL_KEEP - 12]);
+        no_window(&bounded_text(b, &r));
+    }
+
     #[test]
     fn bounded_output_keeps_the_head_and_the_tail() {
         let mut small = BoundedOutput::default();

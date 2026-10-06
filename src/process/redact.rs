@@ -41,6 +41,9 @@ pub struct Redactions {
     ac: Option<std::sync::Arc<AhoCorasick>>,
     replacements: Vec<Vec<u8>>,
     max_len: usize,
+    /// The length of the shortest pattern (0 without secrets): how much a replacement can add
+    /// per byte of the text it replaces (M13-R3).
+    min_len: usize,
     /// Some pattern contains a line break: an occurrence can then span lines, and a line
     /// ending is no safe place to release the stream (M12-04).
     multiline: bool,
@@ -64,6 +67,21 @@ impl Redactions {
             if s.value.is_empty() {
                 continue;
             }
+            // M13-03: a value of line breaks only is not a secret — as a pattern it would
+            // redact every line end
+            if s.value.bytes().all(|b| b == b'\n') {
+                // (M13-R8: once per process and name — every spawn builds its matcher again)
+                static NOTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                let name = sanitize_name(&s.name);
+                let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
+                if !noted.contains(&name) {
+                    eprintln!(
+                        "note: the secret `{name}` holds only line breaks — it is not redacted"
+                    );
+                    noted.push(name);
+                }
+                continue;
+            }
             let repl = format!("[REDACTED:{}]", sanitize_name(&s.name)).into_bytes();
             let literal = s.value.as_bytes().to_vec();
             let escaped_full = serde_json::to_string(&s.value).expect("string serialises");
@@ -82,15 +100,16 @@ impl Redactions {
                 ac: None,
                 replacements,
                 max_len: 0,
+                min_len: 0,
                 multiline: false,
             };
         }
         let max_len = patterns.iter().map(|p| p.len()).max().unwrap_or(0);
-        // a trailing line break (a secret read from a file) ends a line, it does not span lines
-        let multiline = patterns.iter().any(|p| {
-            let end = p.iter().rposition(|b| *b != b'\n').map_or(0, |i| i + 1);
-            p[..end].contains(&b'\n')
-        });
+        let min_len = patterns.iter().map(|p| p.len()).min().unwrap_or(0);
+        // a trailing line break (a secret read from a file) ends a line, it does not span lines.
+        // M13-03: exactly one — the "a complete line is final" rule holds only when a line
+        // break can be nothing but the last byte of a pattern (`ab\n\n` has one inside)
+        let multiline = patterns.iter().any(|p| p[..p.len() - 1].contains(&b'\n'));
         let ac = AhoCorasickBuilder::new()
             .match_kind(MatchKind::Standard) // overlapping search; spans are unioned below
             .build(&patterns)
@@ -99,6 +118,7 @@ impl Redactions {
             ac: Some(std::sync::Arc::new(ac)),
             replacements,
             max_len,
+            min_len,
             multiline,
         }
     }
@@ -109,6 +129,28 @@ impl Redactions {
 
     pub fn is_empty(&self) -> bool {
         self.ac.is_none()
+    }
+
+    /// The length of the longest pattern (0 without secrets): text cut within that many bytes
+    /// of a secret's start can hold a fragment of it (M13-04).
+    pub fn max_len(&self) -> usize {
+        self.max_len
+    }
+
+    /// M13-R3: how many bytes of **redacted** text can stand where a secret's fragment of at most
+    /// `max_len - 1` raw bytes (plus two for a torn character) was: a shorter secret inside the
+    /// fragment becomes its marker, which can be longer than it was. Never less than
+    /// `max_len + 2` plus every marker once; and for repeats (`bbbb…` inside the fragment) the
+    /// raw length times the most a replacement adds per byte. 0 without secrets.
+    pub fn cut_hold(&self) -> usize {
+        if self.max_len == 0 {
+            return 0;
+        }
+        let raw = self.max_len + 2;
+        let markers: usize = self.replacements.iter().map(|r| r.len()).sum();
+        let longest = self.replacements.iter().map(|r| r.len()).max().unwrap_or(0);
+        let per_byte = longest.div_ceil(self.min_len.max(1)).max(1);
+        (raw + markers).max(raw * per_byte)
     }
 
     /// Redact a complete, already-buffered value (e.g. a stored event payload).
@@ -495,6 +537,32 @@ mod tests {
         );
     }
 
+    /// M13-03: a line break may only be the **last** byte of a secret for the "a complete line
+    /// is final" rule to hold. A value that ends in two line breaks has one inside it: with the
+    /// first chunk ending at that inner break the secret used to leave in clear.
+    #[test]
+    fn a_secret_ending_in_two_line_breaks_is_not_released_in_halves() {
+        let r = Redactions::new(&[sec("K", "ab\n\n")]);
+        let mut s = StreamRedactor::new(r);
+        let mut out = s.push(b"zab\n");
+        out.extend(s.push(b"\n"));
+        out.extend(s.finish());
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("ab"), "{text:?}");
+        assert_eq!(text, "z[REDACTED:K]");
+        // a single trailing break is still a line end, not a line span (M12-04 review)
+        let one = Redactions::new(&[sec("K", "ab\n")]);
+        assert!(!one.multiline);
+        let mut s = StreamRedactor::new(one);
+        let out = s.push(b"zab\nnext\n");
+        assert_eq!(s.retained(), 0);
+        assert_eq!(String::from_utf8(out).unwrap(), "z[REDACTED:K]next\n");
+        // a secret of line breaks only is not a secret: dropped, nothing is redacted
+        let only = Redactions::new(&[sec("N", "\n\n"), sec("M", "\n")]);
+        assert!(only.is_empty());
+        assert_eq!(only.redact_str("a\n\nb\n"), "a\n\nb\n");
+    }
+
     #[test]
     fn retained_tail_is_bounded() {
         let r = all();
@@ -618,6 +686,27 @@ mod tests {
             run_chunks(&r, &[b"hello ", "世界".as_bytes()]),
             "hello 世界".as_bytes()
         );
+    }
+
+    /// M13-R3: the hold at a cut covers what the replacements of shorter secrets add to a
+    /// fragment of a longer one — also when the short one repeats inside the fragment.
+    #[test]
+    fn the_cut_hold_covers_a_fragment_full_of_markers() {
+        assert_eq!(Redactions::empty().cut_hold(), 0);
+        let a = format!("{}X", "b".repeat(20));
+        let r = Redactions::new(&[sec("A", &a), sec("B", "b")]);
+        let fragment = &a.as_bytes()[..a.len() - 1];
+        let redacted = r.redact_all(fragment);
+        assert!(redacted.len() > 200, "twenty markers: {}", redacted.len());
+        assert!(
+            r.cut_hold() >= redacted.len(),
+            "{} < {}",
+            r.cut_hold(),
+            redacted.len()
+        );
+        // never less than before
+        let one = Redactions::new(&[sec("S", "SECRET-VALUE-20CHARS")]);
+        assert!(one.cut_hold() >= one.max_len() + 2);
     }
 
     #[test]

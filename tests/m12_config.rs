@@ -540,3 +540,121 @@ fn m12_17_doctor_says_whether_toryo_runs_elevated() {
         );
     }
 }
+
+// ── M13-07: `doctor` never follows a link; one pattern for `%NAME%` ───────────────────────
+
+/// (b) A link under `.toryo/` that points back at `.toryo/` (a junction on Windows, a symlink
+/// elsewhere). Was: the walk followed it (`is_dir()` follows links) and read the same files
+/// again at every level until the path was too long for the system. Now the link is not
+/// followed: one text file is counted once and the link gets one info line.
+#[test]
+fn m13_07_doctor_does_not_follow_a_link_under_the_toryo_folder() {
+    let env = setup("codex-openai");
+    let dir = env.repo.join(".toryo");
+    let ctx = dir.join("context");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::write(ctx.join("10-ok.md"), "plain text\n").unwrap();
+    let link = dir.join("loop");
+    #[cfg(windows)]
+    {
+        let o = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&dir)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&dir, &link).unwrap();
+    let lines = doctor_lines(&env, None);
+    let l = line_with(&lines, "text file(s) under .toryo/ are UTF-8");
+    assert!(l.contains("OK") && l.contains("1 text file(s)"), "{l}");
+    let l = line_with(&lines, "is a link to a folder: not followed");
+    assert!(l.contains("[info]") && l.contains("loop"), "{l}");
+}
+
+/// (c) `%ProgramFiles(x86)%` — a name `expand_vars` expands — is warned like any `%NAME%` in
+/// a profile `env:` value. (Was: the pattern of the warning had no parentheses.)
+#[test]
+fn m13_07_doctor_warns_about_a_parenthesised_variable_in_a_profile_env() {
+    let env = setup("codex-openai");
+    let m = std::fs::read_to_string(&env.machine).unwrap();
+    assert!(m.contains("exe: codex-not-installed }"), "{m}");
+    std::fs::write(
+        &env.machine,
+        m.replace(
+            "exe: codex-not-installed }",
+            "exe: codex-not-installed, env: { TOOLS: '%ProgramFiles(x86)%/Tools' } }",
+        ),
+    )
+    .unwrap();
+    let lines = doctor_lines(&env, None);
+    let l = line_with(&lines, "env TOOLS contains %ProgramFiles(x86)%");
+    assert!(l.contains("WARN") && l.contains("not expanded here"), "{l}");
+}
+
+// ── M13-10: `doctor` looks at long paths where the first run will meet them ───────────────
+
+/// The agents' own Git reads `core.longpaths` from the repository's configuration (Toryo's
+/// Git calls pass it themselves, M12-13): `doctor` says what a plain Git sees in
+/// `project.root` — a WARN with the command when it is not true, OK when it is. `doctor` only
+/// reads: the value is the same before and after.
+#[cfg(windows)]
+#[test]
+fn m13_10_doctor_reads_core_longpaths_of_the_repository() {
+    let env = setup("codex-openai");
+    git(&env.repo, &["config", "core.longpaths", "false"]);
+    let lines = doctor_lines(&env, None);
+    let l = line_with(&lines, "core.longpaths is not true");
+    assert!(
+        l.contains("[WARN]") && l.contains("paths") && l.contains("config core.longpaths true"),
+        "{l}"
+    );
+    assert_eq!(
+        git(&env.repo, &["config", "--get", "core.longpaths"]).trim(),
+        "false",
+        "doctor changes nothing"
+    );
+    git(&env.repo, &["config", "core.longpaths", "true"]);
+    let lines = doctor_lines(&env, None);
+    let l = line_with(&lines, "core.longpaths is true");
+    assert!(l.contains("[OK  ]"), "{l}");
+}
+
+/// The machine's `LongPathsEnabled` (MSBuild and PowerShell stop at 260 characters without
+/// it): the line is there and agrees with the registry — OK when it is 1, else a WARN with
+/// the `reg add` line and "needs an administrator once". The test only reads the registry.
+#[cfg(windows)]
+#[test]
+fn m13_10_doctor_reads_long_paths_enabled() {
+    let env = setup("codex-openai");
+    let o = std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKLM\SYSTEM\CurrentControlSet\Control\FileSystem",
+            "/v",
+            "LongPathsEnabled",
+        ])
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    let enabled = out
+        .lines()
+        .any(|l| l.contains("LongPathsEnabled") && l.trim_end().ends_with("0x1"));
+    let lines = doctor_lines(&env, None);
+    let l = line_with(&lines, "LongPathsEnabled is ");
+    if enabled {
+        assert!(
+            l.contains("[OK  ]") && l.contains("LongPathsEnabled is 1 "),
+            "{l}\n{out}"
+        );
+    } else {
+        assert!(
+            l.contains("[WARN]")
+                && l.contains(r"reg add HKLM\SYSTEM\CurrentControlSet\Control\FileSystem /v LongPathsEnabled /t REG_DWORD /d 1 /f")
+                && l.contains("needs an administrator once; Toryo itself does not need it"),
+            "{l}\n{out}"
+        );
+    }
+}

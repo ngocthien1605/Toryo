@@ -132,6 +132,12 @@ fn gates_persist_and_the_task_completes() {
     let log = trailers(&env, "E-1");
     assert!(log.contains("toryo(E-1): implement|implement|1||"), "{log}");
     assert!(log.contains("toryo(E-1): fix-1|fix-1|1||"), "{log}");
+    // M13-01 (X24, added assertion): the second writing attempt began at the first checkpoint
+    let at = attempts(&env, "E-1");
+    let head_of = |id: &str| at.iter().find(|a| a.id == id).unwrap();
+    let first = head_of("E-1/implement/1").git_head_after.clone();
+    assert!(first.is_some());
+    assert_eq!(head_of("E-1/fix-1/1").git_head_before, first);
     assert!(clean(&wt(&env, "E-1")));
     assert!(t.run_store.join("runstore").join("SUMMARY.md").exists());
 }

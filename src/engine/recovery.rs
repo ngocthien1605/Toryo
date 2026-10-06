@@ -44,6 +44,11 @@ pub(super) fn foreign_commit(
     if wt.head()? != commit {
         return Ok(Some("it is not HEAD".into()));
     }
+    // M13-R5 (X31): a merge commit is never a checkpoint — the history of its second parent
+    // would enter the task branch unseen by every review of the first-parent diff
+    if wt.has_second_parent(commit)? {
+        return Ok(Some("it is a merge commit".into()));
+    }
     let Some(parent) = wt.first_parent(commit)? else {
         return Ok(Some("it has no parent".into()));
     };
@@ -67,6 +72,35 @@ pub(super) fn foreign_commit(
             "it changes {} — which the path policy forbids",
             protect.violation_words(&bad)
         )))
+    }
+}
+
+/// How a read-only attempt that was `Running` when its owner died ends (M13-R4, X32): when the
+/// undo of its write could not be done yet ([`super::runner::UNDO_PENDING`] in `undone`) it
+/// ends `Failed` with that reason, so that the next writing attempt finds it and finishes the
+/// undo; otherwise as always, `Interrupted`.
+fn read_only_end(
+    undone: &Option<String>,
+    class: Option<String>,
+    detail: &str,
+) -> (AttemptStatus, AttemptEnd) {
+    match undone {
+        Some(u) if u.contains(super::runner::UNDO_PENDING) => (
+            AttemptStatus::Failed,
+            AttemptEnd {
+                error_class: class.or_else(|| Some("policy_violation".into())),
+                error_detail: Some(u.clone()),
+                ..Default::default()
+            },
+        ),
+        _ => (
+            AttemptStatus::Interrupted,
+            AttemptEnd {
+                error_class: class,
+                error_detail: Some(detail.into()),
+                ..Default::default()
+            },
+        ),
     }
 }
 
@@ -154,6 +188,42 @@ impl<'a> Recovery<'a> {
             .join(format!("{}-{}", a.stage, a.attempt))
     }
 
+    /// M13-R4 (X32): recovery stops for another reason (a protected change, a missing or
+    /// tampered artifact) in a read-only stage. The role's writes are put back first when the
+    /// record of the tree before its turn is readable (the same undo as after a turn that ended
+    /// normally); when that record is the artifact that is gone, nothing can be put back safely
+    /// and the reason names every dirty path with "not put back". `None`: not a read-only stage,
+    /// an attempt from before M13, or nothing changed.
+    fn undo_before_early_return(
+        &self,
+        t: &TaskRow,
+        atts: &[AttemptRow],
+        wt: &Worktree,
+    ) -> Result<Option<String>> {
+        if !matches!(t.state, St::Planning | St::Reviewing) {
+            return Ok(None);
+        }
+        let Some(a) = atts
+            .iter()
+            .rev()
+            .find(|a| a.status == AttemptStatus::Running)
+        else {
+            return Ok(None);
+        };
+        match super::runner::tree_before(self.store, t, a) {
+            Ok(Some(before)) => super::runner::undo_read_only_write(wt, t, &a.id, &before),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                let paths: Vec<String> = wt.changed()?.into_iter().map(|c| c.1).collect();
+                Ok((!paths.is_empty()).then(|| {
+                    format!(
+                        "the record of the tree before the read-only turn cannot be read ({e:#}), so nothing could be told apart: {paths:?} — not put back"
+                    )
+                }))
+            }
+        }
+    }
+
     /// Reconcile a task after its owner died (or was stopped). Returns what was done.
     pub fn recover(&self, id: &str) -> Result<Vec<String>> {
         let mut notes = Vec::new();
@@ -167,18 +237,17 @@ impl<'a> Recovery<'a> {
             let hard = c.hard();
             if !hard.is_empty() {
                 let reason = protect::escalation_reason(&t.id, &hard, c.diff_path.as_deref());
+                // M13-R4 (X32): the check has run and recorded what it found; the read-only
+                // role's other writes are put back all the same
+                let undone = self.undo_before_early_return(&t, &atts, &wt)?;
+                let reason = match &undone {
+                    Some(u) => format!("{reason}; {u}"),
+                    None => reason,
+                };
                 for a in atts.iter().filter(|a| a.status == AttemptStatus::Running) {
-                    self.finish(
-                        a,
-                        AttemptStatus::Interrupted,
-                        AttemptEnd {
-                            error_class: Some(protect::REASON.into()),
-                            error_detail: Some("owner process ended".into()),
-                            ..Default::default()
-                        },
-                        None,
-                        None,
-                    )?;
+                    let (status, end) =
+                        read_only_end(&undone, Some(protect::REASON.into()), "owner process ended");
+                    self.finish(a, status, end, None, None)?;
                 }
                 let (i, r) = (id.to_string(), reason.clone());
                 self.store.call(move |tx| {
@@ -197,17 +266,16 @@ impl<'a> Recovery<'a> {
             let r = super::artifacts::reconcile(self.store, &t)?;
             notes.extend(r.notes);
             if let Some(problem) = r.problem {
+                // M13-R4 (X32): the undo also runs here — with the record of the tree when it is
+                // readable, and without it the reason names what could not be put back
+                let undone = self.undo_before_early_return(&t, &atts, &wt)?;
+                let problem = match &undone {
+                    Some(u) => format!("{problem}; {u}"),
+                    None => problem,
+                };
                 for a in atts.iter().filter(|a| a.status == AttemptStatus::Running) {
-                    self.finish(
-                        a,
-                        AttemptStatus::Interrupted,
-                        AttemptEnd {
-                            error_detail: Some("owner process ended".into()),
-                            ..Default::default()
-                        },
-                        None,
-                        None,
-                    )?;
+                    let (status, end) = read_only_end(&undone, None, "owner process ended");
+                    self.finish(a, status, end, None, None)?;
                 }
                 if t.state != St::Escalated {
                     let (i, p) = (id.to_string(), problem.clone());
@@ -255,31 +323,56 @@ impl<'a> Recovery<'a> {
                 }
             }
             St::Planning | St::Reviewing => {
+                // M13-06: the turn's `before` state is in the run store — escalate only on what
+                // the role changed since then, and put that back (the same code as after a
+                // turn that ended normally); what the owner had in the tree is left alone.
+                // Before the attempt is closed: an error here leaves it `Running`, and the
+                // next `resume` comes back to this place.
+                let before = match atts
+                    .iter()
+                    .rev()
+                    .find(|a| a.status == AttemptStatus::Running)
+                {
+                    Some(a) => super::runner::tree_before(self.store, &t, a)?.map(|b| (a, b)),
+                    None => None,
+                };
+                let saved = before.is_some();
+                let undone = match &before {
+                    Some((a, before)) => {
+                        super::runner::undo_read_only_write(&wt, &t, &a.id, before)?
+                    }
+                    None => None,
+                };
                 let mut had = false;
                 for a in atts.iter().filter(|a| a.status == AttemptStatus::Running) {
                     had = true;
-                    self.finish(
-                        a,
-                        AttemptStatus::Interrupted,
-                        AttemptEnd {
-                            error_detail: Some("owner process ended".into()),
-                            ..Default::default()
-                        },
-                        None,
-                        None,
-                    )?;
+                    let (status, end) = read_only_end(&undone, None, "owner process ended");
+                    self.finish(a, status, end, None, None)?;
                     notes.push(format!("{}: interrupted (read-only stage, re-run; Claude resumes its session, R48)", a.id));
                 }
-                // read-only roles cannot write: a dirty tree means something else wrote into it
-                let changed = wt.changed()?;
-                if had && !changed.is_empty() {
-                    let paths: Vec<String> = changed.into_iter().map(|c| c.1).collect();
-                    let reason = format!("policy_violation: the worktree changed during a read-only stage: {paths:?}");
-                    let i = id.to_string();
-                    self.store.call(move |tx| {
-                        store::transition(tx, &i, Ev::Escalate { reason }).map(|_| ())
-                    })?;
-                    notes.push("escalated: dirty worktree after a read-only stage".into());
+                if saved {
+                    if let Some(reason) = undone {
+                        let i = id.to_string();
+                        self.store.call(move |tx| {
+                            store::transition(tx, &i, Ev::Escalate { reason }).map(|_| ())
+                        })?;
+                        notes.push(
+                            "escalated: the read-only role changed the worktree (put back)".into(),
+                        );
+                    }
+                } else {
+                    // an attempt from before M13, or one that died before its first turn: a
+                    // dirty tree means something wrote into it (read-only roles cannot write)
+                    let changed = wt.changed()?;
+                    if had && !changed.is_empty() {
+                        let paths: Vec<String> = changed.into_iter().map(|c| c.1).collect();
+                        let reason = format!("policy_violation: the worktree changed during a read-only stage: {paths:?}");
+                        let i = id.to_string();
+                        self.store.call(move |tx| {
+                            store::transition(tx, &i, Ev::Escalate { reason }).map(|_| ())
+                        })?;
+                        notes.push("escalated: dirty worktree after a read-only stage".into());
+                    }
                 }
             }
             _ => {
@@ -631,6 +724,19 @@ impl<'a> Recovery<'a> {
         let t = self.task(id)?;
         let a = self.escalated_writing_attempt(&t)?;
         let wt = Worktree::new(self.g, &t.worktree);
+        // M13-R7: `reset --hard` moves the branch HEAD is on — never one that is not the task's
+        // (the owner checked another branch out). A detached HEAD moves no branch, and an
+        // unfinished operation (a rebase detaches HEAD) is what `--discard-partial` clears.
+        if let Some(on) = wt.head_ref()? {
+            if on != format!("refs/heads/{}", t.branch) {
+                bail!(
+                    "HEAD is on {on}, not on the task branch {} — `--discard-partial` would reset that branch; `git -C \"{}\" checkout {}` first",
+                    t.branch,
+                    t.worktree.display(),
+                    t.branch
+                );
+            }
+        }
         let first = self.snapshot_dir(&t, &a)?;
         snapshot::completion_check(&wt, &first)?; // snapshot_incomplete → no reset
         let before = a
@@ -684,15 +790,41 @@ impl<'a> Recovery<'a> {
         let t = self.task(id)?;
         let a = self.escalated_writing_attempt(&t)?;
         let wt = Worktree::new(self.g, &t.worktree);
+        if let Some(op) = wt.unfinished_operation()? {
+            bail!("an unfinished Git operation ({op}) is still in the worktree — finish or abort it first");
+        }
+        // M13-01 (X24), review: the recovery checkpoint goes on the commit the attempt began
+        // at. A commit left on top of it (recovery's HEAD guard does not reset during an
+        // unfinished operation) is undone into the tree first, so that its changes meet the
+        // policy below — who made it is not asked. A HEAD anywhere else: nothing is committed.
+        let before = a
+            .git_head_before
+            .clone()
+            .context("the attempt has no git_head_before")?;
+        let head = wt.head()?;
+        if head != before {
+            let on_branch = wt.head_ref()? == Some(format!("refs/heads/{}", t.branch));
+            if !(on_branch && wt.contains(&before)?) {
+                bail!(
+                    "HEAD is at {}, which is not the task branch {} on top of the commit the attempt began at ({}) — put the branch back by hand first, or `--discard-partial`",
+                    short(&head),
+                    t.branch,
+                    short(&before)
+                );
+            }
+            wt.soft_reset(&before)?;
+            eprintln!(
+                "note: commits {}..{} made during the attempt were undone; their changes stay in the tree and are checked",
+                short(&before),
+                short(&head)
+            );
+        }
         let prot: Vec<String> = wt
             .changed()?
             .into_iter()
             .map(|c| c.1)
             .filter(|p| self.protect.violates(p))
             .collect();
-        if let Some(op) = wt.unfinished_operation()? {
-            bail!("an unfinished Git operation ({op}) is still in the worktree — finish or abort it first");
-        }
         if !prot.is_empty() {
             bail!("protected paths still changed: {prot:?} — restore them first (or `--discard-partial`)");
         }

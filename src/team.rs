@@ -2360,6 +2360,72 @@ mod tests {
         assert!(e.contains("not found on PATH"), "{e}");
     }
 
+    /// M13-R8: a directory junction named like a program is a folder, not a program — and a
+    /// real file is still one.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_junction_is_not_startable() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("realdir");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = d.path().join("prog.exe");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !made {
+            eprintln!("skipped: no junction could be made here");
+            return;
+        }
+        assert!(!crate::engine::gates::startable(&link));
+        let file = d.path().join("real.exe");
+        std::fs::write(&file, "x").unwrap();
+        assert!(crate::engine::gates::startable(&file));
+    }
+
+    /// M13-R8: the preflight of an environment gate and of a check gate share one resolver —
+    /// a program only the system folder has (`cmd`) is found by both, with an empty PATH.
+    #[cfg(windows)]
+    #[test]
+    fn the_two_preflights_find_the_same_programs() {
+        let (d, y, m) = draft_repo(&[]);
+        let cfg = crate::config::Effective::load(&y, Some(&m)).unwrap();
+        let empty = std::env::join_paths([d.path().join("nowhere")]).unwrap();
+        assert_eq!(
+            crate::engine::gates::program_problem("cmd", Some(&empty)),
+            None
+        );
+        assert!(crate::engine::runner::env_gate_program(&cfg, "cmd", Some(&empty)).is_ok());
+    }
+
+    /// M13-08: an environment gate's program is found with the leniency of a check gate's
+    /// (`gates::startable`). A file `is_file()` cannot see through — an App Execution Alias of
+    /// the Store `pwsh.exe`; here a file link whose target is missing — is not "not found" at
+    /// the preflight (was: a hard `environment_gate_unavailable` while a check gate with the
+    /// same program passed); whether it starts is the system's answer at the start.
+    #[cfg(windows)]
+    #[test]
+    fn a_gate_program_is_file_cannot_see_through_passes_the_preflight() {
+        let (d, y, m) = draft_repo(&[]);
+        let cfg = crate::config::Effective::load(&y, Some(&m)).unwrap();
+        let bin = d.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let alias = bin.join("alias-r8.exe");
+        if std::os::windows::fs::symlink_file(bin.join("nowhere.exe"), &alias).is_err() {
+            eprintln!("skipped: this account may not create a file link");
+            return;
+        }
+        assert!(!alias.is_file(), "what `is_file()` says of it");
+        let path = std::env::join_paths([&bin]).unwrap();
+        let by_name = crate::engine::runner::env_gate_program(&cfg, "alias-r8", Some(&path));
+        assert_eq!(by_name, Ok(alias.clone()));
+        let by_path =
+            crate::engine::runner::env_gate_program(&cfg, &alias.display().to_string(), None);
+        assert_eq!(by_path, Ok(alias));
+    }
+
     /// M11-R9 (X6 replaces X2; was `an_environment_gate_needs_a_clean_checkout`): the
     /// environment gates deploy from a fresh export of the commit, not from the checkout, so a
     /// `tracked` checkout with an environment gate loads.

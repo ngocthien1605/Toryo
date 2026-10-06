@@ -106,7 +106,11 @@ fn violation(kind: &'static str, what: &str, fix: &str) -> HeadGuard {
 
 #[test]
 fn the_head_guard_resets_only_an_agent_commit_on_the_task_branch() {
-    let back = " — check out toryo/T-1 again first";
+    // M13-01: the way out names the resume that undoes the commits made since the anchor
+    let back = " — check out toryo/T-1 again; `toryo resume T-1 --note \"…\"` then undoes the commits made since 111111111111 into the tree and checks them";
+    // M13-R8: after the owner checks the task branch out HEAD is at the anchor again and nothing
+    // is undone — what the agent committed on the other branch stays there
+    let other = " — check out toryo/T-1 again; `toryo resume T-1 --note \"…\"` then starts at 111111111111 (what was committed on the other branch stays there)";
     let rewritten = GitAfterTurn {
         descends_from_base: false,
         ..git(None, Some(TASK_REF), Some(MOVED))
@@ -150,7 +154,7 @@ fn the_head_guard_resets_only_an_agent_commit_on_the_task_branch() {
             violation(
                 "branch changed",
                 "HEAD is on refs/heads/evil, not on the task branch toryo/T-1 (R12)",
-                back,
+                other,
             ),
         ),
         (
@@ -158,7 +162,7 @@ fn the_head_guard_resets_only_an_agent_commit_on_the_task_branch() {
             violation(
                 "branch changed",
                 "HEAD is on refs/heads/evil, not on the task branch toryo/T-1 (R12)",
-                back,
+                other,
             ),
         ),
         // a branch whose name merely starts with the task branch's is another branch
@@ -167,7 +171,7 @@ fn the_head_guard_resets_only_an_agent_commit_on_the_task_branch() {
             violation(
                 "branch changed",
                 "HEAD is on refs/heads/toryo/T-10, not on the task branch toryo/T-1 (R12)",
-                back,
+                other,
             ),
         ),
         (
@@ -532,4 +536,28 @@ fn the_backoff_ends_as_soon_as_the_stop_flag_is_set() {
         assert!(backoff(&stop, wait));
         assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
     }
+}
+
+// ── M13-01 (X24): the anchor ───────────────────────────────────────────────────────────
+
+/// The anchor is the newest commit Toryo recorded for the task — a checkpoint or a recovery
+/// checkpoint — else the task's base commit. Nothing else is read (no HEAD, no author).
+#[test]
+fn the_anchor_is_the_last_commit_toryo_recorded() {
+    let t = task(&["codex-openai"], 0);
+    assert_eq!(anchor_of(&t, &[]), t.base_commit);
+    let plan = attempt("plan", 1, AttemptStatus::Succeeded, None);
+    assert_eq!(anchor_of(&t, std::slice::from_ref(&plan)), t.base_commit);
+    let mut first = attempt("implement", 1, AttemptStatus::Succeeded, None);
+    first.git_head_after = Some(BEFORE.into());
+    let verify = attempt("verify", 1, AttemptStatus::Failed, None);
+    let atts = [plan.clone(), first.clone(), verify.clone()];
+    assert_eq!(anchor_of(&t, &atts), BEFORE);
+    // a later recovery checkpoint is newer than the checkpoint before it
+    let partial = attempt("fix-1", 1, AttemptStatus::Interrupted, Some(MOVED));
+    let running = attempt("fix-1", 2, AttemptStatus::Running, None);
+    assert_eq!(
+        anchor_of(&t, &[plan, first, verify, partial, running]),
+        MOVED
+    );
 }

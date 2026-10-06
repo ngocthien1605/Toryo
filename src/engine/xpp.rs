@@ -550,8 +550,8 @@ pub fn entry(run: &Run, tc: &Toolchain, res: &CommandResult, diags: &Diagnostics
         "toolchain": toolchain_json(tc),
     });
     // M12-16: the file with the whole (bounded, redacted) output
-    if let Some(l) = &res.log {
-        v["log"] = json!(l.display().to_string());
+    if let Some(l) = super::runner::gate_log_rel(res) {
+        v["log"] = json!(l);
     }
     v
 }

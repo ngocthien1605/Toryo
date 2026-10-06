@@ -54,6 +54,16 @@ impl<'a> Worktree<'a> {
             .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string()))
     }
 
+    /// Whether `commit` is a merge commit (has a second parent) — M13-R5.
+    pub fn has_second_parent(&self, commit: &str) -> Result<bool> {
+        let o = self.g.output(
+            &self.loc,
+            true,
+            &["rev-parse", "--verify", "--quiet", &format!("{commit}^2")],
+        )?;
+        Ok(o.status.success())
+    }
+
     /// Every changed path (tracked and untracked, not ignored): `(status, path)`. Rename
     /// detection is off (`--no-renames`), so a rename is the deletion of its source plus the
     /// addition of its destination: both paths reach the path policy with their own status,
@@ -111,13 +121,19 @@ impl<'a> Worktree<'a> {
     /// file would otherwise count as tracked and stay (EC-18).
     pub fn restore(&self, paths: &[String]) -> Result<()> {
         for p in paths {
-            let _ = self.g.output(&self.loc, false, &["reset", "-q", "--", p]);
+            // M13-R7: a literal pathspec — `[`, `]`, `*` and `?` in a file name are not
+            // patterns (`a[1].txt` would also match `a1.txt`, and `restore` would revert the
+            // owner's edit of it and keep the role's file)
+            let spec = format!(":(literal){p}");
             let _ = self
                 .g
-                .output(&self.loc, false, &["checkout", "-q", "HEAD", "--", p]);
+                .output(&self.loc, false, &["reset", "-q", "--", &spec]);
+            let _ = self
+                .g
+                .output(&self.loc, false, &["checkout", "-q", "HEAD", "--", &spec]);
             if self
                 .g
-                .output(&self.loc, true, &["ls-files", "--error-unmatch", p])?
+                .output(&self.loc, true, &["ls-files", "--error-unmatch", &spec])?
                 .status
                 .success()
             {
@@ -285,5 +301,52 @@ pub fn rel(root: &Path, p: &Path) -> Result<String> {
     match p.strip_prefix(root) {
         Ok(r) => Ok(r.display().to_string().replace('\\', "/")),
         Err(_) => bail!("{} is outside {}", p.display(), root.display()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M13-R7: `restore` takes file names literally. `src/[x].ps1` written by a read-only role is
+    /// a pattern for `src/x.ps1` too: with pathspec matching the owner's edit of `src/x.ps1` was
+    /// reverted and the role's file stayed (`ls-files --error-unmatch` matched the other one).
+    #[test]
+    fn restore_takes_a_file_name_with_brackets_literally() {
+        let d = tempfile::tempdir().unwrap();
+        let g = GitCmd::new("git", d.path().join("hooks")).unwrap();
+        let r = d.path().join("repo");
+        std::fs::create_dir_all(r.join("src")).unwrap();
+        let loc = Loc::Discover(r.clone());
+        g.run(&loc, false, &["init", "-q", "-b", "main"]).unwrap();
+        std::fs::write(r.join("src/x.ps1"), "committed\n").unwrap();
+        std::fs::write(r.join("src/a[1].txt"), "committed\n").unwrap();
+        std::fs::write(r.join("src/a1.txt"), "committed\n").unwrap();
+        g.run(&loc, false, &["add", "-A"]).unwrap();
+        g.run(&loc, false, &["commit", "-q", "-m", "base"]).unwrap();
+        // the owner's edit of `x.ps1` and `a1.txt`; the role's new `[x].ps1` and edit of `a[1].txt`
+        std::fs::write(r.join("src/x.ps1"), "the owner's edit\n").unwrap();
+        std::fs::write(r.join("src/a1.txt"), "the owner's edit\n").unwrap();
+        std::fs::write(r.join("src/[x].ps1"), "the role's file\n").unwrap();
+        std::fs::write(r.join("src/a[1].txt"), "the role's edit\n").unwrap();
+        let wt = Worktree::new(&g, &r);
+        wt.restore(&["src/[x].ps1".to_string(), "src/a[1].txt".to_string()])
+            .unwrap();
+        assert!(
+            !r.join("src/[x].ps1").exists(),
+            "the role's new file is gone"
+        );
+        // (Git on Windows may have checked the files out with CRLF)
+        let read = |p: &str| {
+            let text = std::fs::read_to_string(r.join(p)).unwrap();
+            text.lines().collect::<Vec<_>>().join("\n") + "\n"
+        };
+        assert_eq!(
+            read("src/a[1].txt"),
+            "committed\n",
+            "the role's edit is undone"
+        );
+        assert_eq!(read("src/x.ps1"), "the owner's edit\n");
+        assert_eq!(read("src/a1.txt"), "the owner's edit\n");
     }
 }

@@ -12,7 +12,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use crate::config::{CommandKind, CommandSpec, EnvGate};
+use crate::config::{CommandKind, CommandSpec};
 
 /// The escalation class of a check gate that cannot be started (machine-caused).
 pub const GATE_UNAVAILABLE: &str = "gate_unavailable";
@@ -24,16 +24,30 @@ const SCRIPT_EXTENSIONS: [&str; 8] = [".ps1", ".psm1", ".cmd", ".bat", ".sh", ".
 /// where `metadata` cannot see through it (an App Execution Alias of the Store `pwsh.exe` is a
 /// reparse point `is_file()` calls false). Lenient on purpose: if the start then fails, the
 /// typed spawn error stops the gate the same way.
-fn startable(p: &Path) -> bool {
+pub(crate) fn startable(p: &Path) -> bool {
     p.is_file()
-        || (cfg!(windows) && std::fs::symlink_metadata(p).is_ok_and(|m| !m.file_type().is_dir()))
+        || (cfg!(windows)
+            && std::fs::symlink_metadata(p)
+                .is_ok_and(|m| !m.file_type().is_dir() && !is_dir_link(&m.file_type())))
+}
+
+/// A directory junction or directory symlink (Windows) — a folder, however it is reached, never a
+/// program (M13-R8).
+#[cfg(windows)]
+fn is_dir_link(ft: &std::fs::FileType) -> bool {
+    use std::os::windows::fs::FileTypeExt;
+    ft.is_symlink_dir()
+}
+#[cfg(not(windows))]
+fn is_dir_link(_: &std::fs::FileType) -> bool {
+    false
 }
 
 /// `name` the way the engine starts a bare program: a folder of `path` with nothing, `.exe` or
 /// `.cmd` appended (`checks::which_in`) — not `PATHEXT`: a `.bat` or `.com` alone does not start
 /// (M12-05 review) — then, as `CreateProcess` would, the folder of this program and the system
 /// folder on Windows.
-fn on_path(name: &str, path: &OsStr) -> Option<PathBuf> {
+pub(crate) fn on_path(name: &str, path: &OsStr) -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
     if cfg!(windows) {
         dirs.extend(
@@ -77,8 +91,9 @@ pub fn program_problem(program: &str, path: Option<&OsStr>) -> Option<String> {
 }
 
 /// Why the script an environment gate hands to its program cannot be there: the argument after
-/// `-File` / `-f` (case-insensitive), and every absolute argument with a script extension. One
-/// line per problem.
+/// the first `-File` / `-f` (case-insensitive), and every absolute argument with a script
+/// extension before it. What follows the script are the script's own parameters (M13-08: a
+/// `-f C:\logs\out.txt` among them is not a second script). One line per problem.
 pub fn script_problems(args: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let mut it = args.iter();
@@ -90,13 +105,18 @@ pub fn script_problems(args: &[String]) -> Vec<String> {
         let absolute = Path::new(c).is_absolute() || Path::new(c).has_root();
         let script = SCRIPT_EXTENSIONS.iter().any(|x| lower.ends_with(x));
         // an argument after `-File` is the script whatever it is called; any other argument
-        // only when it is an absolute path to a script
-        if (is_file_flag || (absolute && script)) && !Path::new(c).is_file() {
-            // a relative `-File` is the repository's (M18) — a path that is not asked here
-            if is_file_flag && !absolute {
-                continue;
-            }
+        // only when it is an absolute path to a script. A relative `-File` is the
+        // repository's (M18) — a path that is not asked here
+        let asked = if is_file_flag {
+            absolute
+        } else {
+            absolute && script
+        };
+        if asked && !Path::new(c).is_file() {
             out.push(format!("script `{c}` does not exist"));
+        }
+        if is_file_flag {
+            break;
         }
     }
     out
@@ -110,13 +130,6 @@ pub fn check_gate_problem(c: &CommandSpec, path: Option<&OsStr>) -> Option<Strin
     };
     let program = crate::config::expand_vars(program).unwrap_or_else(|_| program.to_string());
     program_problem(&program, path)
-}
-
-/// Why the environment gate `m` cannot start here — program and script — one line per problem.
-pub fn env_gate_problems(m: &EnvGate, path: Option<&OsStr>) -> Vec<String> {
-    let mut out: Vec<String> = program_problem(&m.program, path).into_iter().collect();
-    out.extend(script_problems(&m.args));
-    out
 }
 
 /// M12-05: the refusal of `task create` and `task config --reload` — the first environment gate
@@ -147,82 +160,11 @@ pub fn env_gates_refusal(cfg: &crate::config::Effective) -> Option<String> {
 /// The escalation class of an environment gate that waits for the owner's "yes" (M12-07, X17).
 pub const ENV_CONFIRM: &str = "environment_gate_confirm";
 
-/// What the owner has confirmed so far, in the task's run store (`confirmations.json`): one
-/// entry per gate and checkpoint commit. A small file, not a database column: no migration.
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct Confirmations {
-    #[serde(default)]
-    pub confirmed: Vec<Asked>,
-    /// What the last stop asked and a plain `resume` will confirm.
-    #[serde(default)]
-    pub pending: Vec<Asked>,
-}
-
-/// A deploy the owner is asked about: the gate and the checkpoint commit.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct Asked {
-    pub gate: String,
-    pub commit: String,
-}
-
-fn confirmations_path(run_store: &Path) -> PathBuf {
-    run_store.join("confirmations.json")
-}
-
-/// The confirmations of a task (none when the file is not there or unreadable).
-pub fn confirmations(run_store: &Path) -> Confirmations {
-    std::fs::read(confirmations_path(run_store))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
-}
-
-fn save(run_store: &Path, c: &Confirmations) -> std::io::Result<()> {
-    std::fs::write(
-        confirmations_path(run_store),
-        serde_json::to_vec_pretty(c).unwrap_or_default(),
-    )
-}
-
-/// Has the owner confirmed the deploy of `commit` by `gate`? `first`: any confirmation of the
-/// gate in this task; `always`: this commit. `never` needs none.
-pub fn is_confirmed(
-    c: &Confirmations,
-    mode: crate::config::Confirm,
-    gate: &str,
-    commit: &str,
-) -> bool {
-    use crate::config::Confirm;
-    match mode {
-        Confirm::Never => true,
-        Confirm::First => c.confirmed.iter().any(|a| a.gate == gate),
-        Confirm::Always => c
-            .confirmed
-            .iter()
-            .any(|a| a.gate == gate && a.commit == commit),
-    }
-}
-
-/// The stop asks about these deploys: a plain `resume` confirms them ([`record_confirmation`]).
-pub fn set_pending(run_store: &Path, asked: Vec<Asked>) -> std::io::Result<()> {
-    let mut c = confirmations(run_store);
-    c.pending = asked;
-    save(run_store, &c)
-}
-
-/// A plain `toryo resume` after the stop: what it asked about is now confirmed. Returns the
-/// confirmed deploys.
-pub fn record_confirmation(run_store: &Path) -> std::io::Result<Vec<Asked>> {
-    let mut c = confirmations(run_store);
-    let asked = std::mem::take(&mut c.pending);
-    for a in &asked {
-        if !c.confirmed.contains(a) {
-            c.confirmed.push(a.clone());
-        }
-    }
-    save(run_store, &c)?;
-    Ok(asked)
-}
+// M13-05 (X26): what the owner confirmed is a row of `deploy_confirmations` in the database
+// (`store::ask_deploys`, `store::confirm_deploys`, `store::deploy_confirmed`), bound to the gate,
+// the commit and the task's frozen configuration digest. The M12 file
+// `<run store>/confirmations.json` is no longer read or written: anything that can write the
+// run store could approve its own deploy with it.
 
 #[cfg(test)]
 mod tests {
@@ -290,5 +232,26 @@ mod tests {
         ]))
         .is_empty());
         assert!(script_problems(&s(&["-File", "scripts/x.ps1"])).is_empty());
+    }
+
+    /// M13-08 AC-2: what follows the first `-File <script>` are the script's own parameters —
+    /// a `-f <path>` or an absolute script path among them is not asked. (Was: every `-f` /
+    /// `-File` anywhere was a script: `-File ok.ps1 -f C:\logs\out.txt` was refused.)
+    #[test]
+    fn only_the_first_file_argument_is_the_script() {
+        let d = tempfile::tempdir().unwrap();
+        let ok = d.path().join("ok.ps1");
+        std::fs::write(&ok, "x").unwrap();
+        let ok = ok.display().to_string();
+        let log = d.path().join("logs").join("out.txt").display().to_string();
+        let other = d.path().join("other.ps1").display().to_string();
+        let p = script_problems(&s(&["-NoProfile", "-File", &ok, "-f", &log]));
+        assert!(p.is_empty(), "{p:?}");
+        let p = script_problems(&s(&["-File", &ok, "-Next", &other]));
+        assert!(p.is_empty(), "{p:?}");
+        // the first one is still asked, whatever follows it
+        let p = script_problems(&s(&["-File", &other, "-f", &ok]));
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("other.ps1"), "{p:?}");
     }
 }

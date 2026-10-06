@@ -166,6 +166,24 @@ pub fn run_turn(
     )
 }
 
+/// M13-13: the turn's process was never started — its profile's secret is not there (a missing
+/// Credential Manager entry), its `exe` cannot be expanded, or the program cannot be started.
+/// Nothing ran, so nothing was used: the turn fails with this text and holds no reservation.
+#[derive(Debug)]
+pub struct NotStarted(pub String);
+
+impl std::fmt::Display for NotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotStarted {}
+
+fn not_started(e: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(NotStarted(format!("{e:#}")))
+}
+
 /// `run_turn`, calling `on_line` with every complete (redacted) stdout line as it arrives —
 /// the adapters turn these into live `AgentEvent`s.
 #[allow(clippy::too_many_arguments)]
@@ -180,13 +198,17 @@ pub fn run_turn_with(
     opts: TurnOpts,
     on_line: &mut (dyn FnMut(&[u8]) + Send),
 ) -> Result<TurnRun> {
-    let (mut env, red, secret_keys) = profile_env(profile_name, profile)?;
+    let (mut env, red, secret_keys) = profile_env(profile_name, profile).map_err(not_started)?;
     for (k, v) in &opts.env {
         env.retain(|e, _| !e.eq_ignore_ascii_case(k));
         env.insert(k.clone(), v.clone());
     }
-    let program = PathBuf::from(crate::config::expand_vars(&profile.exe)?);
-    std::fs::create_dir_all(run_dir)?;
+    let program = PathBuf::from(crate::config::expand_vars(&profile.exe).map_err(not_started)?);
+    // M13-R7: all of this runs before any process exists — a failure here is `NotStarted` too
+    // (no process ran, so no budget is held)
+    std::fs::create_dir_all(run_dir)
+        .with_context(|| format!("creating {}", run_dir.display()))
+        .map_err(not_started)?;
     let argv_view: Vec<String> = std::iter::once(program.display().to_string())
         .chain(args.iter().cloned())
         .collect();
@@ -197,7 +219,9 @@ pub fn run_turn_with(
         )?);
         hex::encode(h.finalize())
     };
-    std::fs::write(run_dir.join(format!("{label}.prompt.md")), prompt)?;
+    std::fs::write(run_dir.join(format!("{label}.prompt.md")), prompt)
+        .context("writing the prompt file")
+        .map_err(not_started)?;
     let meta = json!({
         "profile": profile_name,
         "kind": profile.kind,
@@ -210,7 +234,9 @@ pub fn run_turn_with(
     std::fs::write(
         run_dir.join(format!("{label}.meta.json")),
         serde_json::to_vec_pretty(&meta)?,
-    )?;
+    )
+    .context("writing the meta file")
+    .map_err(not_started)?;
 
     let spec = SpawnSpec {
         program: program.clone(),
@@ -220,9 +246,13 @@ pub fn run_turn_with(
         stdin: Some(prompt.as_bytes().to_vec()),
         boundary: Boundary::None,
     };
-    let mut out_file = Capture::create(&run_dir.join(format!("{label}.stdout.jsonl")))?;
-    let mut err_file = Capture::create(&run_dir.join(format!("{label}.stderr.txt")))?;
-    let running = spawn(&spec, &red).with_context(|| format!("starting {}", program.display()))?;
+    let mut out_file =
+        Capture::create(&run_dir.join(format!("{label}.stdout.jsonl"))).map_err(not_started)?;
+    let mut err_file =
+        Capture::create(&run_dir.join(format!("{label}.stderr.txt"))).map_err(not_started)?;
+    let running = spawn(&spec, &red)
+        .with_context(|| format!("starting {}", program.display()))
+        .map_err(not_started)?;
     let mut splitter = LineSplitter::new(LineSplitter::DEFAULT_CAP);
     let mut claude = ClaudeParser::new();
     let mut codex = CodexParser::new();
@@ -289,9 +319,7 @@ pub fn run_turn_with(
     // are redacted already; the derived text is redacted again below)
     if !outcome.success && outcome.error_class == Some(crate::domain::ErrorClass::ProcessCrashed) {
         if let Some(lines) = stderr_last_lines(&stderr_tail, STDERR_LINES) {
-            let detail = outcome.error_detail.take().unwrap_or_default();
-            outcome.error_detail =
-                Some(format!("{detail}; the CLI's stderr (last lines):\n{lines}"));
+            outcome.error_detail = Some(with_stderr(outcome.error_detail.take(), &lines));
         }
     }
     fail_on_capture_errors(
@@ -324,6 +352,17 @@ pub fn run_turn_with(
         argv: argv_view,
         argv_sha256,
     })
+}
+
+/// M12-14: the detail of a turn that died without a result, with what the CLI printed to
+/// stderr. M13-14: also when the turn had no detail of its own — then the stderr lines are the
+/// detail (was: the text began with a stray "; ").
+fn with_stderr(detail: Option<String>, lines: &str) -> String {
+    let tail = format!("the CLI's stderr (last lines):\n{lines}");
+    match detail {
+        Some(d) if !d.trim().is_empty() => format!("{d}; {tail}"),
+        _ => tail,
+    }
 }
 
 /// How much stderr is kept for [`stderr_last_lines`].
@@ -440,5 +479,22 @@ mod tests {
         assert!(!got.contains('\u{1b}'));
         assert_eq!(stderr_last_lines(b"  \n\n", 10), None);
         assert_eq!(stderr_last_lines(b"", 10), None);
+    }
+
+    /// M13-14 (9): the stderr tail is attached also when the turn has no detail of its own —
+    /// as the detail, not after a stray separator.
+    #[test]
+    fn the_stderr_tail_is_the_detail_when_there_is_none() {
+        let lines = "  | error: unknown option --x";
+        assert_eq!(
+            with_stderr(Some("exit code 2 without a result".into()), lines),
+            "exit code 2 without a result; the CLI's stderr (last lines):\n  | error: unknown option --x"
+        );
+        for none in [None, Some(String::new()), Some("  ".to_string())] {
+            assert_eq!(
+                with_stderr(none, lines),
+                "the CLI's stderr (last lines):\n  | error: unknown option --x"
+            );
+        }
     }
 }

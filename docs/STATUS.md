@@ -1,6 +1,6 @@
 # Toryo — status (the first file a session reads)
 
-Updated at the end of M12 (2026-10-05). When you finish work: edit the open list **in place** (delete a closed row and name
+Updated at the end of M13 (2026-10-06). When you finish work: edit the open list **in place** (delete a closed row and name
 it in the commit message — never strike it through), add decisions to [`DECISIONS.md`](DECISIONS.md), append the round's record
 to the milestone notes. Never start a new "Open (the older ones still stand)" list.
 
@@ -8,10 +8,10 @@ to the milestone notes. Never start a new "Open (the older ones still stand)" li
 
 | | |
 |---|---|
-| **Code** | `main` @ `4ad97c3` (M11, pull request #4) plus branch `m12/first-run` (M12, 21 tasks, one commit each; pull request pending the owner's merge). `Cargo.toml` version `0.12.0`; `toryo --version` prints the commit. |
-| **Tests** | 681 passed, 0 failed, 6 ignored on Windows (623 at `4ad97c3`). CI: `test (windows-latest)`, `test (ubuntu-latest)` (fmt, tests, clippy, clippy without the kit), `toryo.exe (release)` (artifact `toryo-windows-x64`). Code under `#[cfg(unix)]` is first built by CI. |
+| **Code** | `main` @ `685aa45` (M12, pull request #5) plus branch `m13/review-fixes` (M13: the review of M12 — 15 tasks, one commit each, and one commit for the review of its first six; pull request pending the owner's merge). `Cargo.toml` version `0.12.0`; `toryo --version` prints the commit. The SQL schema version is 2 since M13-05: a database this binary opened is refused by an older `toryo.exe`. |
+| **Tests** | **750 passed, 0 failed, 6 ignored on Windows** after the review fixes of M13 (732 at the end of M13 proper; the review lead's Linux build of `4ec8fc8`: 749 passed, 1 failed — fixed by R2). Before: 683 at the end of M12 (this file said 681 then and the notes 683 — 683 was right), 623 at `4ad97c3`. **Linux:** 705 passed, 0 ignored at the end of M12 (`e28a866`, the review lead's container build; the difference to Windows is the Unix-only tests); the Linux count of M13 is the one CI prints for `test (ubuntu-latest)` on the M13 pull request. CI: `test (windows-latest)`, `test (ubuntu-latest)` (fmt, tests, clippy, clippy without the kit), `toryo.exe (release)` (artifact `toryo-windows-x64`). Code under `#[cfg(unix)]` is first built by CI. |
 | **Milestones** (repo numbering; plan v0.8 numbers differ after M8) | M0 spike · M1–M7 core, engine, store, context, protection, artifacts, verify, usage · M8 E2E on the real CLIs · M9 trust boundaries, `tool: xpp`, D365FO template · M10 typed events, `events.jsonl`, `watch`, `usage`, toast · M11 org chart, role files, skills, write fence, environment gates (5 review rounds) · M12 ready for the first real task. |
-| **Where things are** | `README.md` (reference), `docs/HUONG-DAN.md` (the guide, Vietnamese; §7.3 "Task thật đầu tiên trên D365FO", §9.1 escalation table), `docs/DECISIONS.md`, `docs/M12-NOTES.md` (what M12 changed, per task), `docs/archive/M11-NOTES.md` (the M11 record), `docs/M9-NOTES.md`, `docs/M10-NOTES.md`, `docs/REVIEW-2026-10-01.md` + `-status.md` (the review and the status of its 62 items). The plan (v0.8) is **not** in the repository. |
+| **Where things are** | `README.md` (reference), `docs/HUONG-DAN.md` (the guide, Vietnamese; §7.3 "Task thật đầu tiên trên D365FO", §9.1 escalation table), `docs/DECISIONS.md` (X1–X29), `docs/M13-NOTES.md` (what M13 changed, per task, and its "Open" list), `docs/M12-NOTES.md` (what M12 changed, per task), `docs/archive/M11-NOTES.md` (the M11 record), `docs/M9-NOTES.md`, `docs/M10-NOTES.md`, `docs/REVIEW-2026-10-01.md` + `-status.md` (the review and the status of its 62 items). The plan (v0.8) is **not** in the repository. |
 
 ## 2. What has run for real, and what never has
 
@@ -23,8 +23,10 @@ to the milestone notes. Never start a new "Open (the older ones still stand)" li
 
 **Never run, only against fakes:** a real X++ build (`tool: xpp`: the MSBuild command line, response file, NuGet layout, duration,
 diagnostics) · a build at Low integrity (`toryo xpp build --low`) · an environment gate against a real D365FO environment · a real
-D365FO task from `TASK.md` to the final gate · a Japanese-Windows run (the cp932 decode is pinned by a unit test with the code page
-given, not through a pipeline) · the elevated-token branch of `doctor` · Foundry under `--restricted` (V07-VERIFY 1).
+D365FO task from `TASK.md` to the final gate · a Japanese-Windows run (since M13-14 a test sends cp932 bytes through a gate into the
+fix prompt with the code page *said* to be 932; a machine whose code page is 932 has not run) · the elevated-token branch of
+`doctor` · Foundry under `--restricted` (V07-VERIFY 1) · **Ctrl+C pressed by a hand** on a real console (M13-12 is tested with a
+console event the process sends itself).
 The M12 template run (`tests/m12_template.rs`) uses fake agents and the print-only example scripts.
 
 ## 3. How to resume work
@@ -60,9 +62,6 @@ later. Kinds: bug · gap · decision · machine (needs a check on the real machi
 
 | ID | What | Kind |
 |---|---|---|
-| O-11 | Review **M19**: after a crash in a read-only stage *any* dirty file (also `.vs\`, also the owner's) escalates `policy_violation`. | bug |
-| O-14 | Review **M3**: a launch error before the agent starts (missing Credential Manager entry, wrong exe) reserves ~600k tokens and pauses on "Budget". | bug |
-| O-15 | Ctrl+C on `toryo run` kills the process (no `run_ended`, no toast); use `toryo stop <id>` from a second window. | gap |
 | O-16 | Where MSBuild puts `obj\` is unknown; see it once on the real machine (the fix would be `/p:BaseIntermediateOutputPath`). | machine |
 | O-17 | `git add --renormalize .` must change nothing in the D365FO repository, else every verify stops with `verify_mutated_tree`. | machine |
 | O-18 | Performance on a D365FO-sized repository is unmeasured (protected scan every loop, `clean -ffdx`, export and two hash passes per gate). Watch the first run. | machine |
@@ -74,29 +73,34 @@ later. Kinds: bug · gap · decision · machine (needs a check on the real machi
 | O-24 | `xppbp.exe` (best-practice check) is not supported: `bp_check: true` is refused at load. V08-VERIFY 4 never ran. | gap + machine |
 | O-25 | Plan v0.9 does not exist; the plan knows nothing of the org chart, environment gates, skills, the fence, X1–X23. Stop rule 4 (compare hours after M8) has no record. | decision |
 | O-26 | Review **H3**: canary evidence is bound to the CLI version only — not to the launch mode, exe or profile settings; re-run `toryo doctor --canaries` after any profile change. | gap |
-| O-29 | Review **L8**: a `task create` that fails half-way leaves the run store and the branch; the retry is refused. | bug |
 | O-30 | Review **T3**/**T4**: CI floats on `stable` and mutable action tags (broke once, `f5ad5e1`); the owner's binary has only version + commit as provenance. | gap |
 | O-32 | Decision 18: which machine facts stay in the repository file (`project.root`, `worktrees_root`, `runs_root`, `policy.allow_submodules` still do). Decide before anyone else commits to `toryo.yaml`. | decision |
 | N-01 | After a reviewer failure the only exits are `approve --force` or `resume --note` (a fix turn, then build and sync again). A forced approval after a rejected review shows "reviewer skipped" and hides the blocking issue. Raising `limits` and reloading changes nothing in the running task. | gap |
 | N-02 | `verify.final_clean` is not implemented (M12-08 says so: the key is accepted and noted). Environment-gate output always goes to the implementer and into `VERIFY_RESULT.json` (an option to share nothing is missing). Check gates run with the checkout as working directory and without `NoDefaultCurrentDirectoryInExePath`. | gap |
 | N-03 | `%VAR%` is expanded in repository-chosen paths (`worktrees_root`, `verify_root`, a check gate's `program`): a commit can pull any variable of the owner's shell into paths and logs. A symlinked `instructions.md`, culture or skill file is followed outside the repository. Context files are read live at every turn, outside the frozen configuration. | gap |
-| N-04 | `task cleanup` after a half-removed worktree fails forever; no retention of run stores, verify checkouts, exports and the new `gate-logs`; the deployment table keeps one row per lock; the SQL schema version was never raised. | gap |
-| N-05 | A gate that exits 0 while a descendant keeps the pipe open past its limit is reported as timed out; a stop that lands after a gate timeout hides the timeout warning (the next resume re-runs the gate); `doctor` shows `confirm:` only on OK lines; the `git -C <worktree> show` hint does not quote a path with spaces; `script_problems` would refuse an absolute non-existent output path ending in `.js`/`.py`/`.exe`. (M12-05..07 review.) | bug (small) |
+| N-04 | No retention of run stores, verify checkouts, exports, `gate-logs` and the copies under `read-only-writes`; the deployment table keeps one row per lock. (`task cleanup --force` removes a worktree Git cannot remove since M13-07; without `--force` a half-removed worktree still stops it.) | gap |
+| N-05 | A gate that exits 0 while a descendant keeps the pipe open past its limit is reported as timed out; a stop that lands after a gate timeout hides the timeout warning (the next resume re-runs the gate); `script_problems` would refuse an absolute non-existent output path ending in `.js`/`.py`/`.exe` when it stands **before** the `-File` script (after it nothing is asked since M13-08). After the timeout of the second of two environment gates the reason names both, but `status` shows the first one's deployment row as passed with no word that it deploys again. (M12-05..07 review, M13-08.) | bug (small) |
 | N-06 | The protected scan descends into every folder of the worktree (not only protected ones) and fails closed: one unlistable folder (a root-owned Docker data folder) escalates `protected_config_changed`. A stop that came with a write prints "stopped at a stage boundary" although the task escalated. (M12-02/03.) | gap |
 | N-07 | `scripts/m3-stop-test.ps1`, `m4-m7-check.ps1`, `m8-check.ps1` set `$env:TORYO_CONFIG` and run `toryo` where they were started: from a folder with its own `toryo.yaml` they now use that file (M12-09). Fix: `--config` in each call. | doc / gap |
-| N-08 | The gate log (`<run store>\gate-logs\`) holds the same bounded text as the result (first 1 MB + last 8 MB), not the whole of a 50 MB output; a secret split by the cut is not redacted. Gate-log names use the clock in milliseconds. | gap |
-| N-09 | A `SKILL.md` that is not UTF-8 stops a turn as `skill_unavailable`, not `context_unreadable`. | gap (small) |
+| N-08 | The gate log (`<run store>\gate-logs\`) holds the same bounded text as the result (first 1 MB + last 8 MB, cut on line boundaries), not the whole of a 50 MB output; gate output is not streamed live. A cp932 character torn by the 1 MB bound in a line with no line break decodes as a wrong character at the cut. Gate-log names use the clock in milliseconds. | gap |
+| N-09 | A `SKILL.md` that is not UTF-8 stops a turn as `skill_unavailable`, not `context_unreadable`. A Codex seat's `AGENTS.md` is not encoding-checked by Toryo (Codex reads it itself). | gap (small) |
+| N-11 | **Threat model of the run store and the database.** Both are writable by an agent started with the owner's token. M13-05 moved the deploy confirmation from a run-store file into the database — the same trust level, not a new boundary. The real guard for agent-written run-store files is the SHA registry (`artifact_tampered`); nothing guards the database against a process with the owner's token. | decision |
+| N-12 | `VERIFY_RESULT.json` (in the reviewer's and the fix-cycle implementer's pack) still carries `verify_checkout` as an absolute path under `verify_root` (default `%LOCALAPPDATA%\toryo-verify`: the Windows user name goes to the vendor). M13-04 made `"log"` relative only. | gap |
+| N-13 | The anchor (X24): HEAD **equal** to the anchor but detached, or with an unfinished Git operation, is not looked at before a fresh checkpoint (a writing turn is stopped by the HEAD guard afterwards) — needs the owner to detach HEAD by hand between stages. The anchor is the newest attempt by `started_at`: a clock set back between attempts would pick an older commit. | gap |
+| N-14 | Read-only put-back (M13-06) limits: recovery's early returns (a protected change, or a missing/tampered artifact, found first) escalate without the put-back; "was this link there before the turn" is judged from the paths that were changed before it (an owner's link with only clean content behind it is removed — the link only — when the role writes through it); what the owner changes in the worktree between a crash and the `resume` is taken for the role's write (put back, a copy kept under `<run store>\read-only-writes\`); `Worktree::restore` passes paths to Git as pathspecs (a file name with `[`…`]` is a pattern) and, for an **implementer's** junction, still follows it. | gap |
+| N-15 | The agents' own Git and the build tools are not long-path safe by anything Toryo does: M12-13 covers Toryo's Git calls, M13-10 only warns (`doctor`, area `paths`: `core.longpaths`, `LongPathsEnabled`). | machine |
+| N-16 | Ctrl+C (X29): a `toryo run` that was started with Ctrl+C ignored (`start /b`, some CI shells) does not see the key, as before. Never pressed by a hand on a real console — press it once on the first real run. | machine |
 
 ### P2 — later / never
 
 | ID | What | Kind |
 |---|---|---|
 | O-34 | Review M4 (Git dir discovered from the worktree), M5 (inherited handles in the Low child), M6 (housekeeping in the Low tree), M7 (`tree_gone` not enforced; on Unix a killed toryo leaves an environment gate's process group running while the lock is free). | bug / gap |
-| O-35 | Review M9 (terminal escape sequences in printed vendor text), M10 (a gate decision lost in a crash window), M14 rest (`artifact_tampered` is not machine-caused), M15 (`events.jsonl` not synced), M16 (`--discard/--keep-partial` without the HEAD guard), M17 (manifest paths not validated). | bug |
+| O-35 | Review M9 (terminal escape sequences in printed vendor text), M10 (a gate decision lost in a crash window), M14 rest (`artifact_tampered` is not machine-caused), M15 (`events.jsonl` not synced), M16 (`--discard-partial` without the HEAD guard; `--keep-partial` starts at the attempt's commit since M13), M17 (manifest paths not validated). | bug |
 | O-36 | Review M20 (`m0-kit` on by default, CI runs no tests without it), M21 (agent-subprocess tests are Unix-only), T1 (test Git calls inherit the developer's global config), T2 (`stop took < 6s` has no margin), T5 rest. | gap |
 | O-37 | Review M22, M23, L22 and the M0 kit: `spike pipeline` verifies with `Boundary::None` whatever the floor says — never use it on a real repository. | gap |
 | O-38 | Review L2–L7, L9–L21, L23 (20 Low items; evidence in `REVIEW-2026-10-01-status.md`). | bug |
-| O-39 | Maintainability Mt1–Mt4: `runner.rs` 6,000+ lines; duplicates (`end_with`/`finish_and`/`finish_classed`, `billing()`, `gate_name`); `engine_cli.rs`; test hooks honoured in release builds (`TORYO_TEST_*`; M12 adds `TORYO_GATE_HEARTBEAT_SECS`). | maintainability |
+| O-39 | Maintainability Mt1–Mt4: `runner.rs` 6,000+ lines; duplicates (`end_with`/`finish_and`/`finish_classed`, `billing()`, `gate_name`); `engine_cli.rs`; test hooks honoured in release builds (`TORYO_TEST_*`; M12 adds `TORYO_GATE_HEARTBEAT_SECS`; M13 adds `TORYO_OEM_CODE_PAGE` — the OEM code page the gate-output decoder assumes —, `TORYO_TEST_INTERRUPT_AFTER_MS` — the process sends itself Ctrl+C —, the crash point `read_only:after_turn` of `TORYO_TEST_CRASH_AT` —, and, from the review fixes, `TORYO_TEST_FAIL_AT=create:after_worktree`: `task create` fails at the step after `git worktree add`, the one site of this variable). | maintainability |
 | O-40 | `DIFF.patch` is not scanned for known secret values. | gap |
 | O-41 | M18 detection limits that protect less than one might expect (interpreter and `make` rules not applied inside a command string; a script behind `env`, `timeout`, `!`; `nmake /f`; `pwsh -EncodedCommand`; …). | gap |
 | O-42 | M18 detection limits that protect more or stay silent (caps depth 6 / 4096 words / 32 folders are silent; here-document read as `sh` only; a fixed PATHEXT list). | gap |
@@ -113,7 +117,7 @@ later. Kinds: bug · gap · decision · machine (needs a check on the real machi
 | O-53 | Fence patterns: `{ } [ ]` and a leading `!` are refused; ignored files outside `writes` are not seen; a fence violation found by crash recovery escalates. | gap |
 | O-54 | Wording after `resume --note` with split limits ("2 gate retries used" after 3 cycles, "1 review rounds"). | bug (text) |
 | O-55 | `which_in` tries only `""`, `.exe`, `.cmd`; `named_path` reads `a.ps1;b.ps1` as one path. (M12-05 made the preflight agree with `which_in`.) | bug |
-| O-56 | The `spike_e2e` flake on `ubuntu-latest` (`pwsh` ended by a signal); a flaky `an_environment_gate_runs_when_the_blobs_keep_crlf_under_eol_crlf` was seen once on Windows (racy Git timing). | bug (test) |
+| O-56 | The `spike_e2e` flake on `ubuntu-latest` (`pwsh` ended by a signal); a flaky `an_environment_gate_runs_when_the_blobs_keep_crlf_under_eol_crlf` was seen once on Windows (racy Git timing). Two tests depend on the speed of the machine — `a_timed_out_environment_gate_is_recorded_as_interrupted` (a 6 s gate timeout that must hold two `pwsh` start-ups) and `m12_06_an_environment_gate_that_times_out_stops_for_the_owner` (3 s): each failed once on a slow Windows machine during M13 and passed when run again. | bug (test) |
 | O-58 | Accepted by the owner, kept so nobody reopens them: a task created before M11 with `boundary: none` keeps it; after `same_vendor_review`, `resume --note` costs one more implementer turn; `instructions:` outside the role folder is refused; `task create --trusted-code` was not added. | decided |
 | O-59 | Small loader leftovers: an unknown enum value keeps serde's message; `templates_keep_their_m10_hash` reads the dogfood template whose `project.root` is this repository. | gap |
 | O-60–O-65 | The elevated-`status` check never done by hand; a hard kill between `record_usage_in` and `turn_finished`; `vendor_reported_cost_usd` never filled; transitions made outside the engine take their class from the reason prefix; a `%` in a path breaks the MSBuild response file; the Low-IL run of Toryo's own test suite on Windows never verified. | mixed |
@@ -122,7 +126,11 @@ later. Kinds: bug · gap · decision · machine (needs a check on the real machi
 
 ## 5. Not in this milestone
 
-Everything in the lists above that is not marked fixed in `docs/M12-NOTES.md`. M12 fixed: review H1, H4, H5, H6, M1, M8, M11, M12,
-M13, L1 (see `REVIEW-2026-10-01-status.md`); audit rows O-03, O-07–O-10, O-12, O-13, O-27, O-28, O-31, O-33, O-57 (and the H5 part of
-O-06) are closed and no longer listed. Plan §3.3 says what comes next: finish v0.1 with V08-VERIFY 2–4 and one real D365FO task, close
+Everything in the lists above that is not marked fixed in `docs/M12-NOTES.md` or `docs/M13-NOTES.md`. M12 fixed: review H1, H4, H5,
+H6, M1, M8, M11, M12, M13, L1 (see `REVIEW-2026-10-01-status.md`); audit rows O-03, O-07–O-10, O-12, O-13, O-27, O-28, O-31, O-33,
+O-57 (and the H5 part of O-06) are closed and no longer listed. **M13 closed** audit rows O-11 (review M19), O-14 (review M3), O-15
+and O-29 (review L8) — deleted above —, and of the M12 rows: the schema-version and half-removed-worktree parts of N-04, the
+`confirm:` and quoting parts of N-05, the "secret split by the cut" part of N-08; it added N-11–N-16 and decisions X24–X29. Left
+for later, as before: `verify.final_clean` (N-02), live streaming of gate output (N-08), the check scripts' `$TORYO_CONFIG` order
+(N-07), `skill_unavailable` for a non-UTF-8 `SKILL.md` (N-09), the width of the protected scan (N-06). Plan §3.3 says what comes next: finish v0.1 with V08-VERIFY 2–4 and one real D365FO task, close
 decisions 9, 10, 12, 14, re-plan as v0.9, then the v1 order.

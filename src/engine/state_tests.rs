@@ -846,3 +846,46 @@ fn the_escalation_class_is_cleared_on_every_way_out() {
     .unwrap();
     assert_eq!(m.reason_class(), None);
 }
+
+/// M13-14 (1): the escalation classes the machine causes are typed twice — as the constants the
+/// engine escalates with, and as the strings of [`MACHINE_CAUSED`]. This ties them: every
+/// constant is machine-caused, the list holds nothing else, and the classes that must cost a
+/// fix cycle are not on it.
+#[test]
+fn every_machine_caused_class_is_one_of_the_engine_constants() {
+    use crate::engine::{context, gates, protect, recovery, runner, verify, xpp};
+    let constants = [
+        gates::GATE_UNAVAILABLE,
+        runner::ENV_TIMEOUT,
+        gates::ENV_CONFIRM,
+        context::SKILL_UNAVAILABLE,
+        context::CONTEXT_OVER_BUDGET,
+        runner::ENV_UNAVAILABLE,
+        xpp::UNAVAILABLE,
+        verify::UNAVAILABLE,
+        context::CONTEXT_UNREADABLE,
+    ];
+    for c in constants {
+        assert!(is_machine_caused(c), "{c} is not in MACHINE_CAUSED");
+    }
+    let (mut a, mut b) = (constants.to_vec(), MACHINE_CAUSED.to_vec());
+    a.sort_unstable();
+    b.sort_unstable();
+    assert_eq!(
+        a, b,
+        "MACHINE_CAUSED and the constants name the same classes"
+    );
+    for c in [
+        verify::MUTATED,
+        protect::REASON,
+        recovery::POLICY_VIOLATION,
+        runner::SAME_VENDOR,
+        xpp::PROJECT_MISSING,
+        "policy_violation",
+    ] {
+        assert!(
+            !is_machine_caused(c),
+            "{c} must not be left by a plain resume"
+        );
+    }
+}

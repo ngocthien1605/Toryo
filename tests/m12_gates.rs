@@ -313,8 +313,22 @@ fn m12_16_a_silent_gate_gets_a_heartbeat_line() {
         .iter()
         .find(|c| c["name"] == "probe")
         .unwrap_or_else(|| panic!("{vr}"));
-    let log = std::fs::read_to_string(probe["log"].as_str().unwrap()).unwrap();
+    // M13-04: the path is relative to the run store (`gate-logs/<file>`), so that the copy of
+    // VERIFY_RESULT.json in the reviewer's pack names no folder of the owner's profile
+    let rel = probe["log"].as_str().unwrap();
+    assert!(
+        rel.starts_with("gate-logs/") && rel.ends_with("-probe.log"),
+        "{rel}"
+    );
+    let log = std::fs::read_to_string(task(&env, "HB-1").run_store.join(rel)).unwrap();
     assert!(log.contains("started") && log.contains("done"), "{log}");
+    // AC-3: nothing in the file names the data directory
+    let data = env.data.display().to_string();
+    let text = vr.to_string().replace("\\\\", "/").replace('\\', "/");
+    assert!(
+        !text.contains(&data.replace('\\', "/")),
+        "VERIFY_RESULT.json names the data directory: {text}"
+    );
 }
 
 /// AC-1: the failure line names the log file.
@@ -336,4 +350,166 @@ fn m12_16_a_failing_gate_names_its_log() {
         line.contains("gate-logs") && line.contains("no-text.log"),
         "{line}"
     );
+}
+
+// ── M13-04 (X27): gate output is cut on line boundaries ──────────────────────────────────
+
+/// AC-1: a secret that straddles the 1 MB cut. The gate prints 1 MB − 10 bytes of `x`, then the
+/// secret and a line break, then 9 MB of `y`. Was: the head ended ten bytes into the secret, the
+/// redactor (which runs on the cut text) could not see it, and the fragment was in `output` and
+/// in the log. Now neither holds the value nor a fragment of 8 bytes or more.
+#[test]
+fn m13_04_a_secret_at_the_cut_leaves_no_fragment() {
+    use toryo::process::redact::{Redactions, Secret};
+    use toryo::runner::{GateIo, LocalRunner, RunSpec};
+    const SECRET: &str = "SECRET-VALUE-20CHARS";
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (program, args): (&str, Vec<String>) = if cfg!(windows) {
+        (
+            "pwsh",
+            vec![
+                "-NoProfile".into(),
+                "-Command".into(),
+                format!("[Console]::Out.Write('x' * 1048566); '{SECRET}'; 'y' * 9437184"),
+            ],
+        )
+    } else {
+        (
+            "sh",
+            vec![
+                "-c".into(),
+                format!("printf '%*s' 1048566 '' | tr ' ' x; echo {SECRET}; printf '%*s' 9437184 '' | tr ' ' y; echo"),
+            ],
+        )
+    };
+    let d = tempfile::tempdir().unwrap();
+    let log = d.path().join("logs").join("cut.log");
+    let spec = RunSpec {
+        name: "cut".into(),
+        program: toryo::engine::checks::resolve_program(program),
+        args,
+        cwd: d.path().to_path_buf(),
+        env: std::env::vars().collect(),
+        boundary: toryo::process::Boundary::None,
+        timeout: std::time::Duration::from_secs(300),
+        cancel: None,
+        redact: Redactions::new(&[Secret {
+            name: "GATE_SECRET".into(),
+            value: SECRET.into(),
+        }]),
+    };
+    let res = rt
+        .block_on(LocalRunner.run_with(
+            spec,
+            None,
+            GateIo {
+                log: Some(log.clone()),
+                heartbeat: None,
+            },
+        ))
+        .unwrap();
+    assert_eq!(res.exit, Some(0), "{}", res.tail(3));
+    let logged = std::fs::read_to_string(&log).unwrap();
+    for text in [&res.output, &logged] {
+        assert!(
+            text.contains("bytes of output omitted"),
+            "the output was cut"
+        );
+        for i in 0..=SECRET.len() - 8 {
+            let fragment = &SECRET[i..i + 8];
+            assert!(
+                !text.contains(fragment),
+                "a fragment of the secret is left: {fragment}"
+            );
+        }
+    }
+}
+
+// ── M13-14 (7): cp932 through the whole pipeline ──────────────────────────────────────────
+
+/// A check gate prints a line in **cp932** (what a tool prints on a Japanese Windows) and
+/// fails. With the machine's OEM code page said to be 932 (`TORYO_OEM_CODE_PAGE`, tests only)
+/// the line goes sink → decode → strip → redact → `output_tail` → the implementer's fix prompt
+/// as the text it is: no `�`, and the `0x5C` trail bytes of 能 and ソ are not backslashes.
+/// Skipped when code page 932 is not installed.
+#[cfg(windows)]
+#[test]
+fn m13_14_a_cp932_line_of_a_gate_reaches_the_fix_prompt_as_text() {
+    if !toryo::process::decode::code_page_installed(932) {
+        eprintln!("skipped: code page 932 is not installed");
+        return;
+    }
+    const TEXT: &str = "エラー: 機能ソース";
+    // TEXT in cp932, then CR LF
+    let bytes = "0x83,0x47,0x83,0x89,0x81,0x5B,0x3A,0x20,0x8B,0x40,0x94,0x5C,0x83,0x5C,0x81,0x5B,0x83,0x58,0x0D,0x0A";
+    let probe = "  probe: { kind: check, program: pwsh, args: [-NoProfile, -NonInteractive, -File, scripts/probe.ps1], timeout: 2m }\n";
+    let org = ORGCHART.replace("IMPLEMENTER", "codex-openai").replacen(
+        "gates:\n",
+        &format!("gates:\n{probe}"),
+        1,
+    );
+    // the first run prints the line and fails; the next one passes (a marker beside the repo)
+    let marker_dir = tempfile::tempdir().unwrap();
+    let marker = marker_dir
+        .path()
+        .join("ran")
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    let ps1 = format!(
+        "if (Test-Path '{marker}') {{ exit 0 }}\nSet-Content -Path '{marker}' -Value x\n$b = [byte[]]({bytes})\n$o = [Console]::OpenStandardOutput()\n$o.Write($b, 0, $b.Length)\n$o.Flush()\nexit 1\n"
+    );
+    let env = setup_orgchart(
+        "codex-openai",
+        "",
+        &[
+            (".toryo/toryo-orgchart.yaml", &org),
+            (
+                ".toryo/roles/implementer/toryo-role.yaml",
+                "toryo: 1\npurpose: Change the code.\nbefore_handoff: [divide-present, probe]\n",
+            ),
+            ("scripts/probe.ps1", &ps1),
+        ],
+    );
+    create(&env, "JP-1");
+    let s = script(
+        &env,
+        "jp1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [
+                turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()]),
+                turn(vec![implementation()]),
+            ],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["run", "JP-1", "--yes", "--fake-agents", &s],
+        &[("TORYO_OEM_CODE_PAGE", "932")],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "JP-1").state, St::Completed, "{err}");
+    let prompts: Vec<String> = calls(&env, "JP-1")
+        .iter()
+        .filter_map(|c| c["prompt"].as_str().map(str::to_string))
+        .collect();
+    let fix = prompts
+        .iter()
+        .find(|p| p.contains("VERIFY FAILED"))
+        .unwrap_or_else(|| panic!("no fix prompt in {prompts:#?}"));
+    assert!(fix.contains(TEXT), "the line as text: {fix}");
+    assert!(!fix.contains('\u{FFFD}'), "{fix}");
+    // the gate log of the failed run holds the same text
+    let logs = task(&env, "JP-1").run_store.join("gate-logs");
+    let logged = std::fs::read_dir(&logs)
+        .unwrap()
+        .flatten()
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .any(|t| t.contains(TEXT));
+    assert!(logged, "no gate log in {} holds the line", logs.display());
 }

@@ -1009,13 +1009,31 @@ fn ec31_a_reviewer_that_changes_a_file_left_before_its_turn_escalates() {
     let (code, err) = toryo(&env, &["resume", "H-4", "--yes", "--fake-agents", &s2], &[]);
     assert_eq!(code, 1, "{err}");
     assert_eq!(task(&env, "H-4").state, St::Escalated, "{err}");
-    assert_eq!(
-        reason(&env, "H-4"),
-        "policy_violation: the worktree changed during a read-only stage: [\"review-notes.txt\"]"
+    // M13-06 (AC-2): the reason used to end after the list. A file that was already changed
+    // before the turn is not put back (Toryo cannot tell the owner's edit from the role's):
+    // the reason now says so, and what is there is copied to the run store.
+    let why = reason(&env, "H-4");
+    assert!(
+        why.starts_with(
+            "policy_violation: the worktree changed during a read-only stage: [\"review-notes.txt\"]; not put back: [\"review-notes.txt\"] — changed already before the turn"
+        ),
+        "{why}"
     );
     assert!(std::fs::read_to_string(w.join("review-notes.txt"))
         .unwrap()
         .ends_with("reviewer was here\n"));
+    let copy = task(&env, "H-4")
+        .run_store
+        .join("read-only-writes")
+        .join("H-4-review-2")
+        .join("review-notes.txt");
+    assert!(
+        std::fs::read_to_string(&copy)
+            .unwrap()
+            .ends_with("reviewer was here\n"),
+        "{}",
+        copy.display()
+    );
 }
 
 /// The Planner likewise: a file it wrote stops the task before the plan gate.
@@ -1115,4 +1133,235 @@ fn item10_a_relative_verify_program_runs_from_the_checkout() {
         !mark.exists(),
         "the decoy in toryo's working directory never ran"
     );
+}
+
+// ── M13-06: read-only turns — recovery puts back only what the role wrote ─────────────────
+
+/// Run `id` to a review turn made of `steps`, with `owner-notes.txt` left in the worktree by
+/// the owner before that turn, and let the engine die right after the turn
+/// (`read_only:after_turn`): the checks of the turn never ran.
+fn die_after_the_review_turn(env: &Env, id: &str, steps: Vec<Value>) -> std::path::PathBuf {
+    create(env, id);
+    let s = script(
+        env,
+        "to-checkpoint.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+        }),
+    );
+    let (code, err) = toryo(
+        env,
+        &["run", id, "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "checkpoint:after_commit")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let w = wt(env, id);
+    std::fs::write(w.join("owner-notes.txt"), "mine\n").unwrap();
+    let s2 = script(
+        env,
+        "review-dies.json",
+        json!({ "reviewer": [turn(steps)] }),
+    );
+    let (code, err) = toryo(
+        env,
+        &["resume", id, "--yes", "--fake-agents", &s2],
+        &[("TORYO_TEST_CRASH_AT", "read_only:after_turn")],
+    );
+    assert_eq!(code, 86, "{err}");
+    w
+}
+
+/// AC-1 (audit O-11): the reviewer writes a file and the engine dies after the turn. Was: the
+/// next `resume` escalated on **every** dirty file — the owner's `owner-notes.txt` too — and
+/// put nothing back, so a later fix cycle committed the reviewer's file. Now recovery knows
+/// what the tree held before the turn: only the reviewer's file is named and put back.
+#[test]
+fn m13_06_recovery_puts_back_only_what_the_read_only_role_wrote() {
+    let env = setup("codex-openai");
+    let w = die_after_the_review_turn(
+        &env,
+        "H-6",
+        vec![write("review-notes.txt", "reviewer was here\n"), approved()],
+    );
+    assert!(w.join("review-notes.txt").exists(), "not undone yet");
+    let s3 = script(
+        &env,
+        "h6.json",
+        json!({"reviewer": [turn(vec![approved()])]}),
+    );
+    let (code, err) = toryo(&env, &["resume", "H-6", "--yes", "--fake-agents", &s3], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "H-6").state, St::Escalated, "{err}");
+    assert_eq!(
+        reason(&env, "H-6"),
+        "policy_violation: the worktree changed during a read-only stage: [\"review-notes.txt\"]",
+        "only the role's write is named: {err}"
+    );
+    assert!(!w.join("review-notes.txt").exists(), "put back: {err}");
+    assert_eq!(
+        std::fs::read_to_string(w.join("owner-notes.txt")).unwrap(),
+        "mine\n",
+        "the owner's file is left alone"
+    );
+    let copy = task(&env, "H-6")
+        .run_store
+        .join("read-only-writes")
+        .join("H-6-review-1")
+        .join("review-notes.txt");
+    assert_eq!(
+        std::fs::read_to_string(&copy).unwrap(),
+        "reviewer was here\n",
+        "{}",
+        copy.display()
+    );
+}
+
+/// AC-3: what the reviewer left is a **link** (here made by the test after the turn, where the
+/// agent would have: a junction on Windows, a symlink elsewhere) to a folder outside the
+/// worktree. Git lists the files behind it like any folder's; putting those "back" would
+/// delete the owner's files outside. The link is removed as a link and never followed.
+#[test]
+fn m13_06_a_link_left_by_the_read_only_role_is_removed_not_followed() {
+    let env = setup("codex-openai");
+    let w = die_after_the_review_turn(&env, "H-7", vec![approved()]);
+    let outside = env.root.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("precious.txt"), "the owner's\n").unwrap();
+    let link = w.join("peek");
+    link_folder(&link, &outside);
+    let s3 = script(
+        &env,
+        "h7.json",
+        json!({"reviewer": [turn(vec![approved()])]}),
+    );
+    let (code, err) = toryo(&env, &["resume", "H-7", "--yes", "--fake-agents", &s3], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "H-7").state, St::Escalated, "{err}");
+    assert!(
+        std::fs::symlink_metadata(&link).is_err(),
+        "the link is gone: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.join("precious.txt")).unwrap(),
+        "the owner's\n",
+        "nothing behind the link was touched: {err}"
+    );
+    let kept = task(&env, "H-7").run_store.join("read-only-writes");
+    assert!(
+        !kept.join("H-7-review-1").join("peek").exists(),
+        "nothing behind the link was copied"
+    );
+}
+
+/// A link `link` to the folder `to`: a junction on Windows (needs no privilege), a symlink
+/// elsewhere.
+fn link_folder(link: &std::path::Path, to: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        let o = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(to)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(to, link).unwrap();
+}
+
+/// AC-3, the other half (review of M13-01…06): the role deletes the tracked folder `src` and
+/// leaves a link of that name to a folder outside. Was: every path behind the link was left out
+/// of the put-back and nothing looked again once the link was gone — the tracked file stayed
+/// deleted, and the next fix cycle's `git add -A` would have committed the deletion. Now the
+/// tree is read again after the link is removed and the tracked file is put back.
+#[test]
+fn m13_06_a_tracked_folder_replaced_by_a_link_is_put_back() {
+    let env = setup("codex-openai");
+    let w = die_after_the_review_turn(&env, "H-8", vec![approved()]);
+    let outside = env.root.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("precious.txt"), "the owner's\n").unwrap();
+    let tracked = w.join("src").join("Calculator.psm1");
+    // (Git may check the file out with other line endings than the agent wrote)
+    let text = |p: &std::path::Path| std::fs::read_to_string(p).unwrap().replace('\r', "");
+    let content = text(&tracked);
+    std::fs::remove_dir_all(w.join("src")).unwrap();
+    link_folder(&w.join("src"), &outside);
+    let s3 = script(
+        &env,
+        "h8.json",
+        json!({"reviewer": [turn(vec![approved()])]}),
+    );
+    let (code, err) = toryo(&env, &["resume", "H-8", "--yes", "--fake-agents", &s3], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "H-8").state, St::Escalated, "{err}");
+    assert!(
+        !std::fs::symlink_metadata(w.join("src"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link is gone and the folder is back: {err}"
+    );
+    assert_eq!(
+        text(&tracked),
+        content,
+        "the tracked file is put back: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.join("precious.txt")).unwrap(),
+        "the owner's\n",
+        "nothing behind the link was touched: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(w.join("owner-notes.txt")).unwrap(),
+        "mine\n"
+    );
+}
+
+/// Review of M13-01…06: Git refuses the put-back (here: a stale `index.lock`, as a killed Git
+/// leaves one). Was: `restore` does not report it — the console and the reason said "put
+/// back" while the reviewer's edit was still in the tree, on its way into the next fix cycle's
+/// checkpoint. Now the tree is looked at after the put-back and the reason names what is left.
+#[test]
+fn m13_06_a_put_back_that_git_refuses_is_named_in_the_reason() {
+    let env = setup("codex-openai");
+    let w = die_after_the_review_turn(
+        &env,
+        "H-9",
+        vec![
+            write("src/Calculator.psm1", "# the reviewer's\n"),
+            approved(),
+        ],
+    );
+    let git_dir = std::path::PathBuf::from(git(&w, &["rev-parse", "--absolute-git-dir"]).trim());
+    let lock = git_dir.join("index.lock");
+    std::fs::write(&lock, "").unwrap();
+    let s3 = script(
+        &env,
+        "h9.json",
+        json!({"reviewer": [turn(vec![approved()]), turn(vec![approved()])]}),
+    );
+    let (code, err) = toryo(&env, &["resume", "H-9", "--yes", "--fake-agents", &s3], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "H-9").state, St::Escalated, "{err}");
+    let why = reason(&env, "H-9");
+    assert!(
+        why.starts_with(
+            "policy_violation: the worktree changed during a read-only stage: [\"src/Calculator.psm1\"]"
+        ) && why.contains("; could NOT be put back: [\"src/Calculator.psm1\"]"),
+        "{why}"
+    );
+    assert!(
+        !err.contains("put back (written by the read-only role)"),
+        "nothing claims a put-back that did not happen: {err}"
+    );
+    assert!(
+        std::fs::read_to_string(w.join("src").join("Calculator.psm1"))
+            .unwrap()
+            .contains("the reviewer's"),
+        "(the edit is indeed still there)"
+    );
+    std::fs::remove_file(&lock).unwrap();
 }

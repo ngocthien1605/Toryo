@@ -24,6 +24,8 @@ pub struct CreateArgs {
 
 /// M12-12 (c): a task id is a file name (the lock file, the run store): `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`
 /// and never `..` — checked before any file is touched, on every command that takes an id.
+/// M13-14: and a file name on Windows too — not a device name (`con`, `nul`, `com1`, … also
+/// before a dot, in any case) and not ending in a dot.
 pub fn valid_task_id(id: &str) -> Result<()> {
     let mut chars = id.chars();
     let ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
@@ -31,10 +33,12 @@ pub fn valid_task_id(id: &str) -> Result<()> {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        && !id.contains("..");
+        && !id.contains("..")
+        && !id.ends_with('.')
+        && !super::lock::is_device_name(id);
     if !ok {
         bail!(
-            "`{id}` is not a task id — letters, digits, `.`, `_` and `-`, starting with a letter or digit, at most 64 characters, never `..`"
+            "`{id}` is not a task id — letters, digits, `.`, `_` and `-`, starting with a letter or digit, at most 64 characters, never `..`, not ending in `.`, and not a Windows device name (con, prn, aux, nul, com1–com9, lpt1–lpt9)"
         );
     }
     Ok(())
@@ -293,6 +297,119 @@ pub fn cleanup_git(repo: &Path) -> Result<GitCmd> {
     Ok(g)
 }
 
+/// M13-11 (X28): what `task create` has made so far. Dropped without [`Made::keep`] — any error
+/// after the first of them — it removes them again in reverse order, best effort, one line
+/// each: the same `TASK.md` can then be created again. The error that ended the creation is
+/// the one reported.
+struct Made<'a> {
+    g: &'a GitCmd,
+    store: &'a Store,
+    repo: PathBuf,
+    id: String,
+    run_store: Option<PathBuf>,
+    worktree: Option<PathBuf>,
+    branch: Option<String>,
+    /// The commit the branch is made at (M13-R7): only a branch still there is deleted.
+    base: String,
+    row: bool,
+    kept: bool,
+}
+
+impl Made<'_> {
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for Made<'_> {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        let repo = Loc::Discover(self.repo.clone());
+        if self.row {
+            let id = self.id.clone();
+            match self
+                .store
+                .call(move |tx| store::remove_created_task(tx, &id))
+            {
+                Ok(()) => eprintln!("removed: the database row of {}", self.id),
+                Err(e) => eprintln!(
+                    "WARNING: could not remove the database row of {}: {e:#}",
+                    self.id
+                ),
+            }
+        }
+        if let Some(wt) = &self.worktree {
+            let existed = wt.exists();
+            let w = wt.display().to_string().replace('\\', "/");
+            if existed
+                && self
+                    .g
+                    .run(&repo, false, &["worktree", "remove", "--force", &w])
+                    .is_err()
+            {
+                let _ = std::fs::remove_dir_all(wt);
+                // M13-R7: only here — `prune` forgets every stale entry of the repository (a
+                // worktree on a drive that is not mounted now), not just ours
+                let _ = self.g.run(&repo, false, &["worktree", "prune"]);
+            }
+            match (existed, wt.exists()) {
+                (true, false) => eprintln!("removed: the worktree {}", wt.display()),
+                (_, true) => eprintln!(
+                    "WARNING: could not remove the worktree {} — delete it by hand",
+                    wt.display()
+                ),
+                (false, false) => {}
+            }
+        }
+        if let Some(b) = &self.branch {
+            // it did not exist before this `task create` (checked there) — but another process
+            // can have made it since: it is ours only while it is still at the base (M13-R7)
+            let at = self
+                .g
+                .output(
+                    &repo,
+                    true,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        &format!("refs/heads/{b}"),
+                    ],
+                )
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+            match at {
+                Some(sha) if sha == self.base => {
+                    match self.g.run(&repo, false, &["branch", "-D", b]) {
+                        Ok(_) => eprintln!("removed: the branch {b}"),
+                        Err(e) => eprintln!("WARNING: could not remove the branch {b}: {e:#}"),
+                    }
+                }
+                Some(sha) => eprintln!(
+                    "WARNING: the branch {b} is at {} now, not at the base it was made at ({}) — it is not ours any more and is left",
+                    crate::git::short(&sha),
+                    crate::git::short(&self.base)
+                ),
+                None => {}
+            }
+        }
+        if let Some(rs) = &self.run_store {
+            if rs.exists() {
+                match std::fs::remove_dir_all(rs) {
+                    Ok(()) => eprintln!("removed: the run store {}", rs.display()),
+                    Err(e) => eprintln!(
+                        "WARNING: could not remove the run store {}: {e} — delete it by hand",
+                        rs.display()
+                    ),
+                }
+            }
+        }
+    }
+}
+
 pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> {
     let repo = std::path::absolute(&a.repo)?;
     let file = if a.file.is_absolute() || a.file.exists() {
@@ -446,6 +563,20 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         bail!("branch {branch} already exists in {}", repo.display());
     }
 
+    // M13-11 (X28): every refusal is above this line — nothing has been made yet. From here
+    // on, whatever fails, what was made is removed again (`Made`).
+    let mut made = Made {
+        g: &g,
+        store,
+        repo: repo.clone(),
+        id: id.clone(),
+        run_store: Some(rs.clone()),
+        worktree: None,
+        branch: None,
+        base: base.clone(),
+        row: false,
+        kept: false,
+    };
     // run store: TASK.md snapshot (R27) + frozen config (R35)
     let art = rs.join("runstore");
     std::fs::create_dir_all(&art)?;
@@ -454,8 +585,10 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     let frozen = cfg.canonical_json();
     std::fs::write(art.join("config.json"), &frozen)?;
 
-    std::fs::create_dir_all(&wt_root)?;
+    std::fs::create_dir_all(&wt_root)
+        .with_context(|| format!("creating project.worktrees_root {}", wt_root.display()))?;
     let fwd = |p: &Path| p.display().to_string().replace('\\', "/");
+    (made.worktree, made.branch) = (Some(wt.clone()), Some(branch.clone()));
     g.run(
         &repol,
         false,
@@ -469,6 +602,15 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
     let excl = PathBuf::from(common.trim()).join("info").join("exclude");
+    // M13-R2 test hook (STATUS O-39): the step after `git worktree add` fails the same way on
+    // every Git version (a folder at `info/exclude` is refused before anything is created by
+    // Git 2.43 and only warned about by 2.55)
+    if std::env::var("TORYO_TEST_FAIL_AT").is_ok_and(|v| v == "create:after_worktree") {
+        bail!(
+            "TORYO_TEST_FAIL_AT=create:after_worktree: cannot write {}",
+            excl.display()
+        );
+    }
     let cur = std::fs::read_to_string(&excl).unwrap_or_default();
     if !cur.lines().any(|l| l.trim() == "/.toryo-tmp/") {
         std::fs::create_dir_all(excl.parent().expect("parent"))?;
@@ -477,7 +619,8 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         } else {
             "\n"
         };
-        std::fs::write(&excl, format!("{cur}{sep}/.toryo-tmp/\n"))?;
+        std::fs::write(&excl, format!("{cur}{sep}/.toryo-tmp/\n"))
+            .with_context(|| format!("writing {}", excl.display()))?;
     }
 
     let nt = NewTask {
@@ -498,18 +641,11 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         reviewer,
         budget_tokens: cfg.repo.pipeline.budget_tokens.map(|b| b as i64),
     };
-    let res = store.call(move |tx| {
+    let t = store.call(move |tx| {
         store::insert_task(tx, &nt)?;
         store::get_task(tx, &nt.id)
-    });
-    if res.is_err() {
-        let _ = g.output(
-            &Loc::Discover(wt.clone()),
-            false,
-            &["worktree", "remove", "--force", &fwd(&wt)],
-        );
-    }
-    let t = res?;
+    })?;
+    made.row = true;
     // R34: the task snapshot and the frozen configuration are the first immutable versions
     super::artifacts::put(
         store,
@@ -534,6 +670,7 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     // R35: protected baseline v1 — after the info/exclude line (R46), before any agent runs
     let (_, protect, _) = super::runner::task_policy(&t, cfg)?;
     super::protect::take_baseline(store, &t, &g, &protect, "v1 (task created)")?;
+    made.keep();
     Ok(t)
 }
 
@@ -570,4 +707,76 @@ pub fn frozen_config_text(t: &TaskRow) -> Result<(PathBuf, String)> {
     let text = String::from_utf8(bytes)
         .with_context(|| format!("the frozen config of {} is not UTF-8", t.id))?;
     Ok((path, text))
+}
+
+#[cfg(test)]
+mod made_tests {
+    use super::*;
+
+    /// A repository with two commits; returns it, the first commit and the second.
+    fn repo(d: &Path) -> (GitCmd, PathBuf, String, String) {
+        let g = GitCmd::new("git", d.join("hooks")).unwrap();
+        let r = d.join("repo");
+        std::fs::create_dir_all(&r).unwrap();
+        let loc = Loc::Discover(r.clone());
+        g.run(&loc, false, &["init", "-q", "-b", "main"]).unwrap();
+        let mut shas = Vec::new();
+        for n in ["a", "b"] {
+            std::fs::write(r.join(format!("{n}.txt")), "x\n").unwrap();
+            g.run(&loc, false, &["add", "-A"]).unwrap();
+            g.run(&loc, false, &["commit", "-q", "-m", n]).unwrap();
+            shas.push(g.run_str(&loc, true, &["rev-parse", "HEAD"]).unwrap());
+        }
+        (g, r, shas[0].trim().into(), shas[1].trim().into())
+    }
+
+    /// M13-R7: `Made` deletes the branch of a failed `task create` only while it is still at the
+    /// commit it was made at. Another process that made `toryo/<id>` in between (the check at
+    /// the top of `create` had passed) owns it.
+    #[test]
+    fn a_branch_made_by_someone_else_in_between_is_not_deleted() {
+        let d = tempfile::tempdir().unwrap();
+        let (g, r, first, second) = repo(d.path());
+        let store = Store::open(&d.path().join("t.db")).unwrap();
+        let loc = Loc::Discover(r.clone());
+        let made = |branch: &str, base: &str| {
+            drop(Made {
+                g: &g,
+                store: &store,
+                repo: r.clone(),
+                id: "x".into(),
+                run_store: None,
+                worktree: None,
+                branch: Some(branch.into()),
+                base: base.into(),
+                row: false,
+                kept: false,
+            })
+        };
+        let there = |b: &str| {
+            g.output(
+                &loc,
+                true,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{b}"),
+                ],
+            )
+            .unwrap()
+            .status
+            .success()
+        };
+        // someone else's branch, at another commit than the base we made ours at
+        g.run(&loc, false, &["branch", "toryo/theirs", &second])
+            .unwrap();
+        made("toryo/theirs", &first);
+        assert!(there("toryo/theirs"), "not ours: it must stay");
+        // ours: at the base
+        g.run(&loc, false, &["branch", "toryo/ours", &first])
+            .unwrap();
+        made("toryo/ours", &first);
+        assert!(!there("toryo/ours"), "ours: removed");
+    }
 }

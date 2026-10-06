@@ -28,10 +28,17 @@ pub fn decode_output_with(bytes: &[u8], code_page: u32) -> String {
 }
 
 /// The OEM code page of this machine (the console's: what the tools print in). 65001 off
-/// Windows.
+/// Windows. `TORYO_OEM_CODE_PAGE` (tests only, M13-14) says another one: a test can then send
+/// cp932 bytes through a gate on a machine whose code page is not 932.
 pub fn oem_code_page() -> u32 {
     #[cfg(windows)]
     {
+        if let Some(page) = std::env::var("TORYO_OEM_CODE_PAGE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            return page;
+        }
         // SAFETY: no arguments, no pointers
         unsafe { windows_sys::Win32::Globalization::GetOEMCP() }
     }

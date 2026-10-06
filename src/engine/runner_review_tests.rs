@@ -627,3 +627,64 @@ fn a_fresh_plan_revision_names_the_plan_being_revised() {
         plan_prompt(None, None, task)
     );
 }
+
+/// M13-06: the copy of what a read-only role wrote — a regular file of at most 8 MB is copied;
+/// a larger one, a link (never followed) and a folder are not, and the reason says why; a path
+/// that is gone is nothing to copy.
+#[test]
+fn the_copy_of_a_read_only_write_is_capped_and_never_follows_a_link() {
+    let d = tempfile::tempdir().unwrap();
+    let (from, to) = (d.path().join("from"), d.path().join("keep"));
+    std::fs::create_dir_all(&from).unwrap();
+    std::fs::write(from.join("small.txt"), "x").unwrap();
+    assert_eq!(
+        keep_copy(&from.join("small.txt"), &to.join("a/small.txt")),
+        None
+    );
+    assert_eq!(
+        std::fs::read_to_string(to.join("a/small.txt")).unwrap(),
+        "x"
+    );
+    // 8 MB + 1 byte (a sparse file: only its length is set)
+    let big = from.join("big.bin");
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len(READ_ONLY_COPY_MAX + 1)
+        .unwrap();
+    let why = keep_copy(&big, &to.join("big.bin")).expect("not copied");
+    assert!(why.contains("over the 8 MB"), "{why}");
+    assert!(!to.join("big.bin").exists());
+    assert_eq!(
+        keep_copy(&from.join("gone.txt"), &to.join("gone.txt")),
+        None
+    );
+    assert!(!to.join("gone.txt").exists());
+    assert_eq!(
+        keep_copy(&from, &to.join("dir")).as_deref(),
+        Some("not a regular file")
+    );
+    // a link to a file outside: the link is not followed, nothing is copied
+    let outside = d.path().join("outside.txt");
+    std::fs::write(&outside, "the owner's").unwrap();
+    let link = from.join("link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    #[cfg(windows)]
+    if std::os::windows::fs::symlink_file(&outside, &link).is_err() {
+        eprintln!("skipped the link case: this account may not create symbolic links");
+        return;
+    }
+    assert_eq!(
+        keep_copy(&link, &to.join("link")).as_deref(),
+        Some("a link: not followed")
+    );
+    assert!(!to.join("link").exists());
+    // the first link on the way to a path is found, the path itself is not asked
+    let root = d.path();
+    assert_eq!(link_on_the_way(root, "from/small.txt"), None);
+    assert_eq!(link_on_the_way(root, "from/link"), None);
+    assert_eq!(
+        link_on_the_way(root, "from/link/inner.txt").as_deref(),
+        Some("from/link")
+    );
+}
