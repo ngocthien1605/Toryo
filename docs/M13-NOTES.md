@@ -481,3 +481,35 @@ items that are plans into `docs/STATUS.md`.)
   Also: `doctor` has two more `paths` lines on Windows (WARN until `core.longpaths` / `LongPathsEnabled` are set), and a task id that is a Windows
   device name is refused.
 
+
+## Review fixes
+
+The review of `4ec8fc8` (`M13-review-fixes.md`, outside the repository; decisions X30–X32) found every M13 task met; one Linux test fails (R2) and a
+few holes are left. Eight commits `(M13-R1 … R8)` on the same branch. Test counts: Windows 732 passed / 0 failed / 6 ignored before; Linux 749 passed /
+1 failed (the review lead's container build, Git 2.43) before.
+
+### Progress (review fixes)
+
+- [x] R1 Replace refs defeat every diff-based check (X30)
+- [ ] R2 `m13_11_…_after_the_worktree…` fails on Linux (Git 2.43)
+- [ ] R3 The output cut holds post-redaction bytes
+- [ ] R4 A read-only write is left in the tree when HEAD was off the branch or recovery stopped first (X32)
+- [ ] R5 `start_at_anchor` trusts a detached or mid-merge HEAD; `foreign_commit` accepts a merge commit (X31)
+- [ ] R6 Toryo's own `git` children share the console
+- [ ] R7 Safety-adjacent Lows
+- [ ] R8 Texts, tests and doctor Lows
+- [ ] Finish: push, comment on the pull request, CI
+
+### R1 — Replace refs (X30)
+
+- **Failing tests first** (all three failed at `4ec8fc8`): `git::tests::toryos_git_ignores_replace_refs` (a replace-aware `ls-tree` shows the replaced
+  tree, Toryo's Git must show the real one), `engine::protect::tests::a_replace_ref_and_grafts_are_protected_git_metadata`, and
+  `regress_recovery::m13_r1_a_replace_ref_does_not_hide_a_forged_commit` (the shape of `m12_01_a_forged_commit_in_checkpointing_is_refused` plus
+  `git replace <base> <stand-in with the forged tree and base's parents>`: the task completed with `src/ZZZ/secret.ps1` in the tree).
+- `GitCmd::command` sets `GIT_NO_REPLACE_OBJECTS=1` for every Git call Toryo makes (the two explicit settings in `verify.rs` stay). `git_meta` adds
+  `@git/info/grafts` and every loose `@git/refs/replace/<sha>` to the protected Git metadata: a change is `protected_config_changed`.
+- **Not covered:** a replace ref that was packed (`git pack-refs --all`) leaves its loose file, which is seen as *removed* — also a change — but a ref
+  that only ever existed in `packed-refs` is not listed. With `GIT_NO_REPLACE_OBJECTS=1` it has no effect on Toryo either way (the protection is the
+  second line, not the first).
+- The e2e test goes through whichever check meets the replace first (the protected scan at the loop top or the refused found commit): the reason must
+  name `refs/replace` or "is not Toryo's".

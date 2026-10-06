@@ -844,6 +844,72 @@ fn m12_01_a_forged_commit_in_checkpointing_is_refused() {
     );
 }
 
+/// M13-R1 (X30): the shape of the test above, plus `git replace <base> <commit with the forged
+/// tree and base's parents>` made by the agent. A replace-aware `diff base..forged` is empty, so
+/// the forged commit used to be accepted as Toryo's checkpoint. Toryo's Git ignores replace refs
+/// (and the ref itself is protected Git metadata): the commit is refused, nothing is checkpointed.
+#[test]
+fn m13_r1_a_replace_ref_does_not_hide_a_forged_commit() {
+    let env = setup_with("codex-openai", "policy:\n  deny_paths: [\"**/ZZZ/**\"]\n");
+    create(&env, "R-1");
+    let s = script(
+        &env,
+        "r1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["run", "R-1", "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "checkpoint:after_commit")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let w = wt(&env, "R-1");
+    let base = rev(&w, "HEAD^");
+    let genuine = rev(&w, "HEAD");
+    let files = [
+        ("src/Calculator.psm1", with_divide(&w, &base)),
+        ("src/ZZZ/secret.ps1", "evil\n".to_string()),
+    ];
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, c)| (*p, c.as_str())).collect();
+    let forged = commit_of(
+        &env,
+        &w,
+        &base,
+        Some(&base),
+        &files,
+        "toryo(R-1): implement\n\nToryo-Task: R-1\nToryo-Stage: implement\nToryo-Attempt: 1\nToryo-Agent: codex-openai\n",
+    );
+    // the replacement: the forged tree under the parents of `base`
+    let parents = git(&w, &["rev-list", "--parents", "-n", "1", &base]);
+    let parent = parents.split_whitespace().nth(1).map(str::to_string);
+    let stand_in = commit_of(&env, &w, &base, parent.as_deref(), &files, "stand-in\n");
+    git(&w, &["replace", &base, &stand_in]);
+    git(&w, &["update-ref", "refs/heads/toryo/R-1", &forged]);
+    let s2 = script(
+        &env,
+        "r1b.json",
+        json!({ "reviewer": [turn(vec![approved()])] }),
+    );
+    let (code, err) = toryo(&env, &["resume", "R-1", "--yes", "--fake-agents", &s2], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "R-1").state, St::Escalated, "{err}");
+    assert_ne!(rev(&w, "HEAD"), genuine);
+    let t = task(&env, "R-1");
+    assert!(
+        t.machine.checkpoint().is_none(),
+        "no checkpoint was recorded: {}",
+        reason(&env, "R-1")
+    );
+    let why = reason(&env, "R-1");
+    assert!(
+        why.contains("refs/replace") || why.contains("is not Toryo's"),
+        "{why}"
+    );
+}
 // ── M12-02 (H4): the protected scan fails closed ─────────────────────────────────────────
 
 /// Take away the right to list `dir` (Unix: mode 000; Windows: a deny ACL for the current

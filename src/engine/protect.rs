@@ -147,7 +147,36 @@ fn git_meta(g: &GitCmd, wt: &Path) -> Result<Vec<(String, PathBuf)>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(unreadable(&hooks, "list", &e)),
     }
+    // M13-R1 (X30): a replace ref or a graft makes a Git that honours it show another history.
+    // Toryo's Git ignores both; a task still needs neither, so a change is hard.
+    v.push((
+        format!("{META}info/grafts"),
+        common.join("info").join("grafts"),
+    ));
+    replace_refs(&common.join("refs").join("replace"), "", &mut v)?;
     Ok(v)
+}
+
+/// Every loose replace ref (`refs/replace/<sha>`; nested names are walked too).
+fn replace_refs(dir: &Path, prefix: &str, v: &mut Vec<(String, PathBuf)>) -> Result<()> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(unreadable(dir, "list", &e)),
+    };
+    for e in rd {
+        let e = e.map_err(|x| unreadable(dir, "list", &x))?;
+        let name = format!("{prefix}{}", e.file_name().to_string_lossy());
+        let ft = e
+            .file_type()
+            .map_err(|x| unreadable(&e.path(), "read", &x))?;
+        if ft.is_dir() {
+            replace_refs(&e.path(), &format!("{name}/"), v)?;
+        } else {
+            v.push((format!("{META}refs/replace/{name}"), e.path()));
+        }
+    }
+    Ok(())
 }
 
 fn walk(
@@ -818,6 +847,36 @@ mod tests {
                 added("sub/Agents.md", true),
             ]
         );
+    }
+
+    /// M13-R1 (X30): a replace ref and `info/grafts` are protected Git metadata like the hooks:
+    /// a change is a hard `@git/…` change, whatever the agent's own Git then shows.
+    #[test]
+    fn a_replace_ref_and_grafts_are_protected_git_metadata() {
+        let d = tempfile::tempdir().unwrap();
+        let g = GitCmd::new("git", d.path().join("hooks")).unwrap();
+        let (wt, base) = repo_at_base(&g, d.path(), &[("a.txt", "a\n")]);
+        let loc = Loc::Discover(wt.clone());
+        std::fs::write(wt.join("b.txt"), "b\n").unwrap();
+        g.run(&loc, false, &["add", "-A"]).unwrap();
+        g.run(&loc, false, &["commit", "-qm", "two"]).unwrap();
+        let protect = Protected::new(vec![], &[]);
+        let before = narrower_baseline(&g, &wt, &protect, &[]);
+        assert!(!before.entries.keys().any(|k| k.contains("replace")));
+        let base = base.trim();
+        g.run(&loc, false, &["replace", "HEAD", base]).unwrap();
+        std::fs::write(wt.join(".git/info/grafts"), format!("{base}\n")).unwrap();
+        let now = scan(&g, &wt, &protect).unwrap();
+        let changes = compare(&before, &now);
+        let got: Vec<(&str, &str)> = changes.iter().map(|c| (c.path.as_str(), c.kind)).collect();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(
+            got.iter()
+                .any(|(p, k)| p.starts_with("@git/refs/replace/") && *k == "added"),
+            "{got:?}"
+        );
+        assert!(got.contains(&("@git/info/grafts", "added")), "{got:?}");
+        assert!(changes.iter().all(Change::is_hard), "{changes:?}");
     }
 
     /// F2 on Windows: `core.autocrlf` checks an LF blob out with CRLF. The file is its blob

@@ -128,6 +128,10 @@ impl GitCmd {
         let mut cmd = Command::new(&self.git);
         let mut env = build_env(std::env::vars(), &BTreeMap::new(), &BTreeMap::new());
         env.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+        // M13-R1 (X30): Toryo's Git never looks through a replace ref. Every diff-based check
+        // (found commit, anchor, path policy) is only as good as what Git reports; a replaced
+        // commit would report another tree than the one the export deploys.
+        env.insert("GIT_NO_REPLACE_OBJECTS".into(), "1".into());
         if read_only {
             env.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
         }
@@ -547,6 +551,45 @@ mod tests {
     }
 
     use super::*;
+
+    /// M13-R1 (X30): Toryo's Git never looks through a replace ref. A replacement of a commit
+    /// (the anchor, a checkpoint) by one with another tree would blind every diff-based check.
+    #[test]
+    fn toryos_git_ignores_replace_refs() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().join("r");
+        std::fs::create_dir_all(&r).unwrap();
+        let g = GitCmd::new("git", d.path().join("hooks")).unwrap();
+        let loc = Loc::Discover(r.clone());
+        g.run(&loc, false, &["init", "-q", "-b", "main"]).unwrap();
+        std::fs::write(r.join("a.txt"), "a\n").unwrap();
+        g.run(&loc, false, &["add", "-A"]).unwrap();
+        g.run(&loc, false, &["commit", "-q", "-m", "one"]).unwrap();
+        let one = g.run_str(&loc, true, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(r.join("b.txt"), "b\n").unwrap();
+        g.run(&loc, false, &["add", "-A"]).unwrap();
+        g.run(&loc, false, &["commit", "-q", "-m", "two"]).unwrap();
+        let two = g.run_str(&loc, true, &["rev-parse", "HEAD"]).unwrap();
+        let (one, two) = (one.trim(), two.trim());
+        g.run(&loc, false, &["replace", two, one]).unwrap();
+        // what a replace-aware Git says: `two` has the tree of `one`
+        let seen = Command::new("git")
+            .arg("-C")
+            .arg(&r)
+            .args(["ls-tree", "--name-only", two])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&seen.stdout).trim(), "a.txt");
+        // what Toryo says: the tree of `two`
+        let tree = g
+            .run_str(&loc, true, &["ls-tree", "--name-only", two])
+            .unwrap();
+        assert_eq!(tree.trim().replace('\r', ""), "a.txt\nb.txt");
+        let diff = g
+            .run_str(&loc, true, &["diff", "--name-only", one, two])
+            .unwrap();
+        assert_eq!(diff.trim(), "b.txt");
+    }
 
     #[test]
     fn status_z_parsing_handles_spaces_and_renames() {
