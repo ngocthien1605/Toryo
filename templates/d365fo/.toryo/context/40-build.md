@@ -2,10 +2,9 @@
 # Build and verify
 
 - Toryo, not you, runs the gates the repository declares, on your checkpoint commit: the `build` gate
-  (a compile, or the team's build script — TODO(owner): say which), then, where this machine has
-  one, a `dbsync` gate that deploys the checkpoint to the dev environment. A green `build` proves what
-  that build covers (a compile is **not** SysTest and **not** a database sync); the tests that need
-  the database are the owner's, by hand, after the final gate.
+  (a compile, or the team's build script — TODO(owner): say which). A green `build` proves what
+  that build covers (a compile is **not** SysTest and **not** a database sync); deploying and the
+  tests that need the database are the owner's, by hand, after the final gate.
 - Build projects: `Projects/Build/<Package>.Build.rnrproj`, one per package — TODO(owner): list them.
   They are **protected**: never edit them, never add `Directory.Build.*` files.
 - Do not change a model descriptor (`Descriptor/*.xml`) or package references unless the task says so.

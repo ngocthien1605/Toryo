@@ -1,5 +1,5 @@
-//! M12-18: the D365FO template loads as shipped, and a whole run of it — with the two print-only
-//! example scripts and fake agents — reaches the final gate.
+//! M12-18: the D365FO template loads as shipped, and a whole run of it — with the print-only
+//! example build script and fake agents — reaches the final gate.
 #![cfg(feature = "m0-kit")]
 
 mod common;
@@ -73,21 +73,10 @@ fn m12_18_the_d365fo_template_loads_as_shipped() {
         .replace("D:\\D365-worktrees", &format!("{tmp}/wts"));
     let y = d.path().join("toryo.yaml");
     std::fs::write(&y, yaml).unwrap();
-    // … and of the machine example: the user, the gate script (the example copied), the root
-    let gates = d.path().join("gates");
-    std::fs::create_dir_all(&gates).unwrap();
-    std::fs::copy(
-        t.join("machine").join("dbsync.ps1.example"),
-        gates.join("dbsync.ps1"),
-    )
-    .unwrap();
+    // … and of the machine example: the user and the root (no gate script: deploying is not a gate)
     let machine = std::fs::read_to_string(t.join("toryo.local.yaml.example"))
         .unwrap()
         .replace("<you>", "tester")
-        .replace(
-            "C:\\toryo-gates\\dbsync.ps1",
-            &format!("{tmp}/gates/dbsync.ps1"),
-        )
         .replace("D:\\toryo-verify", &format!("{tmp}/verify"));
     let m = d.path().join("toryo.local.yaml");
     std::fs::write(&m, machine).unwrap();
@@ -102,8 +91,9 @@ fn m12_18_the_d365fo_template_loads_as_shipped() {
         assert_eq!(cfg.repo.roles[seat].profile, profile, "{seat}");
         assert!(cfg.repo.profiles.contains_key(profile), "{profile}");
     }
-    let dbsync = team.gates["dbsync"].machine.as_ref().expect("dbsync");
-    assert_eq!(dbsync.confirm.as_str(), "first");
+    // the template declares the `build` check gate only: deploy and DB sync are the owner's step
+    assert_eq!(team.gates.keys().collect::<Vec<_>>(), ["build"]);
+    assert!(team.gates["build"].machine.is_none());
     assert_eq!(
         toryo::engine::verify::verify_root(&cfg),
         PathBuf::from(format!("{tmp}/verify"))
@@ -151,9 +141,10 @@ fn m12_18_the_d365fo_template_loads_as_shipped() {
     );
 }
 
-/// AC-2: with the two example scripts in place, a `--fake-agents` run of the template reaches
-/// the final gate. The machine example's `confirm: first` asks before the deploy; `resume` is
-/// the yes. (Script gates run through `pwsh`; where the runner has none the test says so.)
+/// AC-2: with the example build script in place, a `--fake-agents` run of the template goes
+/// through the final gate; the `build` check gate is the only gate and nothing is deployed (deploy
+/// and DB sync are the owner's step from Visual Studio). (Script gates run through `pwsh`; where
+/// the runner has none the test says so.)
 #[test]
 fn m12_18_the_template_reaches_the_final_gate_with_the_example_scripts() {
     if !has_pwsh() {
@@ -182,19 +173,6 @@ fn m12_18_the_template_reaches_the_final_gate_with_the_example_scripts() {
         .map(|(a, b)| (a.as_str(), b.as_str()))
         .collect();
     let env = setup_orgchart("codex-openai", "", &refs);
-    // the machine's `dbsync`: the example script, run by pwsh, with the example's `confirm`
-    let gate = env.root.join("gates").join("dbsync.ps1");
-    std::fs::create_dir_all(gate.parent().unwrap()).unwrap();
-    std::fs::copy(t.join("machine").join("dbsync.ps1.example"), &gate).unwrap();
-    let m = std::fs::read_to_string(&env.machine).unwrap();
-    std::fs::write(
-        &env.machine,
-        format!(
-            "{m}environment_gates:\n  dbsync:\n    program: pwsh\n    args: [-NoProfile, -NonInteractive, -File, '{}']\n    lock: d365-env\n    confirm: first\n",
-            fwd(&gate)
-        ),
-    )
-    .unwrap();
     let (code, err) = toryo(
         &env,
         &["task", "create", "--file", "TASK.md", "--id", "SJP-1234"],
@@ -217,27 +195,15 @@ fn m12_18_the_template_reaches_the_final_gate_with_the_example_scripts() {
                 "decision":"approved","summary":"s","acceptance_criteria":acs,"issues":[]}})])],
         }),
     );
-    let (_, err) = toryo(
+    let (code, err) = toryo(
         &env,
         &["run", "SJP-1234", "--yes", "--fake-agents", &s],
         &[],
     );
-    let t1 = task(&env, "SJP-1234");
-    // `confirm: first`: stopped before the deploy, the build gate (the example script) has passed
-    assert_eq!(t1.state, St::Escalated, "{err}");
-    assert_eq!(
-        t1.machine.reason_class(),
-        Some("environment_gate_confirm"),
-        "{err}"
-    );
-    // the yes: a plain `resume` (`--yes` never confirms a deploy); the run goes on to the final gate
-    let (code, err) = toryo(&env, &["resume", "SJP-1234", "--fake-agents", &s], &[]);
+    // no environment gate, so no stop to confirm a deploy: the build gate (the example script)
+    // passes and the run goes through the final gate, which `--yes` approves
     assert_eq!(code, 0, "{err}");
-    assert_eq!(
-        task(&env, "SJP-1234").state,
-        St::WaitingFinalApproval,
-        "{err}"
-    );
+    assert_eq!(task(&env, "SJP-1234").state, St::Completed, "{err}");
     let vr: serde_json::Value = serde_json::from_slice(
         &std::fs::read(
             task(&env, "SJP-1234")
@@ -257,7 +223,6 @@ fn m12_18_the_template_reaches_the_final_gate_with_the_example_scripts() {
             .to_string()
     };
     assert!(tail("build").contains("print-only") && tail("build").contains("TORYO_SHA="));
-    assert!(
-        tail("dbsync").contains("print-only") && tail("dbsync").contains("TORYO_VERIFY_CHECKOUT=")
-    );
+    // only the build gate ran: nothing deploys
+    assert_eq!(cmds.len(), 1, "{vr}");
 }

@@ -20,7 +20,7 @@ order header.
 
 ## Verification
 - The `build` gate proves AC-5. AC-2 and AC-3 need the database and a manual test in the
-  environment, by the owner after the `dbsync` gate and the final approval.
+  environment, by the owner after the final approval and a deploy from Visual Studio.
 
 ## Allow protected
 <!-- Only when THIS task must change a protected file (a build project, a descriptor, AGENTS.md…): one path per line, "- " first, e.g. the next line without its comment marks. Without such a line an agent's change to a protected file is restored. -->

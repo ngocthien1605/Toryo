@@ -2747,7 +2747,7 @@ mod tests {
         let m = d.path().join("machine.yaml");
         std::fs::write(
             &m,
-            format!("profiles:\n  claude-max: {{ kind: claude, billing: subscription, exe: claude }}\n  codex-openai: {{ kind: codex, billing: subscription, exe: codex, codex: {{ windows_sandbox: unelevated }} }}\nenvironment_gates:\n  dbsync: {{ program: powershell, args: [-NoProfile, -File, '{tmp}/gates/dbsync.ps1'], lock: d365-env }}\n"),
+            "profiles:\n  claude-max: { kind: claude, billing: subscription, exe: claude }\n  codex-openai: { kind: codex, billing: subscription, exe: codex, codex: { windows_sandbox: unelevated } }\n",
         )
         .unwrap();
         let cfg = crate::config::Effective::load(&y, Some(&m)).unwrap();
@@ -2757,7 +2757,8 @@ mod tests {
             team.role("implementer").unwrap().skills,
             ["xpp-axclass", "xpp-batch"]
         );
-        assert!(team.gates["dbsync"].machine.is_some());
+        // deploy and DB sync are the owner's step on a UDE: the template declares `build` only
+        assert_eq!(team.gates.keys().collect::<Vec<_>>(), ["build"]);
         assert_eq!(cfg.repo.commands.verify[0].name, "build");
         // the TODO(owner) items at the top of every new file
         let new_files = [
