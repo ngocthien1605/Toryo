@@ -2360,6 +2360,46 @@ mod tests {
         assert!(e.contains("not found on PATH"), "{e}");
     }
 
+    /// M13-R8: a directory junction named like a program is a folder, not a program — and a
+    /// real file is still one.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_junction_is_not_startable() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("realdir");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = d.path().join("prog.exe");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !made {
+            eprintln!("skipped: no junction could be made here");
+            return;
+        }
+        assert!(!crate::engine::gates::startable(&link));
+        let file = d.path().join("real.exe");
+        std::fs::write(&file, "x").unwrap();
+        assert!(crate::engine::gates::startable(&file));
+    }
+
+    /// M13-R8: the preflight of an environment gate and of a check gate share one resolver —
+    /// a program only the system folder has (`cmd`) is found by both, with an empty PATH.
+    #[cfg(windows)]
+    #[test]
+    fn the_two_preflights_find_the_same_programs() {
+        let (d, y, m) = draft_repo(&[]);
+        let cfg = crate::config::Effective::load(&y, Some(&m)).unwrap();
+        let empty = std::env::join_paths([d.path().join("nowhere")]).unwrap();
+        assert_eq!(
+            crate::engine::gates::program_problem("cmd", Some(&empty)),
+            None
+        );
+        assert!(crate::engine::runner::env_gate_program(&cfg, "cmd", Some(&empty)).is_ok());
+    }
+
     /// M13-08: an environment gate's program is found with the leniency of a check gate's
     /// (`gates::startable`). A file `is_file()` cannot see through — an App Execution Alias of
     /// the Store `pwsh.exe`; here a file link whose target is missing — is not "not found" at

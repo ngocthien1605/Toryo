@@ -70,7 +70,7 @@ toryo reject  ID --gate plan|final --reason "…"
 toryo resume [ID] [--note "…" | --discard-partial | --keep-partial | --accept-protected-change PATH]
                                           # no id: every waiting task as it is (never one still in New)
 toryo stop ID                             # ask the running owner to stop; Ctrl+C in the window of `toryo run`
-                                          # does the same (a second Ctrl+C ends the process at once)
+                                          # or `toryo resume` does the same (a second Ctrl+C ends the process at once)
 toryo status [ID] [--json] · toryo task list|show ID [--json] · toryo watch ID [--json]
 toryo task config ID [--reload]           # the frozen configuration; reload only while the task waits
 toryo task cleanup ID [--force]           # --force when it would delete unsaved work or snapshots

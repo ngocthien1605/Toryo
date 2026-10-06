@@ -277,9 +277,10 @@ fn f4_recovery_never_resets_or_commits_on_the_branch_the_agent_switched_to() {
         "B-1",
         code,
         &err,
-        // (M13-01: the way out no longer says "again first" — it names the resume that undoes
-        // the commits made since the anchor, so the text cannot walk the owner past the check)
-        &format!("policy_violation: after the Implementer turn HEAD is on refs/heads/other, not on the task branch toryo/B-1 (R12); nothing was reset or committed — check out toryo/B-1 again; `toryo resume B-1 --note \"…\"` then undoes the commits made since {} into the tree and checks them", &base[..12]),
+        // (M13-01: the way out no longer says "again first"; M13-R8: with HEAD on another branch
+        // the task branch was not touched — after the owner checks it out the resume starts at the
+        // anchor, and what was committed on the other branch stays there)
+        &format!("policy_violation: after the Implementer turn HEAD is on refs/heads/other, not on the task branch toryo/B-1 (R12); nothing was reset or committed — check out toryo/B-1 again; `toryo resume B-1 --note \"…\"` then starts at {} (what was committed on the other branch stays there)", &base[..12]),
     );
     // … which is true: the teammate's branch holds the teammate's and the agent's commits,
     // the task branch its base, the worktree the agent's edit

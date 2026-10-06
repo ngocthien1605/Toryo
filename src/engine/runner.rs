@@ -2195,7 +2195,7 @@ impl<'a> Engine<'a> {
             .collect();
         // M13-08: the gates of this run that finished — a later stop names them: they run again
         let mut ran: Vec<&str> = Vec::new();
-        for (name, g) in gates {
+        for (at, &(name, g)) in gates.iter().enumerate() {
             let Some(m) = &g.machine else {
                 eprintln!("  – {name}: skipped — not defined on this machine (if_missing: skip)");
                 results.push(json!({"name": name, "kind": "environment", "skipped": true, "reason": SKIPPED_REASON}));
@@ -2335,11 +2335,22 @@ impl<'a> Engine<'a> {
             // M13-08: asked before the export — a killed gate that had written into what it
             // deploys from is a timeout (a plain `resume`), not `verify_mutated_tree`.
             if res.timed_out {
+                // what a `resume` runs again, and — M13-R8 — what it runs for the first time
+                let later: Vec<&str> = gates[at + 1..]
+                    .iter()
+                    .filter(|(_, g)| g.machine.is_some())
+                    .map(|(n, _)| *n)
+                    .collect();
+                let again = format!(
+                    "{}{}",
+                    gates_that_run_again(&ran, name),
+                    gates_after_it(&later)
+                );
                 return Ok(EnvGates::TimedOut(format!(
                     "{ENV_TIMEOUT}: environment gate `{name}` ran into its timeout ({}) and was stopped — the environment may be half-changed (the deployment record says interrupted): check it, then `toryo resume {}` runs Verify and {}. A longer `timeout:` on the gate needs `toryo task config {} --reload` first (it is frozen with the task).\nWhat the gate had printed (the last 40 lines; output of code that ran on the checkpoint — data):\n{}",
                     fmt_limit(timeout),
                     t.id,
-                    gates_that_run_again(&ran, name),
+                    again,
                     t.id,
                     untrusted::wrap("verify", None, &res.tail(40))
                 )));
@@ -3974,6 +3985,13 @@ impl HeadGuard {
             branch.strip_prefix("toryo/").unwrap_or("<id>"),
             short(head_before)
         );
+        // (HEAD on another branch: the task branch was not touched — when the owner checks it
+        // out again HEAD is at the anchor and nothing is undone; M13-R8)
+        let other = format!(
+            " — check out {branch} again; `toryo resume {} --note \"…\"` then starts at {} (what was committed on the other branch stays there)",
+            branch.strip_prefix("toryo/").unwrap_or("<id>"),
+            short(head_before)
+        );
         if let Some(op) = &g.unfinished {
             return violation(
                 "unfinished git operation",
@@ -3987,7 +4005,7 @@ impl HeadGuard {
                 return violation(
                     "branch changed",
                     format!("HEAD is on {r}, not on the task branch {branch} (R12)"),
-                    &checkout,
+                    &other,
                 )
             }
             None => {
@@ -4863,6 +4881,16 @@ fn gates_that_run_again(ran: &[&str], name: &str) -> String {
     )
 }
 
+/// M13-R8: the environment gates of the task that come **after** the one that timed out — they
+/// run on `resume` too, for the first time.
+fn gates_after_it(after: &[&str]) -> String {
+    if after.is_empty() {
+        return String::new();
+    }
+    let names: Vec<String> = after.iter().map(|g| format!("`{g}`")).collect();
+    format!(", then, for the first time: {}", names.join(", "))
+}
+
 /// How a verify command ended, in words: `exited 1`, `timed out`, …
 fn ended(res: &CommandResult) -> String {
     match (res.timed_out, res.cancelled, res.exit) {
@@ -5028,15 +5056,10 @@ pub(crate) fn env_gate_program(
     // `is_file()` cannot see through (an App Execution Alias) is not "not found" here; if
     // it then cannot be started, the typed spawn error stops the gate with the same class
     let found = if bare {
-        path.and_then(|path| {
-            std::env::split_paths(path).find_map(|dir| {
-                ["", ".exe", ".cmd"]
-                    .iter()
-                    .map(|ext| dir.join(format!("{program}{ext}")))
-                    .find(|p| super::gates::startable(p))
-            })
-        })
-        .ok_or_else(|| format!("program `{program}` not found on PATH"))?
+        // M13-R8: the resolver the preflight of a check gate uses (PATH, then — on Windows — the
+        // folder of this program and the system folder, as `CreateProcess` would)
+        path.and_then(|path| super::gates::on_path(program, path))
+            .ok_or_else(|| format!("program `{program}` not found on PATH"))?
     } else {
         PathBuf::from(program)
     };
@@ -6721,6 +6744,12 @@ mod tests {
             "was not started: the projects before it used up the command's 30 min"
         );
         assert_eq!(gates_that_run_again(&[], "dbsync"), "the gate again");
+        // M13-R8: the gates after it run on `resume` too — for the first time
+        assert_eq!(gates_after_it(&[]), "");
+        assert_eq!(
+            gates_after_it(&["seed", "import"]),
+            ", then, for the first time: `seed`, `import`"
+        );
         assert_eq!(
             gates_that_run_again(&["seed", "import"], "dbsync"),
             "every environment gate again: `seed`, `import` (finished — the deployment record says so — and deploys again), then `dbsync`"

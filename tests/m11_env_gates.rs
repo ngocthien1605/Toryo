@@ -2357,7 +2357,13 @@ fn m12_07_confirm_first_stops_before_any_gate_and_resume_is_the_yes() {
             && why.contains("show --stat"),
         "{why}"
     );
-    let _ = head;
+    // M13-R8: the `next:` line of `status` shows the checkpoint, not the `HEAD` fallback
+    let head = head.expect("a checkpoint");
+    let next = toryo::engine::runner::next_action(&t);
+    assert!(
+        next.contains(&format!("show --stat {}", toryo::git::short(&head))),
+        "{next}"
+    );
     assert!(!probe.exists(), "no check gate ran");
     assert!(
         !marker.exists() && deployments(&env).is_empty(),

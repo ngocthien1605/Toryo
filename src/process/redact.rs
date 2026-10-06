@@ -70,10 +70,16 @@ impl Redactions {
             // M13-03: a value of line breaks only is not a secret — as a pattern it would
             // redact every line end
             if s.value.bytes().all(|b| b == b'\n') {
-                eprintln!(
-                    "note: the secret `{}` holds only line breaks — it is not redacted",
-                    sanitize_name(&s.name)
-                );
+                // (M13-R8: once per process and name — every spawn builds its matcher again)
+                static NOTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                let name = sanitize_name(&s.name);
+                let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
+                if !noted.contains(&name) {
+                    eprintln!(
+                        "note: the secret `{name}` holds only line breaks — it is not redacted"
+                    );
+                    noted.push(name);
+                }
                 continue;
             }
             let repl = format!("[REDACTED:{}]", sanitize_name(&s.name)).into_bytes();

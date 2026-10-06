@@ -501,7 +501,7 @@ few holes are left. Eight commits `(M13-R1 … R8)` on the same branch. Test cou
 - [x] R5 `start_at_anchor` trusts a detached or mid-merge HEAD; `foreign_commit` accepts a merge commit (X31)
 - [x] R6 Toryo's own `git` children share the console
 - [x] R7 Safety-adjacent Lows
-- [ ] R8 Texts, tests and doctor Lows
+- [x] R8 Texts, tests and doctor Lows
 - [ ] Finish: push, comment on the pull request, CI
 
 ### R1 — Replace refs (X30)
@@ -614,3 +614,54 @@ few holes are left. Eight commits `(M13-R1 … R8)` on the same branch. Test cou
 7. **`NotStarted`** — `create_dir_all(run_dir)` and the two `Capture::create` calls are classed `NotStarted` as the list says; I also classed the two
    small writes between them (the prompt and the meta file), which run before any process exists too. *By reading* (no test: a profile cannot be
    made to fail there without a seam).
+
+### R8 — Texts, tests and doctor Lows
+
+1. `is_device_name` also refuses `COM0` and `LPT0`. **Earlier assertion changed (named in the commit):** `lock::tests::lock_names_refuse_device_names_and_ignore_case`
+   listed `com0` among the fine names; it is now a refused one (with `LPT0.x`).
+2. `TORYO_TEST_INTERRUPT_AFTER_MS`: the doc comment says each time is milliseconds after the **start of the process**, not after the previous press
+   (`6000,6000` is two presses at once; `6000,12000` would not do); the same sentence is a comment at the test string in `m12_cli.rs`. *Texts.*
+3. The timeout reason of M13-08 names the gates **after** the one that timed out (`gates_after_it`: ", then, for the first time: …"; only gates defined on
+   this machine). Unit test next to `gates_that_run_again` (whose assertions are unchanged). HUONG-DAN §9.1 row `environment_gate_timeout` says every gate.
+4. `env_gate_program` uses `gates::on_path` (PATH, then on Windows the folder of the program and the system folder) — one resolver with
+   `program_problem`; `startable` no longer counts a directory junction or directory symlink. Windows tests: `team::tests::the_two_preflights_find_the_same_programs`
+   (`cmd` with an empty PATH), `a_directory_junction_is_not_startable` (skips itself when no junction can be made).
+5. The HeadGuard "branch changed" text says "… then starts at <anchor> (what was committed on the other branch stays there)". **Earlier assertion changed
+   (named in the commit):** the three "branch changed" cases of `the_head_guard_resets_only_an_agent_commit_on_the_task_branch` expect the new tail;
+   the detached case keeps "undoes the commits made since …".
+6. `m12_07_confirm_first_stops_before_any_gate_and_resume_is_the_yes` also asserts that `next_action` of the stopped task shows `show --stat <short(checkpoint)>`
+   (was: only the `HEAD` fallback was unit-tested). An added assertion, not a changed one.
+7. `team::tests::a_gate_program_is_file_cannot_see_through_passes_the_preflight` **already printed** "skipped: this account may not create a file link" before it
+   returns (M13-08) — nothing to change; cargo shows it only with `--nocapture`.
+8. `doctor`: when `git` cannot be started the `core.longpaths` line is `[info] could not ask git (<error>)` (`git_long_paths_probe`; unit test with an
+   `Err`). The probe is the same single call as before.
+9. README: Ctrl+C applies to `toryo resume` too. *Text.*
+10. `Redactions::new`: the "holds only line breaks" note is printed once per process and name. *By reading* (a counter of stderr lines is not worth a seam).
+
+Tests for items 3 (helper), 4, 8 were written with the change (a compile error is their "fails before"); 1, 5 and 6 changed or added an assertion that fails
+on the old code.
+
+## Open (review fixes)
+
+- **R5 deviation:** the strict "HEAD on the task branch, no operation unfinished" test is applied to a **fresh checkpoint**, not to the start of a writing
+  attempt (the list asks for both): the start would have changed four cases of the `ec18_…` tests, which break the state before the turn and expect the
+  HEAD guard after it; the turn is wasted but no history is touched. See R5.
+- **R4:** the pending undo is run only for an attempt that carries the marker (my narrowing); an owner who edits the tree between the escalation and the
+  `resume` is not mistaken for the role. A `Failed` marker attempt followed by a *read-only* attempt (not a writing one) is not looked at by `start_at_anchor`.
+  The undo may delete the role's untracked protected file after the protected check recorded it (event and diff stay).
+- **R4/R7:** the `Err` of `hub.turn_with` / `usage()` in `read_only_turn` still cannot be provoked with the fake agent: it is covered through the shared
+  helper `read_only_findings` (the R4 tests), not on its own.
+- **R6:** no test that fails before the change (the flag cannot be read back from a `Command`, and a Ctrl+C at a Git call in flight cannot be timed); the
+  Unix half of its unit test (a process-group check through a Git alias, needs `ps`) is written by reading — CI is its first build.
+- **R1:** a replace ref that exists only in `packed-refs` is not listed as protected metadata (it has no effect on Toryo's Git either way).
+- **R7:** `git worktree prune` in the `Made::Drop` fallback and in `task cleanup --force` still forgets every stale entry of the repository.
+- **Linux:** the new Unix-only code (R6) and the R2 hook are built and run first by `test (ubuntu-latest)` of the pull request.
+
+### Counts after the review fixes
+
+- **Windows:** 732 passed / 0 failed / 6 ignored before → **750 passed / 0 failed / 6 ignored** after (18 new tests; the full suite ran green before every commit:
+  735 (R1), 735 (R2), 737 (R3), 741 (R4), 744 (R5), 745 (R6), 748 (R7), and R8: 749 + the one `f4_` test whose expected text the list changes, rerun green
+  with the whole `regress_recovery` file). **Linux:** the review lead's build of `4ec8fc8` was 749 passed / 1 failed; this round's count is the one
+  `test (ubuntu-latest)` prints on the pull request.
+- **R1:** `GIT_NO_REPLACE_OBJECTS=1` switches replace refs off; `info/grafts` is a separate, deprecated mechanism Git may still read — for grafts the defence is
+  the protected-metadata scan (a change is `protected_config_changed`), not the variable (the comment in `protect.rs` and X30 say so).

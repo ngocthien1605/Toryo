@@ -26,14 +26,28 @@ const SCRIPT_EXTENSIONS: [&str; 8] = [".ps1", ".psm1", ".cmd", ".bat", ".sh", ".
 /// typed spawn error stops the gate the same way.
 pub(crate) fn startable(p: &Path) -> bool {
     p.is_file()
-        || (cfg!(windows) && std::fs::symlink_metadata(p).is_ok_and(|m| !m.file_type().is_dir()))
+        || (cfg!(windows)
+            && std::fs::symlink_metadata(p)
+                .is_ok_and(|m| !m.file_type().is_dir() && !is_dir_link(&m.file_type())))
+}
+
+/// A directory junction or directory symlink (Windows) — a folder, however it is reached, never a
+/// program (M13-R8).
+#[cfg(windows)]
+fn is_dir_link(ft: &std::fs::FileType) -> bool {
+    use std::os::windows::fs::FileTypeExt;
+    ft.is_symlink_dir()
+}
+#[cfg(not(windows))]
+fn is_dir_link(_: &std::fs::FileType) -> bool {
+    false
 }
 
 /// `name` the way the engine starts a bare program: a folder of `path` with nothing, `.exe` or
 /// `.cmd` appended (`checks::which_in`) — not `PATHEXT`: a `.bat` or `.com` alone does not start
 /// (M12-05 review) — then, as `CreateProcess` would, the folder of this program and the system
 /// folder on Windows.
-fn on_path(name: &str, path: &OsStr) -> Option<PathBuf> {
+pub(crate) fn on_path(name: &str, path: &OsStr) -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
     if cfg!(windows) {
         dirs.extend(

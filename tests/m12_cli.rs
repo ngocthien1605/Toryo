@@ -359,6 +359,9 @@ fn m13_12_a_second_ctrl_c_ends_the_process_at_once() {
     let env = setup("codex-openai");
     create(&env, "K-2");
     let s = script(&env, "k2.json", json!({"planner": [turn(vec![hang()])]}));
+    // (each time is milliseconds after the **start** of the process, not after the previous press:
+    // `6000,6000` is two presses at once — `6000,12000` would fail, the fake ends the turn after
+    // the first press)
     let (code, err) = run_and_press_ctrl_c(&env, "K-2", &s, "6000,6000");
     assert_ne!(code, Some(0), "killed, not ended: {err}");
     let a = attempts(&env, "K-2")

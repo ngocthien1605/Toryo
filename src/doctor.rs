@@ -947,17 +947,13 @@ pub fn long_path_checks(cfg: &Effective) -> Vec<Check> {
     let mut out = Vec::new();
     if let Ok(root) = expand_vars(&cfg.repo.project.root) {
         // the value a plain Git sees there (system, global and repository configuration)
-        let value = std::process::Command::new(crate::git::git_exe())
+        let asked = std::process::Command::new(crate::git::git_exe())
             .arg("-C")
             .arg(&root)
             .args(["config", "--type=bool", "--get", "core.longpaths"])
             .stdin(std::process::Stdio::null())
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
-        if let Some(on) = value {
-            out.push(git_long_paths_check(&root, on));
-        }
+            .output();
+        out.push(git_long_paths_probe(&root, asked));
     }
     let reg = std::env::var_os("SystemRoot")
         .map(|r| PathBuf::from(r).join("System32").join("reg.exe"))
@@ -979,6 +975,20 @@ fn long_paths_enabled(reg_output: &str) -> Option<u32> {
         .find(|l| l.contains("LongPathsEnabled") && l.contains("REG_DWORD"))?;
     let v = line.split_whitespace().last()?;
     u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()
+}
+
+/// The line for what `git config --get core.longpaths` answered — or, when Git could not be
+/// started, an info line that says so (M13-R8: silence looked like "nothing to say").
+fn git_long_paths_probe(root: &str, asked: std::io::Result<std::process::Output>) -> Check {
+    match asked {
+        Ok(o) => git_long_paths_check(root, String::from_utf8_lossy(&o.stdout).trim() == "true"),
+        Err(e) => Check {
+            level: Level::Info,
+            area: "paths".into(),
+            message: format!("could not ask git ({e})"),
+            source: None,
+        },
+    }
 }
 
 fn git_long_paths_check(root: &str, on: bool) -> Check {
@@ -1537,6 +1547,16 @@ mod tests {
             c.message
         );
         assert_eq!(git_long_paths_check("D:\\repo", true).level, Level::Ok);
+        // M13-R8: git that cannot be started is an info line, not silence
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let c = git_long_paths_probe("D:\\repo", Err(err));
+        assert!(
+            c.level == Level::Info
+                && c.area == "paths"
+                && c.message == "could not ask git (no such file)",
+            "{}",
+            c.message
+        );
     }
 
     /// M11-A2 (group A review): the verify-root check probes the root in force — the machine's

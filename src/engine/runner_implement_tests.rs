@@ -108,6 +108,9 @@ fn violation(kind: &'static str, what: &str, fix: &str) -> HeadGuard {
 fn the_head_guard_resets_only_an_agent_commit_on_the_task_branch() {
     // M13-01: the way out names the resume that undoes the commits made since the anchor
     let back = " — check out toryo/T-1 again; `toryo resume T-1 --note \"…\"` then undoes the commits made since 111111111111 into the tree and checks them";
+    // M13-R8: after the owner checks the task branch out HEAD is at the anchor again and nothing
+    // is undone — what the agent committed on the other branch stays there
+    let other = " — check out toryo/T-1 again; `toryo resume T-1 --note \"…\"` then starts at 111111111111 (what was committed on the other branch stays there)";
     let rewritten = GitAfterTurn {
         descends_from_base: false,
         ..git(None, Some(TASK_REF), Some(MOVED))
@@ -151,7 +154,7 @@ fn the_head_guard_resets_only_an_agent_commit_on_the_task_branch() {
             violation(
                 "branch changed",
                 "HEAD is on refs/heads/evil, not on the task branch toryo/T-1 (R12)",
-                back,
+                other,
             ),
         ),
         (
@@ -159,7 +162,7 @@ fn the_head_guard_resets_only_an_agent_commit_on_the_task_branch() {
             violation(
                 "branch changed",
                 "HEAD is on refs/heads/evil, not on the task branch toryo/T-1 (R12)",
-                back,
+                other,
             ),
         ),
         // a branch whose name merely starts with the task branch's is another branch
@@ -168,7 +171,7 @@ fn the_head_guard_resets_only_an_agent_commit_on_the_task_branch() {
             violation(
                 "branch changed",
                 "HEAD is on refs/heads/toryo/T-10, not on the task branch toryo/T-1 (R12)",
-                back,
+                other,
             ),
         ),
         (

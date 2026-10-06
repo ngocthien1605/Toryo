@@ -207,8 +207,10 @@ const INTERRUPT_NOTE: &str = "\nstop requested — the running turn or gate is e
 /// started without a console window, in their Job.
 ///
 /// `TORYO_TEST_INTERRUPT_AFTER_MS` (tests only: `3000`, or `3000,3000` for two presses) makes
-/// the process send itself the console event after that many milliseconds — only for a
-/// process that has a console of its own.
+/// the process send itself the console event, each press that many milliseconds **after the
+/// start of the process** — not after the previous press: `6000,6000` is two presses at once,
+/// `6000,12000` is two presses six seconds apart — only for a process that has a console of
+/// its own.
 pub fn catch_interrupt() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(install_interrupt_handler);
@@ -380,13 +382,13 @@ pub fn lock_name_problem(lock: &str) -> Option<&'static str> {
         return Some("use letters, digits, `-`, `_` and `.` only (e.g. d365-env)");
     }
     if is_device_name(lock) {
-        return Some("is a Windows device name (con, prn, aux, nul, com1–com9, lpt1–lpt9) — choose another (e.g. d365-env)");
+        return Some("is a Windows device name (con, prn, aux, nul, com0–com9, lpt0–lpt9) — choose another (e.g. d365-env)");
     }
     None
 }
 
-/// Whether `name` is a Windows device name — `con`, `prn`, `aux`, `nul`, `com1`–`com9`,
-/// `lpt1`–`lpt9`, in any case, also before a dot (`nul.lock` is the device): no file or
+/// Whether `name` is a Windows device name — `con`, `prn`, `aux`, `nul`, `com0`–`com9`,
+/// `lpt0`–`lpt9`, in any case, also before a dot (`nul.lock` is the device): no file or
 /// folder can have it (M11-R8 for a lock name, M13-14 for a task id).
 pub fn is_device_name(name: &str) -> bool {
     let stem = name
@@ -398,7 +400,9 @@ pub fn is_device_name(name: &str) -> bool {
         stem.strip_prefix(p)
             .is_some_and(|n| n.len() == 1 && ('1'..='9').contains(&n.chars().next().unwrap()))
     };
-    ["con", "prn", "aux", "nul"].contains(&stem.as_str()) || numbered("com") || numbered("lpt")
+    ["con", "prn", "aux", "nul", "com0", "lpt0"].contains(&stem.as_str())
+        || numbered("com")
+        || numbered("lpt")
 }
 
 /// The stored form of a lock name (M11-R8): lower case, so `D365-Env` and `d365-env` are one
@@ -546,13 +550,14 @@ mod tests {
             "COM9",
             "lpt3",
             "lpt1.lock",
+            // M13-R8: COM0 and LPT0 are reserved too
+            "com0",
+            "LPT0.x",
         ] {
             let why = lock_name_problem(bad).unwrap_or_else(|| panic!("{bad}"));
             assert!(why.contains("Windows device name"), "{bad}: {why}");
         }
-        for ok in [
-            "d365-env", "console", "com10", "com0", "lpt", "nul-env", "x.con",
-        ] {
+        for ok in ["d365-env", "console", "com10", "lpt", "nul-env", "x.con"] {
             assert_eq!(lock_name_problem(ok), None, "{ok}");
         }
         assert_eq!(lock_key("D365-Env"), "d365-env");

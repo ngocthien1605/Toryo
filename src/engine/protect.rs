@@ -148,7 +148,9 @@ fn git_meta(g: &GitCmd, wt: &Path) -> Result<Vec<(String, PathBuf)>> {
         Err(e) => return Err(unreadable(&hooks, "list", &e)),
     }
     // M13-R1 (X30): a replace ref or a graft makes a Git that honours it show another history.
-    // Toryo's Git ignores both; a task still needs neither, so a change is hard.
+    // `GIT_NO_REPLACE_OBJECTS` switches replace refs off for Toryo's Git; grafts are a
+    // deprecated mechanism it may still read — for them this scan is the defence. A task needs
+    // neither, so a change is hard.
     v.push((
         format!("{META}info/grafts"),
         common.join("info").join("grafts"),
