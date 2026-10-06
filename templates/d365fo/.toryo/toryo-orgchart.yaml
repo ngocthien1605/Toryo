@@ -117,6 +117,12 @@ culture: ./CULTURE.md              # optional team-wide norms
 #   tool        check only, instead of program/args: a built-in kind.
 #               `xpp` = headless X++ compile with this machine's toolchain
 #               (needs `metadata` and `projects`).
+#   diagnostics check only, with `program`: how the gate's output is read.
+#               `msbuild` = parse MSBuild error lines (`file(line,col): error
+#               CODE: message`, what MSBuild, `dotnet build` and a script that
+#               wraps them print) so the implementer is sent file, line and
+#               code ahead of the output tail. `none` (default) = the tail only.
+#               (`tool: xpp` always does this.)
 #   timeout     give up after this long and kill the whole process tree.
 #               Format: 30s, 20m, 1h. Required.
 #   if_missing  environment only. What to do on a machine whose config does
@@ -148,7 +154,9 @@ gates:
     kind: check
     program: pwsh
     args: [-NoProfile, -NonInteractive, -File, scripts/build-model.ps1]
-    timeout: 20m    # build-model.ps1 must write its output under $env:TORYO_VERIFY_BUILD.
+    timeout: 20m
+    diagnostics: msbuild    # the script wraps MSBuild/xppc: its error lines reach the implementer as file, line, code
+    # build-model.ps1 must write its output under $env:TORYO_VERIFY_BUILD.
     # At Low integrity it CANNOT write to PackagesLocalDirectory. If your
     # script can only build in place, declare it `kind: environment` instead
     # (then a compile error also touches your environment).

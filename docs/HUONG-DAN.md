@@ -278,7 +278,18 @@ toryo xpp build --repo D:\D365-Git --project Projects\Build\ContosoCore.Build.rn
                       # build thật, ngoài task (không worktree, không lock, không DB): in lỗi đã tách,
                       # log đầy đủ ở <verify_root>\xpp-build\<repo>\logs; exit 1 khi lỗi
 toryo xpp build … --low   # như trên nhưng ở Low integrity, từ bản copy Metadata + project (V08-VERIFY 3)
+toryo gate list           # các check gate mà Verify sẽ chạy (gate môi trường chỉ được liệt kê, không chạy ở đây)
+toryo gate run build --print-only   # in lệnh + các biến TORYO_* của gate `build` (mọi loại gate, không chỉ X++)
+toryo gate run build      # chạy thật gate đó ngoài task, ngay trong thư mục repo, bằng quyền của anh
 ```
+
+`gate run` chạy **cây làm việc** hiện tại (không phải một commit, nên `TORYO_SHA=working-tree`) và không có ranh giới
+Low integrity: script có thể ghi vào repo. Nó không bao giờ chạy gate `environment`. `--low` chỉ dùng cho gate
+`tool: xpp` (gate `program` ở Low integrity cần checkout sạch của một commit — chỉ task mới có).
+
+Gate `program` có thêm khoá tuỳ chọn `diagnostics: msbuild` (mặc định `none`): Toryo đọc output để tách các dòng lỗi
+MSBuild (`file(dòng,cột): error MÃ: nội dung` — MSBuild, `dotnet build`, hay script bọc chúng) và gửi cho implementer
+file, dòng, mã trước phần đuôi output (tiêu đề `Build errors`). Không có khoá thì giữ nguyên: chỉ phần đuôi.
 
 ### 4.3 Dữ liệu được lưu ở đâu?
 
@@ -995,7 +1006,7 @@ các bài kiểm tra hiện có dùng MSBuild giả. Vì vậy các bước 1 v�
   administrator (`toryo doctor` cảnh báo ở dòng `token`). Cần quyền admin để deploy → nâng quyền **bên trong** script
   của gate môi trường.
 - **Chạy tay những việc anh phải biết trước**: `toryo xpp build --repo D:\D365-Git --project Projects\Build\<Package>.Build.rnrproj`
-  (thêm `--print-only` để chỉ in lệnh MSBuild; `--low` để thử ở Low integrity). Kết quả của hai lệnh này quyết định
+  (thêm `--print-only` để chỉ in lệnh MSBuild; `--low` để thử ở Low integrity; gate nào khác thì `toryo gate run <tên>`). Kết quả của hai lệnh này quyết định
   `verify.boundary` (`low_integrity` hay chế độ code tin cậy `none`, cái sau cần `verify: { min_boundary: none }` trong
   machine config) và cho thấy build thật mất bao lâu, lỗi biên dịch trông ra sao, thư mục `obj\` nằm đâu.
 - **Quyết định** gate `dbsync` có nằm trong lần chạy đầu không. Nó chạy script của anh, với quyền đầy đủ của anh, ở

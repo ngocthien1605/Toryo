@@ -72,6 +72,9 @@ pub struct GateDecl {
     pub metadata: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub projects: Vec<String>,
+    /// check only, with `program`: `msbuild` | `none` — how the gate's output is read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<String>,
     /// `30s`, `20m`, `1h` ([`parse_duration`]).
     pub timeout: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -425,6 +428,7 @@ pub fn gate_command(name: &str, d: &GateDecl) -> CommandSpec {
         tool: d.tool.clone(),
         metadata: d.metadata.clone(),
         projects: d.projects.clone(),
+        diagnostics: d.diagnostics.clone(),
     }
 }
 
@@ -1070,6 +1074,7 @@ pub fn problems(cfg: &Effective, root: &Path, machine: &str) -> Vec<String> {
                     ("tool", d.tool.is_some()),
                     ("metadata", d.metadata.is_some()),
                     ("projects", !d.projects.is_empty()),
+                    ("diagnostics", d.diagnostics.is_some()),
                 ] {
                     if set {
                         out.push(format!(
@@ -2458,11 +2463,11 @@ mod tests {
         let org = draft_with(
             ORGCHART,
             "    timeout: 20m\n",
-            "    timeout: 20m\n    tool: xpp\n    if_missing: skip\n",
+            "    timeout: 20m\n    tool: xpp\n    diagnostics: msbuild\n    if_missing: skip\n",
         );
         let org = org.replacen(
             "    kind: environment     # command: toryo.local.yaml -> environment_gates.dbsync\n",
-            "    kind: environment\n    program: pwsh\n    args: [-File, x.ps1]\n",
+            "    kind: environment\n    program: pwsh\n    args: [-File, x.ps1]\n    diagnostics: msbuild\n",
             1,
         );
         let (_d, y, m) = draft_repo(&[(ORGCHART, &org)]);
@@ -2472,6 +2477,8 @@ mod tests {
             "gates.build.if_missing: only for an environment gate",
             "gates.dbsync.program: an environment gate has no command in the repository",
             "gates.dbsync.args: an environment gate has no command in the repository",
+            "gates.dbsync.diagnostics: an environment gate has no command in the repository",
+            "gates.build.diagnostics: only for a `program` command",
             "its command is `environment_gates.dbsync` in the machine config",
         ] {
             assert!(e.contains(want), "{want}\n---\n{e}");

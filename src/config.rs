@@ -230,10 +230,19 @@ pub struct CommandSpec {
     /// `tool: xpp`: one X++ project per package, relative to the repository, in build order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub projects: Vec<String>,
+    /// A `program` command: how to read its output. `msbuild` parses MSBuild diagnostic lines
+    /// (`file(line,col): error CODE: message`) so the fix feedback names file, line and code
+    /// (`dotnet build`, a script wrapping MSBuild); `none` (the default) sends only the tail.
+    /// Serialised only when set, so a configuration without it keeps its hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<String>,
 }
 
 /// The built-in verify kinds (`commands.verify[].tool`, R59).
 pub const VERIFY_TOOLS: &[&str] = &["xpp"];
+
+/// The output readers of a `program` command (`commands.verify[].diagnostics`).
+pub const DIAGNOSTICS_FORMATS: &[&str] = &["msbuild", "none"];
 
 /// What a verify command runs, as [`CommandSpec::kind`] reads a validated item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +271,7 @@ impl CommandSpec {
             tool: None,
             metadata: None,
             projects: Vec::new(),
+            diagnostics: None,
         }
     }
 
@@ -276,7 +286,13 @@ impl CommandSpec {
             tool: Some("xpp".into()),
             metadata: Some(metadata.into()),
             projects: projects.iter().map(|p| p.to_string()).collect(),
+            diagnostics: None,
         }
+    }
+
+    /// True when a `program` command's output is read as MSBuild diagnostics.
+    pub fn reads_msbuild(&self) -> bool {
+        self.diagnostics.as_deref() == Some("msbuild")
     }
 
     /// What this command runs. Load-time validation guarantees exactly one of `program` and
@@ -1118,8 +1134,16 @@ pub(crate) fn verify_command_problems(
                 ));
             }
         }
+        if let Some(d) = &c.diagnostics {
+            one_of(out, &format!("{key}.diagnostics"), d, DIAGNOSTICS_FORMATS);
+        }
         return;
     };
+    if c.diagnostics.is_some() {
+        out.push(format!(
+            "{key}.diagnostics: only for a `program` command — `tool: xpp` always reads MSBuild diagnostics"
+        ));
+    }
     if c.program.is_some() {
         out.push(format!("{key}: has both `program` and `tool` — use one"));
     }
@@ -2067,6 +2091,38 @@ commands:
         // unknown toolchain keys are refused by serde
         let e = load_err(&XPP.replace("bp_check: false", "bpcheck: false"));
         assert!(e.contains("bpcheck"), "{e}");
+    }
+
+    /// `diagnostics: msbuild | none` is for a `program` command only; a bad value, or the key on a
+    /// `tool: xpp` command, names its key; a configuration that sets it is another configuration.
+    #[test]
+    fn diagnostics_is_for_program_commands_only() {
+        let verify = |items: &str| {
+            XPP.split("commands:").next().unwrap().to_string() + "commands:\n  verify:\n" + items
+        };
+        let ok = load_str(&verify(
+            "    - { name: build, program: dotnet, args: [build], diagnostics: msbuild }\n    - { name: test, program: dotnet, args: [test], diagnostics: none }\n    - { name: lint, program: pwsh, args: [-File, l.ps1] }\n",
+        ))
+        .unwrap();
+        let v = &ok.repo.commands.verify;
+        assert!(v[0].reads_msbuild() && !v[1].reads_msbuild() && !v[2].reads_msbuild());
+        let plain = load_str(&verify(
+            "    - { name: build, program: dotnet, args: [build] }\n    - { name: test, program: dotnet, args: [test] }\n    - { name: lint, program: pwsh, args: [-File, l.ps1] }\n",
+        ))
+        .unwrap();
+        assert_ne!(ok.sha256(), plain.sha256());
+        assert!(!plain.canonical_json().contains("diagnostics"));
+        let back = Effective::from_frozen(&ok.canonical_json(), Path::new("config.json")).unwrap();
+        assert_eq!(back.sha256(), ok.sha256());
+        let e = load_err(&verify(
+            "    - { name: a, program: dotnet, diagnostics: junit }\n    - { name: b, tool: xpp, metadata: M, projects: [p.rnrproj], diagnostics: msbuild }\n",
+        ));
+        for want in [
+            "commands.verify[0] (a).diagnostics: `junit` is not a valid value (valid: msbuild, none)",
+            "commands.verify[1] (b).diagnostics: only for a `program` command",
+        ] {
+            assert!(e.contains(want), "{want}\n---\n{e}");
+        }
     }
 
     /// M9-B1 AC-3: a configuration without the new keys keeps the hash it had before R59

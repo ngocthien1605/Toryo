@@ -2037,8 +2037,18 @@ impl<'a> Engine<'a> {
                     let limit = xpp::command_timeout(c);
                     let run = at.spec(&c.name, program, args.to_vec(), limit);
                     self.run_verify_command(run, stop)?.map(|res| {
-                        results.push(command_result(c, &res));
-                        (!res.ok()).then(|| verify_feedback_in(&res, "", Some(limit)))
+                        // `diagnostics: msbuild`: the first real errors ahead of the tail
+                        let diags = c
+                            .reads_msbuild()
+                            .then(|| xpp::diagnostics(&res.output, &co.dir));
+                        results.push(command_result_with(c, &res, diags.as_ref()));
+                        (!res.ok()).then(|| {
+                            let errors = diags
+                                .as_ref()
+                                .map(|d| xpp::feedback_errors_as(d, "Build"))
+                                .unwrap_or_default();
+                            verify_feedback_in(&res, &errors, Some(limit))
+                        })
                     })
                 }
                 (CommandKind::Xpp { .. }, Some(tc)) => {
@@ -4803,7 +4813,19 @@ pub fn gate_log_rel(res: &CommandResult) -> Option<String> {
 }
 
 /// One verify command's entry in VERIFY_RESULT.json.
+#[cfg(test)]
 fn command_result(c: &CommandSpec, res: &CommandResult) -> Value {
+    command_result_with(c, res, None)
+}
+
+/// [`command_result`] for a `program` command with `diagnostics: msbuild`: the parsed errors
+/// and the counts join the entry (the same keys as a `tool: xpp` project's, no `kind`/`scope`:
+/// what a program proves is its own business).
+fn command_result_with(
+    c: &CommandSpec,
+    res: &CommandResult,
+    diags: Option<&xpp::Diagnostics>,
+) -> Value {
     let argv: Vec<String> = match c.kind() {
         CommandKind::Program { program, args } => std::iter::once(program.to_string())
             .chain(args.iter().cloned())
@@ -4814,6 +4836,11 @@ fn command_result(c: &CommandSpec, res: &CommandResult) -> Value {
     // M11-R17: the signal that ended it (Unix), only when there is one
     if let Some(s) = res.signal {
         v["signal"] = json!(s);
+    }
+    if let Some(d) = diags {
+        v["diagnostics"] = json!(d.errors);
+        v["errors_total"] = json!(d.errors_total);
+        v["warnings_total"] = json!(d.warnings_total);
     }
     // M12-16: the file with the whole (bounded, redacted) output
     if let Some(l) = gate_log_rel(res) {
@@ -4910,7 +4937,7 @@ fn ended(res: &CommandResult) -> String {
 /// (`scripts/gate.sh`, `.\build.cmd`) names a file of the checkpoint, so it is anchored at the
 /// verify checkout — Windows would otherwise resolve it against toryo's own working
 /// directory. Absolute programs and bare names (a PATH lookup) are unchanged.
-fn verify_program(program: &str, checkout: &Path) -> PathBuf {
+pub fn verify_program(program: &str, checkout: &Path) -> PathBuf {
     use std::path::Component;
     let p = resolve_program(program);
     let relative_path = (program.contains('/') || program.contains('\\'))

@@ -65,7 +65,7 @@ fn verify_root(cli: &Cli) -> PathBuf {
 
 /// `p` as given when absolute (so a printed argv matches the one Verify recorded, whose
 /// separators may be mixed), else made absolute.
-fn absolute(p: &Path) -> Result<PathBuf> {
+pub(crate) fn absolute(p: &Path) -> Result<PathBuf> {
     if p.is_absolute() {
         Ok(p.to_path_buf())
     } else {
@@ -90,8 +90,39 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What one `tool: xpp` build outside a task needs: from `toryo xpp build`'s flags, or from the
+/// `tool: xpp` gate `toryo gate run` found in the configuration.
+pub struct BuildOpts {
+    /// The name the runs carry (`<name>/<project>`): `build` for `xpp build`, the gate's name.
+    pub name: String,
+    pub repo: PathBuf,
+    pub projects: Vec<String>,
+    pub metadata: String,
+    pub out: Option<PathBuf>,
+    pub print_only: bool,
+    pub low: bool,
+    /// Time for all projects together.
+    pub timeout: Duration,
+}
+
 pub fn run(cli: &Cli, cmd: &XppCmd) -> Result<i32> {
     let XppCmd::Build(a) = cmd;
+    build(
+        cli,
+        &BuildOpts {
+            name: "build".into(),
+            repo: a.repo.clone(),
+            projects: a.projects.clone(),
+            metadata: a.metadata.clone(),
+            out: a.out.clone(),
+            print_only: a.print_only,
+            low: a.low,
+            timeout: Duration::from_secs(60 * a.timeout_min),
+        },
+    )
+}
+
+pub fn build(cli: &Cli, a: &BuildOpts) -> Result<i32> {
     for (key, v) in std::iter::once(("--metadata", &a.metadata))
         .chain(a.projects.iter().map(|p| ("--project", p)))
     {
@@ -134,7 +165,8 @@ pub fn run(cli: &Cli, cmd: &XppCmd) -> Result<i32> {
         None => scratch.join("build").join("xpp"),
     };
     let projects: Vec<&str> = a.projects.iter().map(String::as_str).collect();
-    let spec = CommandSpec::xpp("build", &a.metadata, &projects, Some(a.timeout_min));
+    let minutes = a.timeout.as_secs().div_ceil(60).max(1);
+    let spec = CommandSpec::xpp(&a.name, &a.metadata, &projects, Some(minutes));
     // the response files (the properties, see xpp::invocation) go to the scratch folder, which
     // the build itself cannot write
     let runs = xpp::runs(&spec, &tc, &checkout, &out, &scratch).unwrap_or_default();
@@ -199,7 +231,7 @@ pub fn run(cli: &Cli, cmd: &XppCmd) -> Result<i32> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let deadline = Instant::now() + Duration::from_secs(60 * a.timeout_min);
+    let deadline = Instant::now() + a.timeout;
     println!(
         "MSBuild {} · output {} · {}",
         tc.msbuild.display(),
@@ -213,7 +245,7 @@ pub fn run(cli: &Cli, cmd: &XppCmd) -> Result<i32> {
     for r in runs {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            println!("✘ {}: not started — --timeout-min used up", r.name);
+            println!("✘ {}: not started — the timeout is used up", r.name);
             return Ok(1);
         }
         eprintln!("── {} ({}) …", r.name, r.project);
