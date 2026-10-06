@@ -70,6 +70,35 @@ pub(super) fn foreign_commit(
     }
 }
 
+/// How a read-only attempt that was `Running` when its owner died ends (M13-R4, X32): when the
+/// undo of its write could not be done yet ([`super::runner::UNDO_PENDING`] in `undone`) it
+/// ends `Failed` with that reason, so that the next writing attempt finds it and finishes the
+/// undo; otherwise as always, `Interrupted`.
+fn read_only_end(
+    undone: &Option<String>,
+    class: Option<String>,
+    detail: &str,
+) -> (AttemptStatus, AttemptEnd) {
+    match undone {
+        Some(u) if u.contains(super::runner::UNDO_PENDING) => (
+            AttemptStatus::Failed,
+            AttemptEnd {
+                error_class: class.or_else(|| Some("policy_violation".into())),
+                error_detail: Some(u.clone()),
+                ..Default::default()
+            },
+        ),
+        _ => (
+            AttemptStatus::Interrupted,
+            AttemptEnd {
+                error_class: class,
+                error_detail: Some(detail.into()),
+                ..Default::default()
+            },
+        ),
+    }
+}
+
 pub struct Recovery<'a> {
     pub store: &'a Store,
     pub g: &'a GitCmd,
@@ -154,6 +183,42 @@ impl<'a> Recovery<'a> {
             .join(format!("{}-{}", a.stage, a.attempt))
     }
 
+    /// M13-R4 (X32): recovery stops for another reason (a protected change, a missing or
+    /// tampered artifact) in a read-only stage. The role's writes are put back first when the
+    /// record of the tree before its turn is readable (the same undo as after a turn that ended
+    /// normally); when that record is the artifact that is gone, nothing can be put back safely
+    /// and the reason names every dirty path with "not put back". `None`: not a read-only stage,
+    /// an attempt from before M13, or nothing changed.
+    fn undo_before_early_return(
+        &self,
+        t: &TaskRow,
+        atts: &[AttemptRow],
+        wt: &Worktree,
+    ) -> Result<Option<String>> {
+        if !matches!(t.state, St::Planning | St::Reviewing) {
+            return Ok(None);
+        }
+        let Some(a) = atts
+            .iter()
+            .rev()
+            .find(|a| a.status == AttemptStatus::Running)
+        else {
+            return Ok(None);
+        };
+        match super::runner::tree_before(self.store, t, a) {
+            Ok(Some(before)) => super::runner::undo_read_only_write(wt, t, &a.id, &before),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                let paths: Vec<String> = wt.changed()?.into_iter().map(|c| c.1).collect();
+                Ok((!paths.is_empty()).then(|| {
+                    format!(
+                        "the record of the tree before the read-only turn cannot be read ({e:#}), so nothing could be told apart: {paths:?} — not put back"
+                    )
+                }))
+            }
+        }
+    }
+
     /// Reconcile a task after its owner died (or was stopped). Returns what was done.
     pub fn recover(&self, id: &str) -> Result<Vec<String>> {
         let mut notes = Vec::new();
@@ -167,18 +232,17 @@ impl<'a> Recovery<'a> {
             let hard = c.hard();
             if !hard.is_empty() {
                 let reason = protect::escalation_reason(&t.id, &hard, c.diff_path.as_deref());
+                // M13-R4 (X32): the check has run and recorded what it found; the read-only
+                // role's other writes are put back all the same
+                let undone = self.undo_before_early_return(&t, &atts, &wt)?;
+                let reason = match &undone {
+                    Some(u) => format!("{reason}; {u}"),
+                    None => reason,
+                };
                 for a in atts.iter().filter(|a| a.status == AttemptStatus::Running) {
-                    self.finish(
-                        a,
-                        AttemptStatus::Interrupted,
-                        AttemptEnd {
-                            error_class: Some(protect::REASON.into()),
-                            error_detail: Some("owner process ended".into()),
-                            ..Default::default()
-                        },
-                        None,
-                        None,
-                    )?;
+                    let (status, end) =
+                        read_only_end(&undone, Some(protect::REASON.into()), "owner process ended");
+                    self.finish(a, status, end, None, None)?;
                 }
                 let (i, r) = (id.to_string(), reason.clone());
                 self.store.call(move |tx| {
@@ -197,17 +261,16 @@ impl<'a> Recovery<'a> {
             let r = super::artifacts::reconcile(self.store, &t)?;
             notes.extend(r.notes);
             if let Some(problem) = r.problem {
+                // M13-R4 (X32): the undo also runs here — with the record of the tree when it is
+                // readable, and without it the reason names what could not be put back
+                let undone = self.undo_before_early_return(&t, &atts, &wt)?;
+                let problem = match &undone {
+                    Some(u) => format!("{problem}; {u}"),
+                    None => problem,
+                };
                 for a in atts.iter().filter(|a| a.status == AttemptStatus::Running) {
-                    self.finish(
-                        a,
-                        AttemptStatus::Interrupted,
-                        AttemptEnd {
-                            error_detail: Some("owner process ended".into()),
-                            ..Default::default()
-                        },
-                        None,
-                        None,
-                    )?;
+                    let (status, end) = read_only_end(&undone, None, "owner process ended");
+                    self.finish(a, status, end, None, None)?;
                 }
                 if t.state != St::Escalated {
                     let (i, p) = (id.to_string(), problem.clone());
@@ -278,16 +341,8 @@ impl<'a> Recovery<'a> {
                 let mut had = false;
                 for a in atts.iter().filter(|a| a.status == AttemptStatus::Running) {
                     had = true;
-                    self.finish(
-                        a,
-                        AttemptStatus::Interrupted,
-                        AttemptEnd {
-                            error_detail: Some("owner process ended".into()),
-                            ..Default::default()
-                        },
-                        None,
-                        None,
-                    )?;
+                    let (status, end) = read_only_end(&undone, None, "owner process ended");
+                    self.finish(a, status, end, None, None)?;
                     notes.push(format!("{}: interrupted (read-only stage, re-run; Claude resumes its session, R48)", a.id));
                 }
                 if saved {

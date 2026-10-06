@@ -938,13 +938,6 @@ impl<'a> Engine<'a> {
         }))
     }
 
-    /// M13-01 (X24): the **anchor** — the last commit Toryo recorded for the task.
-    fn anchor(&self, t: &TaskRow) -> Result<String> {
-        let i = self.id.clone();
-        let atts = self.store.call(move |tx| store::attempts(tx, &i))?;
-        Ok(anchor_of(t, &atts))
-    }
-
     /// M13-01 (X24): a writing attempt and a fresh checkpoint start at the anchor. HEAD at another
     /// commit is never trusted — and who made that commit is never asked. When HEAD descends
     /// from the anchor on the task branch it is soft-reset to the anchor: the changes of the
@@ -952,7 +945,14 @@ impl<'a> Engine<'a> {
     /// (another branch, a detached HEAD, an unfinished operation, a history that does not
     /// descend from the anchor) nothing is reset and the task escalates. `false`: escalated.
     fn start_at_anchor(&self, t: &TaskRow, wt: &Worktree) -> Result<bool> {
-        let anchor = self.anchor(t)?;
+        let i = self.id.clone();
+        let atts = self.store.call(move |tx| store::attempts(tx, &i))?;
+        // M13-R4 (X32): what a read-only role wrote while HEAD was off the task branch could not
+        // be put back then; the branch is back now, so it is first — before the anchor test
+        if let Some(reason) = finish_pending_undo(self.store, t, &atts, wt)? {
+            eprintln!("note: the read-only role's earlier write is undone now: {reason}");
+        }
+        let anchor = anchor_of(t, &atts);
         let head = wt.head().ok();
         if head.as_deref() == Some(anchor.as_str()) {
             return Ok(true);
@@ -2877,13 +2877,24 @@ impl<'a> Engine<'a> {
         r: &StageOutcome,
         before: &TreeState,
     ) -> Result<Option<Flow>> {
-        if let Some(reason) = self.protected_violation(t, false)? {
+        // M13-R4 (X32): the protected check runs first (it records what it found), and then the
+        // undo runs all the same — a protected change is no reason to leave the role's other
+        // writes in the tree, where the next fix cycle would commit them
+        let protected = self.protected_violation(t, false)?;
+        let wt = Worktree::new(&self.g, &t.worktree);
+        let undone = undo_read_only_write(&wt, t, &a.id, before)?;
+        if let Some(reason) = protected {
+            let reason = match &undone {
+                Some(u) => format!("{reason}; {u}"),
+                None => reason,
+            };
             self.end_and(
                 a,
                 AttemptStatus::Failed,
                 r,
                 AttemptEnd {
                     error_class: Some(protect::REASON.into()),
+                    error_detail: undone.is_some().then(|| reason.clone()),
                     ..Default::default()
                 },
                 Some(Ev::Escalate { reason }),
@@ -2891,8 +2902,7 @@ impl<'a> Engine<'a> {
             )?;
             return Ok(Some(Flow::Next));
         }
-        let wt = Worktree::new(&self.g, &t.worktree);
-        if let Some(reason) = undo_read_only_write(&wt, t, &a.id, before)? {
+        if let Some(reason) = undone {
             self.end_and(
                 a,
                 AttemptStatus::Failed,
@@ -4299,7 +4309,7 @@ pub(super) fn undo_read_only_write(
         }
     }
     if before.head != after.head {
-        return Ok(Some(reason));
+        return Ok(Some(could_not_undo(wt, t, attempt, before, &after, reason)));
     }
     // (again, written): changed before the turn and changed again / clean or absent before it
     let split = |after: &TreeState| -> (Vec<String>, Vec<String>) {
@@ -4405,6 +4415,99 @@ pub(super) fn undo_read_only_write(
         reason.push_str(&format!("; no copy kept of: {}", not_copied.join(", ")));
     }
     Ok(Some(reason))
+}
+
+/// M13-R4 (X32): the newest attempt is a read-only one that ended with "could not be put back
+/// yet" ([`UNDO_PENDING`] in its detail), and HEAD is on the task branch again with no Git
+/// operation unfinished: run the undo with the state that attempt saved before its turn.
+/// `None`: nothing was pending (or it cannot be done yet).
+pub(super) fn finish_pending_undo(
+    store: &Store,
+    t: &TaskRow,
+    attempts: &[AttemptRow],
+    wt: &Worktree,
+) -> Result<Option<String>> {
+    let Some(a) = attempts.last() else {
+        return Ok(None);
+    };
+    if a.status != AttemptStatus::Failed
+        || !a
+            .error_detail
+            .as_deref()
+            .is_some_and(|d| d.contains(UNDO_PENDING))
+    {
+        return Ok(None);
+    }
+    let on_branch = wt.head_ref().ok().flatten() == Some(format!("refs/heads/{}", t.branch));
+    if !on_branch || wt.unfinished_operation()?.is_some() {
+        return Ok(None);
+    }
+    match tree_before(store, t, a)? {
+        Some(before) => undo_read_only_write(wt, t, &a.id, &before),
+        None => Ok(None),
+    }
+}
+
+/// The tail of a reason that says a read-only role's write could not be undone yet (M13-R4,
+/// X32): the next writing attempt, and recovery, look for it and run the undo first.
+pub(super) const UNDO_PENDING: &str =
+    "the next `toryo resume` undoes what the role committed and puts back what it wrote first";
+
+/// M13-R4 (X32): the role moved HEAD and it cannot be reset now (HEAD is off the task branch, or
+/// a Git operation is unfinished). Nothing is reset or put back — a reset would move another
+/// branch — but the reason says so, what is in the tree is copied for the owner, and the
+/// attempt's record ([`UNDO_PENDING`]) makes the next resume undo it once the branch is back.
+fn could_not_undo(
+    wt: &Worktree,
+    t: &TaskRow,
+    attempt: &str,
+    before: &TreeState,
+    after: &TreeState,
+    mut reason: String,
+) -> String {
+    if before.head.is_none() {
+        return reason; // no commit to go back to, ever
+    }
+    let on_branch = wt.head_ref().ok().flatten() == Some(format!("refs/heads/{}", t.branch));
+    let (why, way_out) = if on_branch {
+        (
+            "a Git operation is unfinished in the worktree".to_string(),
+            "after that operation is finished or aborted".to_string(),
+        )
+    } else {
+        (
+            format!("HEAD is not on {}", t.branch),
+            format!("after `git checkout {}`", t.branch),
+        )
+    };
+    // never through a link: a path behind one is not copied
+    let paths: Vec<String> = after
+        .changed_since(before)
+        .into_iter()
+        .filter(|p| !ide_state(p) && link_on_the_way(&t.worktree, p).is_none())
+        .collect();
+    let keep = t
+        .run_store
+        .join("read-only-writes")
+        .join(attempt.replace('/', "-"));
+    let not_copied: Vec<String> = paths
+        .iter()
+        .filter_map(|p| {
+            keep_copy(&t.worktree.join(p), &keep.join(p)).map(|why| format!("{p} ({why})"))
+        })
+        .collect();
+    let in_tree = if paths.is_empty() {
+        String::new()
+    } else {
+        format!(" — in the tree: {paths:?}, copied to {}", keep.display())
+    };
+    reason.push_str(&format!(
+        "; could NOT be put back ({why}){in_tree}: {way_out} {UNDO_PENDING}"
+    ));
+    if !not_copied.is_empty() {
+        reason.push_str(&format!("; no copy kept of: {}", not_copied.join(", ")));
+    }
+    reason
 }
 
 impl TreeState {

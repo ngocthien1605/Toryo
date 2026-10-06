@@ -1666,3 +1666,308 @@ fn m13_14_a_forged_partial_commit_with_a_fenced_file_is_never_accepted() {
         "{err}"
     );
 }
+
+// ── M13-R4 (X32): what a read-only role wrote is put back, however the turn ended ────────────
+
+/// Run `id` to a review turn made of `steps` and let the engine die right after the turn
+/// (`read_only:after_turn`): the checks of the turn never ran. Returns the worktree.
+fn die_after_the_review(env: &Env, id: &str, steps: Vec<Value>) -> PathBuf {
+    create(env, id);
+    let s = script(
+        env,
+        "r4-to-checkpoint.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+        }),
+    );
+    let (code, err) = toryo(
+        env,
+        &["run", id, "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "checkpoint:after_commit")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let s2 = script(
+        env,
+        "r4-review-dies.json",
+        json!({ "reviewer": [turn(steps)] }),
+    );
+    let (code, err) = toryo(
+        env,
+        &["resume", id, "--yes", "--fake-agents", &s2],
+        &[("TORYO_TEST_CRASH_AT", "read_only:after_turn")],
+    );
+    assert_eq!(code, 86, "{err}");
+    wt(env, id)
+}
+/// AC-1. The reviewer commits `src/Evil.psm1` on the task branch and detaches HEAD there. Was:
+/// the soft reset was skipped, nothing was put back or copied, and after the owner checked the
+/// branch out again the fix cycle took the file for an ordinary change and committed it under
+/// the implementer's name (the EC-31 outcome). Now the reason says what could not be put back and
+/// why, and the next attempt first undoes the role's write.
+#[test]
+fn m13_r4_a_reviewer_that_left_the_branch_is_undone_once_the_branch_is_back() {
+    let env = setup("codex-openai");
+    create(&env, "R-4");
+    let s = script(
+        &env,
+        "r4a.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["run", "R-4", "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "review:after_begin")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let w = wt(&env, "R-4");
+    let c1 = rev(&w, "HEAD");
+    let branch = env.repo.join(".git/refs/heads/toryo/R-4");
+    let x = commit_of(
+        &env,
+        &w,
+        &c1,
+        Some(&c1),
+        &[("src/Evil.psm1", "evil\n")],
+        "reviewer commit",
+    );
+    let s2 = script(
+        &env,
+        "r4b.json",
+        json!({ "reviewer": [turn(vec![
+            write("src/Evil.psm1", "evil\n"),
+            put(&branch, &format!("{x}\n")),
+            put(&git_dir(&w).join("HEAD"), &format!("{x}\n")),
+            approved(),
+        ])] }),
+    );
+    let (_, err) = toryo(&env, &["resume", "R-4", "--yes", "--fake-agents", &s2], &[]);
+    assert_eq!(task(&env, "R-4").state, St::Escalated, "{err}");
+    let why = reason(&env, "R-4");
+    assert!(
+        why.contains("could NOT be put back (HEAD is not on toryo/R-4)")
+            && why.contains("git checkout toryo/R-4"),
+        "{why}"
+    );
+    // the owner does what the text says
+    git(&w, &["checkout", "-q", "toryo/R-4"]);
+    assert_eq!(rev(&w, "HEAD"), x);
+    let s3 = script(
+        &env,
+        "r4c.json",
+        json!({
+            "implementer": [turn(vec![implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "R-4",
+            "--note",
+            "go on",
+            "--yes",
+            "--fake-agents",
+            &s3,
+        ],
+        &[],
+    );
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!files.contains("Evil"), "{files}\n{err}");
+    let log = git(&w, &["log", "--format=%H", "main..HEAD"]);
+    assert!(!log.contains(&x), "{log}");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "R-4").state, St::Completed, "{err}");
+    // a copy for the owner, in the folder of whichever review attempt it was
+    let kept = task(&env, "R-4").run_store.join("read-only-writes");
+    let copies: Vec<PathBuf> = std::fs::read_dir(&kept)
+        .unwrap()
+        .flatten()
+        .map(|d| d.path().join("src").join("Evil.psm1"))
+        .filter(|p| p.exists())
+        .collect();
+    assert_eq!(copies.len(), 1, "{}", kept.display());
+}
+
+/// AC-2. The reviewer runs with the owner's token: it writes a file and a **protected** one
+/// (`.claude/settings.local.json`) and the engine dies after the turn. Was: recovery found the
+/// protected change first and escalated without the undo; `resume --note` then committed the
+/// reviewer's file. Now the escalation is still `protected_config_changed`, and the reviewer's
+/// file is put back, with a copy in the run store.
+#[test]
+fn m13_r4_a_protected_change_does_not_keep_the_reviewers_write_in_the_tree() {
+    let env = setup("codex-openai");
+    let w = die_after_the_review(
+        &env,
+        "R-5",
+        vec![
+            write("src/Evil.psm1", "evil\n"),
+            write(".claude/settings.local.json", "{\"hooks\": {}}\n"),
+            approved(),
+        ],
+    );
+    assert!(w.join("src/Evil.psm1").exists(), "not undone yet");
+    let s = script(
+        &env,
+        "r5.json",
+        json!({"reviewer": [turn(vec![approved()])]}),
+    );
+    let (code, err) = toryo(&env, &["resume", "R-5", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "R-5").state, St::Escalated, "{err}");
+    assert!(
+        reason(&env, "R-5").starts_with("protected_config_changed"),
+        "{}",
+        reason(&env, "R-5")
+    );
+    let status = git(&w, &["status", "--porcelain"]);
+    assert!(!status.contains("Evil"), "put back: {status}\n{err}");
+    let copy = task(&env, "R-5")
+        .run_store
+        .join("read-only-writes")
+        .join("R-5-review-1")
+        .join("src/Evil.psm1");
+    assert_eq!(std::fs::read_to_string(&copy).unwrap(), "evil\n");
+}
+
+/// AC-2, the other early return: the record of the tree before the turn (`tree-before`) is the
+/// artifact that is gone. Nothing can be put back safely, and the reason says which paths are
+/// dirty and that they were **not** put back.
+#[test]
+fn m13_r4_without_the_record_of_the_tree_the_reason_names_what_was_not_put_back() {
+    let env = setup("codex-openai");
+    let w = die_after_the_review(
+        &env,
+        "R-6",
+        vec![write("src/Evil.psm1", "evil\n"), approved()],
+    );
+    // the record is removed from the run store
+    let mut gone = 0;
+    let mut stack = vec![task(&env, "R-6").run_store.join("runstore")];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.to_string_lossy().contains("tree-before") {
+                std::fs::remove_file(&p).unwrap();
+                gone += 1;
+            }
+        }
+    }
+    assert!(gone > 0, "the record of the tree was found and removed");
+    let s = script(
+        &env,
+        "r6.json",
+        json!({"reviewer": [turn(vec![approved()])]}),
+    );
+    let (code, err) = toryo(&env, &["resume", "R-6", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "R-6").state, St::Escalated, "{err}");
+    let why = reason(&env, "R-6");
+    assert!(
+        why.starts_with("artifact_missing")
+            && why.contains("src/Evil.psm1")
+            && why.contains("not put back"),
+        "{why}"
+    );
+    assert!(
+        w.join("src/Evil.psm1").exists(),
+        "nothing is put back without the record"
+    );
+}
+
+/// AC-1 in recovery: the same, but the engine dies after the reviewer's turn, so it is recovery
+/// that finds HEAD off the branch. The attempt ends `Failed` with the "could NOT be put back"
+/// reason (not `Interrupted`), and the next writing attempt finishes the undo.
+#[test]
+fn m13_r4_recovery_that_finds_head_off_the_branch_leaves_the_undo_to_the_next_attempt() {
+    let env = setup("codex-openai");
+    create(&env, "R-7");
+    let s = script(
+        &env,
+        "r7a.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["run", "R-7", "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "checkpoint:after_commit")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let w = wt(&env, "R-7");
+    let c1 = rev(&w, "HEAD");
+    let branch = env.repo.join(".git/refs/heads/toryo/R-7");
+    let x = commit_of(
+        &env,
+        &w,
+        &c1,
+        Some(&c1),
+        &[("src/Evil.psm1", "evil\n")],
+        "reviewer commit",
+    );
+    let s2 = script(
+        &env,
+        "r7b.json",
+        json!({ "reviewer": [turn(vec![
+            write("src/Evil.psm1", "evil\n"),
+            put(&branch, &format!("{x}\n")),
+            put(&git_dir(&w).join("HEAD"), &format!("{x}\n")),
+            approved(),
+        ])] }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["resume", "R-7", "--yes", "--fake-agents", &s2],
+        &[("TORYO_TEST_CRASH_AT", "read_only:after_turn")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let s3 = script(
+        &env,
+        "r7c.json",
+        json!({"reviewer": [turn(vec![approved()])]}),
+    );
+    let (code, err) = toryo(&env, &["resume", "R-7", "--yes", "--fake-agents", &s3], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "R-7").state, St::Escalated, "{err}");
+    assert!(
+        reason(&env, "R-7").contains("could NOT be put back (HEAD is not on toryo/R-7)"),
+        "{}",
+        reason(&env, "R-7")
+    );
+    let last = attempts(&env, "R-7").pop().unwrap();
+    assert_eq!(last.status, AttemptStatus::Failed, "{last:?}");
+    git(&w, &["checkout", "-q", "toryo/R-7"]);
+    let s4 = script(
+        &env,
+        "r7d.json",
+        json!({
+            "implementer": [turn(vec![implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &[
+            "resume",
+            "R-7",
+            "--note",
+            "go on",
+            "--yes",
+            "--fake-agents",
+            &s4,
+        ],
+        &[],
+    );
+    let files = git(&w, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(!files.contains("Evil"), "{files}\n{err}");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "R-7").state, St::Completed, "{err}");
+}

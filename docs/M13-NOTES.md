@@ -493,7 +493,7 @@ few holes are left. Eight commits `(M13-R1 … R8)` on the same branch. Test cou
 - [x] R1 Replace refs defeat every diff-based check (X30)
 - [x] R2 `m13_11_…_after_the_worktree…` fails on Linux (Git 2.43)
 - [x] R3 The output cut holds post-redaction bytes
-- [ ] R4 A read-only write is left in the tree when HEAD was off the branch or recovery stopped first (X32)
+- [x] R4 A read-only write is left in the tree when HEAD was off the branch or recovery stopped first (X32)
 - [ ] R5 `start_at_anchor` trusts a detached or mid-merge HEAD; `foreign_commit` accepts a merge commit (X31)
 - [ ] R6 Toryo's own `git` children share the console
 - [ ] R7 Safety-adjacent Lows
@@ -533,3 +533,27 @@ few holes are left. Eight commits `(M13-R1 … R8)` on the same branch. Test cou
   **repeats** inside the fragment (`bbbb…`), where one marker per secret is not a bound: `ceil(longest marker / shortest pattern)`. Unit test
   `the_cut_hold_covers_a_fragment_full_of_markers` (twenty markers). `a_secret_next_to_the_cut_is_whole_or_gone` and the M13-04 e2e test pass unchanged.
   Cost: with no secret configured the hold is 0 as before; with secrets a few hundred bytes to ~2 KB are dropped at each cut.
+
+### R4 — A read-only write is put back however the turn ended (X32)
+
+- **Failing tests first** (all failed at the commit before): `regress_recovery::m13_r4_a_reviewer_that_left_the_branch_is_undone_once_the_branch_is_back`
+  (AC-1: the reviewer commits `src/Evil.psm1` on the branch and detaches HEAD there; after the owner checks the branch out, `resume --note` committed
+  the file), `m13_r4_a_protected_change_does_not_keep_the_reviewers_write_in_the_tree` (AC-2: a file and a new `.claude/settings.local.json`, the engine
+  dies after the turn; `resume` escalated with `src/Evil.psm1` still in the tree), `m13_r4_without_the_record_of_the_tree_the_reason_names_what_was_not_put_back`
+  (the `tree-before` artifacts are removed). Added after the fix, same mechanism through recovery: `m13_r4_recovery_that_finds_head_off_the_branch_leaves_the_undo_to_the_next_attempt`.
+- **Off the branch** (`could_not_undo`, called by `undo_read_only_write` when HEAD cannot be reset): the reason now says "could NOT be put back (HEAD is
+  not on <branch>) [— in the tree: …, copied to …]: after `git checkout <branch>` the next `toryo resume` undoes what the role committed and puts back
+  what it wrote first" (`runner::UNDO_PENDING`, the marker). Paths behind a link are not copied. With "an unfinished Git operation" the text says
+  that instead of the branch.
+- **The next writing attempt** (`start_at_anchor`, before the anchor test, which also covers the fresh checkpoint) calls `finish_pending_undo`: the
+  newest attempt is `Failed` with `UNDO_PENDING` in its detail, HEAD is on the branch with no operation unfinished, and its `tree-before` is
+  readable → `undo_read_only_write` with that state. **Narrowing (my choice, recorded):** only an attempt that carries the marker is looked at —
+  an undo that completed is never repeated, so what the owner changes later is not taken for the role's write (Open #14 stays as it was).
+- **Recovery** (`Planning | Reviewing`): an attempt that was `Running` ends `Failed` with the reason when it carries the marker (`read_only_end`), else
+  `Interrupted` as before.
+- **Early returns** of `recover` (a protected change; `artifact_missing` / `artifact_tampered`): `undo_before_early_return` runs the undo first when the
+  record is readable, and the reason carries its text; when the record itself is unreadable it names every dirty path "not put back" (nothing can be told
+  apart from the owner's files). The protected check has already run and recorded its diff; the undo may then remove the role's untracked protected
+  file — the event and the diff stay.
+- **The normal path** (`read_only_checks`): the protected check runs first, then the undo runs all the same; the escalation carries both.
+  Closes Open #11. `anchor()` (unused after this) was removed.
