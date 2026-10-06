@@ -136,6 +136,19 @@ impl GitCmd {
             env.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
         }
         cmd.env_clear().envs(env).stdin(Stdio::null());
+        // M13-R6: Git never needs the console. Ctrl+C goes to every process of the console
+        // (Windows) or of the foreground process group (Unix): a Git call in flight would die
+        // of it, and the engine would see a Git error instead of the stop M13-12 promises
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(GIT_CREATION_FLAGS);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         let mut args = self.prefix(read_only);
         match loc {
             Loc::Discover(dir) => {
@@ -538,6 +551,12 @@ pub fn parse_status_z(out: &[u8]) -> Vec<(String, String)> {
     v
 }
 
+/// M13-R6 (Windows): `CREATE_NO_WINDOW` — the Git child gets a console of its own (hidden), so a
+/// Ctrl+C aimed at Toryo's console does not reach it. (On Unix the child is in a process group
+/// of its own: `process_group(0)`.)
+#[cfg(windows)]
+pub(crate) const GIT_CREATION_FLAGS: u32 = 0x0800_0000;
+
 pub mod canary;
 pub mod filter_process;
 
@@ -551,6 +570,44 @@ mod tests {
     }
 
     use super::*;
+
+    /// M13-R6: the Git children Toryo starts do not share its console (Windows) or its process
+    /// group (Unix), so Ctrl+C on `toryo run` never reaches a Git call in flight.
+    #[cfg(windows)]
+    #[test]
+    fn toryos_git_children_do_not_share_the_console() {
+        // the flag is `CREATE_NO_WINDOW` of the Win32 API
+        assert_eq!(super::GIT_CREATION_FLAGS, 0x0800_0000);
+        // and it is applied: a Git call through `GitCmd` still works with it
+        let d = tempfile::tempdir().unwrap();
+        let g = GitCmd::new("git", d.path().join("hooks")).unwrap();
+        let loc = Loc::Discover(d.path().to_path_buf());
+        g.run(&loc, false, &["init", "-q", "-b", "main"]).unwrap();
+        assert!(d.path().join(".git").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn toryos_git_children_do_not_share_the_console() {
+        let d = tempfile::tempdir().unwrap();
+        let g = GitCmd::new("git", d.path().join("hooks")).unwrap();
+        let loc = Loc::Discover(d.path().to_path_buf());
+        g.run(&loc, false, &["init", "-q", "-b", "main"]).unwrap();
+        let pgid = |pid: &str| {
+            let o = Command::new("ps")
+                .args(["-o", "pgid=", "-p", pid])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        let ours = pgid(&std::process::id().to_string());
+        // an alias runs in a shell that is Git's child: it has Git's process group
+        let theirs = g
+            .run_str(&loc, true, &["-c", "alias.pg=!ps -o pgid= -p $$", "pg"])
+            .unwrap();
+        assert!(!ours.is_empty() && !theirs.trim().is_empty());
+        assert_ne!(ours, theirs.trim(), "the Git child is in our process group");
+    }
 
     /// M13-R1 (X30): Toryo's Git never looks through a replace ref. A replacement of a commit
     /// (the anchor, a checkpoint) by one with another tree would blind every diff-based check.

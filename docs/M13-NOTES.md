@@ -314,6 +314,10 @@ failed first; the rest is under "Open".
   that drives several tasks stops each of them at its first boundary.
 - **Children:** agents and gates are started without a console (`CREATE_NO_WINDOW`) inside their Job — they never saw the key and still do not; they
   are ended by the stop, as after `toryo stop`.
+  **Review fixes (M13-R6):** Toryo's own **Git** children did not share that protection — they were plain children of the console, so a Git call in
+  flight (Checkpointing's `add -A` / `commit`, the verify checkout, the protected scan at each loop top) died of the key and the engine saw a Git error,
+  not a stop. `GitCmd::command` now starts every Git call with `CREATE_NO_WINDOW` (Windows) / `process_group(0)` (Unix): a Git call in flight survives the
+  key, and the stop lands at the next boundary.
 - **Tests — with a real console event, also on Windows** (`tests/m12_cli.rs`; before the change both hung until the test killed the run):
   `m13_12_ctrl_c_on_run_is_a_stop_request` (AC-1: the note, "stop request handled", attempt `Interrupted`, state `Planning`, last event `run_ended`,
   then `resume` completes) and `m13_12_a_second_ctrl_c_ends_the_process_at_once` (AC-2: two presses → the process is gone, the attempt is still
@@ -495,7 +499,7 @@ few holes are left. Eight commits `(M13-R1 … R8)` on the same branch. Test cou
 - [x] R3 The output cut holds post-redaction bytes
 - [x] R4 A read-only write is left in the tree when HEAD was off the branch or recovery stopped first (X32)
 - [x] R5 `start_at_anchor` trusts a detached or mid-merge HEAD; `foreign_commit` accepts a merge commit (X31)
-- [ ] R6 Toryo's own `git` children share the console
+- [x] R6 Toryo's own `git` children share the console
 - [ ] R7 Safety-adjacent Lows
 - [ ] R8 Texts, tests and doctor Lows
 - [ ] Finish: push, comment on the pull request, CI
@@ -577,3 +581,12 @@ few holes are left. Eight commits `(M13-R1 … R8)` on the same branch. Test cou
   fresh checkpoint is the place where it would cost history.
 - Closes Open #10 for the fresh checkpoint (HEAD equal to the anchor but detached; the attempt start is as before). Test detail: after `git reset --soft <began>` on the attached branch the **branch** is at
   `<began>` too, so AC-1 asserts the branch is still there and nothing was committed.
+### R6 — Toryo's own `git` children share the console
+
+- **Test** (`git::tests::toryos_git_children_do_not_share_the_console`, one per platform): Windows — `GIT_CREATION_FLAGS` is `CREATE_NO_WINDOW`
+  (`0x0800_0000`) and a Git call through `GitCmd` works with it; Unix — an alias run by Git (`!ps -o pgid= -p $$`) reports a process group that is not
+  the test's own (written by reading: not compiled here; CI is its first build). **By reading, as the list allows:** the flag cannot be read back from a
+  `Command`, so there is no test that fails before the change — what would is a Ctrl+C aimed at a console that has a Git call in flight, which a
+  test cannot time. The two M13-12 tests pass unchanged (they cannot see this: the event is self-sent while a fake agent hangs).
+- `GitCmd::command` (every Git call of Toryo): `creation_flags(CREATE_NO_WINDOW)` on Windows, `process_group(0)` on Unix. `git/canary.rs` (admission
+  probes with their own `Command`) is not touched — it runs once, before any task. M13-12's notes paragraph says what changes.
