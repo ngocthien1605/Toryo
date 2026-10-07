@@ -473,14 +473,20 @@ fn drive_inner(store: &Store, lock: &TaskLock, rec: &Recorder, d: &DriveArgs) ->
     };
     let t = get(store, &lock.task)?;
     let summary = write_summary(store, &t)?;
-    toryo::errln!("\n══════════ {}: {:?} ══════════", t.id, t.state);
+    // the end of the run: the banner and its lines, or — painted — an open frame (M15-02)
+    let mut lines = Vec::new();
     if t.state == PipelineState::WaitingFinalApproval {
         for n in toryo::engine::runner::final_gate_notes(store, &t)? {
-            toryo::errln!("final gate — {n}");
+            lines.push(format!("final gate — {n}"));
         }
     }
-    toryo::errln!("next: {}", next_action(&t));
-    toryo::errln!("summary: {}", summary.display());
+    lines.push(format!("next: {}", next_action(&t)));
+    lines.push(format!("summary: {}", summary.display()));
+    toryo::term::end_block(
+        &format!("{}: {:?}", t.id, t.state),
+        &format!("{:?}", t.state),
+        &lines,
+    );
     Ok(match end {
         RunEnd::Done(PipelineState::Completed) | RunEnd::Stopped => 0,
         RunEnd::Waiting(
@@ -1835,11 +1841,16 @@ pub fn watch(id: &str, json: bool, from_start: bool, no_follow: bool) -> Result<
 /// Print the `watch` text of `lines` on stdout. `false`: stdout is closed (a broken pipe).
 fn show_lines(lines: &[String], json: bool) -> Result<bool> {
     use std::io::Write;
-    let out = std::io::stdout();
-    let mut out = out.lock();
+    use toryo::term::{try_line, Stream};
     for line in lines {
         if let Some(text) = toryo::engine::flight::watch_line(line, json) {
-            match writeln!(out, "{text}").and_then(|_| out.flush()) {
+            // `--json`: the recorded line as it is; else the rendered text, painted on a terminal
+            let written = if json {
+                writeln!(std::io::stdout(), "{text}")
+            } else {
+                try_line(Stream::Out, &text)
+            };
+            match written.and_then(|_| std::io::stdout().flush()) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(false),
                 Err(e) => return Err(e.into()),

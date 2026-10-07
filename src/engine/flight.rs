@@ -408,7 +408,7 @@ impl EventSink for StderrSink {
     fn emit(&self, e: &Envelope) -> Result<()> {
         if !e.quiet {
             // R9: a closed stderr is an error of this sink (reported once), never a panic
-            writeln!(std::io::stderr(), "{}", render(e))?;
+            crate::term::try_line(crate::term::Stream::Err, &render(e))?;
         }
         Ok(())
     }

@@ -642,7 +642,8 @@ impl<'a> Engine<'a> {
         let md = super::render::render("plan", &plan)?;
         self.put(t, &a, "plan", "json", &bytes, "plan.json")?;
         self.put(t, &a, "plan-md", "md", md.as_bytes(), "PLAN.md")?;
-        crate::errln!("\n{md}");
+        // the agent wrote it: inert, and never painted like a line of Toryo's own (M15)
+        crate::term::quoted(crate::term::Stream::Err, &format!("\n{md}"));
         let bad: Vec<String> = plan_files(&plan)
             .into_iter()
             .filter(|f| self.protect.violates(f))
@@ -2634,7 +2635,8 @@ impl<'a> Engine<'a> {
             "review.json",
         )?;
         self.put(t, a, "review-md", "md", md.as_bytes(), "REVIEW.md")?;
-        crate::errln!("\n{md}");
+        // the agent wrote it: inert, and never painted like a line of Toryo's own (M15)
+        crate::term::quoted(crate::term::Stream::Err, &format!("\n{md}"));
         let verdict = ReviewVerdict::of(&review);
         if let Some(unmet) = &verdict.downgraded {
             crate::errln!("!! review_inconsistent: `approved` with unmet {unmet:?} / blocking issues → changes_requested");

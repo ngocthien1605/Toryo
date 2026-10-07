@@ -773,6 +773,8 @@ name = "toryo"
 version = "0.12.0"
 dependencies = [
  "aho-corasick",
+ "anstream",
+ "anstyle",
  "anyhow",
  "async-trait",
  "clap",

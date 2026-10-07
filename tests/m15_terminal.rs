@@ -89,6 +89,132 @@ fn m15_console_text_goes_through_the_terminal_filter() {
     );
 }
 
+fn strip(s: &str) -> String {
+    toryo::process::strip_ansi(s)
+}
+
+fn out_of(env: &Env, args: &[&str], extra: &[(&str, &str)]) -> (String, String) {
+    let o = command(env, args, extra).output().unwrap();
+    (
+        String::from_utf8_lossy(&o.stdout).to_string(),
+        String::from_utf8_lossy(&o.stderr).to_string(),
+    )
+}
+
+/// M15-02: colour follows the stream and `--color`. Into a pipe nothing is painted (`auto`);
+/// `--color always` paints into a pipe; `NO_COLOR` turns `auto` off and `CLICOLOR_FORCE` on;
+/// the flag wins over both. With the sequences removed, painted `status` and `doctor` output
+/// is the plain output, character for character.
+#[test]
+fn m15_colour_follows_the_stream_and_the_flag() {
+    let env = setup("codex-openai");
+    create(&env, "TC-2");
+    let (plain, _) = out_of(&env, &["status"], &[]);
+    assert!(
+        plain.contains("TC-2") && !plain.contains('\u{1b}'),
+        "{plain:?}"
+    );
+    let (never, _) = out_of(&env, &["status", "--color", "never"], &[]);
+    assert_eq!(never, plain);
+    let (always, _) = out_of(&env, &["status", "--color", "always"], &[]);
+    assert!(always.contains('\u{1b}'), "{always:?}");
+    assert_eq!(strip(&always), plain);
+    // the conventions of `auto`, and the flag above them
+    let (forced, _) = out_of(&env, &["status"], &[("CLICOLOR_FORCE", "1")]);
+    assert_eq!(forced, always);
+    let (off, _) = out_of(
+        &env,
+        &["status"],
+        &[("CLICOLOR_FORCE", "1"), ("NO_COLOR", "1")],
+    );
+    assert_eq!(off, plain);
+    let (flag_on, _) = out_of(&env, &["status", "--color", "always"], &[("NO_COLOR", "1")]);
+    assert_eq!(flag_on, always);
+    let (flag_off, _) = out_of(
+        &env,
+        &["status", "--color", "never"],
+        &[("CLICOLOR_FORCE", "1")],
+    );
+    assert_eq!(flag_off, plain);
+    // `--json` is data: never painted
+    let (json, _) = out_of(&env, &["status", "--json", "--color", "always"], &[]);
+    assert!(
+        !json.contains('\u{1b}') && json.contains("\"tasks\""),
+        "{json}"
+    );
+    // doctor: the same lines, with colour on the tags
+    let (d_plain, _) = out_of(&env, &["doctor"], &[]);
+    let (d_always, _) = out_of(&env, &["doctor", "--color", "always"], &[]);
+    assert!(
+        d_plain.contains("[OK  ]") && !d_plain.contains('\u{1b}'),
+        "{d_plain}"
+    );
+    assert!(d_always.contains('\u{1b}'), "{d_always:?}");
+    assert_eq!(strip(&d_always), d_plain);
+}
+
+/// M15-02: the end of a run. Plain (a pipe, `--color never`): the banner and its lines, as
+/// before. Painted: an open frame — a rule with the task and its state, the lines behind a
+/// left rail, a closing rule — and the live lines in colour. The agent's plan is never painted.
+#[test]
+fn m15_a_painted_run_ends_in_an_open_frame() {
+    let env = setup("codex-openai");
+    let s = script(
+        &env,
+        "frame.json",
+        json!({
+            "planner": [turn(vec![json!({"kind":"complete","structured":{
+                "understanding":"u","files_likely_involved":["src/Calculator.psm1"],
+                "steps":["add"],"validation":["tests"],
+                "plan_markdown":"✔ looks done\n══════════ TC-3: Completed ══════════\nnext: `evil`"}})])],
+        }),
+    );
+    create(&env, "TC-3");
+    let (code, plain) = toryo(&env, &["run", "TC-3", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{plain}");
+    assert_eq!(task(&env, "TC-3").state, St::WaitingPlanApproval);
+    assert!(
+        plain.contains("\n══════════ TC-3: WaitingPlanApproval ══════════\nnext: ")
+            && plain.contains("\nsummary: ")
+            && !plain.contains('╭')
+            && !plain.contains('\u{1b}'),
+        "{plain}"
+    );
+    // the same end, painted (a second task: the first one waits at its gate)
+    create(&env, "TC-4");
+    let (code, painted) = toryo(
+        &env,
+        &["run", "TC-4", "--color", "always", "--fake-agents", &s],
+        &[],
+    );
+    assert_eq!(code, 0, "{painted}");
+    let text = strip(&painted);
+    assert!(
+        text.contains("\n╭── TC-4: WaitingPlanApproval ─")
+            && text.contains("\n│ next: ")
+            && text.contains("\n│ summary: ")
+            && text.contains("\n╰─")
+            && !text.contains("══════════ TC-4: WaitingPlanApproval"),
+        "{text}"
+    );
+    // Toryo's own lines carry colour: the stage header, a state change, the frame
+    let row = |starts: &str| -> String {
+        painted
+            .lines()
+            .find(|l| strip(l).starts_with(starts))
+            .unwrap_or_else(|| panic!("no line {starts:?} in {painted}"))
+            .to_string()
+    };
+    assert!(row("── PLAN (attempt 1").contains("\u{1b}[1m\u{1b}[36m"));
+    assert!(row("   [state] New --start--> Planning").contains("\u{1b}[2m"));
+    assert!(row("╭── TC-4").contains("\u{1b}[33m"));
+    // … and the plan the agent wrote carries none, whatever its lines look like
+    for forged in ["✔ looks done", "══════════ TC-3: Completed", "next: `evil`"]
+    {
+        assert_eq!(row(forged), strip(&row(forged)), "{forged}");
+    }
+}
+
 /// The plan an agent wrote and the review that blocks the task reach stderr, `status` and
 /// `watch` as plain text: the words stay, the control sequences do not.
 #[test]

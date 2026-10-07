@@ -143,6 +143,10 @@ pub fn command(env: &Env, args: &[&str], extra: &[(&str, &str)]) -> Command {
         .env("TORYO_DATA_DIR", &env.data)
         .env("TORYO_RETRY_BASE_SECS", "0")
         .env("TORYO_GLOBAL_CONTEXT", env.root.join("global.md"))
+        // the colour of a line follows the stream (a pipe here: none), not the developer's shell
+        .env_remove("NO_COLOR")
+        .env_remove("CLICOLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(&env.root)
         .stdin(Stdio::null());
     for (k, v) in extra {

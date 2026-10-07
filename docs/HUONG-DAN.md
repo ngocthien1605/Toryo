@@ -415,6 +415,8 @@ Tuỳ chọn chung của `run`, `resume` và `approve --continue`:
 | `--accept-unverified` | vẫn chạy dù profile chưa được canary xác nhận cho version CLI đang cài (R51) — nên chạy `doctor --canaries` thay vì dùng cờ này |
 | `--notify` / `--no-notify` | bật / tắt toast cho lần chạy này, bất kể machine config |
 
+Mọi lệnh nhận thêm cờ chung `--color auto|always|never` (mặc định `auto`): màu cho các dòng toryo in ra, xem mục 5.8.
+
 Model của từng ghế đặt trong config (`model:` của role / seat hoặc của profile), không có cờ dòng lệnh. Engine luôn chạy
 Claude ở launch mode `restricted`.
 
@@ -749,6 +751,34 @@ bị lọc bỏ. PowerShell được gọi với `-Command` (không dùng `-Enco
 không kế thừa handle nào của toryo. Không bao giờ làm hỏng lần chạy; khi thoát, toryo chờ toast xong (tối đa
 10 giây rồi dừng nó). Giới hạn: máy bật Constrained Language Mode (AppLocker/WDAC) thì PowerShell không nạp được
 WinRT — `notify-test` sẽ báo lỗi.
+
+**Màu trên terminal.** Khi in ra terminal, toryo tô màu **các dòng của chính nó** theo ý nghĩa:
+
+| Màu | Nghĩa |
+|---|---|
+| xanh lá | đã qua, đã xong: `✔`, `Completed`, `ACTIVE`, `[OK  ]` của `doctor` |
+| đỏ | hỏng, cần anh quyết: `✘`, `!!`, `Escalated`, `Failed`, `[FAIL]` |
+| vàng | đang chờ anh hoặc cảnh báo: `Waiting…Approval`, `Paused`, `gate open`, cảnh báo budget, `[WARN]` |
+| mờ | sổ sách: dòng `[state] …`, `turn …`, `summary:` |
+| đậm / xanh lơ | tiêu đề stage, tên gate, `next:`; **lệnh cần gõ** (trong dấu backtick) màu xanh lơ |
+
+Ký hiệu `✔ ✘ !!` vẫn giữ, nên màu không bao giờ là thứ duy nhất mang nghĩa. Khi `run` / `resume` kết thúc, thay cho dòng
+`══════════ ID: State ══════════` là một **khung hở** theo màu của trạng thái (không có cạnh phải, nên dòng dài cứ tự xuống dòng):
+
+```text
+╭── SJP-1234: WaitingFinalApproval ──────────────────────────
+│ final gate — verify: compile only (X++: no DB sync, no unit tests)
+│ next: review the branch toryo/SJP-1234 …, then `toryo approve SJP-1234 --gate final` or …
+│ summary: C:\…\runs\SJP-1234\runstore\SUMMARY.md
+╰───────────────────────────────────────────────────────────────
+```
+
+- **Chữ do agent viết không bao giờ được tô** (plan, review, các dòng sau dòng đầu của một lý do): trên terminal, có màu nghĩa
+  là dòng đó của toryo. Một plan có dòng `✔ xong` hay một dòng "Completed" giả vẫn là chữ thường.
+- `--color auto` (mặc định): chỉ tô khi output là terminal; biến môi trường `NO_COLOR` tắt, `CLICOLOR_FORCE` bật.
+  `--color always` tô cả khi pipe; `--color never` không bao giờ tô. Cờ thắng biến môi trường.
+- **Khi pipe hoặc ghi ra file, output là chữ thường y như trước** (kể cả dòng `══════════`), nên script đang đọc output
+  của toryo không bị ảnh hưởng. Output `--json` không bao giờ có màu.
 
 ---
 
@@ -1516,5 +1546,6 @@ rồi chuyển agent dự phòng (mục 5.1), hết thì `Paused`.
 | `doctor` báo `cannot give … a Low integrity label` (verify root) | Thư mục tạo trực tiếp dưới `C:\` chỉ cho user quyền Modify (thiếu `WRITE_OWNER`). Để `verify.verify_root` trong `%LOCALAPPDATA%` (mặc định), xem F7 trong `M0-FINDINGS.md` |
 | Test tạo thư mục tạm bị lỗi quyền khi Codex chạy | Toryo đã cấp TEMP riêng `<worktree>\.toryo-tmp` (git bỏ qua). Nếu vẫn lỗi, xem `implement.meta.json` có biến `TEMP` không |
 | Muốn xem AI "nghĩ" gì | `runs\<ID>\captures\*.stdout.jsonl` (stream đầy đủ), `*.prompt.md`, và `toryo context show` |
-| Ký tự lạ kiểu `ΓòÉΓòÉ`, `ΓåÆ` khi **pipe** output của toryo (`toryo … \| Tee-Object`, `\| Select-String`) | toryo in UTF-8, còn PowerShell giải mã output qua pipe bằng code page OEM 437. Thêm vào `$PROFILE`: `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)` (các script trong `scripts\` đã tự đặt). Chạy trực tiếp không pipe thì luôn hiển thị đúng |
+| Ký tự lạ kiểu `ΓòÉΓòÉ`, `ΓåÆ` khi **pipe** output của toryo (`toryo … \| Tee-Object`, `\| Select-String`) | toryo in UTF-8, còn PowerShell giải mã output qua pipe bằng code page OEM 437. Thêm vào `$PROFILE`: `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)` (các script trong `scripts\` đã tự đặt). Chạy trực tiếp không pipe thì luôn hiển thị đúng. Không liên quan tới màu: khi pipe, toryo không in mã màu nào |
+| Terminal hiện mã kiểu `←[32m` thay vì màu, hoặc anh không muốn màu | Terminal không hiểu mã màu (console cũ): thêm `--color never`, hoặc đặt `$env:NO_COLOR = '1'` trong `$PROFILE` |
 | `!! a check gate left files in the verify checkout — they are not deployed` | Chỉ là cảnh báo: gate môi trường deploy từ bản xuất mới của commit, không từ checkout. Nên cho check gate ghi output vào `TORYO_VERIFY_BUILD`; danh sách nằm ở `checkout_extra` trong `VERIFY_RESULT.json` |

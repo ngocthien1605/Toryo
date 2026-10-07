@@ -17,6 +17,8 @@ default = ["m0-kit"]
 m0-kit = []
 
 [dependencies]
+anstream = "1"
+anstyle = "1"
 anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }

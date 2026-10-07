@@ -34,6 +34,15 @@ pub(crate) struct Cli {
     /// Machine config (default: %USERPROFILE%\.toryo\toryo.local.yaml)
     #[arg(long, global = true)]
     pub(crate) machine_config: Option<PathBuf>,
+    /// Colour for the lines toryo prints: on a terminal (unless NO_COLOR is set), always, or never
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value = "auto",
+        value_name = "WHEN"
+    )]
+    pub(crate) color: toryo::term::Color,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -438,6 +447,8 @@ fn main() -> ExitCode {
 
 fn cli_main() -> ExitCode {
     let cli = Cli::parse();
+    // before the first line is printed
+    toryo::term::set_color(cli.color);
     let code = match run(cli) {
         Ok(code) => ExitCode::from(exit_status(code)),
         Err(e) => match e.downcast_ref::<toryo::engine::lock::TaskActive>() {

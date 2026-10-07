@@ -11,6 +11,14 @@
 //! Not for data: `--json` output is printed as it is (JSON escapes control characters).
 //! `toryo context show` prints the agent's context through [`data`]: byte for byte into a pipe
 //! or a file, as inert text when stdout is a terminal.
+//!
+//! Colour (M15-02) is a property of the stream, never of the text: the macros paint a line
+//! ([`paint`]) only when the stream takes colour ([`painted`]). Into a pipe or a file the
+//! output is the plain text. Nothing outside this module writes an escape sequence.
+
+use std::sync::OnceLock;
+
+pub mod paint;
 
 /// What stands where a control character was.
 pub const MARK: char = '\u{FFFD}';
@@ -51,25 +59,136 @@ pub fn data(s: &str) -> String {
     }
 }
 
-/// `eprintln!` through [`text`](crate::term::text): a human-readable line on stderr.
+/// `--color`: when Toryo's own lines are painted (M15-02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum Color {
+    /// On a terminal, unless `NO_COLOR` is set (`CLICOLOR_FORCE` forces it into a pipe).
+    #[default]
+    Auto,
+    /// Also into a pipe or a file.
+    Always,
+    /// Never: the plain text.
+    Never,
+}
+
+static COLOR: OnceLock<Color> = OnceLock::new();
+
+/// Set once by `main`, before the first line is printed (`--color`); later calls change nothing.
+pub fn set_color(c: Color) {
+    let _ = COLOR.set(c);
+}
+
+/// The stream a line goes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    Out,
+    Err,
+}
+
+/// Are lines for `s` painted? Decided once per stream: `--color always` / `never` as said;
+/// `auto` by what the stream is — a terminal that takes colour, with the `NO_COLOR`,
+/// `CLICOLOR_FORCE` and `TERM=dumb` conventions (`anstream`). A pipe or a file gets the plain
+/// text, byte for byte what Toryo printed before it had colours.
+pub fn painted(s: Stream) -> bool {
+    static OUT: OnceLock<bool> = OnceLock::new();
+    static ERR: OnceLock<bool> = OnceLock::new();
+    let cell = match s {
+        Stream::Out => &OUT,
+        Stream::Err => &ERR,
+    };
+    *cell.get_or_init(|| match COLOR.get().copied().unwrap_or_default() {
+        Color::Always => true,
+        Color::Never => false,
+        Color::Auto => {
+            let choice = match s {
+                Stream::Out => anstream::AutoStream::choice(&std::io::stdout()),
+                Stream::Err => anstream::AutoStream::choice(&std::io::stderr()),
+            };
+            choice != anstream::ColorChoice::Never
+        }
+    })
+}
+
+/// Write `t` and a line feed to `s`. Painted text goes through `anstream`, which turns on the
+/// console's escape-sequence mode on Windows (or falls back to the console API).
+fn emit(s: Stream, t: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    match (s, painted(s)) {
+        (Stream::Err, false) => writeln!(std::io::stderr(), "{t}"),
+        (Stream::Out, false) => writeln!(std::io::stdout(), "{t}"),
+        (Stream::Err, true) => writeln!(anstream::AutoStream::always(std::io::stderr()), "{t}"),
+        (Stream::Out, true) => writeln!(anstream::AutoStream::always(std::io::stdout()), "{t}"),
+    }
+}
+
+/// Print one block of Toryo's own text: inert ([`text`]), then painted when the stream is.
+pub fn try_line(s: Stream, block: &str) -> std::io::Result<()> {
+    let t = text(block);
+    if painted(s) {
+        emit(s, &paint::block(&t))
+    } else {
+        emit(s, &t)
+    }
+}
+
+/// [`try_line`] for the macros: a stream that cannot be written is a panic, as with `println!`.
+pub fn line(s: Stream, block: &str) {
+    if let Err(e) = try_line(s, block) {
+        let name = match s {
+            Stream::Out => "stdout",
+            Stream::Err => "stderr",
+        };
+        panic!("failed printing to {name}: {e}");
+    }
+}
+
+/// Print text somebody else wrote as a whole — a plan, a review: inert, and **never painted**.
+/// On a terminal colour marks the lines that are Toryo's own.
+pub fn quoted(s: Stream, block: &str) {
+    if let Err(e) = emit(s, &text(block)) {
+        panic!("failed printing: {e}");
+    }
+}
+
+/// The end of a run on stderr: the state and what comes next. Plain: an empty line, the banner
+/// `══════════ <title> ══════════`, then each of `lines` — the text every version printed.
+/// Painted: an open frame in the state's colour ([`paint::frame`]).
+pub fn end_block(title: &str, state: &str, lines: &[String]) {
+    if painted(Stream::Err) {
+        let lines: Vec<String> = lines.iter().map(|l| text(l)).collect();
+        let framed = paint::frame(&text(title), state, &lines);
+        if let Err(e) = emit(Stream::Err, &format!("\n{framed}")) {
+            panic!("failed printing to stderr: {e}");
+        }
+    } else {
+        line(Stream::Err, &format!("\n══════════ {title} ══════════"));
+        for l in lines {
+            line(Stream::Err, l);
+        }
+    }
+}
+
+/// `eprintln!` for a human-readable line: inert ([`text`](crate::term::text)), and painted when
+/// stderr is ([`painted`](crate::term::painted)).
 #[macro_export]
 macro_rules! errln {
     () => {
-        eprintln!()
+        $crate::term::line($crate::term::Stream::Err, "")
     };
     ($($arg:tt)*) => {
-        eprintln!("{}", $crate::term::text(&format!($($arg)*)))
+        $crate::term::line($crate::term::Stream::Err, &format!($($arg)*))
     };
 }
 
-/// `println!` through [`text`](crate::term::text): a human-readable line on stdout.
+/// `println!` for a human-readable line: inert ([`text`](crate::term::text)), and painted when
+/// stdout is ([`painted`](crate::term::painted)).
 #[macro_export]
 macro_rules! outln {
     () => {
-        println!()
+        $crate::term::line($crate::term::Stream::Out, "")
     };
     ($($arg:tt)*) => {
-        println!("{}", $crate::term::text(&format!($($arg)*)))
+        $crate::term::line($crate::term::Stream::Out, &format!($($arg)*))
     };
 }
 

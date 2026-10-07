@@ -219,6 +219,11 @@ a protected file that changed → restore it, or `resume --accept-protected-chan
 - `toryo usage ID` shows tokens per stage × profile × model, and an estimated cost for per-token billing from the
   machine's `prices.toml` (`templates/prices.toml.example`); subscription rows show `—`.
 - `notify: { toast: true }` in the machine config (or `--notify`) shows a Windows toast when a task needs you.
+- **Colour.** On a terminal, toryo paints its own lines by what they mean — green `✔` / `Completed`, red `✘` / `!!` /
+  `Escalated`, yellow for what waits for you, dim bookkeeping, the commands to type in cyan — and ends a run in an open
+  frame instead of the `══════════` banner. `--color auto|always|never` (default `auto`; `NO_COLOR` turns `auto` off,
+  `CLICOLOR_FORCE` on). Into a pipe or a file the output is the plain text, as before; `--json` is never painted. Text an
+  agent wrote (the plan, the review, the lines of a reason) is never painted: colour marks the lines that are toryo's own.
 
 ## Repository layout
 
