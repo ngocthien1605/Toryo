@@ -316,7 +316,7 @@ impl LocalRunner {
             let heartbeat = io.heartbeat.map(|every| {
                 let (name, seen) = (spec.name.clone(), seen.clone());
                 let beat: crate::process::Heartbeat = Box::new(move |elapsed| {
-                    eprintln!(
+                    crate::errln!(
                         "  ... {name} still running: {}:{:02} elapsed, {} bytes of output so far",
                         elapsed.as_secs() / 60,
                         elapsed.as_secs() % 60,
@@ -360,7 +360,7 @@ impl LocalRunner {
                 match std::fs::write(p, &output) {
                     Ok(()) => Some(p.clone()),
                     Err(e) => {
-                        eprintln!("WARNING: could not write the gate log {}: {e}", p.display());
+                        crate::errln!("WARNING: could not write the gate log {}: {e}", p.display());
                         None
                     }
                 }

@@ -286,7 +286,7 @@ fn press_ctrl_c() {
         // here the key is pressed as on the owner's console
         SetConsoleCtrlHandler(None, 0);
         if GenerateConsoleCtrlEvent(0, 0) == 0 {
-            eprintln!(
+            crate::errln!(
                 "TORYO_TEST_INTERRUPT_AFTER_MS: no Ctrl+C could be sent ({})",
                 std::io::Error::last_os_error()
             );

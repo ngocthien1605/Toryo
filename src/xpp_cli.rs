@@ -173,15 +173,15 @@ pub fn build(cli: &Cli, a: &BuildOpts) -> Result<i32> {
     if a.print_only {
         for r in &runs {
             r.write_response()?;
-            println!("# {} ({})", r.name, r.project);
-            println!("# response file {}:", r.rsp.display());
+            toryo::outln!("# {} ({})", r.name, r.project);
+            toryo::outln!("# response file {}:", r.rsp.display());
             for l in r.response.lines() {
-                println!("#   {l}");
+                toryo::outln!("#   {l}");
             }
-            println!("{}", xpp::powershell_line(&tc.msbuild, &r.command));
+            toryo::outln!("{}", xpp::powershell_line(&tc.msbuild, &r.command));
         }
         if a.low {
-            println!(
+            toryo::outln!(
                 "# --low: builds a copy of {} and the projects in {}",
                 a.metadata,
                 checkout.display()
@@ -232,7 +232,7 @@ pub fn build(cli: &Cli, a: &BuildOpts) -> Result<i32> {
         .enable_all()
         .build()?;
     let deadline = Instant::now() + a.timeout;
-    println!(
+    toryo::outln!(
         "MSBuild {} · output {} · {}",
         tc.msbuild.display(),
         out.display(),
@@ -245,10 +245,10 @@ pub fn build(cli: &Cli, a: &BuildOpts) -> Result<i32> {
     for r in runs {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            println!("✘ {}: not started — the timeout is used up", r.name);
+            toryo::outln!("✘ {}: not started — the timeout is used up", r.name);
             return Ok(1);
         }
-        eprintln!("── {} ({}) …", r.name, r.project);
+        toryo::errln!("── {} ({}) …", r.name, r.project);
         r.write_response()?;
         let res = rt.block_on(LocalRunner.run(
             RunSpec {
@@ -278,7 +278,7 @@ pub fn build(cli: &Cli, a: &BuildOpts) -> Result<i32> {
             (None, true) => "timed out".into(),
             (None, false) => "no exit code".into(),
         };
-        println!(
+        toryo::outln!(
             "{} {} ({ended}, {:.1}s) — {} error(s), {} warning(s) — full output: {}",
             if res.ok() { "✔" } else { "✘" },
             r.name,
@@ -288,14 +288,14 @@ pub fn build(cli: &Cli, a: &BuildOpts) -> Result<i32> {
             log.display()
         );
         for e in &d.errors {
-            println!("  {}", e.render());
+            toryo::outln!("  {}", e.render());
         }
         if d.errors_total > d.errors.len() {
-            println!("  … and {} more", d.errors_total - d.errors.len());
+            toryo::outln!("  … and {} more", d.errors_total - d.errors.len());
         }
         if !res.ok() {
             if d.errors.is_empty() {
-                println!("last output:\n{}", res.tail(40));
+                toryo::outln!("last output:\n{}", res.tail(40));
             }
             return Ok(1);
         }

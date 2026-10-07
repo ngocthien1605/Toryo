@@ -199,7 +199,7 @@ impl CliSession {
                 };
                 let preflight = l.check();
                 for w in &preflight.warnings {
-                    eprintln!("WARNING: {w}");
+                    crate::errln!("WARNING: {w}");
                 }
                 // Codex has no system-prompt file flag: the context becomes the prompt preamble (§7).
                 let prompt = match &self.req.context_file {

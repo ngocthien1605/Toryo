@@ -116,7 +116,7 @@ pub fn check_entry_points(
         bail!("{refusal}");
     }
     for n in a.notes {
-        eprintln!("note: {n}");
+        crate::errln!("note: {n}");
     }
     Ok(a.build)
 }
@@ -333,8 +333,8 @@ impl Drop for Made<'_> {
                 .store
                 .call(move |tx| store::remove_created_task(tx, &id))
             {
-                Ok(()) => eprintln!("removed: the database row of {}", self.id),
-                Err(e) => eprintln!(
+                Ok(()) => crate::errln!("removed: the database row of {}", self.id),
+                Err(e) => crate::errln!(
                     "WARNING: could not remove the database row of {}: {e:#}",
                     self.id
                 ),
@@ -355,8 +355,8 @@ impl Drop for Made<'_> {
                 let _ = self.g.run(&repo, false, &["worktree", "prune"]);
             }
             match (existed, wt.exists()) {
-                (true, false) => eprintln!("removed: the worktree {}", wt.display()),
-                (_, true) => eprintln!(
+                (true, false) => crate::errln!("removed: the worktree {}", wt.display()),
+                (_, true) => crate::errln!(
                     "WARNING: could not remove the worktree {} — delete it by hand",
                     wt.display()
                 ),
@@ -384,11 +384,11 @@ impl Drop for Made<'_> {
             match at {
                 Some(sha) if sha == self.base => {
                     match self.g.run(&repo, false, &["branch", "-D", b]) {
-                        Ok(_) => eprintln!("removed: the branch {b}"),
-                        Err(e) => eprintln!("WARNING: could not remove the branch {b}: {e:#}"),
+                        Ok(_) => crate::errln!("removed: the branch {b}"),
+                        Err(e) => crate::errln!("WARNING: could not remove the branch {b}: {e:#}"),
                     }
                 }
-                Some(sha) => eprintln!(
+                Some(sha) => crate::errln!(
                     "WARNING: the branch {b} is at {} now, not at the base it was made at ({}) — it is not ours any more and is left",
                     crate::git::short(&sha),
                     crate::git::short(&self.base)
@@ -399,8 +399,8 @@ impl Drop for Made<'_> {
         if let Some(rs) = &self.run_store {
             if rs.exists() {
                 match std::fs::remove_dir_all(rs) {
-                    Ok(()) => eprintln!("removed: the run store {}", rs.display()),
-                    Err(e) => eprintln!(
+                    Ok(()) => crate::errln!("removed: the run store {}", rs.display()),
+                    Err(e) => crate::errln!(
                         "WARNING: could not remove the run store {}: {e} — delete it by hand",
                         rs.display()
                     ),
@@ -489,9 +489,9 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         true,
         &["rev-parse", &format!("{base_ref}^{{commit}}")],
     )?;
-    eprintln!("base: {base_ref} @ {}", crate::git::short(&base));
+    crate::errln!("base: {base_ref} @ {}", crate::git::short(&base));
     if base_ref != checked_out {
-        eprintln!(
+        crate::errln!(
             "note: {checked_out} is checked out in {}; the task starts from {base_ref} ({})",
             repo.display(),
             if a.base.is_some() {
@@ -502,7 +502,7 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         );
     }
     for key in cfg.keys_without_effect() {
-        eprintln!("note: {}", Effective::no_effect_line(key));
+        crate::errln!("note: {}", Effective::no_effect_line(key));
     }
     // M11-R14 (X9): the entry scripts admitted as build output are frozen with the task
     let admitted = Effective {

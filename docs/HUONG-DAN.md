@@ -1419,6 +1419,10 @@ Một cách nói thẳng, để anh không hiểu nhầm "Low integrity" thành 
   `confirm: first` (hoặc `always`) — khi đó Toryo hỏi trước khi deploy.
 - **40 dòng cuối output của gate được gửi cho nhà cung cấp mô hình** (làm phản hồi cho implementer), và chỉ giá trị `secret_env`
   bị che. Đừng in connection string, key hay token; toàn bộ output nằm ở `<run store>\gate-logs\`.
+- Chữ do agent, nhà cung cấp hay gate viết ra **màn hình của anh** là chữ "trơ": chuỗi escape bị bỏ, ký tự về đầu dòng (`\r`)
+  bị bỏ, các ký tự điều khiển và ký tự đảo chiều chữ khác hiện thành `�`. Một plan hay một lý do escalate không thể ghi vào
+  clipboard, đổi tiêu đề cửa sổ hay vẽ một dòng "Completed" giả. Output `--json` là dữ liệu nên giữ nguyên (JSON tự escape);
+  `toryo context show` giữ nguyên từng byte khi pipe và là chữ trơ khi in ra terminal.
 
 ---
 
