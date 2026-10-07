@@ -446,7 +446,7 @@ pub fn prepare(
             // a locked file is no reason to stop: a stale entry would show in the next run's
             // own checks
             if let Err(err) = remove_entry(&co.dir, &e.path) {
-                eprintln!("warning: could not remove the build-output entry `{}` from the verify checkout: {err:#}", e.path);
+                crate::errln!("warning: could not remove the build-output entry `{}` from the verify checkout: {err:#}", e.path);
             }
         }
     }

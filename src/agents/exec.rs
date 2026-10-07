@@ -343,7 +343,7 @@ pub fn run_turn_with(
         serde_json::to_vec_pretty(&json!({ "outcome": outcome, "exit": exit }))?,
     )?;
     if echo {
-        eprintln!();
+        crate::errln!();
     }
     Ok(TurnRun {
         outcome,
@@ -396,25 +396,25 @@ fn echo_line(kind: ProfileKind, line: &[u8]) {
     match kind {
         ProfileKind::Claude => {
             if let Some(t) = v.pointer("/event/delta/text").and_then(|t| t.as_str()) {
-                eprint!("{t}");
+                eprint!("{}", crate::term::text(t));
             } else if v["type"] == "system" {
-                eprintln!("\n[system/{}]", v["subtype"].as_str().unwrap_or("?"));
+                crate::errln!("\n[system/{}]", v["subtype"].as_str().unwrap_or("?"));
             } else if v["type"] == "result" {
-                eprintln!("\n[result/{}]", v["subtype"].as_str().unwrap_or("?"));
+                crate::errln!("\n[result/{}]", v["subtype"].as_str().unwrap_or("?"));
             }
         }
         ProfileKind::Codex => {
             let ty = v["type"].as_str().unwrap_or("?");
             let item = v["item"]["type"].as_str().unwrap_or("");
             if ty == "item.completed" && item == "command_execution" {
-                eprintln!(
+                crate::errln!(
                     "[cmd] {} → {} (exit {})",
                     v["item"]["command"].as_str().unwrap_or(""),
                     v["item"]["status"].as_str().unwrap_or("?"),
                     v["item"]["exit_code"]
                 );
             } else if ty != "item.updated" {
-                eprintln!("[{ty}{}{}]", if item.is_empty() { "" } else { " " }, item);
+                crate::errln!("[{ty}{}{}]", if item.is_empty() { "" } else { " " }, item);
             }
         }
     }
@@ -423,35 +423,39 @@ fn echo_line(kind: ProfileKind, line: &[u8]) {
 /// Print the human summary of one turn.
 pub fn print_summary(r: &TurnRun) {
     let o = &r.outcome;
-    eprintln!("── turn summary ─────────────────────────────");
-    eprintln!("success          : {}", o.success);
-    eprintln!(
+    crate::errln!("── turn summary ─────────────────────────────");
+    crate::errln!("success          : {}", o.success);
+    crate::errln!(
         "session/thread id: {}",
         o.session_id.as_deref().unwrap_or("-")
     );
     if let Some(c) = o.error_class {
-        eprintln!(
+        crate::errln!(
             "error            : {:?} — {}",
             c,
             o.error_detail.as_deref().unwrap_or("")
         );
     }
-    eprintln!("permission denials: {}", o.permission_denials.len());
-    eprintln!("usage ({:?})   : {:?}", o.accounting, o.usage);
+    crate::errln!("permission denials: {}", o.permission_denials.len());
+    crate::errln!("usage ({:?})   : {:?}", o.accounting, o.usage);
     if let Some(raw) = &o.raw_usage {
-        eprintln!("raw usage        : {raw}");
+        crate::errln!("raw usage        : {raw}");
     }
-    eprintln!(
+    crate::errln!(
         "exit             : {:?} timed_out={} stalled={} cancelled={} tree_gone={}",
-        r.exit.code, r.exit.timed_out, r.exit.stalled, r.exit.cancelled, r.exit.tree_gone
+        r.exit.code,
+        r.exit.timed_out,
+        r.exit.stalled,
+        r.exit.cancelled,
+        r.exit.tree_gone
     );
     if !o.protocol_errors.is_empty() {
-        eprintln!("protocol errors  : {:?}", o.protocol_errors);
+        crate::errln!("protocol errors  : {:?}", o.protocol_errors);
     }
     if !o.warnings.is_empty() {
-        eprintln!("warnings         : {:?}", o.warnings);
+        crate::errln!("warnings         : {:?}", o.warnings);
     }
-    eprintln!("captured in      : {}", r.run_dir.display());
+    crate::errln!("captured in      : {}", r.run_dir.display());
     if let Some(s) = &o.structured {
         println!("{}", serde_json::to_string_pretty(s).unwrap_or_default());
     }

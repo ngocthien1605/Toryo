@@ -1495,11 +1495,11 @@ fn finish(r: Report, json: bool) -> Result<i32> {
                 Level::Warn => "WARN",
                 Level::Fail => "FAIL",
             };
-            println!("[{tag}] {:<22} {}", c.area, c.message);
+            crate::outln!("[{tag}] {:<22} {}", c.area, c.message);
         }
         let fails = r.0.iter().filter(|c| c.level == Level::Fail).count();
         let warns = r.0.iter().filter(|c| c.level == Level::Warn).count();
-        println!("\n{fails} FAIL, {warns} WARN");
+        crate::outln!("\n{fails} FAIL, {warns} WARN");
     }
     Ok(if worst == Level::Fail { 1 } else { 0 })
 }

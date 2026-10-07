@@ -99,14 +99,14 @@ fn list(cli: &Cli) -> Result<i32> {
     let root = project_root(&cfg)?;
     match verify_commands(&cfg, &root) {
         Ok(cmds) if !cmds.is_empty() => {
-            println!("check gates (run by Verify, in this order):");
+            toryo::outln!("check gates (run by Verify, in this order):");
             for c in &cmds {
                 let reads = if c.reads_msbuild() {
                     ", diagnostics: msbuild"
                 } else {
                     ""
                 };
-                println!(
+                toryo::outln!(
                     "  {}  [{}{reads}]  {}",
                     c.name,
                     limit_words(c),
@@ -114,14 +114,14 @@ fn list(cli: &Cli) -> Result<i32> {
                 );
             }
         }
-        _ => println!(
+        _ => toryo::outln!(
             "no check gate configured — Verify has nothing to run (skipped): add `commands.verify` to toryo.yaml, or `gates:` to the org chart"
         ),
     }
     if let Some(team) = &cfg.team {
         for (name, g) in &team.gates {
             if g.decl.kind == GateType::Environment {
-                println!(
+                toryo::outln!(
                     "  {name}  (environment gate — runs with your full rights; not run by this command)"
                 );
             }
@@ -220,11 +220,11 @@ fn run_program(
     xpp::set_ui_language(&mut env, &BTreeMap::new());
     let program = verify_program(&expand_vars(program)?, &co.dir);
     if print_only {
-        println!("# {} — runs in {}", c.name, repo.display());
+        toryo::outln!("# {} — runs in {}", c.name, repo.display());
         for (k, v) in env.iter().filter(|(k, _)| k.starts_with("TORYO_")) {
-            println!("#   {k}={v}");
+            toryo::outln!("#   {k}={v}");
         }
-        println!("{}", xpp::powershell_line(&program, args));
+        toryo::outln!("{}", xpp::powershell_line(&program, args));
         return Ok(0);
     }
     for d in [
@@ -239,7 +239,7 @@ fn run_program(
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    println!(
+    toryo::outln!(
         "{} · {} · no boundary (your own rights), working tree of {}",
         c.name,
         describe(c),
@@ -272,7 +272,7 @@ fn run_program(
     let secs = res.duration_ms as f64 / 1000.0;
     if c.reads_msbuild() {
         let d = xpp::diagnostics(&res.output, &co.dir);
-        println!(
+        toryo::outln!(
             "{mark} {} ({ended}, {secs:.1}s) — {} error(s), {} warning(s) — full output: {}",
             c.name,
             d.errors_total,
@@ -280,22 +280,22 @@ fn run_program(
             log.display()
         );
         for e in &d.errors {
-            println!("  {}", e.render());
+            toryo::outln!("  {}", e.render());
         }
         if d.errors_total > d.errors.len() {
-            println!("  … and {} more", d.errors_total - d.errors.len());
+            toryo::outln!("  … and {} more", d.errors_total - d.errors.len());
         }
         if !res.ok() && d.errors.is_empty() {
-            println!("last output:\n{}", res.tail(40));
+            toryo::outln!("last output:\n{}", res.tail(40));
         }
     } else {
-        println!(
+        toryo::outln!(
             "{mark} {} ({ended}, {secs:.1}s) — full output: {}",
             c.name,
             log.display()
         );
         if !res.ok() {
-            println!("last output:\n{}", res.tail(40));
+            toryo::outln!("last output:\n{}", res.tail(40));
         }
     }
     Ok(if res.ok() { 0 } else { 1 })

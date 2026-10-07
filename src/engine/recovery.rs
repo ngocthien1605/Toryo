@@ -655,7 +655,7 @@ impl<'a> Recovery<'a> {
                 size,
             )
         })?;
-        eprintln!(
+        crate::errln!(
             "   snapshot v{} of {}: {} entries → {}",
             m.version,
             a.id,
@@ -813,7 +813,7 @@ impl<'a> Recovery<'a> {
                 );
             }
             wt.soft_reset(&before)?;
-            eprintln!(
+            crate::errln!(
                 "note: commits {}..{} made during the attempt were undone; their changes stay in the tree and are checked",
                 short(&before),
                 short(&head)

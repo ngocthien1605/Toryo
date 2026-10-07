@@ -90,7 +90,7 @@ const MAX_CORRECTIONS: u32 = 2;
 pub fn crash_point(name: &str) {
     if let Ok(v) = std::env::var("TORYO_TEST_CRASH_AT") {
         if v.split(',').any(|p| p.trim() == name) {
-            eprintln!("!! TORYO_TEST_CRASH_AT: crashing at `{name}`");
+            crate::errln!("!! TORYO_TEST_CRASH_AT: crashing at `{name}`");
             std::process::exit(86);
         }
     }
@@ -413,7 +413,7 @@ impl<'a> Engine<'a> {
         };
         let used = t.spent_tokens + t.reserved_tokens;
         if used >= b {
-            eprintln!(
+            crate::errln!(
                 "!! admission cap reached: {used} tokens used ({} spent + ~{} reserved) of {b} — paused before the turn (`toryo budget set {} --tokens N`, then `toryo resume {}`)",
                 t.spent_tokens, t.reserved_tokens, t.id, t.id
             );
@@ -429,7 +429,7 @@ impl<'a> Engine<'a> {
     /// The live interrupt fired: the turn's provisional usage is recorded, the attempt is
     /// interrupted and the task pauses.
     fn budget_interrupted(&self, a: &AttemptRow, r: &StageOutcome) -> Result<Flow> {
-        eprintln!(
+        crate::errln!(
             "!! budget reached during the turn — interrupted (R41 live interrupt), the task pauses"
         );
         self.end_with(
@@ -451,7 +451,7 @@ impl<'a> Engine<'a> {
 
     fn stopped(&self) -> Result<Flow> {
         self.lock.handle_stop("stopped")?;
-        eprintln!("■ stop request handled: the stage attempt is `interrupted`; `toryo resume {}` continues", self.id);
+        crate::errln!("■ stop request handled: the stage attempt is `interrupted`; `toryo resume {}` continues", self.id);
         Ok(Flow::Stopped)
     }
 
@@ -483,7 +483,7 @@ impl<'a> Engine<'a> {
         loop {
             if self.lock.stop_requested()? {
                 self.lock.handle_stop("stopped_at_boundary")?;
-                eprintln!("■ stopped at a stage boundary (nothing was interrupted)");
+                crate::errln!("■ stopped at a stage boundary (nothing was interrupted)");
                 return Ok(RunEnd::Stopped);
             }
             let t = self.task()?;
@@ -509,7 +509,7 @@ impl<'a> Engine<'a> {
                     } else {
                         GateKind::Final
                     };
-                    eprintln!("({kind:?} gate approved automatically: --yes)");
+                    crate::errln!("({kind:?} gate approved automatically: --yes)");
                     approve_now(self.store, self.rec, &t, kind, None)?;
                     Flow::Next
                 }
@@ -595,7 +595,7 @@ impl<'a> Engine<'a> {
             match ReadOnlyTurn::of(&r) {
                 ReadOnlyTurn::Retry(class) => match retries.next(class) {
                     Some(how) => {
-                        eprintln!(
+                        crate::errln!(
                             "{}",
                             retry_note("planner", class, &r, how, retries.of(class))
                         );
@@ -642,7 +642,8 @@ impl<'a> Engine<'a> {
         let md = super::render::render("plan", &plan)?;
         self.put(t, &a, "plan", "json", &bytes, "plan.json")?;
         self.put(t, &a, "plan-md", "md", md.as_bytes(), "PLAN.md")?;
-        eprintln!("\n{md}");
+        // the agent wrote it: inert, and never painted like a line of Toryo's own (M15)
+        crate::term::quoted(crate::term::Stream::Err, &format!("\n{md}"));
         let bad: Vec<String> = plan_files(&plan)
             .into_iter()
             .filter(|f| self.protect.violates(f))
@@ -656,11 +657,11 @@ impl<'a> Engine<'a> {
             let fb = match plan_fence_feedback(&bad, &self.protect) {
                 // M11-C2: the feedback names the fence rule each path breaks
                 Some(fb) => {
-                    eprintln!("!! the plan lists paths the implementer may not change {bad:?} — rejected automatically (plan-time policy, write fence)");
+                    crate::errln!("!! the plan lists paths the implementer may not change {bad:?} — rejected automatically (plan-time policy, write fence)");
                     fb
                 }
                 None => {
-                    eprintln!("!! the plan lists protected or denied paths {bad:?} — rejected automatically (plan-time policy)");
+                    crate::errln!("!! the plan lists protected or denied paths {bad:?} — rejected automatically (plan-time policy)");
                     format!("Your plan lists protected or denied paths {bad:?} (toryo.yaml policy), which may not change. Create the plan again without touching them.")
                 }
             };
@@ -676,7 +677,7 @@ impl<'a> Engine<'a> {
         }
         // M11-D2: the implementer's skills — on its menu, within its context budget
         if let Some((reason, fb)) = self.plan_skills_problem(t, &plan)? {
-            eprintln!("!! {reason} — rejected automatically (plan-time skills check)");
+            crate::errln!("!! {reason} — rejected automatically (plan-time skills check)");
             self.end_and(
                 &a,
                 AttemptStatus::Succeeded,
@@ -950,7 +951,7 @@ impl<'a> Engine<'a> {
         // M13-R4 (X32): what a read-only role wrote while HEAD was off the task branch could not
         // be put back then; the branch is back now, so it is first — before the anchor test
         if let Some(reason) = finish_pending_undo(self.store, t, &atts, wt)? {
-            eprintln!("note: the read-only role's earlier write is undone now: {reason}");
+            crate::errln!("note: the read-only role's earlier write is undone now: {reason}");
         }
         let anchor = anchor_of(t, &atts);
         let head = wt.head().ok();
@@ -970,7 +971,7 @@ impl<'a> Engine<'a> {
         let descends = head.is_some() && wt.contains(&anchor)?;
         if on_branch && descends && unfinished.is_none() {
             wt.soft_reset(&anchor)?;
-            eprintln!(
+            crate::errln!(
                 "note: commits {}..{at} on top of the anchor were undone; their changes stay in the tree and are checked like any turn's",
                 short(&anchor)
             );
@@ -1042,7 +1043,7 @@ impl<'a> Engine<'a> {
             )?;
             // EC-25: the report is informational, so a schema mismatch is recorded, not fatal
             if let Err(errors) = contracts::validate("implementation.schema.json", v) {
-                eprintln!(
+                crate::errln!(
                     "!! implementation.json does not match implementation.schema.json: {}",
                     errors.join("; ")
                 );
@@ -1084,7 +1085,7 @@ impl<'a> Engine<'a> {
             ImplementOutcome::BudgetHit => self.budget_interrupted(a, r),
             ImplementOutcome::Stopped => self.stopped_turn(a, r),
             ImplementOutcome::Retry { retry, wait } => {
-                eprintln!(
+                crate::errln!(
                     "!! {}: {:?} — retry {retry}/{RATE_LIMIT_RETRIES} in {}s",
                     turn.profile,
                     r.error_class,
@@ -1094,7 +1095,7 @@ impl<'a> Engine<'a> {
                 // a stop request cuts the backoff short (EC-17, R38); the run loop then
                 // stops at this stage boundary, before the retry starts
                 if backoff(&run.stop.flag, wait) {
-                    eprintln!("■ stop requested during the backoff: the retry does not start");
+                    crate::errln!("■ stop requested during the backoff: the retry does not start");
                 }
                 Ok(Flow::Next)
             }
@@ -1142,11 +1143,11 @@ impl<'a> Engine<'a> {
                     notes.push(match change_fence_feedback(&others, &self.protect) {
                         // M11-C2: the fix note names the fence rule each path breaks
                         Some(fb) => {
-                            eprintln!("!! paths the implementer may not change were changed: {others:?} — restored, nothing committed; sent back to the implementer (write fence)");
+                            crate::errln!("!! paths the implementer may not change were changed: {others:?} — restored, nothing committed; sent back to the implementer (write fence)");
                             fb
                         }
                         None => {
-                            eprintln!("!! protected or denied paths changed: {others:?} — restored, nothing committed; sent back to the implementer");
+                            crate::errln!("!! protected or denied paths changed: {others:?} — restored, nothing committed; sent back to the implementer");
                             format!("- POLICY: you changed protected or denied paths {others:?}. They were restored. Do not modify them; achieve the task another way.")
                         }
                     });
@@ -1154,7 +1155,7 @@ impl<'a> Engine<'a> {
                 if let Some(fb) =
                     build_output_feedback(&built, &self.protect, self.cfg.team.is_some())
                 {
-                    eprintln!("!! build output that a gate runs as its script reached the change list: {built:?} — removed, nothing committed; sent back to the implementer");
+                    crate::errln!("!! build output that a gate runs as its script reached the change list: {built:?} — removed, nothing committed; sent back to the implementer");
                     notes.push(fb);
                 }
                 let fb = notes.join("\n");
@@ -1224,7 +1225,7 @@ impl<'a> Engine<'a> {
         )? {
             HeadGuard::Unchanged => return Ok(None),
             HeadGuard::Reset { head } => {
-                eprintln!(
+                crate::errln!(
                     "!! policy_violation: the agent moved HEAD — soft reset to {}",
                     short(&run.head_before)
                 );
@@ -1273,7 +1274,7 @@ impl<'a> Engine<'a> {
         let escalation = failed.escalation(&sha);
         // an escalation's reason is printed with its event
         if escalation.is_none() {
-            eprintln!(
+            crate::errln!(
                 "!! {}; {} — the stage runs again from it (once, §11)",
                 failed.reason,
                 FailedTurn::kept(&sha)
@@ -1329,7 +1330,7 @@ impl<'a> Engine<'a> {
             .collect();
         let committed = self.committed_partial(wt, &run.attempt)?;
         let next = implementer_at(t, t.implementer_index + 1, self.opts.no_fallback);
-        eprintln!(
+        crate::errln!(
             "!! implementer {profile}: {reason} → {}",
             next.as_deref()
                 .map(|n| format!("switching to {n}"))
@@ -1554,7 +1555,7 @@ impl<'a> Engine<'a> {
                     short(&head)
                 ),
             )?;
-            eprintln!("   protected baseline renewed: {allowed:?} (## Allow protected)");
+            crate::errln!("   protected baseline renewed: {allowed:?} (## Allow protected)");
         }
         self.finish_and(
             &a,
@@ -1660,7 +1661,7 @@ impl<'a> Engine<'a> {
             before_deploy = verify::mutated(&self.g, &co, &head)?;
             let found = verify::checkout_extra(&self.g, &co)?;
             if !found.is_empty() {
-                eprintln!(
+                crate::errln!(
                     "!! a check gate left files in the verify checkout — they are not deployed: {:?}",
                     found.iter().take(10).collect::<Vec<_>>()
                 );
@@ -2161,7 +2162,7 @@ impl<'a> Engine<'a> {
             kind: kind.map(str::to_string),
         });
         if let (false, Some(log)) = (res.ok(), &res.log) {
-            eprintln!("    full output: {}", log.display());
+            crate::errln!("    full output: {}", log.display());
         }
         Ok(Some(res))
     }
@@ -2207,7 +2208,9 @@ impl<'a> Engine<'a> {
         let mut ran: Vec<&str> = Vec::new();
         for (at, &(name, g)) in gates.iter().enumerate() {
             let Some(m) = &g.machine else {
-                eprintln!("  – {name}: skipped — not defined on this machine (if_missing: skip)");
+                crate::errln!(
+                    "  – {name}: skipped — not defined on this machine (if_missing: skip)"
+                );
                 results.push(json!({"name": name, "kind": "environment", "skipped": true, "reason": SKIPPED_REASON}));
                 continue;
             };
@@ -2306,7 +2309,7 @@ impl<'a> Engine<'a> {
             // stop that arrived after the gate finished keeps the gate's real result.
             let ok = deployment_ok(&res);
             if let (false, Some(log)) = (res.ok(), &res.log) {
-                eprintln!("    full output: {}", log.display());
+                crate::errln!("    full output: {}", log.display());
             }
             let (i, l) = (t.id.clone(), lock_name.clone());
             self.store
@@ -2436,7 +2439,7 @@ impl<'a> Engine<'a> {
         // checkpoint — a `task config --reload` that changed the verify configuration while
         // the task waited (Paused, Escalated) invalidated it: verify again first
         if self.verify_stale(t)? {
-            eprintln!("!! checkpoint {} has no current passing verify result (e.g. the verify configuration was reloaded) — it is verified again before the review (R29)", short(&head));
+            crate::errln!("!! checkpoint {} has no current passing verify result (e.g. the verify configuration was reloaded) — it is verified again before the review (R29)", short(&head));
             self.apply(Ev::Reverify)?;
             return Ok(Flow::Next);
         }
@@ -2566,7 +2569,7 @@ impl<'a> Engine<'a> {
                 ReadOnlyTurn::Invalid(why) => vec![why],
                 ReadOnlyTurn::Retry(class) => match retries.next(class) {
                     Some(how) => {
-                        eprintln!(
+                        crate::errln!(
                             "{}",
                             retry_note("reviewer", class, &r, how, retries.of(class))
                         );
@@ -2594,7 +2597,7 @@ impl<'a> Engine<'a> {
                 }
             };
             last = r;
-            eprintln!(
+            crate::errln!(
                 "!! invalid review (correction {}/{MAX_CORRECTIONS}): {viol:?}",
                 corrections + 1
             );
@@ -2632,10 +2635,11 @@ impl<'a> Engine<'a> {
             "review.json",
         )?;
         self.put(t, a, "review-md", "md", md.as_bytes(), "REVIEW.md")?;
-        eprintln!("\n{md}");
+        // the agent wrote it: inert, and never painted like a line of Toryo's own (M15)
+        crate::term::quoted(crate::term::Stream::Err, &format!("\n{md}"));
         let verdict = ReviewVerdict::of(&review);
         if let Some(unmet) = &verdict.downgraded {
-            eprintln!("!! review_inconsistent: `approved` with unmet {unmet:?} / blocking issues → changes_requested");
+            crate::errln!("!! review_inconsistent: `approved` with unmet {unmet:?} / blocking issues → changes_requested");
         }
         let (i, h) = (self.id.clone(), head.to_string());
         self.store
@@ -2768,7 +2772,7 @@ impl<'a> Engine<'a> {
                         })?;
                     }
                     Ok(None) => {}
-                    Err(x) => eprintln!(
+                    Err(x) => crate::errln!(
                         "!! the checks after the read-only turn failed too ({x:#}); the turn's own error follows"
                     ),
                 }
@@ -2779,7 +2783,7 @@ impl<'a> Engine<'a> {
         if let Err(e) = self.usage(a, profile, &r, model.as_deref()) {
             // the same for an error while the usage is recorded: checks first
             if let Some(flow) = self.read_only_checks(t, a, &r, &before)? {
-                eprintln!("!! the turn's usage could not be recorded: {e:#}");
+                crate::errln!("!! the turn's usage could not be recorded: {e:#}");
                 return Ok(Err(flow));
             }
             return Err(e);
@@ -3037,9 +3041,9 @@ impl<'a> Engine<'a> {
             return Ok(None);
         }
         for w in &c.warnings {
-            eprintln!("!! {w}");
+            crate::errln!("!! {w}");
         }
-        eprintln!(
+        crate::errln!(
             "   context: {} bytes, {} sources, sha256 {}",
             c.text.len(),
             c.sources.len(),
@@ -4351,7 +4355,7 @@ pub(super) fn undo_read_only_write(
         let on_branch = wt.head_ref().ok().flatten() == Some(format!("refs/heads/{}", t.branch));
         if on_branch && wt.unfinished_operation()?.is_none() {
             wt.soft_reset(began)?;
-            eprintln!(
+            crate::errln!(
                 "   the read-only role had moved HEAD — soft reset to {}",
                 short(began)
             );
@@ -4443,7 +4447,7 @@ pub(super) fn undo_read_only_write(
         let (left, back): (Vec<String>, Vec<String>) =
             written.into_iter().partition(|p| now.contains(p));
         if !back.is_empty() {
-            eprintln!(
+            crate::errln!(
                 "   put back (written by the read-only role): {back:?} — a copy is in {}",
                 keep.display()
             );
@@ -5412,7 +5416,7 @@ pub fn approve_now(
                 );
             }
             if let Some(note) = uncommitted_note(&worktree_changes(&g, t), &gate.subject) {
-                eprintln!("{note}");
+                crate::errln!("{note}");
             }
             Ev::FinalApproved {
                 occurrence: gate.occurrence,

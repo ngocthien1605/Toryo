@@ -263,30 +263,30 @@ impl StageOutcome {
     }
 
     pub fn print_summary(&self) {
-        eprintln!("── turn summary ({}) ──", self.label);
-        eprintln!("success          : {}", self.success);
-        eprintln!(
+        crate::errln!("── turn summary ({}) ──", self.label);
+        crate::errln!("success          : {}", self.success);
+        crate::errln!(
             "session id       : {}",
             self.session_id.as_deref().unwrap_or("-")
         );
         if let Some(c) = self.error_class {
-            eprintln!(
+            crate::errln!(
                 "error            : {c:?} — {}",
                 self.error_detail.as_deref().unwrap_or("")
             );
         }
-        eprintln!("permission denials: {}", self.permission_denials.len());
+        crate::errln!("permission denials: {}", self.permission_denials.len());
         match self.usage {
-            Some(u) => eprintln!("usage ({:?})     : {:?}", u.accounting, u.buckets),
-            None => eprintln!("usage            : none reported"),
+            Some(u) => crate::errln!("usage ({:?})     : {:?}", u.accounting, u.buckets),
+            None => crate::errln!("usage            : none reported"),
         }
-        eprintln!(
+        crate::errln!(
             "duration         : {:.1}s{}",
             self.duration_ms as f64 / 1000.0,
             if self.timed_out { " (timed out)" } else { "" }
         );
         if let Some(d) = &self.capture_dir {
-            eprintln!("captured in      : {}", d.display());
+            crate::errln!("captured in      : {}", d.display());
         }
     }
 }

@@ -218,7 +218,7 @@ fn hub_for(t: &TaskRow, d: &DriveArgs) -> Result<AgentHub> {
                 .collect::<Vec<_>>()
                 .join("\n");
             if d.accept_unverified {
-                eprintln!(
+                toryo::errln!(
                     "WARNING: running with unverified profiles (--accept-unverified):\n{list}"
                 );
             } else {
@@ -254,7 +254,7 @@ fn machine_notify(d: &DriveArgs) -> toryo::config::Notify {
         Some(p) => match toryo::config::MachineConfig::load(p) {
             Ok(m) => m.notify,
             Err(e) => {
-                eprintln!("WARNING: {e:#} — no toasts");
+                toryo::errln!("WARNING: {e:#} — no toasts");
                 Default::default()
             }
         },
@@ -430,7 +430,7 @@ fn drive_inner(store: &Store, lock: &TaskLock, rec: &Recorder, d: &DriveArgs) ->
             .collect()
     };
     for n in recovery.recover(&lock.task)? {
-        eprintln!("↺ recovery: {n}");
+        toryo::errln!("↺ recovery: {n}");
     }
     recovered_events(store, rec, &lock.task, &running, &usage_before)?;
     let before = t.state;
@@ -473,14 +473,20 @@ fn drive_inner(store: &Store, lock: &TaskLock, rec: &Recorder, d: &DriveArgs) ->
     };
     let t = get(store, &lock.task)?;
     let summary = write_summary(store, &t)?;
-    eprintln!("\n══════════ {}: {:?} ══════════", t.id, t.state);
+    // the end of the run: the banner and its lines, or — painted — an open frame (M15-02)
+    let mut lines = Vec::new();
     if t.state == PipelineState::WaitingFinalApproval {
         for n in toryo::engine::runner::final_gate_notes(store, &t)? {
-            eprintln!("final gate — {n}");
+            lines.push(format!("final gate — {n}"));
         }
     }
-    eprintln!("next: {}", next_action(&t));
-    eprintln!("summary: {}", summary.display());
+    lines.push(format!("next: {}", next_action(&t)));
+    lines.push(format!("summary: {}", summary.display()));
+    toryo::term::end_block(
+        &format!("{}: {:?}", t.id, t.state),
+        &format!("{:?}", t.state),
+        &lines,
+    );
     Ok(match end {
         RunEnd::Done(PipelineState::Completed) | RunEnd::Stopped => 0,
         RunEnd::Waiting(
@@ -531,8 +537,8 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
                     max_fix_cycles: *max_fix_cycles,
                 },
             )?;
-            println!("{}", t.id);
-            eprintln!(
+            toryo::outln!("{}", t.id);
+            toryo::errln!(
                 "created {}: {} acceptance criteria {:?}\n  worktree {} · branch {} · base {}\n  planner {} · implementer {} · reviewer {}\n  run store {}\nnext: `toryo run {}`",
                 t.id,
                 t.acceptance_ids.len(),
@@ -565,7 +571,7 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
             let cfg = match frozen_config(&t) {
                 Ok(c) => Some(c),
                 Err(e) => {
-                    eprintln!("WARNING: {e:#} — cleaning up without it (every repository filter driver neutralised)");
+                    toryo::errln!("WARNING: {e:#} — cleaning up without it (every repository filter driver neutralised)");
                     None
                 }
             };
@@ -604,7 +610,7 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
                     if !*force {
                         return Err(e);
                     }
-                    eprintln!("note: {e:#} — removing the folder itself");
+                    toryo::errln!("note: {e:#} — removing the folder itself");
                     std::fs::remove_dir_all(&t.worktree)
                         .with_context(|| format!("removing {}", t.worktree.display()))?;
                     let _ = g.run(&repo, false, &["worktree", "prune"]);
@@ -619,7 +625,7 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
                 store::event(tx, Some(&i), None, "cleaned_up", &serde_json::json!({}))
             })?;
             lock.release();
-            eprintln!("removed the worktree and the run store of {id}; the branch {} is kept (`git branch -D {}` when you no longer need it)", t.branch, t.branch);
+            toryo::errln!("removed the worktree and the run store of {id}; the branch {} is kept (`git branch -D {}` when you no longer need it)", t.branch, t.branch);
             Ok(0)
         }
     }
@@ -659,7 +665,7 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     if !reload {
         let t = get(&st, id)?;
         let (_, text) = task::frozen_config_text(&t)?;
-        eprintln!(
+        toryo::errln!(
             "{id}: frozen configuration, digest {}",
             short(&t.config_sha256)
         );
@@ -699,7 +705,7 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     let new_text = new.canonical_json();
     let new_sha = sha256_hex(new_text.as_bytes());
     if new_sha == t.config_sha256 {
-        eprintln!(
+        toryo::errln!(
             "{id}: the effective configuration is unchanged ({})",
             short(&new_sha)
         );
@@ -736,8 +742,8 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
             &b.display().to_string(),
         ],
     )?;
-    eprintln!("{}", String::from_utf8_lossy(&out.stdout));
-    eprintln!(
+    toryo::errln!("{}", String::from_utf8_lossy(&out.stdout));
+    toryo::errln!(
         "{id}: new configuration digest {} (was {})",
         short(&new_sha),
         short(&t.config_sha256)
@@ -833,10 +839,10 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
             .join("\n"),
     )?;
     for x in &notes {
-        eprintln!("{id}: {x}");
+        toryo::errln!("{id}: {x}");
     }
     let t = get(&st, id)?;
-    eprintln!("next: {}", next_action(&t));
+    toryo::errln!("next: {}", next_action(&t));
     lock.release();
     Ok(0)
 }
@@ -890,18 +896,18 @@ pub fn approve(
         let t = get(&st, id)?;
         // the owner just opened this gate: recorded, never toasted (R1)
         recorded(&recorder(&t, &lock), before, "force_final", &t);
-        eprintln!(
+        toryo::errln!(
             "{id}: reviewer skipped — the final gate is open for checkpoint {}",
             t.machine.checkpoint().unwrap_or("")
         );
-        eprintln!("next: {}", next_action(&t));
+        toryo::errln!("next: {}", next_action(&t));
         lock.release();
         return Ok(0);
     }
     if let Some(g) = t.machine.gate() {
         let digest =
             toryo::engine::runner::gate_digest(&st, id, g.kind, g.occurrence).unwrap_or_default();
-        eprintln!(
+        toryo::errln!(
             "{id}: {:?} gate, occurrence {}, subject {} (digest {})",
             g.kind,
             g.occurrence,
@@ -915,7 +921,7 @@ pub fn approve(
     } else {
         let t = get(&st, id)?;
         write_summary(&st, &t)?;
-        eprintln!("next: {}", next_action(&t));
+        toryo::errln!("next: {}", next_action(&t));
         0
     };
     lock.release();
@@ -931,7 +937,7 @@ pub fn reject(id: &str, gate: Gate, reason: &str) -> Result<i32> {
     let t = get(&st, id)?;
     reject_now(&st, &recorder(&t, &lock), &t, gate.into(), reason)?;
     let t = get(&st, id)?;
-    eprintln!("next: {}", next_action(&t));
+    toryo::errln!("next: {}", next_action(&t));
     lock.release();
     Ok(0)
 }
@@ -968,7 +974,7 @@ fn resume_protected(st: &Store, t: &TaskRow, accept: &[String]) -> Result<bool> 
             )?;
             store::transition(tx, &i, PipelineEvent::ResumeStage).map(|_| ())
         })?;
-        eprintln!(
+        toryo::errln!(
             "{}: protected state matches the baseline again — the stage continues",
             t.id
         );
@@ -982,7 +988,7 @@ fn resume_protected(st: &Store, t: &TaskRow, accept: &[String]) -> Result<bool> 
         .map(|x| format!("{} {}", x.kind, x.path))
         .collect();
     if accept.is_empty() || !missing.is_empty() {
-        eprintln!(
+        toryo::errln!(
             "{}: protected state still differs from the baseline: {}
   diff: {}
   → restore, or `toryo resume {} --accept-protected-change <path>` for each",
@@ -1026,7 +1032,7 @@ fn resume_protected(st: &Store, t: &TaskRow, accept: &[String]) -> Result<bool> 
         ),
     )?;
     st.call(move |tx| store::transition(tx, &i, PipelineEvent::ResumeStage).map(|_| ()))?;
-    eprintln!(
+    toryo::errln!(
         "{}: accepted {} — protected baseline v{}",
         t.id,
         list.join(", "),
@@ -1118,7 +1124,7 @@ fn resume_before_drive(st: &Store, t: &TaskRow, r: &ResumeArgs, protected: bool)
         } else {
             rec.keep_partial(&t.id)?
         };
-        eprintln!("↺ {msg}");
+        toryo::errln!("↺ {msg}");
         toryo::engine::decisions::append(
             st,
             t,
@@ -1167,7 +1173,7 @@ fn resume_before_drive(st: &Store, t: &TaskRow, r: &ResumeArgs, protected: bool)
             Ok(said)
         })?;
         if confirms {
-            eprintln!(
+            toryo::errln!(
                 "{}: deploy confirmed ({})",
                 t.id,
                 said.iter()
@@ -1235,13 +1241,13 @@ pub fn resume(id: Option<&str>, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
             for t in tasks.into_iter().filter(|t| !t.state.is_terminal()) {
                 // M12-12 (b): a task that was never started is `run`, not `resume`
                 if t.state == PipelineState::New {
-                    eprintln!("\n{}: not started — `toryo run {}`", t.id, t.id);
+                    toryo::errln!("\n{}: not started — `toryo run {}`", t.id, t.id);
                     continue;
                 }
                 // M12-07 (review): a stop that asks before a deploy is answered by `resume <id>`
                 // — never by a resume of everything
                 if waits_for_a_deploy_yes(&t) {
-                    eprintln!(
+                    toryo::errln!(
                         "\n{}: waits for your yes before it deploys — look at it, then `toryo resume {}`",
                         t.id, t.id
                     );
@@ -1250,20 +1256,20 @@ pub fn resume(id: Option<&str>, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
                 }
                 match TaskLock::acquire(&st, &t.id) {
                     Ok(lock) => {
-                        eprintln!("\n▶ resume {}", t.id);
+                        toryo::errln!("\n▶ resume {}", t.id);
                         // M12-12 (b): one failing task does not stop the others; the exit
                         // code says that one failed
                         match resume_one(&st, &lock, &ResumeArgs::default(), d) {
                             Ok(c) => code = code.max(c),
                             Err(e) => {
-                                eprintln!("{}: error: {e:#}", t.id);
+                                toryo::errln!("{}: error: {e:#}", t.id);
                                 code = code.max(2);
                             }
                         }
                         lock.release();
                     }
                     Err(e) => match e.downcast_ref::<lock::TaskActive>() {
-                        Some(a) => eprintln!("{} — skipped", a),
+                        Some(a) => toryo::errln!("{} — skipped", a),
                         None => return Err(e),
                     },
                 }
@@ -1276,18 +1282,18 @@ pub fn resume(id: Option<&str>, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
 pub fn stop(id: &str, wait: u64) -> Result<i32> {
     let st = store()?;
     get(&st, id)?;
-    eprintln!("stop requested for {id}; waiting up to {wait}s …");
+    toryo::errln!("stop requested for {id}; waiting up to {wait}s …");
     Ok(match lock::stop(&st, id, Duration::from_secs(wait))? {
         StopOutcome::Stopped(o) => {
-            eprintln!("{id}: {o}");
+            toryo::errln!("{id}: {o}");
             0
         }
         StopOutcome::NoOwner => {
-            eprintln!("{id}: no_owner — nothing was running");
+            toryo::errln!("{id}: no_owner — nothing was running");
             0
         }
         StopOutcome::Pending => {
-            eprintln!("{id}: the owner has not answered yet (the request stays for it)");
+            toryo::errln!("{id}: the owner has not answered yet (the request stays for it)");
             1
         }
     })
@@ -1376,7 +1382,7 @@ pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
         return Ok(0);
     }
     if tasks.is_empty() {
-        println!("no tasks (`toryo task create --file TASK.md`)");
+        toryo::outln!("no tasks (`toryo task create --file TASK.md`)");
     }
     for t in tasks {
         let f = facts(&st, &t)?;
@@ -1385,7 +1391,7 @@ pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
             .as_ref()
             .map(|o| format!(" · ACTIVE ({o})"))
             .unwrap_or_default();
-        println!(
+        toryo::outln!(
             "{:<14} {:<22} fix {} · tokens {}{}{}{}",
             t.id,
             format!("{:?}", t.state),
@@ -1403,7 +1409,7 @@ pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
         );
         // R59: an X++ verify proves compile level only — say so wherever the state is shown
         if f.compile_only == Some(true) {
-            println!("               {}", toryo::engine::xpp::COMPILE_ONLY);
+            toryo::outln!("               {}", toryo::engine::xpp::COMPILE_ONLY);
         }
         // M11-E3: an environment gate waiting for its machine-wide lock (only while its run is
         // alive: a crash while waiting leaves the row behind — group E review)
@@ -1416,14 +1422,14 @@ pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
                     .find(|d| d.lock == lock && d.finished_at.is_none() && d.task != t.id)
                     .map(|d| format!(" (held by {})", d.task))
                     .unwrap_or_default();
-                println!("               waiting for lock {lock}{holder}");
+                toryo::outln!("               waiting for lock {lock}{holder}");
             }
         }
-        println!("               next: {}", f.next_action);
+        toryo::outln!("               next: {}", f.next_action);
     }
     // M11-E3: one line per environment lock — what code that environment runs
     for (d, s, _) in &envs {
-        println!("environment    {}", views::deployment_line(d, s));
+        toryo::outln!("environment    {}", views::deployment_line(d, s));
     }
     Ok(0)
 }
@@ -1484,15 +1490,15 @@ fn show(id: &str, json: bool) -> Result<i32> {
         return Ok(0);
     }
     status(Some(id), false)?;
-    println!(
+    toryo::outln!(
         "               worktree: {} · branch {} · run store {}",
         t.worktree.display(),
         t.branch,
         t.run_store.display()
     );
-    println!("\nstage attempts:");
+    toryo::outln!("\nstage attempts:");
     for a in atts {
-        println!(
+        toryo::outln!(
             "  {:<22} {:<11} {:<14} {}{}{}",
             a.id,
             format!("{:?}", a.status),
@@ -1507,14 +1513,14 @@ fn show(id: &str, json: bool) -> Result<i32> {
         );
     }
     if !usage.is_empty() {
-        println!("\nusage (R41; ~ = reservation for a turn with no telemetry):");
+        toryo::outln!("\nusage (R41; ~ = reservation for a turn with no telemetry):");
         for u in usage {
             let amount = match (u.accounting.as_str(), u.budget_tokens, u.reservation_tokens) {
                 ("unknown", _, Some(r)) => format!("~{r}"),
                 (_, Some(b), _) => b.to_string(),
                 _ => "?".into(),
             };
-            println!(
+            toryo::outln!(
                 "  #{:<4} {:<22} {:<14} {:<11} {amount:>9}{}{}",
                 u.id,
                 u.attempt,
@@ -1532,9 +1538,9 @@ fn show(id: &str, json: bool) -> Result<i32> {
         }
     }
     if !ap.is_empty() {
-        println!("\ngates:");
+        toryo::outln!("\ngates:");
         for a in ap {
-            println!(
+            toryo::outln!(
                 "  {} #{} {:<10} digest {} {}",
                 a.gate,
                 a.occurrence,
@@ -1586,7 +1592,7 @@ pub fn budget(cmd: &BudgetCmd) -> Result<i32> {
             t.reserved_tokens
         ),
     )?;
-    eprintln!(
+    toryo::errln!(
         "{id}: admission cap {} (used {used}; may overshoot by one turn){}",
         new.map(|b| b.to_string()).unwrap_or_else(|| "none".into()),
         if t.state == PipelineState::Paused {
@@ -1630,7 +1636,7 @@ pub fn context(cmd: &ContextCmd) -> Result<i32> {
             let text = String::from_utf8_lossy(&bytes).to_string();
             let sha = toryo::engine::task::sha256_hex(&bytes);
             let ok = a.context_sha256.as_deref() == Some(sha.as_str()) && v.sha256 == sha;
-            eprintln!(
+            toryo::errln!(
                 "{}: context of {} ({}), sha256 {} — {}",
                 id,
                 a.id,
@@ -1642,8 +1648,8 @@ pub fn context(cmd: &ContextCmd) -> Result<i32> {
                     "DOES NOT MATCH stage_attempts.context_sha256 (artifact_tampered)"
                 }
             );
-            print!("{text}");
-            eprintln!(
+            print!("{}", toryo::term::data(&text));
+            toryo::errln!(
                 "(the user prompt sent with it — for the Claude implementer with the <untrusted_data> blocks, R61 — is captured in {})",
                 t.captures().display()
             );
@@ -1657,14 +1663,18 @@ pub fn context(cmd: &ContextCmd) -> Result<i32> {
             };
             let c = cx::assemble(&cx::request(&st, &t, &cfg, &stage, &profile)?)?;
             eprint!(
-                "{id}: next `{stage}` attempt with `{profile}` — {}",
-                cx::describe(&c)
+                "{}",
+                toryo::term::text(&format!(
+                    "{id}: next `{stage}` attempt with `{profile}` — {}",
+                    cx::describe(&c)
+                ))
             );
-            print!("{}", c.text);
+            print!("{}", toryo::term::data(&c.text));
             // R61: what goes into the user prompt instead of the context (Claude implementer)
             if let Some(d) = c.data_prompt() {
                 print!(
-                    "\n<!-- user prompt part: untrusted task files as data blocks (R61) -->\n{d}"
+                    "\n<!-- user prompt part: untrusted task files as data blocks (R61) -->\n{}",
+                    toryo::term::data(&d)
                 );
             }
             Ok(0)
@@ -1700,7 +1710,7 @@ pub fn partial(cmd: &PartialCmd) -> Result<i32> {
             let cfg = frozen_config(&t)?;
             let g = task::task_git(&cfg, &t.repo)?;
             let m = snapshot::export(&Worktree::new(&g, &t.worktree), &dir, into)?;
-            eprintln!(
+            toryo::errln!(
                 "{}: {} entries of {} restored into {} (a detached worktree at {}; remove it with `git worktree remove`)",
                 id,
                 m.entries.len(),
@@ -1831,11 +1841,16 @@ pub fn watch(id: &str, json: bool, from_start: bool, no_follow: bool) -> Result<
 /// Print the `watch` text of `lines` on stdout. `false`: stdout is closed (a broken pipe).
 fn show_lines(lines: &[String], json: bool) -> Result<bool> {
     use std::io::Write;
-    let out = std::io::stdout();
-    let mut out = out.lock();
+    use toryo::term::{try_line, Stream};
     for line in lines {
         if let Some(text) = toryo::engine::flight::watch_line(line, json) {
-            match writeln!(out, "{text}").and_then(|_| out.flush()) {
+            // `--json`: the recorded line as it is; else the rendered text, painted on a terminal
+            let written = if json {
+                writeln!(std::io::stdout(), "{text}")
+            } else {
+                try_line(Stream::Out, &text)
+            };
+            match written.and_then(|_| std::io::stdout().flush()) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(false),
                 Err(e) => return Err(e.into()),
@@ -1874,7 +1889,10 @@ pub fn usage(id: &str, json: bool, prices: Option<&std::path::Path>) -> Result<i
     if json {
         print_json(&ur::to_json(&r, id, path.as_deref()))?;
     } else {
-        print!("{}", ur::render_text(&r, id, path.as_deref()));
+        print!(
+            "{}",
+            toryo::term::text(&ur::render_text(&r, id, path.as_deref()))
+        );
     }
     Ok(0)
 }

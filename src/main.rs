@@ -34,6 +34,15 @@ pub(crate) struct Cli {
     /// Machine config (default: %USERPROFILE%\.toryo\toryo.local.yaml)
     #[arg(long, global = true)]
     pub(crate) machine_config: Option<PathBuf>,
+    /// Colour for the lines toryo prints: on a terminal (unless NO_COLOR is set), always, or never
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value = "auto",
+        value_name = "WHEN"
+    )]
+    pub(crate) color: toryo::term::Color,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -238,7 +247,7 @@ pub(crate) fn config_path(cli: &Cli) -> PathBuf {
             if !same {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
-                    eprintln!(
+                    toryo::errln!(
                         "note: using {} (the file in this folder); $TORYO_CONFIG ({}) is ignored here — pass --config to choose",
                         std::fs::canonicalize(&local).unwrap_or(local.clone()).display(),
                         v.display()
@@ -320,7 +329,7 @@ fn run(cli: Cli) -> Result<i32> {
                 variable.as_deref(),
             )?;
             if !failed.is_empty() {
-                eprintln!("canaries that did not pass: {}", failed.join(", "));
+                toryo::errln!("canaries that did not pass: {}", failed.join(", "));
                 return Ok(code.max(1));
             }
             Ok(code)
@@ -335,7 +344,7 @@ fn run(cli: Cli) -> Result<i32> {
                 bail!("empty secret on stdin");
             }
             toryo::config::store_secret(target, v)?;
-            eprintln!("stored credman:{target}");
+            toryo::errln!("stored credman:{target}");
             Ok(0)
         }
         #[cfg(feature = "m0-kit")]
@@ -350,7 +359,7 @@ fn run(cli: Cli) -> Result<i32> {
                     serde_json::to_string_pretty(&toryo::config_show::json(&cfg))?
                 );
             } else {
-                print!("{}", toryo::config_show::text(&cfg));
+                print!("{}", toryo::term::text(&toryo::config_show::text(&cfg)));
             }
             Ok(0)
         }
@@ -405,7 +414,7 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Xpp { cmd } => xpp_cli::run(&cli, cmd),
         Cmd::NotifyTest { dry_run } => {
             let code = toryo::notify::test_toast(*dry_run)?;
-            eprintln!("{}", toryo::notify::test_message(code, *dry_run));
+            toryo::errln!("{}", toryo::notify::test_message(code, *dry_run));
             Ok(if code == 0 { 0 } else { 1 })
         }
     }
@@ -430,7 +439,7 @@ fn main() -> ExitCode {
     {
         Ok(h) => h.join().unwrap_or_else(|_| ExitCode::from(101)),
         Err(e) => {
-            eprintln!("error: cannot start the CLI thread: {e}");
+            toryo::errln!("error: cannot start the CLI thread: {e}");
             ExitCode::from(2)
         }
     }
@@ -438,15 +447,17 @@ fn main() -> ExitCode {
 
 fn cli_main() -> ExitCode {
     let cli = Cli::parse();
+    // before the first line is printed
+    toryo::term::set_color(cli.color);
     let code = match run(cli) {
         Ok(code) => ExitCode::from(exit_status(code)),
         Err(e) => match e.downcast_ref::<toryo::engine::lock::TaskActive>() {
             Some(a) => {
-                eprintln!("task_active: {a}");
+                toryo::errln!("task_active: {a}");
                 ExitCode::from(exit_status(toryo::engine::lock::EXIT_TASK_ACTIVE))
             }
             None => {
-                eprintln!("error: {e:#}");
+                toryo::errln!("error: {e:#}");
                 ExitCode::from(2)
             }
         },

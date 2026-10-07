@@ -75,7 +75,7 @@ impl Redactions {
                 let name = sanitize_name(&s.name);
                 let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
                 if !noted.contains(&name) {
-                    eprintln!(
+                    crate::errln!(
                         "note: the secret `{name}` holds only line breaks — it is not redacted"
                     );
                     noted.push(name);

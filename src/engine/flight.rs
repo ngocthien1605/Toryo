@@ -243,7 +243,15 @@ impl EventSink for FileSink {
 /// The text of an event: for the events the CLI printed before M10, exactly that text (the
 /// stage headers start with an empty line); for the others (`quiet` live), a line for
 /// `toryo watch`.
+///
+/// M15 (review M9): the text is inert on a terminal — a reason, an error or a `next:` line that
+/// an agent or a vendor wrote carries no escape sequence, carriage return or direction
+/// override to the console ([`crate::term::text`]). The recorded event keeps what was sent.
 pub fn render(env: &Envelope) -> String {
+    crate::term::text(&render_raw(env))
+}
+
+fn render_raw(env: &Envelope) -> String {
     use EngineEvent as E;
     let secs = |ms: u64| ms as f64 / 1000.0;
     match &env.event {
@@ -400,7 +408,7 @@ impl EventSink for StderrSink {
     fn emit(&self, e: &Envelope) -> Result<()> {
         if !e.quiet {
             // R9: a closed stderr is an error of this sink (reported once), never a panic
-            writeln!(std::io::stderr(), "{}", render(e))?;
+            crate::term::try_line(crate::term::Stream::Err, &render(e))?;
         }
         Ok(())
     }
@@ -861,7 +869,7 @@ impl Recorder {
             .unwrap_or_else(|_| Redactions::empty());
         let (first, warning) = next_seq(&seqs(&path));
         if let Some(w) = warning {
-            eprintln!("!! flight recorder {}: {w}", path.display());
+            crate::errln!("!! flight recorder {}: {w}", path.display());
         }
         Self::new(&t.id, generation, first - 1, redact)
             .with(Box::new(FileSink::new(path)))
@@ -950,8 +958,11 @@ impl Recorder {
                     // while `RunEndGuard` unwinds would abort the process
                     let _ = writeln!(
                         std::io::stderr(),
-                        "!! {}: {err:#} — the run continues without it",
-                        s.name()
+                        "{}",
+                        crate::term::text(&format!(
+                            "!! {}: {err:#} — the run continues without it",
+                            s.name()
+                        ))
                     );
                 }
             }
@@ -1292,6 +1303,47 @@ mod tests {
                 "══════════ {}: {:?} ══════════\nnext: {}",
                 "T-1", state, next
             )
+        );
+    }
+
+    /// M15 (review M9): what `run` and `watch` print of an event cannot drive the terminal —
+    /// an OSC 52 clipboard write, "erase the line above" plus a forged end banner, a carriage
+    /// return over the `!!`, a bidi override; the words stay.
+    #[test]
+    fn rendered_text_is_inert_on_a_terminal() {
+        let r = |e: EngineEvent| render(&env(e));
+        assert_eq!(
+            r(EngineEvent::Escalated {
+                reason_class: "review_blocked".into(),
+                reason: "blocked\u{1b}]52;c;QUJD\u{7}\n\u{1b}[1A\u{1b}[2K══ T-1: Completed ══\rok"
+                    .into(),
+            }),
+            "!! blocked\n══ T-1: Completed ══ok"
+        );
+        assert_eq!(
+            r(EngineEvent::Paused {
+                reason: "quota \u{202e}dlo\u{9b}31m".into()
+            }),
+            "!! quota \u{FFFD}dlo\u{FFFD}31m"
+        );
+        let end = r(EngineEvent::RunEnded {
+            state: St::Escalated,
+            next_action: "a\u{1b}[2Jb".into(),
+            from: None,
+            error: Some("x\u{7}y\r\n".into()),
+        });
+        assert_eq!(
+            end,
+            "══════════ T-1: Escalated ══════════\nnext: ab\n!! stopped with an error: x\u{FFFD}y\n"
+        );
+        // the recorded event is data: it keeps what was sent, and JSON escapes it
+        let line = serde_json::to_string(&env(EngineEvent::Paused {
+            reason: "quota \u{1b}]0;owned\u{7}".into(),
+        }))
+        .unwrap();
+        assert!(
+            line.contains(r"\u001b]0;owned\u0007") && !line.contains('\u{1b}'),
+            "{line}"
         );
     }
 

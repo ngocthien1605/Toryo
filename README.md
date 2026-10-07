@@ -192,6 +192,10 @@ In plain words, so that "Low integrity" is not read as "sandbox":
 - The last 40 lines of a gate's output go to the model vendors (as the implementer's fix feedback), and only `secret_env`
   values are redacted. Print no connection string, key or token.
 - Untrusted text (a task pack file, verify output) reaches the agents only as data, never as instructions.
+- Text an agent, a vendor or a gate wrote reaches **your console** as inert text: escape sequences are removed, carriage
+  returns dropped, other control and direction-changing characters shown as `�` — a plan or an escalation reason cannot
+  write your clipboard, retitle the window or paint a forged "Completed" line. `--json` output is data and keeps what was
+  sent (JSON escapes it); `toryo context show` is byte-exact into a pipe and inert on a terminal.
 
 ## When a task stops
 
@@ -215,6 +219,11 @@ a protected file that changed → restore it, or `resume --accept-protected-chan
 - `toryo usage ID` shows tokens per stage × profile × model, and an estimated cost for per-token billing from the
   machine's `prices.toml` (`templates/prices.toml.example`); subscription rows show `—`.
 - `notify: { toast: true }` in the machine config (or `--notify`) shows a Windows toast when a task needs you.
+- **Colour.** On a terminal, toryo paints its own lines by what they mean — green `✔` / `Completed`, red `✘` / `!!` /
+  `Escalated`, yellow for what waits for you, dim bookkeeping, the commands to type in cyan — and ends a run in an open
+  frame instead of the `══════════` banner. `--color auto|always|never` (default `auto`; `NO_COLOR` turns `auto` off,
+  `CLICOLOR_FORCE` on). Into a pipe or a file the output is the plain text, as before; `--json` is never painted. Text an
+  agent wrote (the plan, the review, the lines of a reason) is never painted: colour marks the lines that are toryo's own.
 
 ## Repository layout
 
