@@ -241,10 +241,10 @@ fn a_task_waits_for_the_verify_lock_before_its_check_gates_run() {
     wait_until("V-1 to wait for the verify lock", 90, || {
         events(&env, "V-1")
             .iter()
-            .any(|e| e["type"] == "lock_waiting" && e["lock"] == "verify")
+            .any(|e| e["type"] == "lock_waiting" && e["lock"] == "machine:verify")
     });
     assert_eq!(task(&env, "V-1").state, St::Verifying);
-    assert!(status_out(&env, "V-1").contains("waiting for lock verify"));
+    assert!(status_out(&env, "V-1").contains("waiting for lock machine:verify"));
     std::thread::sleep(std::time::Duration::from_millis(1500));
     assert!(
         intervals(&log).is_empty(),
@@ -285,7 +285,7 @@ fn a_stop_ends_the_wait_for_the_verify_lock() {
     wait_until("W-1 to wait for the verify lock", 90, || {
         events(&env, "W-1")
             .iter()
-            .any(|e| e["type"] == "lock_waiting" && e["lock"] == "verify")
+            .any(|e| e["type"] == "lock_waiting" && e["lock"] == "machine:verify")
     });
     let (code, err) = toryo(&env, &["stop", "W-1"], &[]);
     assert_eq!(code, 0, "{err}");
@@ -328,4 +328,51 @@ fn the_check_gates_of_two_tasks_run_at_once_never_overlap() {
     iv.sort_by_key(|i| i.1);
     assert_ne!(iv[0].0, iv[1].0);
     assert!(iv[0].2 <= iv[1].1, "the gates overlapped: {iv:?}");
+}
+
+/// M16-R2: a run killed while it waited for the verify lock leaves its wait row; the next run
+/// of the task clears it even when it gets the lock at once, so `status` never shows the task
+/// waiting while it verifies.
+#[test]
+fn a_wait_row_a_killed_run_left_is_gone_with_the_next_run() {
+    let env = setup("codex-openai");
+    create(&env, "K-1");
+    let lock_path = env.data.join("locks").join("machine").join("verify.lock");
+    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    held.try_lock().unwrap();
+    let s = happy(&env);
+    let mut child = spawn(
+        &env,
+        &["run", "K-1", "--yes", "--fake-agents", &s],
+        "k1.log",
+    );
+    wait_until("K-1 to wait for the verify lock", 90, || {
+        events(&env, "K-1")
+            .iter()
+            .any(|e| e["type"] == "lock_waiting" && e["lock"] == "machine:verify")
+    });
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let wait = |env: &Env| {
+        db(env)
+            .call(|tx| toryo::engine::store::env_wait(tx, "K-1"))
+            .unwrap()
+    };
+    assert_eq!(
+        wait(&env).as_deref(),
+        Some("machine:verify"),
+        "the killed run left its row"
+    );
+    drop(held);
+    let (code, err) = toryo(&env, &["resume", "K-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "K-1").state, St::Completed, "{err}");
+    assert_eq!(wait(&env), None);
 }

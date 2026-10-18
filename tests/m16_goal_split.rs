@@ -359,3 +359,40 @@ fn in_org_chart_mode_the_planner_seat_splits() {
     assert_eq!(task(&env, "ORG-2").acceptance_ids, ["AC-1"]);
     goals_dir_is_clean(&env);
 }
+
+/// M16-R2: the base is chosen as `task create` chooses it — a `project.base_branch` that does
+/// not exist is an error naming the key, before the planner runs.
+#[test]
+fn a_missing_base_branch_is_named_like_task_create_names_it() {
+    let env = setup("codex-openai");
+    std::fs::write(env.root.join("GOAL.md"), GOAL).unwrap();
+    let cfg = std::fs::read_to_string(&env.config).unwrap();
+    std::fs::write(
+        &env.config,
+        cfg.replacen("project:\n", "project:\n  base_branch: no-such-branch\n", 1),
+    )
+    .unwrap();
+    let s = planner(&env, "split.json", vec![complete(split_answer())]);
+    let (code, _, stderr) = out(
+        &env,
+        &[
+            "goal",
+            "split",
+            "--file",
+            "GOAL.md",
+            "--out",
+            "o",
+            "--prefix",
+            "B",
+            "--fake-agents",
+            &s,
+        ],
+    );
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("project.base_branch: the branch `no-such-branch` does not exist"),
+        "{stderr}"
+    );
+    assert!(!env.root.join("o").exists());
+    goals_dir_is_clean(&env);
+}

@@ -463,8 +463,10 @@ fn try_lock_at(p: &Path, holder: &str) -> Result<Option<File>> {
     Ok(Some(file))
 }
 
-/// M16-02 (X35, O-23): the name the verify lock is shown under (`lock_waiting`, `status`).
-pub const VERIFY_LOCK: &str = "verify";
+/// M16-02 (X36, O-23): the name the verify lock is shown under (`lock_waiting`, `status`, the
+/// wait row). M16-R2: with a `:`, which no environment lock name may hold
+/// ([`lock_name_problem`]) — an environment gate's `lock: verify` is another lock.
+pub const VERIFY_LOCK: &str = "machine:verify";
 
 /// M16-02: the file of the verify lock, `<data_dir>/locks/machine/verify.lock` — a folder of its
 /// own, so neither a task id (`locks/<task>.lock`) nor an environment lock (`locks/env/…`) can
@@ -486,15 +488,41 @@ pub struct VerifyLock {
     file: File,
 }
 
+/// M16-R2: `<data_dir>/locks/machine/verify.holder` — the id of the task that holds the verify
+/// lock, for `status` and `lock_waiting` (Windows does not let another process read a locked
+/// file). Written after the lock is taken, emptied before it is released; a crash leaves it
+/// behind, so a reader also asks whether that task is driven and verifying.
+pub fn verify_holder_path() -> PathBuf {
+    data_dir()
+        .join("locks")
+        .join("machine")
+        .join("verify.holder")
+}
+
+/// The task the holder file names, if any (see [`verify_holder_path`]).
+pub fn verify_holder() -> Option<String> {
+    std::fs::read_to_string(verify_holder_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 impl VerifyLock {
-    /// Take the lock if it is free (non-blocking); `None` while another process holds it.
-    pub fn try_acquire(holder: &str) -> Result<Option<VerifyLock>> {
-        Ok(try_lock_at(&verify_lock_path(), holder)?.map(|file| VerifyLock { file }))
+    /// Take the lock for `task` if it is free (non-blocking); `None` while another process
+    /// holds it. `label` is written in the lock file, the task id in the holder file.
+    pub fn try_acquire(task: &str, label: &str) -> Result<Option<VerifyLock>> {
+        let Some(file) = try_lock_at(&verify_lock_path(), label)? else {
+            return Ok(None);
+        };
+        let _ = std::fs::write(verify_holder_path(), task);
+        Ok(Some(VerifyLock { file }))
     }
 }
 
 impl Drop for VerifyLock {
     fn drop(&mut self) {
+        // emptied while the lock is still held: the next holder writes its own id after it
+        let _ = std::fs::write(verify_holder_path(), "");
         let _ = self.file.unlock();
     }
 }
@@ -605,6 +633,22 @@ mod tests {
         }
         assert_eq!(lock_key("D365-Env"), "d365-env");
         assert_eq!(env_lock_path("D365-Env"), env_lock_path("d365-env"));
+    }
+
+    /// M16-R2: the verify lock's name can never be an environment lock's — in the wait row, the
+    /// `lock_waiting` event and `status` the two are always told apart; and its files are in a
+    /// folder of their own.
+    #[test]
+    fn the_verify_lock_is_no_environment_lock() {
+        assert!(lock_name_problem(VERIFY_LOCK).is_some(), "{VERIFY_LOCK}");
+        assert_eq!(
+            lock_name_problem("verify"),
+            None,
+            "an environment lock may be `verify`"
+        );
+        assert_ne!(verify_lock_path(), env_lock_path("verify"));
+        assert_ne!(verify_lock_path(), lock_path("verify"));
+        assert_eq!(verify_lock_path().parent(), verify_holder_path().parent());
     }
 
     /// Group E review: an environment lock never shares a file with a task lock (task ids

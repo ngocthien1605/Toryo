@@ -100,7 +100,7 @@ lines are printed with the task's id in front (`A │ …`), then one end block 
 `run`) and no queued task starts after it. Two tasks verify one after the other: the check gates of a task run under a
 machine-wide **verify lock** (`<data dir>\locks\machine\verify.lock`), because every task's verify folders are
 Low-writable and the code under test of one task could change another's checkout, build or caches while both run
-(O-23). A task that waits for it records `lock_waiting` (`lock: verify`) and `status` shows `waiting for lock verify
+(O-23). A task that waits for it records `lock_waiting` (`lock: machine:verify` — a name no environment lock can have) and `status` shows `waiting for lock machine:verify
 (held by <task>)`; `toryo stop` ends the wait. Agents of different tasks run at the same time; `toryo dashboard` shows
 them all. With one id, `run` is the in-process run of before.
 

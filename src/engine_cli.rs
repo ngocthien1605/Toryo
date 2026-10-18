@@ -1329,6 +1329,19 @@ pub fn stop(id: &str, wait: u64) -> Result<i32> {
 /// the lock, compile-only verify (R59), and the next action (the cleaned-up variant once the
 /// worktree and the run store are gone).
 fn facts(st: &Store, t: &TaskRow) -> Result<TaskFacts> {
+    facts_with(st, t, compile_only(t))
+}
+
+/// R59 for [`facts`]: `null` when the frozen configuration cannot be read (after `task cleanup`).
+fn compile_only(t: &TaskRow) -> Option<bool> {
+    task::frozen_config(t)
+        .ok()
+        .map(|c| toryo::engine::xpp::compile_only(&c))
+}
+
+/// [`facts`] with `compile_only` known — `dashboard` keeps it per task and frozen configuration
+/// instead of reading and parsing that configuration on every frame (M16-R2).
+fn facts_with(st: &Store, t: &TaskRow, compile_only: Option<bool>) -> Result<TaskFacts> {
     // R6: from the recorded owner, never a lock probe; `None`, never an empty label
     let active_owner = driven_owner(st, &t.id)?;
     let next_action = if t.state.is_terminal() && !t.run_store.exists() && !t.worktree.exists() {
@@ -1338,10 +1351,7 @@ fn facts(st: &Store, t: &TaskRow) -> Result<TaskFacts> {
     };
     Ok(TaskFacts {
         active_owner,
-        // R6: unknown (`null`) when the frozen configuration cannot be read (after `task cleanup`)
-        compile_only: task::frozen_config(t)
-            .ok()
-            .map(|c| toryo::engine::xpp::compile_only(&c)),
+        compile_only,
         next_action,
     })
 }
@@ -1897,7 +1907,11 @@ pub fn dashboard(json: bool, once: bool, interval: u64, hide_done: bool) -> Resu
     if live {
         catch_ctrl_c();
     }
-    let mut seen: HashMap<String, (Tail, Activity)> = HashMap::new();
+    // per task: the events file followed so far, and `compile_only` of its frozen configuration
+    // — read again when its digest changes (`task config --reload`) or its run store goes
+    // (`task cleanup`: then it is `null`, as in `status`)
+    type Seen = (Tail, Activity, Option<((String, bool), Option<bool>)>);
+    let mut seen: HashMap<String, Seen> = HashMap::new();
     loop {
         let mut rows = Vec::new();
         for t in st
@@ -1905,11 +1919,15 @@ pub fn dashboard(json: bool, once: bool, interval: u64, hide_done: bool) -> Resu
             .into_iter()
             .filter(|t| !(hide_done && t.state.is_terminal()))
         {
-            let (tail, a) = seen.entry(t.id.clone()).or_default();
+            let (tail, a, cfg) = seen.entry(t.id.clone()).or_default();
             // an unreadable events file is a row without activity, never the end of the view
             a.apply_lines(&tail.poll(&flight::events_path(&t)).unwrap_or_default());
             let a = a.clone();
-            let f = facts(&st, &t)?;
+            let key = (t.config_sha256.clone(), t.run_store.exists());
+            if cfg.as_ref().is_none_or(|(k, _)| *k != key) {
+                *cfg = Some((key, compile_only(&t)));
+            }
+            let f = facts_with(&st, &t, cfg.as_ref().and_then(|(_, c)| *c))?;
             rows.push((t, f, a));
         }
         let since = |ts: &str| flight::ms_since(ts);

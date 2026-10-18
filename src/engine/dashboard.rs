@@ -12,7 +12,6 @@ use serde_json::{json, Value};
 use super::flight::{EngineEvent, Envelope};
 use super::store::{AttemptStatus, TaskRow};
 use super::views::{self, TaskFacts};
-use super::PipelineState as St;
 
 /// A stage that started and has not finished.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,16 +190,8 @@ pub fn age(ms: u64) -> String {
     }
 }
 
-/// Does the task wait for the owner (a gate, an escalation, a pause)?
-pub fn waits_for_owner(state: St) -> bool {
-    matches!(
-        state,
-        St::WaitingPlanApproval | St::WaitingFinalApproval | St::Escalated | St::Paused
-    )
-}
-
 /// The first line of the dashboard: how many tasks, how many a process drives now, how many
-/// wait for the owner.
+/// wait for the owner ([`St::is_waiting`]: a gate, an escalation, a pause).
 pub fn header(rows: &[(&TaskRow, &TaskFacts)], updated: &str) -> String {
     let active = rows
         .iter()
@@ -208,7 +199,7 @@ pub fn header(rows: &[(&TaskRow, &TaskFacts)], updated: &str) -> String {
         .count();
     let waiting = rows
         .iter()
-        .filter(|(t, f)| f.active_owner.is_none() && waits_for_owner(t.state))
+        .filter(|(t, f)| f.active_owner.is_none() && t.state.is_waiting())
         .count();
     format!(
         "toryo dashboard — {} task{} · {active} active · {waiting} waiting for you · {updated}",
@@ -295,6 +286,7 @@ pub fn task_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::PipelineState as St;
 
     fn env(seq: u64, event: EngineEvent) -> Envelope {
         Envelope {

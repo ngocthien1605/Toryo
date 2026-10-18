@@ -2463,10 +2463,13 @@ impl<'a> Engine<'a> {
             let i = t.id.clone();
             e.store.call(move |tx| store::set_env_wait(tx, &i, None))
         };
+        // M16-R2: this process holds the task lock, so a wait row of the task is left by a run
+        // that died while it waited — gone before this run is shown waiting, or not
+        done_waiting(self)?;
         loop {
             // M16-R1: an error while the task waits clears the wait row before it goes up —
             // a later run must not be shown waiting for the lock (nor skipped as its holder)
-            let got = match VerifyLock::try_acquire(&label) {
+            let got = match VerifyLock::try_acquire(&t.id, &label) {
                 Ok(g) => g,
                 Err(e) => {
                     if waiting {
@@ -5193,23 +5196,24 @@ pub(crate) fn env_gate_program(
     Ok(found)
 }
 
-/// M16-02: the task that most likely holds the verify lock — another task in `Verifying` whose
-/// recorded lock owner is alive and that does not wait for a lock itself. For the
-/// `lock_waiting` event and `status` only: the OS lock decides, this only names.
+/// M16-02: the task that holds the verify lock — the one the holder file names, when it is
+/// not `me`, its recorded lock owner is alive and it is `Verifying`. For the `lock_waiting`
+/// event and `status` only: the OS lock decides, this only names.
 pub fn verifying_now(tx: &rusqlite::Transaction, me: &str) -> Result<Option<String>> {
-    for t in store::list_tasks(tx)? {
-        if t.id == me || t.state != St::Verifying {
-            continue;
-        }
-        let alive = matches!(
-            store::lock_owner(tx, &t.id)?,
-            Some((_, _, Some(pid), Some(created))) if store::identity_alive(pid, &created)
-        );
-        if alive && store::env_wait(tx, &t.id)?.is_none() {
-            return Ok(Some(t.id));
-        }
-    }
-    Ok(None)
+    // M16-R2: the holder file names the task that took the lock (a task that released it for
+    // its environment gates is no longer named); a file a crash left behind names a task that
+    // is no longer driven or no longer verifying
+    let Some(id) = super::lock::verify_holder().filter(|id| id != me) else {
+        return Ok(None);
+    };
+    let Ok(t) = store::get_task(tx, &id) else {
+        return Ok(None);
+    };
+    let alive = matches!(
+        store::lock_owner(tx, &id)?,
+        Some((_, _, Some(pid), Some(created))) if store::identity_alive(pid, &created)
+    );
+    Ok((alive && t.state == St::Verifying).then_some(id))
 }
 
 /// How often a waiting environment gate tries its lock again: about every 2 s

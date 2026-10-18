@@ -184,7 +184,27 @@ fn base_commit(
     let loc = Loc::Discover(repo.to_path_buf());
     let base_ref = match (base, &cfg.repo.project.base_branch) {
         (Some(b), _) => b.to_string(),
-        (None, Some(b)) => b.clone(),
+        // M16-R2: as `task create` does — the branch must exist, and the error names the key
+        (None, Some(b)) => {
+            let found = g.output(
+                &loc,
+                true,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{b}^{{commit}}"),
+                ],
+            )?;
+            if !found.status.success() {
+                bail!(
+                    "project.base_branch: the branch `{b}` does not exist in {} — create it, or fix the key in {} (or remove it to start from the checked-out branch)",
+                    repo.display(),
+                    cfg.repo_path.display()
+                );
+            }
+            b.clone()
+        }
         (None, None) => g
             .run_str(&loc, true, &["rev-parse", "--abbrev-ref", "HEAD"])?
             .trim()
@@ -356,7 +376,14 @@ fn split(cli: &Cli, s: &Split) -> Result<i32> {
             capture_dir: home.join("captures"),
             schema: Some(toryo::engine::contracts::schema(goal::SCHEMA)?.into()),
             context_file: Some(ctx_file),
-            model: cfg.repo.roles.get("planner").and_then(|r| r.model.clone()),
+            // M16-R2: the seat's model only for the seat's own profile — another `--profile`
+            // (perhaps another CLI) runs with its profile's `model`
+            model: cfg
+                .repo
+                .roles
+                .get("planner")
+                .filter(|r| r.profile == profile)
+                .and_then(|r| r.model.clone()),
             resume: None,
         },
         TurnInput {

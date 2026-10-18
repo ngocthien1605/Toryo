@@ -187,7 +187,9 @@ pub(crate) fn run_many(
             said_stop = true;
             queue.clear();
         }
-        while running.len() < jobs {
+        // M16-R2: asked again before each start — a Ctrl+C pressed after the check above
+        // must not start a child that would never see it
+        while running.len() < jobs && !interrupted() {
             let Some(i) = queue.pop_front() else { break };
             let spawned = Command::new(&exe)
                 .args(child_args(cli, &ids[i], d))
