@@ -301,6 +301,13 @@ CI (`.github/workflows/ci.yml`) runs the tests and clippy on `windows-latest` an
 without the M0 kit (no tests run without it), and builds the release `toryo.exe`. Never run real agents in tests: use
 `--fake-agents`.
 
+**M16 acceptance tests** (Windows, PowerShell 7, Pester 5+ — `Install-Module Pester -MinimumVersion 5.0.0 -Scope
+CurrentUser`): `pwsh -NoProfile -File scripts/test-e2e.ps1 [-Repeat N]` builds, runs `cargo test`, the pseudo-console
+tests (`tests/e2e_m16.rs`, `#[ignore]`: Ctrl+C written as `0x03` to a ConPTY — AT-5, AT-6, AT-7, AT-9) one at a time,
+and the Pester tests (`tests/e2e/M16.Tests.ps1`: `toryo run A B C --jobs 2` — AT-1, AT-2, AT-3, AT-4, AT-8), each in a
+fresh workspace of `tests/e2e/New-M16Fixture.ps1` under the temp folder (kept, and named in the summary, when its test
+fails); it writes `test-results/summary.md` and exits 0 only when everything passed in every repetition. Not in CI.
+
 ## Documentation
 
 - `docs/HUONG-DAN.md` — the guide (Vietnamese): the flow, installation, configuration, a practice project, **§7.3 the
