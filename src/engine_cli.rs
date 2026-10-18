@@ -1814,6 +1814,8 @@ fn catch_ctrl_c() {
         }
         // SAFETY: registers a handler that only stores to an atomic
         unsafe {
+            // M16-R3 (N-16): Ctrl+C back for this process when it was started with it ignored
+            SetConsoleCtrlHandler(None, 0);
             SetConsoleCtrlHandler(Some(handler), 1);
         }
     }

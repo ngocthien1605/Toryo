@@ -236,6 +236,10 @@ fn install_interrupt_handler() {
         }
         // SAFETY: registers a handler that counts in an atomic and prints one line
         unsafe {
+            // M16-R3 (N-16): a process started with Ctrl+C ignored (`start /b`, a runner or a shell
+            // that ignores it, CREATE_NEW_PROCESS_GROUP) inherits the ignoring and would never see
+            // the key, however its handler is set: take Ctrl+C back for this process first
+            SetConsoleCtrlHandler(None, 0);
             SetConsoleCtrlHandler(Some(handler), 1);
         }
     }
