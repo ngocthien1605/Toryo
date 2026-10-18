@@ -1685,6 +1685,14 @@ impl<'a> Engine<'a> {
         // change the checkout; then the next task may run its check gates while the
         // environment gates of this one wait for their own lock (M11-E3)
         let scripts = verify::script_hashes(&verify_files(&self.cmds, &co.dir), &co);
+        // M16-R1: when no environment gate follows (none is defined, or a check gate failed),
+        // this is the one check of the checkout after the run — made under the lock, so that no
+        // other task's Low code can hide a mutation (or add one) before it is looked at
+        let locked_mutated = if failure.is_none() && self.deploys() {
+            None
+        } else {
+            Some(verify::mutated(&self.g, &co, &head)?)
+        };
         drop(verify_lock);
         // M11-E3: the environment gates, only after every check gate passed
         let mut export_mutated: Option<String> = None;
@@ -1707,9 +1715,12 @@ impl<'a> Engine<'a> {
         let pass = failure.is_none() && before_deploy.is_none();
         // R29/R47: the checkout must be exactly the checkpoint after the run; M11-R9: the
         // export too, after each environment gate (E3 AC-8)
-        let mutated = match before_deploy.or(export_mutated) {
-            Some(reason) => Some(reason),
-            None => verify::mutated(&self.g, &co, &head)?,
+        let mutated = match (before_deploy.or(export_mutated), locked_mutated) {
+            (Some(reason), _) => Some(reason),
+            (None, Some(m)) => m,
+            // after the environment gates: a re-check that can only add a mutation (the
+            // check before them was made under the lock)
+            (None, None) => verify::mutated(&self.g, &co, &head)?,
         };
         let tree = self.g.run_str(
             &Worktree::new(&self.g, &t.worktree).loc,
@@ -2453,7 +2464,18 @@ impl<'a> Engine<'a> {
             e.store.call(move |tx| store::set_env_wait(tx, &i, None))
         };
         loop {
-            if let Some(l) = VerifyLock::try_acquire(&label)? {
+            // M16-R1: an error while the task waits clears the wait row before it goes up —
+            // a later run must not be shown waiting for the lock (nor skipped as its holder)
+            let got = match VerifyLock::try_acquire(&label) {
+                Ok(g) => g,
+                Err(e) => {
+                    if waiting {
+                        let _ = done_waiting(self);
+                    }
+                    return Err(e);
+                }
+            };
+            if let Some(l) = got {
                 if waiting {
                     done_waiting(self)?;
                 }
@@ -2462,10 +2484,15 @@ impl<'a> Engine<'a> {
             if !waiting {
                 waiting = true;
                 let i = t.id.clone();
-                let holder = self.store.call(move |tx| {
-                    store::set_env_wait(tx, &i, Some(super::lock::VERIFY_LOCK))?;
-                    verifying_now(tx, &i)
-                })?;
+                let holder = self
+                    .store
+                    .call(move |tx| {
+                        store::set_env_wait(tx, &i, Some(super::lock::VERIFY_LOCK))?;
+                        verifying_now(tx, &i)
+                    })
+                    .inspect_err(|_| {
+                        let _ = done_waiting(self);
+                    })?;
                 self.rec.emit(EngineEvent::LockWaiting {
                     lock: super::lock::VERIFY_LOCK.to_string(),
                     holder,

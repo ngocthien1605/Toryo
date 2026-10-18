@@ -85,6 +85,19 @@ fn checked(st: &Store, ids: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// What a child's exit code counts as (M16-R1): itself when it is 0 to 255, else a failure
+/// (1) — on Windows a crash, an abort or a Ctrl+C that ended the child before it took the
+/// console event is a negative NTSTATUS (`0xC000013A` is -1073741510), and on Unix a child
+/// ended by a signal has no code at all (passed as -1). Never a code that a `max` would rank
+/// below success.
+fn counted(code: i32) -> i32 {
+    if (0..=255).contains(&code) {
+        code
+    } else {
+        1
+    }
+}
+
 /// A line of a child, for the parent to print.
 enum Line {
     Out(usize, String),
@@ -213,8 +226,8 @@ pub(crate) fn run_many(
             match running[k].1.try_wait()? {
                 Some(status) => {
                     let (i, _) = running.remove(k);
-                    // a child ended by a signal or a forced kill has no code: a failure
-                    codes[i] = Some(status.code().unwrap_or(1));
+                    // the code as the child ended (shown); what it counts is `counted`
+                    codes[i] = Some(status.code().unwrap_or(-1));
                 }
                 None => k += 1,
             }
@@ -234,7 +247,7 @@ pub(crate) fn run_many(
         let i2 = id.clone();
         let state = st.read(move |tx| store::get_task(tx, &i2)).ok();
         let code = codes[i];
-        worst = worst.max(code.unwrap_or(0));
+        worst = worst.max(code.map_or(0, counted));
         let what = match code {
             Some(c) => format!("exit {c}"),
             None => {
@@ -277,6 +290,24 @@ mod tests {
         match &cli.cmd {
             crate::Cmd::Run { drive, .. } => Some(drive.clone()),
             _ => None,
+        }
+    }
+
+    #[test]
+    fn a_crashed_or_killed_child_counts_as_a_failure() {
+        assert_eq!(counted(0), 0);
+        assert_eq!(counted(3), 3);
+        assert_eq!(counted(255), 255);
+        // STATUS_CONTROL_C_EXIT, STATUS_STACK_OVERFLOW, a fast-fail abort, a signal (-1)
+        for c in [
+            0xC000013Au32 as i32,
+            0xC00000FDu32 as i32,
+            0xC0000409u32 as i32,
+            -1,
+            256,
+        ] {
+            assert_eq!(counted(c), 1, "{c}");
+            assert!(0.max(counted(c)) > 0, "{c} must rank above success");
         }
     }
 
