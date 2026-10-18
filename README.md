@@ -65,6 +65,9 @@ frozen at `task create`; the task id (letters, digits, `_`, `-`, at most 64) is 
 ```
 toryo task create --file TASK.md [--id ID] [--repo R] [--base B]    # prints "base: <branch> @ <sha>"
 toryo run ID                              # 🔒 runs until a gate, an escalation, a stop or completion
+toryo run ID ID … [--jobs N]              # 🔒 several tasks at once, each in its own `toryo run <id>` process
+toryo goal split --file GOAL.md --out DIR --prefix P [--max-tasks N] [--profile P] [--base B]
+                                          # a goal → task files `P-1.md` … + GOAL-SPLIT.json; creates no task
 toryo approve ID --gate plan|final [--continue] [--expect DIGEST] [--force]
 toryo reject  ID --gate plan|final --reason "…"
 toryo resume [ID] [--note "…" | --discard-partial | --keep-partial | --accept-protected-change PATH]
@@ -72,6 +75,7 @@ toryo resume [ID] [--note "…" | --discard-partial | --keep-partial | --accept-
 toryo stop ID                             # ask the running owner to stop; Ctrl+C in the window of `toryo run`
                                           # or `toryo resume` does the same (a second Ctrl+C ends the process at once)
 toryo status [ID] [--json] · toryo task list|show ID [--json] · toryo watch ID [--json]
+toryo dashboard [--once] [--json] [--interval S] [--hide-done]   # every task at a glance; no lock, writes nothing
 toryo task config ID [--reload]           # the frozen configuration; reload only while the task waits
 toryo task cleanup ID [--force]           # --force when it would delete unsaved work or snapshots
 toryo budget set ID --tokens N | --none   · toryo usage ID [--json] [--prices FILE]
@@ -85,6 +89,38 @@ toryo partial export ID --attempt N --into DIR · toryo secrets set <target> · 
 ```
 
 🔒 = takes the task lock; a second command on a running task is refused (`task_active`, exit code 3).
+
+**Several tasks at once.** `toryo run A B C` starts a `toryo run <id>` child process per task — the same binary,
+`--config`, `--machine-config` and drive flags (`--yes`, `--fake-agents`, `--no-fallback`, …) — at most `--jobs` at a
+time (default: all, at most 4; 1 to 8), the rest queued in the order given. Every id is checked first (an unknown id,
+an id given twice: nothing starts). Each child is exactly the `run` of one task: it takes that task's lock (a task
+another process drives fails with `task_active` and the others go on), drives, and ends with its own `run_ended`. Their
+lines are printed with the task's id in front (`A │ …`), then one end block gives each task's state, exit code and
+`next:`; the exit code is the highest of the children's. Ctrl+C reaches every child (each stops its task, as with one
+`run`) and no queued task starts after it. Two tasks verify one after the other: the check gates of a task run under a
+machine-wide **verify lock** (`<data dir>\locks\machine\verify.lock`), because every task's verify folders are
+Low-writable and the code under test of one task could change another's checkout, build or caches while both run
+(O-23). A task that waits for it records `lock_waiting` (`lock: machine:verify` — a name no environment lock can have) and `status` shows `waiting for lock machine:verify
+(held by <task>)`; `toryo stop` ends the wait. Agents of different tasks run at the same time; `toryo dashboard` shows
+them all. With one id, `run` is the in-process run of before.
+
+**A goal into tasks.** `toryo goal split --file GOAL.md --out DIR --prefix BR` asks the planner seat (or `--profile`)
+for one read-only turn: split the goal — the owner's text, in the prompt — into at most `--max-tasks` (default 8, at
+most 20) tasks, each with a title, a description, 1 to 12 acceptance criteria and the earlier tasks it depends on. The
+turn runs in a **throwaway detached checkout** of the base (`--base`, else as `task create`) under
+`<data dir>\goals\<prefix>-<stamp>\` — never in your checkout — which is removed on every exit (what the planner wrote
+there is reported and discarded); its context is the project's own (policy, `AGENTS.md`, culture, the global context)
+with the embedded `goal-splitter.md` role text; the profile's canary evidence is checked as before a task turn (R51,
+`--accept-unverified`). Toryo, not the planner, decides what is written: the ids are `BR-1`, `BR-2`, … in the
+planner's order (none may exist yet: checked before the turn), dependencies point only to earlier tasks, the planner's
+text is inert and one line per title and criterion, a description line that would be a heading or a code fence is
+escaped (no `## Allow protected`, no second `## Acceptance criteria`), and every file is read back with the parser of
+`task create` before the first is written — an answer that is not usable writes nothing. `DIR` (new or empty) gets
+`BR-1.md` … and `GOAL-SPLIT.json` (goal file and SHA-256, base commit, profile, summary, the planner's open questions,
+the tasks and their **waves**). No task is created: read the files, then `toryo task create --file DIR\BR-1.md` and
+`toryo run BR-1 BR-3` wave by wave — a task that depends on another is created after that work is merged, so that its
+base holds it (X38).
+
 The repository file is chosen by `--config`, else `./toryo.yaml` — the file in the folder you run `toryo` **in** (the
 current directory, not the repository root) — else `$TORYO_CONFIG`.
 
@@ -213,6 +249,15 @@ a protected file that changed → restore it, or `resume --accept-protected-chan
 - `toryo watch <ID>` follows the flight recorder `<data dir>\runs\<ID>\events.jsonl` without taking the lock; `--json`
   prints the raw events (`run_started`, `state_changed`, `stage_started/finished`, `turn_finished`, `checkpoint_created`,
   `verify_command`, `gate_opened`, `escalated` with a typed `reason_class`, `paused`, `run_ended`, …).
+- `toryo dashboard` shows every task at once from the store and each task's `events.jsonl`, without taking a lock or
+  writing anything: the task's `status` row (state, fix cycle, tokens, `ACTIVE (owner)` while a process drives it), what
+  its flight recorder says it is doing — `now:` the stage that started and has not finished, only while a process
+  drives the task — or did last (`last:` the newest event and its age), and `next:`. On a terminal it redraws every
+  `--interval` seconds (default 2) until Ctrl+C; into a pipe or a file, and with `--once`, it prints one frame.
+  `--hide-done` leaves out Completed, Cancelled and Failed tasks. `--json` prints one document,
+  `{ "generated_at", "tasks": [ … ] }`: each task is the `status --json` object plus `activity` (`events`, `last_seq`,
+  `run_open`, `stage`, `last`). The dashboard's lines are Toryo's own words — an escalation shows its `reason_class`,
+  never its reason, a pause or an error no text at all; `toryo watch <ID>` shows the text (X35).
 - `toryo status [ID] --json`, `toryo task list --json` and `toryo task show ID --json` print one JSON document on
   stdout (snake_case; a key is always present, `null` when there is no value): state, fix cycle, token spend and
   budget, `active_owner`, `next_action`, attempts, usage rows, gate occurrences and the environments' deployment rows.

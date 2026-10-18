@@ -1,6 +1,7 @@
 //! `toryo` CLI (plan v0.7 §15): the engine commands (`task`, `run`, `approve`, `reject`,
-//! `resume`, `stop`, `status`, `partial`), `doctor`, `secrets`, `gate list|run` (M14), `xpp build`
-//! (M9-B4), and the M0 kit (`spike`, feature `m0-kit`).
+//! `resume`, `stop`, `status`, `partial`; `dashboard`, `run A B …` and `goal split`, M16),
+//! `doctor`, `secrets`,
+//! `gate list|run` (M14), `xpp build` (M9-B4), and the M0 kit (`spike`, feature `m0-kit`).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -13,6 +14,8 @@ use toryo::config::{default_machine_config_path, Effective};
 
 mod engine_cli;
 mod gate_cli;
+mod goal_cli;
+mod run_cli;
 #[cfg(feature = "m0-kit")]
 mod spike_cli;
 mod xpp_cli;
@@ -76,9 +79,20 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TaskCmd,
     },
+    /// Split a goal into several task files (M16-03): `toryo goal split --file GOAL.md --out DIR
+    /// --prefix P` — read them, then `toryo task create` each.
+    Goal {
+        #[command(subcommand)]
+        cmd: goal_cli::GoalCmd,
+    },
     /// 🔒 Run a task until a gate, an escalation, a stop or completion (recovers first).
+    /// Several ids (M16-02): each in its own `toryo run <id>` process, `--jobs` at a time.
     Run {
-        id: String,
+        #[arg(required = true, num_args = 1.., value_name = "ID")]
+        ids: Vec<String>,
+        /// With several ids: how many run at the same time (1 to 8; default: all, at most 4)
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=run_cli::MAX_JOBS as u64))]
+        jobs: Option<u64>,
         #[command(flatten)]
         drive: DriveArgs,
     },
@@ -154,6 +168,23 @@ enum Cmd {
         /// Print the history and exit
         #[arg(long)]
         no_follow: bool,
+    },
+    /// Every task at a glance (M16-01): state, what its flight recorder says it does now or did
+    /// last, and what comes next — no task lock, nothing written. On a terminal it redraws
+    /// every `--interval` seconds until Ctrl+C; into a pipe or a file it prints once.
+    Dashboard {
+        /// One JSON document on stdout: `{ "generated_at", "tasks": [ … ] }` (then exit)
+        #[arg(long)]
+        json: bool,
+        /// Print once and exit, also on a terminal
+        #[arg(long)]
+        once: bool,
+        /// Seconds between two frames on a terminal (1 to 3600)
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        interval: u64,
+        /// Leave out the tasks that are finished (Completed, Cancelled, Failed)
+        #[arg(long)]
+        hide_done: bool,
     },
     /// Tokens per stage × profile × model and the estimated cost (plan §12): prices from
     /// `%USERPROFILE%\.toryo\prices.toml` (or --prices) for rows billed foundry/api.
@@ -364,7 +395,14 @@ fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Cmd::Task { cmd } => engine_cli::task(&cli, cmd),
-        Cmd::Run { id, drive } => engine_cli::run(id, &drive_with(&cli, drive)),
+        Cmd::Goal { cmd } => goal_cli::run(&cli, cmd),
+        // one id: the run of before, in this process
+        Cmd::Run { ids, drive, .. } if ids.len() == 1 => {
+            engine_cli::run(&ids[0], &drive_with(&cli, drive))
+        }
+        Cmd::Run { ids, jobs, drive } => {
+            run_cli::run_many(&cli, ids, jobs.map(|j| j as usize), drive)
+        }
         Cmd::Approve {
             id,
             gate,
@@ -406,6 +444,12 @@ fn run(cli: Cli) -> Result<i32> {
             from_start,
             no_follow,
         } => engine_cli::watch(id, *json, *from_start, *no_follow),
+        Cmd::Dashboard {
+            json,
+            once,
+            interval,
+            hide_done,
+        } => engine_cli::dashboard(*json, *once, *interval, *hide_done),
         Cmd::Usage { id, json, prices } => engine_cli::usage(id, *json, prices.as_deref()),
         Cmd::Partial { cmd } => engine_cli::partial(cmd),
         Cmd::Context { cmd } => engine_cli::context(cmd),

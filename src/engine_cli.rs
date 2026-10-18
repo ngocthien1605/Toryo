@@ -67,6 +67,32 @@ pub struct DriveArgs {
     pub machine_config: Option<PathBuf>,
 }
 
+impl DriveArgs {
+    /// M16-02: these options as the arguments of a `toryo run <id>` child (`run A B …`): only
+    /// what is set — the child chooses the rest the same way.
+    pub(crate) fn flags(&self) -> Vec<String> {
+        let mut a: Vec<String> = Vec::new();
+        for (on, flag) in [
+            (self.yes, "--yes"),
+            (self.no_fallback, "--no-fallback"),
+            (self.accept_unverified, "--accept-unverified"),
+        ] {
+            if on {
+                a.push(flag.into());
+            }
+        }
+        if let Some(p) = &self.fake_agents {
+            a.extend(["--fake-agents".into(), p.display().to_string()]);
+        }
+        for (on, flag) in [(self.notify, "--notify"), (self.no_notify, "--no-notify")] {
+            if on {
+                a.push(flag.into());
+            }
+        }
+        a
+    }
+}
+
 #[derive(Subcommand)]
 pub enum TaskCmd {
     /// Snapshot TASK.md, freeze the config, create the worktree + branch `toryo/<id>`.
@@ -1303,6 +1329,19 @@ pub fn stop(id: &str, wait: u64) -> Result<i32> {
 /// the lock, compile-only verify (R59), and the next action (the cleaned-up variant once the
 /// worktree and the run store are gone).
 fn facts(st: &Store, t: &TaskRow) -> Result<TaskFacts> {
+    facts_with(st, t, compile_only(t))
+}
+
+/// R59 for [`facts`]: `null` when the frozen configuration cannot be read (after `task cleanup`).
+fn compile_only(t: &TaskRow) -> Option<bool> {
+    task::frozen_config(t)
+        .ok()
+        .map(|c| toryo::engine::xpp::compile_only(&c))
+}
+
+/// [`facts`] with `compile_only` known — `dashboard` keeps it per task and frozen configuration
+/// instead of reading and parsing that configuration on every frame (M16-R2).
+fn facts_with(st: &Store, t: &TaskRow, compile_only: Option<bool>) -> Result<TaskFacts> {
     // R6: from the recorded owner, never a lock probe; `None`, never an empty label
     let active_owner = driven_owner(st, &t.id)?;
     let next_action = if t.state.is_terminal() && !t.run_store.exists() && !t.worktree.exists() {
@@ -1312,10 +1351,7 @@ fn facts(st: &Store, t: &TaskRow) -> Result<TaskFacts> {
     };
     Ok(TaskFacts {
         active_owner,
-        // R6: unknown (`null`) when the frozen configuration cannot be read (after `task cleanup`)
-        compile_only: task::frozen_config(t)
-            .ok()
-            .map(|c| toryo::engine::xpp::compile_only(&c)),
+        compile_only,
         next_action,
     })
 }
@@ -1416,12 +1452,18 @@ pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
         if t.state == PipelineState::Verifying && f.active_owner.is_some() {
             let i = t.id.clone();
             if let Some(lock) = st.read(move |tx| store::env_wait(tx, &i))? {
-                let holder = st
-                    .read(store::deployments)?
-                    .into_iter()
-                    .find(|d| d.lock == lock && d.finished_at.is_none() && d.task != t.id)
-                    .map(|d| format!(" (held by {})", d.task))
-                    .unwrap_or_default();
+                // M16-02: the verify lock's holder is the task verifying now, not a deployment
+                let holder = if lock == lock::VERIFY_LOCK {
+                    let i = t.id.clone();
+                    st.read(move |tx| toryo::engine::runner::verifying_now(tx, &i))?
+                } else {
+                    st.read(store::deployments)?
+                        .into_iter()
+                        .find(|d| d.lock == lock && d.finished_at.is_none() && d.task != t.id)
+                        .map(|d| d.task)
+                }
+                .map(|h| format!(" (held by {h})"))
+                .unwrap_or_default();
                 toryo::outln!("               waiting for lock {lock}{holder}");
             }
         }
@@ -1757,6 +1799,17 @@ fn catch_ctrl_c() {
     }
 }
 
+/// M16-02: [`catch_ctrl_c`] for the other commands that wait (`run A B …`, `goal split`): from
+/// here on Ctrl+C sets a flag ([`interrupted`]) instead of ending this process.
+pub(crate) fn watch_interrupt() {
+    catch_ctrl_c();
+}
+
+/// Was Ctrl+C pressed since [`watch_interrupt`]?
+pub(crate) fn interrupted() -> bool {
+    INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Sleep `d` in short steps; true when Ctrl+C was pressed.
 fn interrupted_during(d: Duration) -> bool {
     let end = std::time::Instant::now() + d;
@@ -1833,6 +1886,94 @@ pub fn watch(id: &str, json: bool, from_start: bool, no_follow: bool) -> Result<
         let now_done = flight::watch_done(state, driven(&st, id)?, last.elapsed());
         if done.observe(now_done, !new.is_empty()) {
             show_lines(&tail.poll(&path)?, json)?;
+            return Ok(0);
+        }
+    }
+}
+
+/// `toryo dashboard` (M16-01): every task's `status` row and what its flight recorder says it
+/// does now or did last — read-only like `watch`: `Store::read` only, no task lock, nothing
+/// written. Each events file is followed with its own [`Tail`](toryo::engine::flight::Tail), so a
+/// frame reads only what was appended since the last one. On a terminal it redraws every
+/// `interval` seconds until Ctrl+C (exit 0); into a pipe or a file, with `--once` or `--json`,
+/// it prints one frame (one JSON document) and exits.
+pub fn dashboard(json: bool, once: bool, interval: u64, hide_done: bool) -> Result<i32> {
+    use std::collections::HashMap;
+    use toryo::engine::dashboard::{self as dash, Activity};
+    use toryo::engine::flight::{self, Tail};
+    use toryo::term::{try_line, Stream};
+    let st = store()?;
+    let live = !json && !once && toryo::term::stdout_is_terminal();
+    if live {
+        catch_ctrl_c();
+    }
+    // per task: the events file followed so far, and `compile_only` of its frozen configuration
+    // — read again when its digest changes (`task config --reload`) or its run store goes
+    // (`task cleanup`: then it is `null`, as in `status`)
+    type Seen = (Tail, Activity, Option<((String, bool), Option<bool>)>);
+    let mut seen: HashMap<String, Seen> = HashMap::new();
+    loop {
+        let mut rows = Vec::new();
+        for t in st
+            .read(store::list_tasks)?
+            .into_iter()
+            .filter(|t| !(hide_done && t.state.is_terminal()))
+        {
+            let (tail, a, cfg) = seen.entry(t.id.clone()).or_default();
+            // an unreadable events file is a row without activity, never the end of the view
+            a.apply_lines(&tail.poll(&flight::events_path(&t)).unwrap_or_default());
+            let a = a.clone();
+            let key = (t.config_sha256.clone(), t.run_store.exists());
+            if cfg.as_ref().is_none_or(|(k, _)| *k != key) {
+                *cfg = Some((key, compile_only(&t)));
+            }
+            let f = facts_with(&st, &t, cfg.as_ref().and_then(|(_, c)| *c))?;
+            rows.push((t, f, a));
+        }
+        let since = |ts: &str| flight::ms_since(ts);
+        let now = store::now();
+        if json {
+            let tasks: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|(t, f, a)| dash::task_json(t, f, a, since))
+                .collect();
+            print_json(&serde_json::json!({ "generated_at": now, "tasks": tasks }))?;
+            return Ok(0);
+        }
+        let refs: Vec<(&TaskRow, &TaskFacts)> = rows.iter().map(|(t, f, _)| (t, f)).collect();
+        let updated = now
+            .get(11..19)
+            .map(|c| format!("{c} UTC"))
+            .unwrap_or(now.clone());
+        let mut blocks = vec![dash::header(&refs, &updated)];
+        if rows.is_empty() {
+            blocks.push(String::new());
+            blocks.push("no tasks (`toryo task create --file TASK.md`)".into());
+        }
+        for (t, f, a) in &rows {
+            blocks.push(String::new());
+            blocks.extend(dash::task_lines(t, f, a, since));
+        }
+        if !live {
+            for b in &blocks {
+                match try_line(Stream::Out, b) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(0),
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            return Ok(0);
+        }
+        blocks.push(String::new());
+        blocks.push(format!(
+            "every {interval}s · Ctrl+C to quit · `toryo watch <id>` follows one task"
+        ));
+        match toryo::term::screen(&blocks) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(0),
+            Err(e) => return Err(e.into()),
+        }
+        if interrupted_during(Duration::from_secs(interval)) {
             return Ok(0);
         }
     }

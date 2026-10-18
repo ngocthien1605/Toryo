@@ -168,6 +168,42 @@ pub fn end_block(title: &str, state: &str, lines: &[String]) {
     }
 }
 
+/// Is stdout a terminal — where a live view ([`screen`]) can be drawn in place?
+pub fn stdout_is_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
+}
+
+/// The text of one [`screen`] frame: the cursor home, then each block — inert ([`text`]),
+/// painted like any other block when `paint` — with every line erasing the rest of its row,
+/// then the rest of the screen erased. The cursor moves and erasures are the only escape
+/// sequences besides the colours, and they are Toryo's, never the text's.
+pub fn frame_text(blocks: &[String], paint: bool) -> String {
+    let mut s = String::from("\u{1b}[H");
+    for b in blocks {
+        let t = text(b);
+        let t = if paint { paint::block(&t) } else { t };
+        for l in t.split('\n') {
+            s.push_str(l);
+            s.push_str("\u{1b}[K\n");
+        }
+    }
+    s.push_str("\u{1b}[J");
+    s
+}
+
+/// Draw `blocks` as the whole screen of a live view (`toryo dashboard`, M16-01) over the
+/// previous frame, without the flicker of a full clear. Only for a terminal
+/// ([`stdout_is_terminal`]): into a pipe or a file a view prints its blocks once, as text.
+pub fn screen(blocks: &[String]) -> std::io::Result<()> {
+    use std::io::Write;
+    let s = frame_text(blocks, painted(Stream::Out));
+    // `always`: on Windows this turns on the console's escape-sequence mode
+    let mut out = anstream::AutoStream::always(std::io::stdout().lock());
+    out.write_all(s.as_bytes())?;
+    out.flush()
+}
+
 /// `eprintln!` for a human-readable line: inert ([`text`](crate::term::text)), and painted when
 /// stderr is ([`painted`](crate::term::painted)).
 #[macro_export]
@@ -250,6 +286,33 @@ mod tests {
         );
         // the tab and the line feed stay
         assert_eq!(text("a\tb\nc"), "a\tb\nc");
+    }
+
+    #[test]
+    fn a_frame_carries_no_escape_sequence_of_the_text() {
+        let blocks = vec![
+            "T-1            Escalated              fix 0/3 · tokens 5".to_string(),
+            "evil\u{1b}]52;c;QUJD\u{7} \u{1b}[2J\rgone".to_string(),
+        ];
+        let f = frame_text(&blocks, false);
+        assert!(
+            f.starts_with("\u{1b}[H") && f.ends_with("\u{1b}[J"),
+            "{f:?}"
+        );
+        // the text's own sequences are gone: what is left of the frame without Toryo's cursor
+        // and erase sequences is the inert text
+        let body = f
+            .trim_start_matches("\u{1b}[H")
+            .trim_end_matches("\u{1b}[J")
+            .replace("\u{1b}[K", "");
+        assert_eq!(
+            body,
+            "T-1            Escalated              fix 0/3 · tokens 5\nevil gone\n"
+        );
+        // painted: only colours are added — with every sequence removed it is the same text
+        let p = frame_text(&blocks, true);
+        assert_eq!(crate::process::strip_ansi(&p), body);
+        assert!(p.contains("\u{1b}["), "the state is painted");
     }
 
     #[test]

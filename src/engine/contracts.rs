@@ -30,6 +30,11 @@ pub const SCHEMAS: &[(&str, &str)] = &[
         "implementer-probe.schema.json",
         include_str!("../../schemas/implementer-probe.schema.json"),
     ),
+    // M16-03: the answer of `toryo goal split`
+    (
+        "goal-split.schema.json",
+        include_str!("../../schemas/goal-split.schema.json"),
+    ),
 ];
 
 pub const ROLES: &[(&str, &str)] = &[
@@ -44,6 +49,12 @@ pub const ROLES: &[(&str, &str)] = &[
     (
         "reviewer.md",
         include_str!("../../templates/roles/reviewer.md"),
+    ),
+    // M16-03: the role text of the `toryo goal split` turn (after the three seats: the M0 kit
+    // indexes them)
+    (
+        "goal-splitter.md",
+        include_str!("../../templates/roles/goal-splitter.md"),
     ),
 ];
 
@@ -327,7 +338,8 @@ mod tests {
     /// embedded schema may use only [`KEYWORDS`] (and annotations), with well-formed values.
     #[test]
     fn every_embedded_schema_uses_only_supported_keywords() {
-        assert_eq!(SCHEMAS.len(), 5);
+        // M16-03: goal-split.schema.json is the sixth
+        assert_eq!(SCHEMAS.len(), 6);
         for (name, text) in SCHEMAS {
             let s: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(schema_problems(&s), Vec::<String>::new(), "{name}");
