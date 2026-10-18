@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "required": ["summary", "tasks"],
+  "properties": {
+    "summary": { "type": "string" },
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["title", "description", "acceptance_criteria", "depends_on"],
+        "properties": {
+          "title":                 { "type": "string", "minLength": 1 },
+          "description":           { "type": "string" },
+          "acceptance_criteria":   { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+          "depends_on":            { "type": "array", "items": { "type": "integer" } },
+          "files_likely_involved": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "open_questions": { "type": "array", "items": { "type": "string" } }
+  }
+}

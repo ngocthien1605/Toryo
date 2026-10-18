@@ -66,6 +66,8 @@ frozen at `task create`; the task id (letters, digits, `_`, `-`, at most 64) is 
 toryo task create --file TASK.md [--id ID] [--repo R] [--base B]    # prints "base: <branch> @ <sha>"
 toryo run ID                              # 🔒 runs until a gate, an escalation, a stop or completion
 toryo run ID ID … [--jobs N]              # 🔒 several tasks at once, each in its own `toryo run <id>` process
+toryo goal split --file GOAL.md --out DIR --prefix P [--max-tasks N] [--profile P] [--base B]
+                                          # a goal → task files `P-1.md` … + GOAL-SPLIT.json; creates no task
 toryo approve ID --gate plan|final [--continue] [--expect DIGEST] [--force]
 toryo reject  ID --gate plan|final --reason "…"
 toryo resume [ID] [--note "…" | --discard-partial | --keep-partial | --accept-protected-change PATH]
@@ -101,6 +103,23 @@ Low-writable and the code under test of one task could change another's checkout
 (O-23). A task that waits for it records `lock_waiting` (`lock: verify`) and `status` shows `waiting for lock verify
 (held by <task>)`; `toryo stop` ends the wait. Agents of different tasks run at the same time; `toryo dashboard` shows
 them all. With one id, `run` is the in-process run of before.
+
+**A goal into tasks.** `toryo goal split --file GOAL.md --out DIR --prefix BR` asks the planner seat (or `--profile`)
+for one read-only turn: split the goal — the owner's text, in the prompt — into at most `--max-tasks` (default 8, at
+most 20) tasks, each with a title, a description, 1 to 12 acceptance criteria and the earlier tasks it depends on. The
+turn runs in a **throwaway detached checkout** of the base (`--base`, else as `task create`) under
+`<data dir>\goals\<prefix>-<stamp>\` — never in your checkout — which is removed on every exit (what the planner wrote
+there is reported and discarded); its context is the project's own (policy, `AGENTS.md`, culture, the global context)
+with the embedded `goal-splitter.md` role text; the profile's canary evidence is checked as before a task turn (R51,
+`--accept-unverified`). Toryo, not the planner, decides what is written: the ids are `BR-1`, `BR-2`, … in the
+planner's order (none may exist yet: checked before the turn), dependencies point only to earlier tasks, the planner's
+text is inert and one line per title and criterion, a description line that would be a heading or a code fence is
+escaped (no `## Allow protected`, no second `## Acceptance criteria`), and every file is read back with the parser of
+`task create` before the first is written — an answer that is not usable writes nothing. `DIR` (new or empty) gets
+`BR-1.md` … and `GOAL-SPLIT.json` (goal file and SHA-256, base commit, profile, summary, the planner's open questions,
+the tasks and their **waves**). No task is created: read the files, then `toryo task create --file DIR\BR-1.md` and
+`toryo run BR-1 BR-3` wave by wave — a task that depends on another is created after that work is merged, so that its
+base holds it (X38).
 
 The repository file is chosen by `--config`, else `./toryo.yaml` — the file in the folder you run `toryo` **in** (the
 current directory, not the repository root) — else `$TORYO_CONFIG`.

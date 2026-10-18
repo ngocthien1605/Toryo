@@ -1,5 +1,6 @@
 //! `toryo` CLI (plan v0.7 §15): the engine commands (`task`, `run`, `approve`, `reject`,
-//! `resume`, `stop`, `status`, `partial`, `dashboard` and `run A B …`, M16), `doctor`, `secrets`,
+//! `resume`, `stop`, `status`, `partial`; `dashboard`, `run A B …` and `goal split`, M16),
+//! `doctor`, `secrets`,
 //! `gate list|run` (M14), `xpp build` (M9-B4), and the M0 kit (`spike`, feature `m0-kit`).
 
 use std::path::PathBuf;
@@ -13,6 +14,7 @@ use toryo::config::{default_machine_config_path, Effective};
 
 mod engine_cli;
 mod gate_cli;
+mod goal_cli;
 mod run_cli;
 #[cfg(feature = "m0-kit")]
 mod spike_cli;
@@ -76,6 +78,12 @@ enum Cmd {
     Task {
         #[command(subcommand)]
         cmd: TaskCmd,
+    },
+    /// Split a goal into several task files (M16-03): `toryo goal split --file GOAL.md --out DIR
+    /// --prefix P` — read them, then `toryo task create` each.
+    Goal {
+        #[command(subcommand)]
+        cmd: goal_cli::GoalCmd,
     },
     /// 🔒 Run a task until a gate, an escalation, a stop or completion (recovers first).
     /// Several ids (M16-02): each in its own `toryo run <id>` process, `--jobs` at a time.
@@ -387,6 +395,7 @@ fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Cmd::Task { cmd } => engine_cli::task(&cli, cmd),
+        Cmd::Goal { cmd } => goal_cli::run(&cli, cmd),
         // one id: the run of before, in this process
         Cmd::Run { ids, drive, .. } if ids.len() == 1 => {
             engine_cli::run(&ids[0], &drive_with(&cli, drive))

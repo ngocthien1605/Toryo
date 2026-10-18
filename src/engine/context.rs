@@ -102,6 +102,9 @@ pub struct Request {
     pub budget: usize,
     /// M11-C1: org chart mode — the team's culture and the role's instructions.
     pub team: Option<TeamContext>,
+    /// M16-03: the embedded role template by file name (`goal-splitter.md`) instead of the
+    /// role's own; `None` for every pipeline stage.
+    pub template: Option<&'static str>,
 }
 
 /// What org chart mode adds to sources 3 and 4 (M11-C1): files of the repository checkout,
@@ -316,7 +319,12 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
             &mut skipped,
         );
     }
-    let role = req.role.as_str();
+    // M16-03: a turn that is not one of the pipeline's (the goal split) names its own embedded
+    // template; the repository's `.toryo/roles/<role>.md` replaces only the pipeline's
+    let role = match req.template {
+        Some(t) => t.trim_end_matches(".md"),
+        None => req.role.as_str(),
+    };
     let custom = req
         .repo
         .join(".toryo")
@@ -324,7 +332,7 @@ pub fn assemble(req: &Request) -> Result<Assembled> {
         .join(format!("{role}.md"));
     // org chart mode never replaces the embedded template (M11-C1): it carries the engine's
     // rules — the output contract, no Git, untrusted data
-    if req.team.is_none() && custom.is_file() {
+    if req.team.is_none() && req.template.is_none() && custom.is_file() {
         add(
             4,
             &format!(".toryo/roles/{role}.md"),
@@ -727,6 +735,7 @@ pub fn request(
         no_run_store: role == Role::Implementer && kind == ProfileKind::Claude,
         budget: (kb as usize) * 1024,
         team,
+        template: None,
     })
 }
 
@@ -867,6 +876,7 @@ mod tests {
             no_run_store: false,
             budget: 40 * 1024,
             team: None,
+            template: None,
         }
     }
 

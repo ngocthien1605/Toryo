@@ -10,6 +10,7 @@ pub mod dashboard;
 pub mod decisions;
 pub mod flight;
 pub mod gates;
+pub mod goal;
 pub mod lock;
 pub mod protect;
 pub mod recovery;
