@@ -37,7 +37,7 @@ use super::context;
 use super::contracts;
 use super::flight::{EngineEvent, Recorder, TurnUsage};
 use super::gates::GATE_UNAVAILABLE;
-use super::lock::{EnvLock, StopWatch, TaskLock};
+use super::lock::{EnvLock, StopWatch, TaskLock, VerifyLock};
 use super::protect;
 use super::state::{GateKind, Machine, PipelineEvent as Ev, PipelineState as St};
 use super::store::{self, AttemptEnd, AttemptRow, AttemptStatus, NewAttempt, Store, TaskRow};
@@ -1624,6 +1624,19 @@ impl<'a> Engine<'a> {
             self.escalate_attempt(&a, super::gates::ENV_CONFIRM.into(), reason)?;
             return Ok(Flow::Next);
         }
+        // M16-02 (X36, O-23): one task at a time runs its check gates on this machine — from
+        // before the checkout is reset until its checks after the check gates are done; released
+        // before the environment gates (they read a fresh export no Low code can write, X6)
+        let Some(verify_lock) = self.verify_lock(t, &self.lock.watch_stop())? else {
+            self.finish_and(
+                &a,
+                AttemptStatus::Interrupted,
+                AttemptEnd::default(),
+                None,
+                None,
+            )?;
+            return self.stopped();
+        };
         let Some((b, co)) = self.verify_checkout(t, &a, &head)? else {
             return Ok(Flow::Next);
         };
@@ -1668,6 +1681,11 @@ impl<'a> Engine<'a> {
                 extra = Some(found.into_iter().take(10).collect());
             }
         }
+        // M16-02 (X36): what the check gates ran, hashed while no other task's Low code can
+        // change the checkout; then the next task may run its check gates while the
+        // environment gates of this one wait for their own lock (M11-E3)
+        let scripts = verify::script_hashes(&verify_files(&self.cmds, &co.dir), &co);
+        drop(verify_lock);
         // M11-E3: the environment gates, only after every check gate passed
         let mut export_mutated: Option<String> = None;
         if failure.is_none() && before_deploy.is_none() {
@@ -1706,7 +1724,7 @@ impl<'a> Engine<'a> {
             "checkout": self.cfg.repo.verify.checkout,
             "verify_checkout": co.dir,
             "config_sha256": t.config_sha256,
-            "scripts": verify::script_hashes(&verify_files(&self.cmds, &co.dir), &co),
+            "scripts": scripts,
             "mutated": mutated,
             "commands": results,
         });
@@ -2417,6 +2435,45 @@ impl<'a> Engine<'a> {
                     let i = t.id.clone();
                     self.store
                         .call(move |tx| store::set_env_wait(tx, &i, None))?;
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    /// M16-02 (X35, O-23): take the machine's verify lock for task `t`, waiting while another
+    /// task verifies — like [`Self::env_lock`]: one `lock_waiting` event, `status` shows the
+    /// wait, a `toryo stop` ends it (`None`).
+    fn verify_lock(&self, t: &TaskRow, stop: &StopWatch) -> Result<Option<VerifyLock>> {
+        let label = format!("{} ({})", t.id, super::lock::owner_label());
+        let mut waiting = false;
+        let done_waiting = |e: &Self| -> Result<()> {
+            let i = t.id.clone();
+            e.store.call(move |tx| store::set_env_wait(tx, &i, None))
+        };
+        loop {
+            if let Some(l) = VerifyLock::try_acquire(&label)? {
+                if waiting {
+                    done_waiting(self)?;
+                }
+                return Ok(Some(l));
+            }
+            if !waiting {
+                waiting = true;
+                let i = t.id.clone();
+                let holder = self.store.call(move |tx| {
+                    store::set_env_wait(tx, &i, Some(super::lock::VERIFY_LOCK))?;
+                    verifying_now(tx, &i)
+                })?;
+                self.rec.emit(EngineEvent::LockWaiting {
+                    lock: super::lock::VERIFY_LOCK.to_string(),
+                    holder,
+                });
+            }
+            for _ in 0..(env_lock_poll_ms() / 100).max(1) {
+                if stop.stopped() {
+                    done_waiting(self)?;
                     return Ok(None);
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -5107,6 +5164,25 @@ pub(crate) fn env_gate_program(
         ));
     }
     Ok(found)
+}
+
+/// M16-02: the task that most likely holds the verify lock — another task in `Verifying` whose
+/// recorded lock owner is alive and that does not wait for a lock itself. For the
+/// `lock_waiting` event and `status` only: the OS lock decides, this only names.
+pub fn verifying_now(tx: &rusqlite::Transaction, me: &str) -> Result<Option<String>> {
+    for t in store::list_tasks(tx)? {
+        if t.id == me || t.state != St::Verifying {
+            continue;
+        }
+        let alive = matches!(
+            store::lock_owner(tx, &t.id)?,
+            Some((_, _, Some(pid), Some(created))) if store::identity_alive(pid, &created)
+        );
+        if alive && store::env_wait(tx, &t.id)?.is_none() {
+            return Ok(Some(t.id));
+        }
+    }
+    Ok(None)
 }
 
 /// How often a waiting environment gate tries its lock again: about every 2 s

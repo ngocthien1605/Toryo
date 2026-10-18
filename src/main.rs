@@ -1,6 +1,6 @@
 //! `toryo` CLI (plan v0.7 §15): the engine commands (`task`, `run`, `approve`, `reject`,
-//! `resume`, `stop`, `status`, `partial`), `doctor`, `secrets`, `gate list|run` (M14), `xpp build`
-//! (M9-B4), and the M0 kit (`spike`, feature `m0-kit`).
+//! `resume`, `stop`, `status`, `partial`, `dashboard` and `run A B …`, M16), `doctor`, `secrets`,
+//! `gate list|run` (M14), `xpp build` (M9-B4), and the M0 kit (`spike`, feature `m0-kit`).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -13,6 +13,7 @@ use toryo::config::{default_machine_config_path, Effective};
 
 mod engine_cli;
 mod gate_cli;
+mod run_cli;
 #[cfg(feature = "m0-kit")]
 mod spike_cli;
 mod xpp_cli;
@@ -77,8 +78,13 @@ enum Cmd {
         cmd: TaskCmd,
     },
     /// 🔒 Run a task until a gate, an escalation, a stop or completion (recovers first).
+    /// Several ids (M16-02): each in its own `toryo run <id>` process, `--jobs` at a time.
     Run {
-        id: String,
+        #[arg(required = true, num_args = 1.., value_name = "ID")]
+        ids: Vec<String>,
+        /// With several ids: how many run at the same time (1 to 8; default: all, at most 4)
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=run_cli::MAX_JOBS as u64))]
+        jobs: Option<u64>,
         #[command(flatten)]
         drive: DriveArgs,
     },
@@ -381,7 +387,13 @@ fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Cmd::Task { cmd } => engine_cli::task(&cli, cmd),
-        Cmd::Run { id, drive } => engine_cli::run(id, &drive_with(&cli, drive)),
+        // one id: the run of before, in this process
+        Cmd::Run { ids, drive, .. } if ids.len() == 1 => {
+            engine_cli::run(&ids[0], &drive_with(&cli, drive))
+        }
+        Cmd::Run { ids, jobs, drive } => {
+            run_cli::run_many(&cli, ids, jobs.map(|j| j as usize), drive)
+        }
         Cmd::Approve {
             id,
             gate,

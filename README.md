@@ -65,6 +65,7 @@ frozen at `task create`; the task id (letters, digits, `_`, `-`, at most 64) is 
 ```
 toryo task create --file TASK.md [--id ID] [--repo R] [--base B]    # prints "base: <branch> @ <sha>"
 toryo run ID                              # 🔒 runs until a gate, an escalation, a stop or completion
+toryo run ID ID … [--jobs N]              # 🔒 several tasks at once, each in its own `toryo run <id>` process
 toryo approve ID --gate plan|final [--continue] [--expect DIGEST] [--force]
 toryo reject  ID --gate plan|final --reason "…"
 toryo resume [ID] [--note "…" | --discard-partial | --keep-partial | --accept-protected-change PATH]
@@ -86,6 +87,21 @@ toryo partial export ID --attempt N --into DIR · toryo secrets set <target> · 
 ```
 
 🔒 = takes the task lock; a second command on a running task is refused (`task_active`, exit code 3).
+
+**Several tasks at once.** `toryo run A B C` starts a `toryo run <id>` child process per task — the same binary,
+`--config`, `--machine-config` and drive flags (`--yes`, `--fake-agents`, `--no-fallback`, …) — at most `--jobs` at a
+time (default: all, at most 4; 1 to 8), the rest queued in the order given. Every id is checked first (an unknown id,
+an id given twice: nothing starts). Each child is exactly the `run` of one task: it takes that task's lock (a task
+another process drives fails with `task_active` and the others go on), drives, and ends with its own `run_ended`. Their
+lines are printed with the task's id in front (`A │ …`), then one end block gives each task's state, exit code and
+`next:`; the exit code is the highest of the children's. Ctrl+C reaches every child (each stops its task, as with one
+`run`) and no queued task starts after it. Two tasks verify one after the other: the check gates of a task run under a
+machine-wide **verify lock** (`<data dir>\locks\machine\verify.lock`), because every task's verify folders are
+Low-writable and the code under test of one task could change another's checkout, build or caches while both run
+(O-23). A task that waits for it records `lock_waiting` (`lock: verify`) and `status` shows `waiting for lock verify
+(held by <task>)`; `toryo stop` ends the wait. Agents of different tasks run at the same time; `toryo dashboard` shows
+them all. With one id, `run` is the in-process run of before.
+
 The repository file is chosen by `--config`, else `./toryo.yaml` — the file in the folder you run `toryo` **in** (the
 current directory, not the repository root) — else `$TORYO_CONFIG`.
 

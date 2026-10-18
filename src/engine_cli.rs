@@ -67,6 +67,32 @@ pub struct DriveArgs {
     pub machine_config: Option<PathBuf>,
 }
 
+impl DriveArgs {
+    /// M16-02: these options as the arguments of a `toryo run <id>` child (`run A B …`): only
+    /// what is set — the child chooses the rest the same way.
+    pub(crate) fn flags(&self) -> Vec<String> {
+        let mut a: Vec<String> = Vec::new();
+        for (on, flag) in [
+            (self.yes, "--yes"),
+            (self.no_fallback, "--no-fallback"),
+            (self.accept_unverified, "--accept-unverified"),
+        ] {
+            if on {
+                a.push(flag.into());
+            }
+        }
+        if let Some(p) = &self.fake_agents {
+            a.extend(["--fake-agents".into(), p.display().to_string()]);
+        }
+        for (on, flag) in [(self.notify, "--notify"), (self.no_notify, "--no-notify")] {
+            if on {
+                a.push(flag.into());
+            }
+        }
+        a
+    }
+}
+
 #[derive(Subcommand)]
 pub enum TaskCmd {
     /// Snapshot TASK.md, freeze the config, create the worktree + branch `toryo/<id>`.
@@ -1416,12 +1442,18 @@ pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
         if t.state == PipelineState::Verifying && f.active_owner.is_some() {
             let i = t.id.clone();
             if let Some(lock) = st.read(move |tx| store::env_wait(tx, &i))? {
-                let holder = st
-                    .read(store::deployments)?
-                    .into_iter()
-                    .find(|d| d.lock == lock && d.finished_at.is_none() && d.task != t.id)
-                    .map(|d| format!(" (held by {})", d.task))
-                    .unwrap_or_default();
+                // M16-02: the verify lock's holder is the task verifying now, not a deployment
+                let holder = if lock == lock::VERIFY_LOCK {
+                    let i = t.id.clone();
+                    st.read(move |tx| toryo::engine::runner::verifying_now(tx, &i))?
+                } else {
+                    st.read(store::deployments)?
+                        .into_iter()
+                        .find(|d| d.lock == lock && d.finished_at.is_none() && d.task != t.id)
+                        .map(|d| d.task)
+                }
+                .map(|h| format!(" (held by {h})"))
+                .unwrap_or_default();
                 toryo::outln!("               waiting for lock {lock}{holder}");
             }
         }
@@ -1755,6 +1787,17 @@ fn catch_ctrl_c() {
             libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
         }
     }
+}
+
+/// M16-02: [`catch_ctrl_c`] for the other commands that wait (`run A B …`, `goal split`): from
+/// here on Ctrl+C sets a flag ([`interrupted`]) instead of ending this process.
+pub(crate) fn watch_interrupt() {
+    catch_ctrl_c();
+}
+
+/// Was Ctrl+C pressed since [`watch_interrupt`]?
+pub(crate) fn interrupted() -> bool {
+    INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Sleep `d` in short steps; true when Ctrl+C was pressed.
