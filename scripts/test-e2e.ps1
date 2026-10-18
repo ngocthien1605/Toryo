@@ -58,7 +58,10 @@ function Write-Summary([bool]$Done) {
         }
     }
     $repCols = (1..$Repeat | ForEach-Object { "Run $_" }) -join ' | '
-    $md = @("# M16 acceptance tests", "", "Generated $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')) by ``scripts/test-e2e.ps1 -Repeat $Repeat``" + $(if ($Done) { '' } else { ' (stopped early)' }) + ".", "")
+    $tick = [string][char]0x60   # a Markdown code mark
+    $when = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    $early = if ($Done) { '' } else { ' (stopped early)' }
+    $md = @('# M16 acceptance tests', '', "Generated $when by ${tick}scripts/test-e2e.ps1 -Repeat $Repeat${tick}$early.", '')
     $md += "| Step | $repCols |"
     $md += "|---|" + ('---|' * $Repeat)
     foreach ($s in $steps.Keys) {
@@ -71,14 +74,18 @@ function Write-Summary([bool]$Done) {
     foreach ($id in $where.Keys) {
         $cells = 1..$Repeat | ForEach-Object {
             $r = $rows[$id][$_]
-            if ($null -eq $r) { '—' } elseif ($r.Pass) { 'PASS' } else { "FAIL$(if ($r.Note) { " ($($r.Note))" })" }
+            if ($null -eq $r) { '—' }
+            elseif ($r.Pass) { 'PASS' }
+            elseif ($r.Note) { 'FAIL (' + $r.Note + ')' }
+            else { 'FAIL' }
         }
         $last = $rows[$id].Keys | Sort-Object | Select-Object -Last 1
-        $dur = if ($null -ne $last) { "$($rows[$id][$last].Seconds) s" } else { '—' }
-        $md += "| $id | $($where[$id]) | $($cells -join ' | ') | $dur | $(if ($kept[$id]) { "``$($kept[$id])``" } else { '' }) |"
+        $dur = if ($null -ne $last) { [string]$rows[$id][$last].Seconds + ' s' } else { '—' }
+        $keptCell = if ($kept[$id]) { $tick + $kept[$id] + $tick } else { '' }
+        $md += "| $id | $($where[$id]) | $($cells -join ' | ') | $dur | $keptCell |"
     }
-    $md += ""
-    $md += "Logs: ``test-results/logs/``; Pester NUnit XML: ``test-results/pester.xml``."
+    $md += ''
+    $md += "Logs: ${tick}test-results/logs/${tick}; Pester NUnit XML: ${tick}test-results/pester.xml${tick}."
     $md -join "`n" | Set-Content -Encoding utf8NoBOM (Join-Path $results 'summary.md')
 }
 
