@@ -1838,6 +1838,86 @@ pub fn watch(id: &str, json: bool, from_start: bool, no_follow: bool) -> Result<
     }
 }
 
+/// `toryo dashboard` (M16-01): every task's `status` row and what its flight recorder says it
+/// does now or did last — read-only like `watch`: `Store::read` only, no task lock, nothing
+/// written. Each events file is followed with its own [`Tail`](toryo::engine::flight::Tail), so a
+/// frame reads only what was appended since the last one. On a terminal it redraws every
+/// `interval` seconds until Ctrl+C (exit 0); into a pipe or a file, with `--once` or `--json`,
+/// it prints one frame (one JSON document) and exits.
+pub fn dashboard(json: bool, once: bool, interval: u64, hide_done: bool) -> Result<i32> {
+    use std::collections::HashMap;
+    use toryo::engine::dashboard::{self as dash, Activity};
+    use toryo::engine::flight::{self, Tail};
+    use toryo::term::{try_line, Stream};
+    let st = store()?;
+    let live = !json && !once && toryo::term::stdout_is_terminal();
+    if live {
+        catch_ctrl_c();
+    }
+    let mut seen: HashMap<String, (Tail, Activity)> = HashMap::new();
+    loop {
+        let mut rows = Vec::new();
+        for t in st
+            .read(store::list_tasks)?
+            .into_iter()
+            .filter(|t| !(hide_done && t.state.is_terminal()))
+        {
+            let (tail, a) = seen.entry(t.id.clone()).or_default();
+            // an unreadable events file is a row without activity, never the end of the view
+            a.apply_lines(&tail.poll(&flight::events_path(&t)).unwrap_or_default());
+            let a = a.clone();
+            let f = facts(&st, &t)?;
+            rows.push((t, f, a));
+        }
+        let since = |ts: &str| flight::ms_since(ts);
+        let now = store::now();
+        if json {
+            let tasks: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|(t, f, a)| dash::task_json(t, f, a, since))
+                .collect();
+            print_json(&serde_json::json!({ "generated_at": now, "tasks": tasks }))?;
+            return Ok(0);
+        }
+        let refs: Vec<(&TaskRow, &TaskFacts)> = rows.iter().map(|(t, f, _)| (t, f)).collect();
+        let updated = now
+            .get(11..19)
+            .map(|c| format!("{c} UTC"))
+            .unwrap_or(now.clone());
+        let mut blocks = vec![dash::header(&refs, &updated)];
+        if rows.is_empty() {
+            blocks.push(String::new());
+            blocks.push("no tasks (`toryo task create --file TASK.md`)".into());
+        }
+        for (t, f, a) in &rows {
+            blocks.push(String::new());
+            blocks.extend(dash::task_lines(t, f, a, since));
+        }
+        if !live {
+            for b in &blocks {
+                match try_line(Stream::Out, b) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(0),
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            return Ok(0);
+        }
+        blocks.push(String::new());
+        blocks.push(format!(
+            "every {interval}s · Ctrl+C to quit · `toryo watch <id>` follows one task"
+        ));
+        match toryo::term::screen(&blocks) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(0),
+            Err(e) => return Err(e.into()),
+        }
+        if interrupted_during(Duration::from_secs(interval)) {
+            return Ok(0);
+        }
+    }
+}
+
 /// Print the `watch` text of `lines` on stdout. `false`: stdout is closed (a broken pipe).
 fn show_lines(lines: &[String], json: bool) -> Result<bool> {
     use std::io::Write;

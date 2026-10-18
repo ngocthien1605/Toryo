@@ -72,6 +72,7 @@ toryo resume [ID] [--note "…" | --discard-partial | --keep-partial | --accept-
 toryo stop ID                             # ask the running owner to stop; Ctrl+C in the window of `toryo run`
                                           # or `toryo resume` does the same (a second Ctrl+C ends the process at once)
 toryo status [ID] [--json] · toryo task list|show ID [--json] · toryo watch ID [--json]
+toryo dashboard [--once] [--json] [--interval S] [--hide-done]   # every task at a glance; no lock, writes nothing
 toryo task config ID [--reload]           # the frozen configuration; reload only while the task waits
 toryo task cleanup ID [--force]           # --force when it would delete unsaved work or snapshots
 toryo budget set ID --tokens N | --none   · toryo usage ID [--json] [--prices FILE]
@@ -213,6 +214,15 @@ a protected file that changed → restore it, or `resume --accept-protected-chan
 - `toryo watch <ID>` follows the flight recorder `<data dir>\runs\<ID>\events.jsonl` without taking the lock; `--json`
   prints the raw events (`run_started`, `state_changed`, `stage_started/finished`, `turn_finished`, `checkpoint_created`,
   `verify_command`, `gate_opened`, `escalated` with a typed `reason_class`, `paused`, `run_ended`, …).
+- `toryo dashboard` shows every task at once from the store and each task's `events.jsonl`, without taking a lock or
+  writing anything: the task's `status` row (state, fix cycle, tokens, `ACTIVE (owner)` while a process drives it), what
+  its flight recorder says it is doing — `now:` the stage that started and has not finished, only while a process
+  drives the task — or did last (`last:` the newest event and its age), and `next:`. On a terminal it redraws every
+  `--interval` seconds (default 2) until Ctrl+C; into a pipe or a file, and with `--once`, it prints one frame.
+  `--hide-done` leaves out Completed, Cancelled and Failed tasks. `--json` prints one document,
+  `{ "generated_at", "tasks": [ … ] }`: each task is the `status --json` object plus `activity` (`events`, `last_seq`,
+  `run_open`, `stage`, `last`). The dashboard's lines are Toryo's own words — an escalation shows its `reason_class`,
+  never its reason, a pause or an error no text at all; `toryo watch <ID>` shows the text (X35).
 - `toryo status [ID] --json`, `toryo task list --json` and `toryo task show ID --json` print one JSON document on
   stdout (snake_case; a key is always present, `null` when there is no value): state, fix cycle, token spend and
   budget, `active_owner`, `next_action`, attempts, usage rows, gate occurrences and the environments' deployment rows.

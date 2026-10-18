@@ -6,6 +6,7 @@ pub mod checks;
 pub mod cmdline;
 pub mod context;
 pub mod contracts;
+pub mod dashboard;
 pub mod decisions;
 pub mod flight;
 pub mod gates;

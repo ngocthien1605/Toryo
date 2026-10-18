@@ -155,6 +155,23 @@ enum Cmd {
         #[arg(long)]
         no_follow: bool,
     },
+    /// Every task at a glance (M16-01): state, what its flight recorder says it does now or did
+    /// last, and what comes next — no task lock, nothing written. On a terminal it redraws
+    /// every `--interval` seconds until Ctrl+C; into a pipe or a file it prints once.
+    Dashboard {
+        /// One JSON document on stdout: `{ "generated_at", "tasks": [ … ] }` (then exit)
+        #[arg(long)]
+        json: bool,
+        /// Print once and exit, also on a terminal
+        #[arg(long)]
+        once: bool,
+        /// Seconds between two frames on a terminal (1 to 3600)
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        interval: u64,
+        /// Leave out the tasks that are finished (Completed, Cancelled, Failed)
+        #[arg(long)]
+        hide_done: bool,
+    },
     /// Tokens per stage × profile × model and the estimated cost (plan §12): prices from
     /// `%USERPROFILE%\.toryo\prices.toml` (or --prices) for rows billed foundry/api.
     Usage {
@@ -406,6 +423,12 @@ fn run(cli: Cli) -> Result<i32> {
             from_start,
             no_follow,
         } => engine_cli::watch(id, *json, *from_start, *no_follow),
+        Cmd::Dashboard {
+            json,
+            once,
+            interval,
+            hide_done,
+        } => engine_cli::dashboard(*json, *once, *interval, *hide_done),
         Cmd::Usage { id, json, prices } => engine_cli::usage(id, *json, prices.as_deref()),
         Cmd::Partial { cmd } => engine_cli::partial(cmd),
         Cmd::Context { cmd } => engine_cli::context(cmd),

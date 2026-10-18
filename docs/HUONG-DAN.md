@@ -395,6 +395,7 @@ Chưa có cơ chế tự dọn theo thời gian — task xong thì nhớ `task c
 | `toryo stop ID` | yêu cầu lệnh đang chạy task dừng lại (Ctrl+C trong cửa sổ `toryo run` cũng vậy) |
 | `toryo status [ID] [--json]` · `toryo task list` · `toryo task show ID` | trạng thái và `next:` — đúng lệnh cần gõ tiếp |
 | `toryo watch ID` · `toryo usage ID` | theo dõi trực tiếp; token và chi phí ước tính (mục 5.8) |
+| `toryo dashboard [--once] [--json] [--interval S] [--hide-done]` | mọi task trên một màn hình, không lấy lock (mục 5.8) |
 | `toryo context show ID --stage plan\|implement\|fix-N\|review [--attempt N] [--profile P]` | xem **đúng** những gì agent nhận (ngữ cảnh, skill, nguồn, SHA-256) |
 | `toryo task config ID [--reload] [--expect DIGEST]` | cấu hình đã đóng băng của task; `--reload` nạp lại file config (chỉ khi task đang chờ) |
 | `toryo task cleanup ID [--force]` | xoá worktree + run store (branch được giữ); `--force` khi task chưa xong hoặc sẽ mất thay đổi chưa commit / snapshot |
@@ -687,6 +688,22 @@ toryo watch BR-003 --json           # các dòng JSON nguyên bản (cho script)
 
 `watch` tự thoát 2 giây sau sự kiện cuối khi task chờ anh (gate, Escalated, Paused), đã xong, hoặc không còn
 tiến trình nào chạy nó (run bị crash → `toryo resume`). Ctrl+C cũng thoát (exit 0).
+
+**Mọi task cùng lúc — `toryo dashboard`** (M16-01): đọc store và `events.jsonl` của từng task, không lấy lock,
+không ghi gì. Mỗi task một khối: dòng `status` (trạng thái, vòng sửa, token, `ACTIVE (…)` khi có tiến trình đang
+chạy nó), `now:` stage đang chạy (chỉ khi task đang được chạy) hoặc `last:` sự kiện mới nhất và cách đây bao lâu,
+rồi `next:`.
+
+```powershell
+toryo dashboard                     # trên terminal: vẽ lại mỗi 2 giây, Ctrl+C để thoát
+toryo dashboard --interval 5        # mỗi 5 giây
+toryo dashboard --once              # in một lần rồi thoát (vào pipe / file thì luôn như vậy)
+toryo dashboard --hide-done         # bỏ các task Completed, Cancelled, Failed
+toryo dashboard --json              # một tài liệu JSON: mỗi task = object của status --json + "activity"
+```
+
+Dashboard chỉ dùng lời của Toryo: một escalation hiện `reason_class`, không hiện lý do; pause hay lỗi không hiện
+chữ nào của agent. Muốn đọc lý do: `toryo watch <ID>` hoặc `toryo status <ID>`.
 
 **Cho script / dashboard** — một tài liệu JSON trên stdout, schema trong README ("Following a task"):
 
