@@ -512,14 +512,17 @@ pub fn verify_holder() -> Option<String> {
 }
 
 impl VerifyLock {
-    /// Take the lock for `task` if it is free (non-blocking); `None` while another process
-    /// holds it. `label` is written in the lock file, the task id in the holder file.
-    pub fn try_acquire(task: &str, label: &str) -> Result<Option<VerifyLock>> {
-        let Some(file) = try_lock_at(&verify_lock_path(), label)? else {
-            return Ok(None);
-        };
+    /// Take the lock if it is free (non-blocking); `None` while another process holds it.
+    /// `label` is written in the lock file. The holder file is not: see [`Self::announce`].
+    pub fn try_acquire(label: &str) -> Result<Option<VerifyLock>> {
+        Ok(try_lock_at(&verify_lock_path(), label)?.map(|file| VerifyLock { file }))
+    }
+
+    /// M16-R4: name `task` in the holder file — called once the holder's `lock_acquired` is in
+    /// its flight recorder, so no waiter's `lock_waiting` can name a holder before that holder's
+    /// own log says it took the lock (a waiter that finds no name yet asks again).
+    pub fn announce(&self, task: &str) {
         let _ = std::fs::write(verify_holder_path(), task);
-        Ok(Some(VerifyLock { file }))
     }
 }
 

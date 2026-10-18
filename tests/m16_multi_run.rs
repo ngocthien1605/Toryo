@@ -328,6 +328,21 @@ fn the_check_gates_of_two_tasks_run_at_once_never_overlap() {
     iv.sort_by_key(|i| i.1);
     assert_ne!(iv[0].0, iv[1].0);
     assert!(iv[0].2 <= iv[1].1, "the gates overlapped: {iv:?}");
+    // M16-R4: a waiter names a holder whose own `lock_acquired` came first
+    for (me, other) in [("G-1", "G-2"), ("G-2", "G-1")] {
+        for w in events(&env, me)
+            .iter()
+            .filter(|e| e["type"] == "lock_waiting" && e["lock"] == "machine:verify")
+        {
+            assert_eq!(w["holder"], other, "{w}");
+            let acquired = first_ts(&events(&env, other), "lock_acquired");
+            assert!(
+                acquired.as_str() < w["ts"].as_str().unwrap(),
+                "{me} waited at {} for {other}, which acquired at {acquired}",
+                w["ts"]
+            );
+        }
+    }
 }
 
 /// M16-R2: a run killed while it waited for the verify lock leaves its wait row; the next run

@@ -1688,6 +1688,10 @@ impl<'a> Engine<'a> {
             return self.stopped();
         };
         let verify_lock = Held::new(self.rec, super::lock::VERIFY_LOCK, verify_lock);
+        // M16-R4: named as the holder only now that its `lock_acquired` is recorded
+        if let Some(l) = &verify_lock.lock {
+            l.announce(&t.id);
+        }
         let Some((b, co)) = self.verify_checkout(t, &a, &head)? else {
             return Ok(Flow::Next);
         };
@@ -2521,7 +2525,7 @@ impl<'a> Engine<'a> {
         loop {
             // M16-R1: an error while the task waits clears the wait row before it goes up —
             // a later run must not be shown waiting for the lock (nor skipped as its holder)
-            let got = match VerifyLock::try_acquire(&t.id, &label) {
+            let got = match VerifyLock::try_acquire(&label) {
                 Ok(g) => g,
                 Err(e) => {
                     if waiting {
@@ -2539,15 +2543,27 @@ impl<'a> Engine<'a> {
             if !waiting {
                 waiting = true;
                 let i = t.id.clone();
-                let holder = self
-                    .store
-                    .call(move |tx| {
-                        store::set_env_wait(tx, &i, Some(super::lock::VERIFY_LOCK))?;
-                        verifying_now(tx, &i)
-                    })
+                self.store
+                    .call(move |tx| store::set_env_wait(tx, &i, Some(super::lock::VERIFY_LOCK)))
                     .inspect_err(|_| {
                         let _ = done_waiting(self);
                     })?;
+                // M16-R4: the holder names itself right after its `lock_acquired` is recorded; a
+                // waiter that comes in between asks again for a moment (at most a second)
+                let mut holder = None;
+                for _ in 0..20 {
+                    let i = t.id.clone();
+                    holder = self
+                        .store
+                        .read(move |tx| verifying_now(tx, &i))
+                        .inspect_err(|_| {
+                            let _ = done_waiting(self);
+                        })?;
+                    if holder.is_some() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
                 self.rec.emit(EngineEvent::LockWaiting {
                     lock: super::lock::VERIFY_LOCK.to_string(),
                     holder,
