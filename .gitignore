@@ -4,3 +4,8 @@
 # Prebuilt Windows binary: a local build artifact, not source.
 # Build: cargo build --release --target x86_64-pc-windows-gnu  (or natively on Windows: cargo build --release)
 /bin/*.exe
+
+# M16 acceptance runs (scripts/test-e2e.ps1): logs, summary and NUnit XML stay local; the
+# report is committed
+/test-results/*
+!/test-results/REPORT.md

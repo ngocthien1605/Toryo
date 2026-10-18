@@ -1,0 +1,7 @@
+# M16 acceptance tests: the machine config (passed with --machine-config). The profiles name
+# executables that do not exist: every turn is scripted (--fake-agents), so no real CLI runs.
+profiles:
+  claude-max:   { kind: claude, billing: subscription, exe: claude-not-installed }
+  codex-openai: { kind: codex,  billing: subscription, exe: codex-not-installed }
+# the fixture verifies in trusted-code mode (its slow gate writes gates.log in the temp root)
+verify: { min_boundary: none }

@@ -1,0 +1,24 @@
+# M16 acceptance tests: the repository config of one temp root (written by New-M16Fixture.ps1).
+version: 1
+project:
+  root: "@REPO@"
+  worktrees_root: "@ROOT@/wts"
+  base_branch: main
+roles:
+  planner:     { profile: claude-max }
+  implementer: { profile: codex-openai }
+  reviewer:    { profile: claude-max }
+verify:
+  checkout: clean
+  boundary: none
+  verify_root: "@ROOT@/verify"
+commands:
+  verify:
+    - { name: build, program: pwsh, args: ["-NoProfile", "-File", "scripts/build.ps1"] }
+    - { name: test,  program: pwsh, args: ["-NoProfile", "-File", "scripts/test.ps1"] }
+    # AT-4: a gate that takes a while and logs its start and end (UTC ticks), so the verify
+    # lock is contended and two tasks' gates can be compared
+    - { name: slow,  program: pwsh, args: ["-NoProfile", "-NonInteractive", "-Command", "Add-Content -Path '@ROOT@/gates.log' -Value ($env:TORYO_TASK + ' start ' + [DateTime]::UtcNow.Ticks); Start-Sleep -Seconds 3; Add-Content -Path '@ROOT@/gates.log' -Value ($env:TORYO_TASK + ' end ' + [DateTime]::UtcNow.Ticks)"] }
+timeouts:
+  agent_stall_min: 30
+  agent_stage_max_min: 60
