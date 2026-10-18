@@ -116,6 +116,10 @@ pub enum AgentEvent {
     /// limit is suspended; the max limit and stop requests still apply (EC-06). Sent by
     /// the real CLI adapter only. Consumers ignore it.
     CommandRunning(bool),
+    /// M16-AT (X39): the turn's agent started — its process id (the real CLI adapter, right
+    /// after the process is started), or none (a scripted fake agent, at the start of its turn).
+    /// Carries nothing for the outcome; the engine records it as `agent_spawned`.
+    Spawned(Option<u32>),
     Retrying {
         attempt: u32,
         delay_ms: u64,
@@ -237,7 +241,7 @@ impl StageOutcome {
             // the turn and the terminal one is final, so nothing is counted twice
             AgentEvent::Usage(u) => self.usage = Some(*u),
             // liveness only: `run_to_completion` reads them for the stall limit
-            AgentEvent::Heartbeat | AgentEvent::CommandRunning(_) => {}
+            AgentEvent::Heartbeat | AgentEvent::CommandRunning(_) | AgentEvent::Spawned(_) => {}
             AgentEvent::Retrying { .. } => self.retries += 1,
             AgentEvent::TurnCompleted {
                 final_text,

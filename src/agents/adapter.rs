@@ -66,6 +66,10 @@ pub type SessionHook = Arc<dyn Fn(&str) + Send + Sync>;
 /// Called with the turn's usage so far on every usage event (live adapters, R41).
 pub type UsageHook = Arc<dyn Fn(&crate::domain::TokenUsage) + Send + Sync>;
 
+/// M16-AT (X39): called when the turn's agent started, with its process id (none for a
+/// scripted fake agent).
+pub type SpawnHook = Arc<dyn Fn(Option<u32>) + Send + Sync>;
+
 /// Optional hooks for one turn.
 #[derive(Clone, Default)]
 pub struct TurnHooks {
@@ -76,6 +80,8 @@ pub struct TurnHooks {
     pub on_session: Option<SessionHook>,
     /// R41: live usage (Claude), e.g. to interrupt a turn when the budget is crossed.
     pub on_usage: Option<UsageHook>,
+    /// M16-AT (X39): the agent started (`AgentEvent::Spawned`).
+    pub on_spawn: Option<SpawnHook>,
 }
 
 /// Like [`run_to_completion`], with [`TurnHooks`].
@@ -129,6 +135,9 @@ pub async fn run_to_completion_with(
                 }
                 if let (AgentEvent::Usage(u), Some(f)) = (&e, &hooks.on_usage) {
                     f(u);
+                }
+                if let (AgentEvent::Spawned(pid), Some(f)) = (&e, &hooks.on_spawn) {
+                    f(*pid);
                 }
                 let terminal = e.is_terminal();
                 out.apply(&e);

@@ -13,6 +13,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,9 @@ pub enum EngineEvent {
     /// carries the lock generation.
     RunStarted {
         owner: String,
+        /// M16-AT (X39): the process id of the drive command (for a checker: is it still alive).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
     },
     /// `event` is the pipeline event's name (`plan_ready`, `escalate`, …; `recovery` for what
     /// the §10 recovery changed).
@@ -138,6 +142,50 @@ pub enum EngineEvent {
         from: Option<St>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// M16-AT (X39): how the drive ended — `done` (a terminal state), `waiting` (a gate,
+        /// an escalation, a pause), `stopped` (a stop request, Ctrl+C included), `error`,
+        /// `panicked`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<String>,
+        /// M16-AT (X39): the exit code of the drive command.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+    },
+    // ── M16-AT (X39): diagnostic events — written to the file, never printed (always quiet),
+    // left out of `watch` and of the dashboard's `last:`; for checkers and post-mortems ──
+    /// A machine-wide lock was taken: the verify lock (`machine:verify`) or an environment
+    /// gate's lock. Written right after the OS lock is held.
+    LockAcquired {
+        lock: String,
+    },
+    /// The lock is given back. Written right **before** the OS lock is released, so the next
+    /// holder's `lock_acquired` always comes after it.
+    LockReleased {
+        lock: String,
+    },
+    /// The engine takes up a stop request: `source` is `ctrl_c` (the console's Ctrl+C) or
+    /// `stop` (`toryo stop <id>`).
+    CancelRequested {
+        source: String,
+    },
+    /// A turn's agent started; `pid`: its process (none for a scripted fake agent, which runs
+    /// in this process).
+    AgentSpawned {
+        stage: String,
+        attempt: u32,
+        profile: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
+    },
+    /// Toryo ended a turn's agent before it finished: `reason` is `stop` (a stop request) or
+    /// `limit` (the stall or max limit). A real agent's process tree is ended with its Job.
+    AgentKilled {
+        stage: String,
+        attempt: u32,
+        profile: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
+        reason: String,
     },
 }
 
@@ -172,7 +220,25 @@ impl EngineEvent {
             Self::Escalated { .. } => "escalated",
             Self::Paused { .. } => "paused",
             Self::RunEnded { .. } => "run_ended",
+            Self::LockAcquired { .. } => "lock_acquired",
+            Self::LockReleased { .. } => "lock_released",
+            Self::CancelRequested { .. } => "cancel_requested",
+            Self::AgentSpawned { .. } => "agent_spawned",
+            Self::AgentKilled { .. } => "agent_killed",
         }
+    }
+
+    /// M16-AT (X39): a diagnostic event — in the file, never on the console, in `watch` or in
+    /// the dashboard's `last:` (their text is what it was before these events existed).
+    pub fn is_diagnostic(&self) -> bool {
+        matches!(
+            self,
+            Self::LockAcquired { .. }
+                | Self::LockReleased { .. }
+                | Self::CancelRequested { .. }
+                | Self::AgentSpawned { .. }
+                | Self::AgentKilled { .. }
+        )
     }
 }
 
@@ -255,7 +321,7 @@ fn render_raw(env: &Envelope) -> String {
     use EngineEvent as E;
     let secs = |ms: u64| ms as f64 / 1000.0;
     match &env.event {
-        E::RunStarted { owner } => format!(
+        E::RunStarted { owner, .. } => format!(
             "▶ {} — run started (generation {}, {owner})",
             env.task, env.generation
         ),
@@ -394,6 +460,30 @@ fn render_raw(env: &Envelope) -> String {
             }
             s
         }
+        // diagnostic events: never printed (quiet) and never shown by `watch` — a line only
+        // for a reader of the raw file
+        E::LockAcquired { lock } => format!("   lock {lock} acquired"),
+        E::LockReleased { lock } => format!("   lock {lock} released"),
+        E::CancelRequested { source } => format!("   stop request taken up ({source})"),
+        E::AgentSpawned {
+            stage,
+            attempt,
+            profile,
+            pid,
+        } => format!(
+            "   agent {stage}/{attempt} ({profile}) started{}",
+            pid.map(|p| format!(", pid {p}")).unwrap_or_default()
+        ),
+        E::AgentKilled {
+            stage,
+            attempt,
+            profile,
+            pid,
+            reason,
+        } => format!(
+            "   agent {stage}/{attempt} ({profile}) ended by toryo ({reason}){}",
+            pid.map(|p| format!(", pid {p}")).unwrap_or_default()
+        ),
     }
 }
 
@@ -487,18 +577,35 @@ impl Tail {
 /// How many events `watch` shows of the history without `--from-start`.
 pub const WATCH_HISTORY: usize = 20;
 
-/// The history `watch` prints first: everything, or the last [`WATCH_HISTORY`] lines.
-pub fn history(lines: &[String], from_start: bool) -> &[String] {
+/// The history `watch` prints first: everything, or the last [`WATCH_HISTORY`] lines. Rendered
+/// (`json` false) the window counts no diagnostic event (X39), so the rendered history is the
+/// one it was before they were written; `--json` is the file's last lines, as before.
+pub fn history(lines: &[String], from_start: bool, json: bool) -> &[String] {
     if from_start {
-        lines
-    } else {
-        &lines[lines.len().saturating_sub(WATCH_HISTORY)..]
+        return lines;
     }
+    if json {
+        return &lines[lines.len().saturating_sub(WATCH_HISTORY)..];
+    }
+    let mut counted = 0;
+    let mut from = lines.len();
+    while from > 0 && counted < WATCH_HISTORY {
+        from -= 1;
+        if !diagnostic_line(&lines[from]) {
+            counted += 1;
+        }
+    }
+    &lines[from..]
+}
+
+/// The `type` of a line names a diagnostic event (X39)?
+fn diagnostic_line(line: &str) -> bool {
+    serde_json::from_str::<Envelope>(line).is_ok_and(|e| e.event.is_diagnostic())
 }
 
 /// What `watch` prints for one line of the file: the line itself (`--json`) or its rendered
 /// text; nothing for a line that is not a JSON object (a damaged line) or, rendered, not an
-/// event this toryo knows.
+/// event this toryo knows — or a diagnostic event (X39: the file's, not the console's).
 pub fn watch_line(line: &str, json: bool) -> Option<String> {
     let v: Value = serde_json::from_str(line).ok().filter(Value::is_object)?;
     if json {
@@ -506,6 +613,7 @@ pub fn watch_line(line: &str, json: bool) -> Option<String> {
     }
     serde_json::from_value::<Envelope>(v)
         .ok()
+        .filter(|e| !e.event.is_diagnostic())
         .map(|e| render(&e))
 }
 
@@ -767,8 +875,24 @@ fn redact_event(r: &Redactions, mut e: EngineEvent) -> EngineEvent {
     };
     use EngineEvent as E;
     match &mut e {
-        E::RunStarted { owner } => s(owner),
+        E::RunStarted { owner, .. } => s(owner),
         E::StateChanged { event, .. } => s(event),
+        E::LockAcquired { lock } | E::LockReleased { lock } => s(lock),
+        E::CancelRequested { source } => s(source),
+        E::AgentSpawned { stage, profile, .. } => {
+            s(stage);
+            s(profile);
+        }
+        E::AgentKilled {
+            stage,
+            profile,
+            reason,
+            ..
+        } => {
+            s(stage);
+            s(profile);
+            s(reason);
+        }
         E::StageStarted {
             stage,
             profile,
@@ -816,10 +940,14 @@ fn redact_event(r: &Redactions, mut e: EngineEvent) -> EngineEvent {
         }
         E::Paused { reason } => s(reason),
         E::RunEnded {
-            next_action, error, ..
+            next_action,
+            error,
+            outcome,
+            ..
         } => {
             s(next_action);
             o(error);
+            o(outcome);
         }
     }
     e
@@ -837,14 +965,36 @@ fn limit(mut e: EngineEvent) -> EngineEvent {
     e
 }
 
-/// Wraps events in envelopes and hands them to the sinks.
+/// M16-AT (X39): the time of an event — RFC 3339 in UTC like [`super::store::now`], and
+/// strictly later than the previous event's of this process (a clock that stands still or
+/// steps back gives the last time plus a microsecond), so a checker can order the events of
+/// one process by `ts` alone.
+fn event_time() -> String {
+    use time::format_description::well_known::Rfc3339;
+    static LAST: std::sync::Mutex<Option<time::OffsetDateTime>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let mut now = time::OffsetDateTime::now_utc();
+    if let Some(prev) = *last {
+        if now <= prev {
+            now = prev + time::Duration::microseconds(1);
+        }
+    }
+    *last = Some(now);
+    now.format(&Rfc3339).unwrap_or_else(|_| "unknown".into())
+}
+
+/// Wraps events in envelopes and hands them to the sinks. A clone shares everything — the
+/// sequence numbers, the sinks, the dispatch lock — so a turn's hook can record events while
+/// the engine records its own (M16-AT): one event at a time, in `seq` order in the file.
+#[derive(Clone)]
 pub struct Recorder {
     task: String,
     generation: i64,
-    next: AtomicU64,
-    redact: Redactions,
-    sinks: Vec<Box<dyn EventSink>>,
-    reported: Vec<AtomicBool>,
+    next: Arc<AtomicU64>,
+    redact: Arc<Redactions>,
+    sinks: Arc<Vec<Box<dyn EventSink>>>,
+    reported: Arc<Vec<AtomicBool>>,
+    dispatching: Arc<std::sync::Mutex<()>>,
 }
 
 impl Recorder {
@@ -853,10 +1003,11 @@ impl Recorder {
         Self {
             task: task.to_string(),
             generation,
-            next: AtomicU64::new(last_seq.saturating_add(1)),
-            redact,
-            sinks: Vec::new(),
-            reported: Vec::new(),
+            next: Arc::new(AtomicU64::new(last_seq.saturating_add(1))),
+            redact: Arc::new(redact),
+            sinks: Arc::new(Vec::new()),
+            reported: Arc::new(Vec::new()),
+            dispatching: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -876,9 +1027,14 @@ impl Recorder {
             .with(Box::new(StderrSink))
     }
 
+    /// Add a sink — while the recorder is built, before it is cloned.
     pub fn with(mut self, sink: Box<dyn EventSink>) -> Self {
-        self.sinks.push(sink);
-        self.reported.push(AtomicBool::new(false));
+        Arc::get_mut(&mut self.sinks)
+            .expect("Recorder::with before the recorder is cloned")
+            .push(sink);
+        Arc::get_mut(&mut self.reported)
+            .expect("Recorder::with before the recorder is cloned")
+            .push(AtomicBool::new(false));
         self
     }
 
@@ -925,6 +1081,8 @@ impl Recorder {
     }
 
     fn dispatch(&self, e: EngineEvent, quiet: bool) {
+        // one event at a time across clones: `seq`, `ts` and the line's place in the file agree
+        let _one = self.dispatching.lock().unwrap_or_else(|e| e.into_inner());
         let env = Envelope {
             v: VERSION,
             // never wraps: at the (implausible) end of the range the number stays there. A plain
@@ -944,14 +1102,14 @@ impl Recorder {
                     }
                 }
             },
-            ts: super::store::now(),
+            ts: event_time(),
             task: self.task.clone(),
             generation: self.generation,
             // R7: redact first, then shorten — a cut never leaves a secret's prefix behind
             event: limit(redact_event(&self.redact, e)),
             quiet,
         };
-        for (s, reported) in self.sinks.iter().zip(&self.reported) {
+        for (s, reported) in self.sinks.iter().zip(self.reported.iter()) {
             if let Err(err) = s.emit(&env) {
                 if !reported.swap(true, Ordering::SeqCst) {
                     // R9: never `eprintln!` here: it panics when stderr is gone, and a panic
@@ -1008,10 +1166,88 @@ mod tests {
         m
     }
 
+    /// M16-AT (X39): the diagnostic events are in the file (`watch --json` shows the file),
+    /// never in the rendered `watch`; and they never take a place in its history of 20.
+    #[test]
+    fn diagnostic_events_stay_out_of_the_rendered_watch_and_its_history() {
+        let c = Collect::default();
+        let r = Recorder::new("T", 1, 0, Redactions::empty()).with(Box::new(c.clone()));
+        for i in 0..25 {
+            r.emit_quiet(EngineEvent::GateOpened {
+                gate: format!("g{i}"),
+                occurrence: 1,
+            });
+            r.emit_quiet(EngineEvent::LockAcquired { lock: "l".into() });
+        }
+        let lines: Vec<String> =
+            c.0.lock()
+                .unwrap()
+                .iter()
+                .map(|e| serde_json::to_string(e).unwrap())
+                .collect();
+        let h = history(&lines, false, false);
+        let gates = h.iter().filter(|l| l.contains("gate_opened")).count();
+        assert_eq!(
+            gates, WATCH_HISTORY,
+            "the history is 20 events, not 20 lines"
+        );
+        assert!(h[0].contains("\"g5\""), "{}", h[0]);
+        for l in h {
+            let shown = watch_line(l, false);
+            assert_eq!(shown.is_some(), l.contains("gate_opened"), "{l}");
+            assert!(watch_line(l, true).is_some(), "--json is the file: {l}");
+        }
+        assert!(EngineEvent::CancelRequested {
+            source: "stop".into()
+        }
+        .is_diagnostic());
+        assert!(!EngineEvent::Paused { reason: "r".into() }.is_diagnostic());
+    }
+
+    /// M16-AT (X39): within a process the times of the events only go forward, and a clone of
+    /// the recorder numbers its events with the original's.
+    #[test]
+    fn event_times_increase_and_clones_share_the_numbering() {
+        let c = Collect::default();
+        let r = Recorder::new("T", 1, 6, Redactions::empty()).with(Box::new(c.clone()));
+        let r2 = r.clone();
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let r = r2.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        r.emit_quiet(EngineEvent::LockReleased { lock: "l".into() });
+                    }
+                })
+            })
+            .collect();
+        for _ in 0..50 {
+            r.emit_quiet(EngineEvent::LockAcquired { lock: "l".into() });
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        let got = c.0.lock().unwrap().clone();
+        assert_eq!(got.len(), 250);
+        let seqs: Vec<u64> = got.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, (7..257).collect::<Vec<u64>>(), "in seq order, no gap");
+        let ts: Vec<time::OffsetDateTime> = got
+            .iter()
+            .map(|e| {
+                time::OffsetDateTime::parse(&e.ts, &time::format_description::well_known::Rfc3339)
+                    .unwrap()
+            })
+            .collect();
+        assert!(ts.windows(2).all(|w| w[0] < w[1]), "strictly increasing");
+    }
+
     #[test]
     fn every_variant_round_trips_through_its_line() {
         let all = vec![
-            EngineEvent::RunStarted { owner: "me".into() },
+            EngineEvent::RunStarted {
+                pid: None,
+                owner: "me".into(),
+            },
             EngineEvent::StateChanged {
                 from: St::New,
                 to: St::Planning,
@@ -1091,12 +1327,16 @@ mod tests {
                 reason: "budget".into(),
             },
             EngineEvent::RunEnded {
+                outcome: None,
+                exit_code: None,
                 state: St::Completed,
                 next_action: "done".into(),
                 from: None,
                 error: None,
             },
             EngineEvent::RunEnded {
+                outcome: None,
+                exit_code: None,
                 state: St::New,
                 next_action: "`toryo run T-1`".into(),
                 from: Some(St::New),
@@ -1294,6 +1534,8 @@ mod tests {
         let (state, next) = (St::Completed, "done — merge it");
         assert_eq!(
             r(EngineEvent::RunEnded {
+                outcome: None,
+                exit_code: None,
                 state,
                 next_action: next.into(),
                 from: Some(St::Reviewing),
@@ -1327,6 +1569,8 @@ mod tests {
             "!! quota \u{FFFD}dlo\u{FFFD}31m"
         );
         let end = r(EngineEvent::RunEnded {
+            outcome: None,
+            exit_code: None,
             state: St::Escalated,
             next_action: "a\u{1b}[2Jb".into(),
             from: None,
@@ -1353,6 +1597,7 @@ mod tests {
         let r = |e: EngineEvent| render(&env(e));
         assert_eq!(
             r(EngineEvent::RunStarted {
+                pid: None,
                 owner: "me pid 7".into()
             }),
             "▶ T-1 — run started (generation 2, me pid 7)"
@@ -1583,6 +1828,8 @@ mod tests {
         )
         .with(Box::new(c.clone()));
         r.emit(EngineEvent::RunEnded {
+            outcome: None,
+            exit_code: None,
             state: St::Completed,
             next_action: "done: Completed — merge it".into(),
             from: Some(St::Reviewing),
@@ -1645,6 +1892,8 @@ mod tests {
         .with(Box::new(c.clone()));
         let error = format!("{}{secret} and more", "x".repeat(ERROR_MAX - 5));
         r.emit(EngineEvent::RunEnded {
+            outcome: None,
+            exit_code: None,
             state: St::New,
             next_action: "n".into(),
             from: None,
@@ -1710,7 +1959,7 @@ mod tests {
         fn fields_named(e: &EngineEvent) -> &'static str {
             use EngineEvent as E;
             match e {
-                E::RunStarted { owner: _ } => "run_started",
+                E::RunStarted { owner: _, pid: _ } => "run_started",
                 E::StateChanged {
                     from: _,
                     to: _,
@@ -1772,13 +2021,34 @@ mod tests {
                     next_action: _,
                     from: _,
                     error: _,
+                    outcome: _,
+                    exit_code: _,
                 } => "run_ended",
+                E::LockAcquired { lock: _ } => "lock_acquired",
+                E::LockReleased { lock: _ } => "lock_released",
+                E::CancelRequested { source: _ } => "cancel_requested",
+                E::AgentSpawned {
+                    stage: _,
+                    attempt: _,
+                    profile: _,
+                    pid: _,
+                } => "agent_spawned",
+                E::AgentKilled {
+                    stage: _,
+                    attempt: _,
+                    profile: _,
+                    pid: _,
+                    reason: _,
+                } => "agent_killed",
             }
         }
         /// The number of arms of `fields_named`.
-        const VARIANTS: usize = 14;
+        const VARIANTS: usize = 19;
         let all = vec![
-            EngineEvent::RunStarted { owner: "o".into() },
+            EngineEvent::RunStarted {
+                owner: "o".into(),
+                pid: Some(1),
+            },
             EngineEvent::StateChanged {
                 from: St::New,
                 to: St::Planning,
@@ -1846,6 +2116,26 @@ mod tests {
                 next_action: "n".into(),
                 from: Some(St::New),
                 error: Some("e".into()),
+                outcome: Some("done".into()),
+                exit_code: Some(0),
+            },
+            EngineEvent::LockAcquired { lock: "l".into() },
+            EngineEvent::LockReleased { lock: "l".into() },
+            EngineEvent::CancelRequested {
+                source: "ctrl_c".into(),
+            },
+            EngineEvent::AgentSpawned {
+                stage: "s".into(),
+                attempt: 1,
+                profile: "p".into(),
+                pid: Some(1),
+            },
+            EngineEvent::AgentKilled {
+                stage: "s".into(),
+                attempt: 1,
+                profile: "p".into(),
+                pid: Some(1),
+                reason: "stop".into(),
             },
         ];
         let kinds: std::collections::BTreeSet<&str> = all.iter().map(fields_named).collect();
@@ -1931,7 +2221,10 @@ mod tests {
         assert_eq!(last_seq(&p), 1, "a partial last line is skipped");
         let r = Recorder::new("T", 1, last_seq(&p), Redactions::empty())
             .with(Box::new(FileSink::new(p.clone())));
-        r.emit(EngineEvent::RunStarted { owner: "o".into() });
+        r.emit(EngineEvent::RunStarted {
+            pid: None,
+            owner: "o".into(),
+        });
         r.emit(EngineEvent::BudgetWarning { used: 1, cap: 2 });
         let text = std::fs::read_to_string(&p).unwrap();
         let lines = read_lines(&text);
@@ -1965,9 +2258,10 @@ mod tests {
     #[test]
     fn watch_shows_the_last_events_and_renders_or_passes_lines() {
         let lines: Vec<String> = (1..=25).map(|i| i.to_string()).collect();
-        assert_eq!(history(&lines, true).len(), 25);
-        assert_eq!(history(&lines, false), &lines[5..]);
-        assert_eq!(history(&lines[..3], false).len(), 3);
+        assert_eq!(history(&lines, true, false).len(), 25);
+        assert_eq!(history(&lines, false, false), &lines[5..]);
+        assert_eq!(history(&lines, false, true), &lines[5..]);
+        assert_eq!(history(&lines[..3], false, false).len(), 3);
         let line = serde_json::to_string(&env(EngineEvent::GateOpened {
             gate: "plan".into(),
             occurrence: 1,
@@ -2032,8 +2326,14 @@ mod tests {
         let p = dir.path().join(EVENTS_FILE);
         std::fs::create_dir_all(&p).unwrap(); // a directory in its place
         let r = Recorder::new("T", 1, 0, Redactions::empty()).with(Box::new(FileSink::new(p)));
-        r.emit(EngineEvent::RunStarted { owner: "o".into() });
-        r.emit(EngineEvent::RunStarted { owner: "o".into() });
+        r.emit(EngineEvent::RunStarted {
+            pid: None,
+            owner: "o".into(),
+        });
+        r.emit(EngineEvent::RunStarted {
+            pid: None,
+            owner: "o".into(),
+        });
     }
 
     #[test]

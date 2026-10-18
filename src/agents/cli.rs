@@ -290,6 +290,13 @@ impl AgentSession for CliSession {
             echo: input.echo,
             env: input.env.clone(),
             cancel: Some(self.cancel.clone()),
+            // M16-AT (X39): the process id, as an event of the turn
+            on_spawn: {
+                let tx = tx.clone();
+                Some(Arc::new(move |pid| {
+                    let _ = tx.send(AgentEvent::Spawned(Some(pid)));
+                }))
+            },
         };
         let label = input.label.clone();
         self.task = Some(tokio::task::spawn_blocking(move || {

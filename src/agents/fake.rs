@@ -321,6 +321,9 @@ impl AgentSession for FakeSession {
                     .push_front(FakeStep::Emit(Box::new(AgentEvent::SessionIdentified(id))));
             }
         }
+        // M16-AT (X39): a scripted agent has no process of its own — its turn starts here
+        self.pending
+            .push_front(FakeStep::Emit(Box::new(AgentEvent::Spawned(None))));
         self.done = false;
         self.hang = false;
         self.denials = 0;
