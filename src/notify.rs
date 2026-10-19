@@ -127,6 +127,7 @@ pub fn toast_for(e: &Envelope) -> Option<Toast> {
             next_action,
             from,
             error: None,
+            ..
         } if matches!(state, St::Completed | St::Failed) && *from != Some(*state) => {
             format!("{state:?} — {next_action}")
         }
@@ -409,7 +410,10 @@ mod tests {
 
     fn every_event() -> Vec<EngineEvent> {
         vec![
-            EngineEvent::RunStarted { owner: "o".into() },
+            EngineEvent::RunStarted {
+                pid: None,
+                owner: "o".into(),
+            },
             EngineEvent::StateChanged {
                 from: St::Planning,
                 to: St::WaitingPlanApproval,
@@ -435,24 +439,32 @@ mod tests {
                 reason: "implementer_quota: all out".into(),
             },
             EngineEvent::RunEnded {
+                outcome: None,
+                exit_code: None,
                 state: St::WaitingPlanApproval,
                 next_action: "review".into(),
                 from: Some(St::Reviewing),
                 error: None,
             },
             EngineEvent::RunEnded {
+                outcome: None,
+                exit_code: None,
                 state: St::Escalated,
                 next_action: "resume".into(),
                 from: Some(St::Reviewing),
                 error: None,
             },
             EngineEvent::RunEnded {
+                outcome: None,
+                exit_code: None,
                 state: St::Completed,
                 next_action: "done — merge `toryo/BR-9` yourself".into(),
                 from: Some(St::Reviewing),
                 error: None,
             },
             EngineEvent::RunEnded {
+                outcome: None,
+                exit_code: None,
                 state: St::Failed,
                 next_action: "failed: x — `toryo task cleanup BR-9`".into(),
                 from: Some(St::Reviewing),
@@ -506,6 +518,8 @@ mod tests {
     fn a_run_end_toasts_on_an_error_or_a_new_end_state() {
         let end = |state, from, error: Option<&str>| {
             toast_for(&env(EngineEvent::RunEnded {
+                outcome: None,
+                exit_code: None,
                 state,
                 next_action: "next".into(),
                 from,

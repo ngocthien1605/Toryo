@@ -359,6 +359,7 @@ fn drive(store: &Store, lock: &TaskLock, rec: &Recorder, d: &DriveArgs) -> Resul
     lock::catch_interrupt();
     rec.emit_quiet(EngineEvent::RunStarted {
         owner: lock::owner_label(),
+        pid: Some(std::process::id()),
     });
     let from = get(store, &lock.task).ok().map(|t| t.state);
     // R7: a panic unwinding through the drive still ends the record (exit code 101 stays)
@@ -371,15 +372,31 @@ fn drive(store: &Store, lock: &TaskLock, rec: &Recorder, d: &DriveArgs) -> Resul
     };
     let res = drive_inner(store, lock, rec, d);
     guard.armed = false;
-    // the full text: the recorder redacts it, then shortens it (R7)
+    // the full text: the recorder redacts it, then shortens it (R7). An error is exit code 2,
+    // as `main` prints it (X39)
+    let (outcome, exit_code) = match &res {
+        Ok((code, end)) => (end_outcome(end), *code),
+        Err(_) => ("error", 2),
+    };
     run_ended(
         store,
         rec,
         &lock.task,
         from,
         res.as_ref().err().map(|e| format!("{e:#}")),
+        outcome,
+        exit_code,
     );
-    res
+    res.map(|(code, _)| code)
+}
+
+/// X39: `run_ended.outcome` of how the engine ended the drive.
+fn end_outcome(end: &RunEnd) -> &'static str {
+    match end {
+        RunEnd::Done(_) => "done",
+        RunEnd::Waiting(_) => "waiting",
+        RunEnd::Stopped => "stopped",
+    }
 }
 
 /// Emit the one `run_ended` of a drive: state and next action re-read from the store, the last
@@ -390,6 +407,8 @@ fn run_ended(
     task: &str,
     from: Option<PipelineState>,
     error: Option<String>,
+    outcome: &str,
+    exit_code: i32,
 ) {
     let (state, next) = match get(store, task) {
         Ok(t) => (t.state, next_action(&t)),
@@ -403,6 +422,8 @@ fn run_ended(
         next_action: next,
         from,
         error,
+        outcome: Some(outcome.into()),
+        exit_code: Some(exit_code),
     });
 }
 
@@ -418,18 +439,26 @@ struct RunEndGuard<'a> {
 impl Drop for RunEndGuard<'_> {
     fn drop(&mut self) {
         if self.armed && std::thread::panicking() {
+            // a panic exits with code 101
             run_ended(
                 self.store,
                 self.rec,
                 self.task,
                 self.from,
                 Some("panicked".into()),
+                "panicked",
+                101,
             );
         }
     }
 }
 
-fn drive_inner(store: &Store, lock: &TaskLock, rec: &Recorder, d: &DriveArgs) -> Result<i32> {
+fn drive_inner(
+    store: &Store,
+    lock: &TaskLock,
+    rec: &Recorder,
+    d: &DriveArgs,
+) -> Result<(i32, RunEnd)> {
     // recovery launches no agent: it needs neither the hub nor the R51 check
     let t = get(store, &lock.task)?;
     let cfg = frozen_config(&t)?;
@@ -513,13 +542,14 @@ fn drive_inner(store: &Store, lock: &TaskLock, rec: &Recorder, d: &DriveArgs) ->
         &format!("{:?}", t.state),
         &lines,
     );
-    Ok(match end {
+    let code = match end {
         RunEnd::Done(PipelineState::Completed) | RunEnd::Stopped => 0,
         RunEnd::Waiting(
             PipelineState::WaitingPlanApproval | PipelineState::WaitingFinalApproval,
         ) => 0,
         _ => 1,
-    })
+    };
+    Ok((code, end))
 }
 
 pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
@@ -1784,6 +1814,8 @@ fn catch_ctrl_c() {
         }
         // SAFETY: registers a handler that only stores to an atomic
         unsafe {
+            // M16-R3 (N-16): Ctrl+C back for this process when it was started with it ignored
+            SetConsoleCtrlHandler(None, 0);
             SetConsoleCtrlHandler(Some(handler), 1);
         }
     }
@@ -1864,7 +1896,7 @@ pub fn watch(id: &str, json: bool, from_start: bool, no_follow: bool) -> Result<
     let mut tail = Tail::default();
     let history = tail.poll(&path)?;
     // a reader that went away (`watch … | head -n 5`) ends `watch` with exit 0 (R1)
-    if !show_lines(flight::history(&history, from_start), json)? || no_follow {
+    if !show_lines(flight::history(&history, from_start, json), json)? || no_follow {
         return Ok(0);
     }
     let mut last = std::time::Instant::now();

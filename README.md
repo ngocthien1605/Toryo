@@ -249,6 +249,12 @@ a protected file that changed → restore it, or `resume --accept-protected-chan
 - `toryo watch <ID>` follows the flight recorder `<data dir>\runs\<ID>\events.jsonl` without taking the lock; `--json`
   prints the raw events (`run_started`, `state_changed`, `stage_started/finished`, `turn_finished`, `checkpoint_created`,
   `verify_command`, `gate_opened`, `escalated` with a typed `reason_class`, `paused`, `run_ended`, …).
+  The file also holds **diagnostic events** (X39) — never printed, left out of the rendered `watch` (and of its
+  history of 20) and of the dashboard's `last:`: `lock_acquired` / `lock_released` (`machine:verify` or an environment
+  lock; `released` is written before the lock is let go), `cancel_requested` (`source`: `ctrl_c` or `stop`),
+  `agent_spawned` / `agent_killed` (`stage`, `attempt`, `profile`, `pid` — `null` for a scripted agent; `reason`:
+  `stop` or `limit`); `run_started` carries the `pid` of the drive command and `run_ended` its `outcome`
+  (`done`, `waiting`, `stopped`, `error`, `panicked`) and `exit_code`. Within one process `ts` only goes forward.
 - `toryo dashboard` shows every task at once from the store and each task's `events.jsonl`, without taking a lock or
   writing anything: the task's `status` row (state, fix cycle, tokens, `ACTIVE (owner)` while a process drives it), what
   its flight recorder says it is doing — `now:` the stage that started and has not finished, only while a process
@@ -294,6 +300,13 @@ cargo test --locked
 CI (`.github/workflows/ci.yml`) runs the tests and clippy on `windows-latest` and `ubuntu-latest`, clippy on the core
 without the M0 kit (no tests run without it), and builds the release `toryo.exe`. Never run real agents in tests: use
 `--fake-agents`.
+
+**M16 acceptance tests** (Windows, PowerShell 7, Pester 5+ — `Install-Module Pester -MinimumVersion 5.0.0 -Scope
+CurrentUser`): `pwsh -NoProfile -File scripts/test-e2e.ps1 [-Repeat N]` builds, runs `cargo test`, the pseudo-console
+tests (`tests/e2e_m16.rs`, `#[ignore]`: Ctrl+C written as `0x03` to a ConPTY — AT-5, AT-6, AT-7, AT-9) one at a time,
+and the Pester tests (`tests/e2e/M16.Tests.ps1`: `toryo run A B C --jobs 2` — AT-1, AT-2, AT-3, AT-4, AT-8), each in a
+fresh workspace of `tests/e2e/New-M16Fixture.ps1` under the temp folder (kept, and named in the summary, when its test
+fails); it writes `test-results/summary.md` and exits 0 only when everything passed in every repetition. Not in CI.
 
 ## Documentation
 

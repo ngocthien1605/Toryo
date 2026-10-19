@@ -1,0 +1,33 @@
+{
+  "turns": {
+    "planner": [
+      { "steps": [
+        { "kind": "delay", "ms": 500 },
+        { "kind": "complete", "structured": {
+          "understanding": "Add a note line.", "files_likely_involved": ["NOTES.md"],
+          "steps": ["append a line to NOTES.md"], "validation": ["build", "test", "slow"],
+          "plan_markdown": "Append one line to NOTES.md." } }
+      ] }
+    ],
+    "implementer": [
+      { "steps": [
+        { "kind": "delay", "ms": 1500 },
+        { "kind": "write_file", "path": "NOTES.md", "content": "fake implementer was here\n", "append": true },
+        { "kind": "complete", "structured": {
+          "summary": "Appended a line to NOTES.md.", "deviations": [], "validation_performed": ["read"],
+          "open_issues": [], "resolved": [] } }
+      ] }
+    ],
+    "reviewer": [
+      { "steps": [
+        { "kind": "delay", "ms": 500 },
+        { "kind": "complete", "structured": {
+          "decision": "approved", "summary": "ok", "issues": [],
+          "acceptance_criteria": [
+            { "id": "AC-1", "met": true, "evidence": "e1" },
+            { "id": "AC-2", "met": true, "evidence": "e2" },
+            { "id": "AC-3", "met": true, "evidence": "e3" } ] } }
+      ] }
+    ]
+  }
+}

@@ -1564,6 +1564,18 @@ pub fn pending_stop(tx: &Transaction, task: &str, generation: i64) -> Result<Opt
         .optional()?)
 }
 
+/// M16-AT (X39): who asked for the oldest unhandled stop of this owner (`requested_by`: an
+/// owner label, `… (Ctrl+C)` for a Ctrl+C in the driving process).
+pub fn pending_stop_by(tx: &Transaction, task: &str, generation: i64) -> Result<Option<String>> {
+    Ok(tx
+        .query_row(
+            "SELECT requested_by FROM control_requests WHERE task_id = ?1 AND kind = 'stop' AND handled_at IS NULL AND target_generation = ?2 ORDER BY id LIMIT 1",
+            params![task, generation],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 /// Mark every unhandled stop for this owner handled with `outcome`.
 pub fn handle_stops(tx: &Transaction, task: &str, generation: i64, outcome: &str) -> Result<usize> {
     Ok(tx.execute(

@@ -85,6 +85,10 @@ impl Activity {
             }
             _ => {}
         }
+        // X39: a diagnostic event is not what the task did — `last:` stays the task's own event
+        if e.event.is_diagnostic() {
+            return;
+        }
         self.last = Some(LastEvent {
             kind: e.event.kind().to_string(),
             text: describe(&e.event),
@@ -176,6 +180,12 @@ pub fn describe(e: &EngineEvent) -> String {
         E::Escalated { reason_class, .. } => format!("escalated: {reason_class}"),
         E::Paused { .. } => "paused".into(),
         E::RunEnded { state, .. } => format!("run ended ({state:?})"),
+        // X39: diagnostic events never become `last:` (Activity::apply skips them); a name only
+        E::LockAcquired { .. }
+        | E::LockReleased { .. }
+        | E::CancelRequested { .. }
+        | E::AgentSpawned { .. }
+        | E::AgentKilled { .. } => e.kind().replace('_', " "),
     }
 }
 
@@ -318,6 +328,7 @@ mod tests {
         a.apply(&env(
             1,
             EngineEvent::RunStarted {
+                pid: None,
                 owner: "pid 1".into(),
             },
         ));
@@ -341,18 +352,49 @@ mod tests {
         assert_eq!(a.last.as_ref().unwrap().text, "plan attempt 1 succeeded");
     }
 
+    /// M16-AT (X39): a diagnostic event is counted, but `last:` stays the task's own event.
+    #[test]
+    fn a_diagnostic_event_never_becomes_last() {
+        let mut a = Activity::default();
+        a.apply(&started(1, "verify", 1));
+        a.apply(&env(
+            2,
+            EngineEvent::LockAcquired {
+                lock: "machine:verify".into(),
+            },
+        ));
+        assert_eq!(a.events, 2);
+        assert_eq!(a.last_seq, 2);
+        assert_eq!(a.last.as_ref().unwrap().kind, "stage_started");
+        assert_eq!(a.stage.as_ref().unwrap().stage, "verify");
+    }
+
     #[test]
     fn a_new_run_closes_what_a_crashed_run_left_open() {
         let mut a = Activity::default();
-        a.apply(&env(1, EngineEvent::RunStarted { owner: "x".into() }));
+        a.apply(&env(
+            1,
+            EngineEvent::RunStarted {
+                pid: None,
+                owner: "x".into(),
+            },
+        ));
         a.apply(&started(2, "implement", 1));
         // the process died: no stage_finished, no run_ended; then a new run
-        a.apply(&env(3, EngineEvent::RunStarted { owner: "y".into() }));
+        a.apply(&env(
+            3,
+            EngineEvent::RunStarted {
+                pid: None,
+                owner: "y".into(),
+            },
+        ));
         assert_eq!(a.stage, None);
         assert!(a.run_open);
         a.apply(&env(
             4,
             EngineEvent::RunEnded {
+                outcome: None,
+                exit_code: None,
                 state: St::Escalated,
                 next_action: "n".into(),
                 from: None,
@@ -375,12 +417,15 @@ mod tests {
                 reason: reason.into(),
             },
             EngineEvent::RunEnded {
+                outcome: None,
+                exit_code: None,
                 state: St::Escalated,
                 next_action: reason.into(),
                 from: None,
                 error: Some(reason.into()),
             },
             EngineEvent::RunStarted {
+                pid: None,
                 owner: reason.into(),
             },
         ] {
@@ -426,7 +471,13 @@ mod tests {
         }))
         .unwrap();
         let mut a = Activity::default();
-        a.apply(&env(1, EngineEvent::RunStarted { owner: "x".into() }));
+        a.apply(&env(
+            1,
+            EngineEvent::RunStarted {
+                pid: None,
+                owner: "x".into(),
+            },
+        ));
         a.apply(&started(2, "implement", 1));
         let mut f = TaskFacts {
             active_owner: None,

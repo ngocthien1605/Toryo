@@ -197,6 +197,8 @@ pub struct Engine<'a> {
     protect: Protected,
     cmds: Vec<CommandSpec>,
     retries: u32,
+    /// M16-AT (X39): the pid of the running turn's agent (from its `agent_spawned`).
+    agent_pid: Arc<std::sync::Mutex<Option<u32>>>,
 }
 
 impl<'a> Engine<'a> {
@@ -226,6 +228,7 @@ impl<'a> Engine<'a> {
             protect,
             cmds,
             retries: 0,
+            agent_pid: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -356,12 +359,17 @@ impl<'a> Engine<'a> {
     /// left of the budget (the returned flag says it was the budget, not a stop).
     fn hooks(
         &self,
-        attempt: &str,
+        attempt: &AttemptRow,
         stop: &StopWatch,
         profile: &str,
     ) -> Result<(TurnHooks, Arc<AtomicBool>)> {
-        let (st, a) = (self.store.clone(), attempt.to_string());
+        let (st, a) = (self.store.clone(), attempt.id.clone());
         let hit = Arc::new(AtomicBool::new(false));
+        // M16-AT (X39): `agent_spawned` as the agent starts (a recorder clone shares the file
+        // and the numbering); its pid is kept for an `agent_killed`
+        *self.agent_pid.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let (rec, pid_cell) = (self.rec.clone(), self.agent_pid.clone());
+        let (stage, n, who) = (attempt.stage.clone(), attempt.attempt, profile.to_string());
         let mut h = TurnHooks {
             cancel: Some(stop.flag.clone()),
             on_session: Some(Arc::new(move |sid: &str| {
@@ -369,6 +377,15 @@ impl<'a> Engine<'a> {
                 let _ = st.call(move |tx| store::set_attempt_session(tx, &a, &s));
             })),
             on_usage: None,
+            on_spawn: Some(Arc::new(move |pid: Option<u32>| {
+                *pid_cell.lock().unwrap_or_else(|e| e.into_inner()) = pid;
+                rec.emit_quiet(EngineEvent::AgentSpawned {
+                    stage: stage.clone(),
+                    attempt: n,
+                    profile: who.clone(),
+                    pid,
+                });
+            })),
         };
         let t = self.task()?;
         let live = self.hub.capabilities(profile)?.live
@@ -385,6 +402,23 @@ impl<'a> Engine<'a> {
             }));
         }
         Ok((h, hit))
+    }
+
+    /// M16-AT (X39): after a turn that toryo ended before it finished — a stop request or a
+    /// limit — `agent_killed` with the pid its `agent_spawned` had (the real agent's process
+    /// tree ends with its Job).
+    fn agent_ended(&self, attempt: &AttemptRow, profile: &str, r: &StageOutcome) {
+        if !(r.cancelled || r.timed_out) {
+            return;
+        }
+        let pid = *self.agent_pid.lock().unwrap_or_else(|e| e.into_inner());
+        self.rec.emit_quiet(EngineEvent::AgentKilled {
+            stage: attempt.stage.clone(),
+            attempt: attempt.attempt,
+            profile: profile.to_string(),
+            pid,
+            reason: if r.cancelled { "stop" } else { "limit" }.into(),
+        });
     }
 
     fn weights(&self) -> Weights {
@@ -450,6 +484,21 @@ impl<'a> Engine<'a> {
     }
 
     fn stopped(&self) -> Result<Flow> {
+        // M16-AT (X39): which stop this is — a Ctrl+C turned into the request (M13-12) is named
+        // `… (Ctrl+C)`, a `toryo stop` by its owner label
+        let (t, g) = (self.id.clone(), self.lock.generation);
+        let by = self
+            .store
+            .call(move |tx| store::pending_stop_by(tx, &t, g))?
+            .unwrap_or_default();
+        self.rec.emit_quiet(EngineEvent::CancelRequested {
+            source: if by.ends_with("(Ctrl+C)") {
+                "ctrl_c"
+            } else {
+                "stop"
+            }
+            .into(),
+        });
         self.lock.handle_stop("stopped")?;
         crate::errln!("■ stop request handled: the stage attempt is `interrupted`; `toryo resume {}` continues", self.id);
         Ok(Flow::Stopped)
@@ -906,7 +955,7 @@ impl<'a> Engine<'a> {
             None => turn.prompt.clone(),
         };
         let stop = self.lock.watch_stop();
-        let (hooks, budget_hit) = self.hooks(&a.id, &stop, &turn.profile)?;
+        let (hooks, budget_hit) = self.hooks(&a, &stop, &turn.profile)?;
         let r = self.hub.turn_with(
             OpenSession {
                 profile: turn.profile.clone(),
@@ -929,6 +978,7 @@ impl<'a> Engine<'a> {
             hooks,
         )?;
         crash_point("implement:after_turn");
+        self.agent_ended(&a, &turn.profile, &r);
         self.usage(&a, &turn.profile, &r, turn.model.as_deref())?;
         Ok(Some(ImplementRun {
             budget_hit: budget_hit.load(Ordering::SeqCst),
@@ -1637,6 +1687,11 @@ impl<'a> Engine<'a> {
             )?;
             return self.stopped();
         };
+        let verify_lock = Held::new(self.rec, super::lock::VERIFY_LOCK, verify_lock);
+        // M16-R4: named as the holder only now that its `lock_acquired` is recorded
+        if let Some(l) = &verify_lock.lock {
+            l.announce(&t.id);
+        }
         let Some((b, co)) = self.verify_checkout(t, &a, &head)? else {
             return Ok(Flow::Next);
         };
@@ -2253,6 +2308,7 @@ impl<'a> Engine<'a> {
             let Some(lock) = self.env_lock(t, &lock_name, stop)? else {
                 return Ok(EnvGates::Stopped);
             };
+            let lock = Held::new(self.rec, &lock_name, lock);
             // M11-R9 (X6): what the gate deploys — a fresh export of the commit from the object
             // store, made once the lock is held, into a folder Low code cannot write
             let export = match verify::deploy_source(&self.g, co, head) {
@@ -2469,7 +2525,7 @@ impl<'a> Engine<'a> {
         loop {
             // M16-R1: an error while the task waits clears the wait row before it goes up —
             // a later run must not be shown waiting for the lock (nor skipped as its holder)
-            let got = match VerifyLock::try_acquire(&t.id, &label) {
+            let got = match VerifyLock::try_acquire(&label) {
                 Ok(g) => g,
                 Err(e) => {
                     if waiting {
@@ -2487,15 +2543,27 @@ impl<'a> Engine<'a> {
             if !waiting {
                 waiting = true;
                 let i = t.id.clone();
-                let holder = self
-                    .store
-                    .call(move |tx| {
-                        store::set_env_wait(tx, &i, Some(super::lock::VERIFY_LOCK))?;
-                        verifying_now(tx, &i)
-                    })
+                self.store
+                    .call(move |tx| store::set_env_wait(tx, &i, Some(super::lock::VERIFY_LOCK)))
                     .inspect_err(|_| {
                         let _ = done_waiting(self);
                     })?;
+                // M16-R4: the holder names itself right after its `lock_acquired` is recorded; a
+                // waiter that comes in between asks again for a moment (at most a second)
+                let mut holder = None;
+                for _ in 0..20 {
+                    let i = t.id.clone();
+                    holder = self
+                        .store
+                        .read(move |tx| verifying_now(tx, &i))
+                        .inspect_err(|_| {
+                            let _ = done_waiting(self);
+                        })?;
+                    if holder.is_some() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
                 self.rec.emit(EngineEvent::LockWaiting {
                     lock: super::lock::VERIFY_LOCK.to_string(),
                     holder,
@@ -2791,7 +2859,7 @@ impl<'a> Engine<'a> {
             Role::Planner => (&t.planner, "plan.schema.json"),
             _ => (&t.reviewer, "review.schema.json"),
         };
-        let (hooks, budget_hit) = self.hooks(&a.id, stop, profile)?;
+        let (hooks, budget_hit) = self.hooks(a, stop, profile)?;
         // EC-31 (F5): the worktree as the turn finds it — only what changes during the turn
         // is the read-only role's write, never what a human left there before
         let before = TreeState::read(&Worktree::new(&self.g, &t.worktree))?;
@@ -2833,7 +2901,10 @@ impl<'a> Engine<'a> {
         // M13-06: an error after the agent ran (an I/O error, the session's close) must not
         // skip the checks either — what the role wrote is undone before the error goes up
         let r = match r {
-            Ok(r) => r,
+            Ok(r) => {
+                self.agent_ended(a, profile, &r);
+                r
+            }
             Err(e) => {
                 // M13-R7: the same findings as after a turn that ended normally — the protected
                 // check first, so that an untracked protected file the role edited is seen
@@ -5194,6 +5265,36 @@ pub(crate) fn env_gate_program(
         ));
     }
     Ok(found)
+}
+
+/// M16-AT (X39): a held machine-wide lock (the verify lock, an environment lock) that records
+/// `lock_acquired` when it is wrapped — right after the OS lock is held — and `lock_released`
+/// when it is dropped, **before** the OS lock is let go: the next holder's `lock_acquired`
+/// always comes after this holder's `lock_released`. Every way out of the stage drops it.
+struct Held<'r, L> {
+    rec: &'r Recorder,
+    name: String,
+    lock: Option<L>,
+}
+
+impl<'r, L> Held<'r, L> {
+    fn new(rec: &'r Recorder, name: &str, lock: L) -> Self {
+        rec.emit_quiet(EngineEvent::LockAcquired { lock: name.into() });
+        Self {
+            rec,
+            name: name.into(),
+            lock: Some(lock),
+        }
+    }
+}
+
+impl<L> Drop for Held<'_, L> {
+    fn drop(&mut self) {
+        self.rec.emit_quiet(EngineEvent::LockReleased {
+            lock: self.name.clone(),
+        });
+        drop(self.lock.take());
+    }
 }
 
 /// M16-02: the task that holds the verify lock — the one the holder file names, when it is

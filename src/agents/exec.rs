@@ -33,6 +33,8 @@ pub struct TurnOpts {
     pub env: BTreeMap<String, String>,
     /// Set to `true` to terminate the turn's Job (adapter `interrupt()`, `toryo stop`).
     pub cancel: Option<Arc<AtomicBool>>,
+    /// M16-AT (X39): called with the process id right after the agent started.
+    pub on_spawn: Option<Arc<dyn Fn(u32) + Send + Sync>>,
 }
 
 impl Default for TurnOpts {
@@ -44,6 +46,7 @@ impl Default for TurnOpts {
             echo: true,
             env: BTreeMap::new(),
             cancel: None,
+            on_spawn: None,
         }
     }
 }
@@ -253,6 +256,9 @@ pub fn run_turn_with(
     let running = spawn(&spec, &red)
         .with_context(|| format!("starting {}", program.display()))
         .map_err(not_started)?;
+    if let Some(f) = &opts.on_spawn {
+        f(running.root.pid);
+    }
     let mut splitter = LineSplitter::new(LineSplitter::DEFAULT_CAP);
     let mut claude = ClaudeParser::new();
     let mut codex = CodexParser::new();
