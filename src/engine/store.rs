@@ -362,7 +362,22 @@ pub struct Store {
 
 fn configure(conn: &Connection) -> Result<()> {
     conn.busy_timeout(Duration::from_secs(15))?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
+    // R23-18: the change to WAL on a fresh file needs the database to itself, and SQLite does
+    // not call the busy handler for it: several processes that open a new store at once (`toryo
+    // run A B …` after an upgrade) are retried here, for as long as the busy timeout
+    let started = std::time::Instant::now();
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => break,
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy
+                    && started.elapsed() < Duration::from_secs(15) =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(e).context("setting journal_mode=WAL"),
+        }
+    }
     conn.pragma_update(None, "synchronous", "FULL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     Ok(())
@@ -382,7 +397,9 @@ impl Store {
             Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         configure(&conn)?;
         {
-            let tx = conn.transaction()?;
+            // R23-18: the write lock first — a deferred read-then-write transaction whose snapshot
+            // goes stale gets SQLITE_BUSY, which the busy handler does not retry
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             tx.execute_batch(SCHEMA)?;
             let v: Option<String> = tx
                 .query_row(

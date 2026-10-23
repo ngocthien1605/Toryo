@@ -449,3 +449,29 @@ fn r23_17_a_task_id_that_differs_only_in_case_is_refused() {
     );
     assert!(!err.contains("remove it"), "{err}");
 }
+
+/// R23-18: eight processes open a fresh store at once (`toryo run A B …` after an upgrade).
+/// Was: the schema transaction was deferred — read, then write — and a store whose snapshot
+/// went stale before its write got SQLITE_BUSY, which the busy handler does not retry
+/// ("database is locked"). Now it takes the write lock first.
+#[test]
+fn r23_18_many_stores_open_a_fresh_database_at_once() {
+    for round in 0..10 {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("toryo.db");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let opened: Vec<_> = (0..8)
+            .map(|_| {
+                let (p, b) = (p.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    toryo::engine::store::Store::open(&p).map(|_| ())
+                })
+            })
+            .collect();
+        for h in opened {
+            let r = h.join().unwrap();
+            assert!(r.is_ok(), "round {round}: {:#}", r.unwrap_err());
+        }
+    }
+}
