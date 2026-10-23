@@ -105,6 +105,20 @@ pub fn new_machine(cfg: &Effective, cli_max: Option<u32>) -> Result<Machine> {
 /// be written by the implementer before verify runs it. At `task create` and at `task config
 /// --reload` (group E review).
 /// Returns the entry scripts admitted as build output (M11-R14, X9), to freeze with the task.
+/// R23-37 (review 2026-10-23 A5): what this machine refuses of a configuration, the same for
+/// `task create` and `task config --reload` — the verify sandbox below the machine's floor
+/// (review H2, M11-A2), and an environment gate this machine cannot start (M12-05), like one it
+/// does not define.
+pub fn machine_admission(cfg: &Effective) -> Result<()> {
+    if let Some(reason) = super::verify::below_floor(cfg) {
+        bail!("{reason}");
+    }
+    if let Some(reason) = super::gates::env_gates_refusal(cfg) {
+        bail!("{reason}");
+    }
+    Ok(())
+}
+
 pub fn check_entry_points(
     cfg: &Effective,
     g: &GitCmd,
@@ -449,19 +463,12 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         .map(|l| l.trim_start_matches("# ").trim().to_string())
         .unwrap_or_else(|| id.clone());
     let (planner, implementers, reviewer) = roles(cfg)?;
-    // review H2 (M11-A2): the repository chooses its verify sandbox only above the floor
-    if let Some(reason) = super::verify::below_floor(cfg) {
-        bail!("{reason}");
-    }
+    machine_admission(cfg)?;
     let machine = new_machine(cfg, a.max_fix_cycles)?;
 
     let g = task_git(cfg, &repo)?;
     // R36/R45 admission: the verify boundary must be available before anything is created
     super::verify::probe(cfg)?;
-    // M12-05: an environment gate this machine cannot start is refused, like one it does not define
-    if let Some(reason) = super::gates::env_gates_refusal(cfg) {
-        bail!("{reason}");
-    }
     // R59 admission: a `tool: xpp` command needs MSBuild and the five CI/CD packages here
     super::xpp::for_config(cfg)?;
     let repol = Loc::Discover(repo.clone());

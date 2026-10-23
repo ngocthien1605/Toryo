@@ -1011,9 +1011,10 @@ pub fn problems(cfg: &Effective, root: &Path, machine: &str) -> Vec<String> {
             continue;
         };
         let rf = role_file(seat);
+        // R23-37: whether the path is one at all is the loader's (`load`, as written); said once
         if let Some(i) = &r.instructions {
             match crate::config::not_a_repo_path(i) {
-                Some(why) => out.push(format!("{}: instructions: `{i}` {why}", rf.display())),
+                Some(_) => {}
                 None if !root.join(i).is_file() => out.push(format!(
                     "{}: instructions: {} not found (the path is relative to the role folder)",
                     rf.display(),
@@ -1174,7 +1175,7 @@ pub fn problems(cfg: &Effective, root: &Path, machine: &str) -> Vec<String> {
     }
     if let Some(c) = &team.culture {
         match crate::config::not_a_repo_path(c) {
-            Some(why) => out.push(format!("{}: `{c}` {why}", org_at("culture"))),
+            Some(_) => {} // (the loader's, as for the instructions)
             None if !root.join(c).is_file() => out.push(format!(
                 "{}: {} not found (the path is relative to the repository root)",
                 org_at("culture"),
@@ -1963,6 +1964,30 @@ mod tests {
         )]);
         let e = load_err(&y, &m);
         assert!(e.contains("before_handoff: no check gate"), "{e}");
+    }
+
+    /// R23-37 (review 2026-10-23 A5): an `instructions` or `culture` path that is no path inside
+    /// the repository is said once. Was: twice — by the loader, and again by `problems`.
+    #[test]
+    fn a_bad_instructions_or_culture_path_is_said_once() {
+        let org = draft_with(ORGCHART, "culture: ./CULTURE.md", "culture: ../CULTURE.md");
+        let role = draft_with(
+            IMPL_ROLE,
+            "instructions: ./instructions.md",
+            "instructions: ../../../x.md",
+        );
+        let (_d, y, m) = draft_repo(&[(ORGCHART, &org), (IMPL_ROLE, &role)]);
+        let e = load_err(&y, &m);
+        assert_eq!(
+            e.matches("`../../../x.md` may not contain `..`").count(),
+            1,
+            "{e}"
+        );
+        assert_eq!(
+            e.matches("`../CULTURE.md` may not contain `..`").count(),
+            1,
+            "{e}"
+        );
     }
 
     /// Group B review: the loader's own problems, each with its file and key path — a missing
