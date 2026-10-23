@@ -339,10 +339,9 @@ pub fn run_turn_with(
     // stream redactor could not see a secret split across two deltas: redact derived fields too.
     outcome.final_text = red.redact_str(&outcome.final_text);
     outcome.error_detail = outcome.error_detail.as_deref().map(|t| red.redact_str(t));
+    // R23-21: leaf by leaf, so a secret never turns the whole payload into one string
     if let Some(v) = &outcome.structured {
-        let text = red.redact_str(&v.to_string());
-        outcome.structured =
-            Some(serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)));
+        outcome.structured = Some(red.redact_value(v));
     }
     std::fs::write(
         run_dir.join(format!("{label}.outcome.json")),

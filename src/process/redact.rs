@@ -165,6 +165,34 @@ impl Redactions {
     pub fn redact_str(&self, input: &str) -> String {
         String::from_utf8_lossy(&self.redact_all(input.as_bytes())).into_owned()
     }
+
+    /// R23-21: a JSON value with every secret redacted, leaf by leaf — strings (and keys) as
+    /// text; a number whose digits hold a secret becomes the redacted string, that leaf alone.
+    /// Was: the whole value was redacted as one JSON text and parsed again; a secret that
+    /// matched outside a string (a number) made the text unparseable, and the whole payload
+    /// became one string — an `InvalidOutput` with no word why.
+    pub fn redact_value(&self, v: &serde_json::Value) -> serde_json::Value {
+        use serde_json::Value as V;
+        match v {
+            V::String(s) => V::String(self.redact_str(s)),
+            V::Number(n) => {
+                let text = n.to_string();
+                let red = self.redact_str(&text);
+                if red == text {
+                    v.clone()
+                } else {
+                    V::String(red)
+                }
+            }
+            V::Array(items) => V::Array(items.iter().map(|i| self.redact_value(i)).collect()),
+            V::Object(o) => V::Object(
+                o.iter()
+                    .map(|(k, v)| (self.redact_str(k), self.redact_value(v)))
+                    .collect(),
+            ),
+            V::Bool(_) | V::Null => v.clone(),
+        }
+    }
 }
 
 fn sanitize_name(name: &str) -> String {
@@ -338,6 +366,27 @@ mod tests {
             name: name.into(),
             value: v.into(),
         }
+    }
+
+    /// R23-21: a secret in a number leaf of a structured output — that leaf alone becomes the
+    /// redacted string; the rest of the payload keeps its shape (was: one string, unparseable).
+    #[test]
+    fn a_json_value_is_redacted_leaf_by_leaf() {
+        let r = Redactions::new(&[sec("N", "47114711"), sec("K", "s3cret-value")]);
+        let v = serde_json::json!({
+            "decision": "approved",
+            "count": 47114711,
+            "other": 12,
+            "issues": [{"description": "the key is s3cret-value"}],
+        });
+        let out = r.redact_value(&v);
+        assert_eq!(out["decision"], "approved");
+        assert_eq!(out["count"], "[REDACTED:N]");
+        assert_eq!(out["other"], 12);
+        assert_eq!(out["issues"][0]["description"], "the key is [REDACTED:K]");
+        // the old way: the whole payload became one string
+        let text = r.redact_str(&v.to_string());
+        assert!(serde_json::from_str::<serde_json::Value>(&text).is_err());
     }
 
     fn run_chunks(r: &Redactions, chunks: &[&[u8]]) -> Vec<u8> {

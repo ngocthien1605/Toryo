@@ -334,6 +334,13 @@ impl CodexParser {
         o.final_text = self.last_agent_message.clone().unwrap_or_default();
         if let Some(u) = &self.completed_usage {
             o.raw_usage = Some(u.clone());
+        }
+        // R23-21: counters that are not whole numbers are no exact usage: unknown (reserved)
+        if let Some(u) = self
+            .completed_usage
+            .as_ref()
+            .filter(|u| crate::usage::usage_is_exact(u, crate::usage::CODEX_USAGE_KEYS))
+        {
             o.usage = Some(codex_buckets(&raw_counters(u), subsets));
             // NB: on a resumed thread these counters are cumulative (R21) — the caller stores the delta.
             o.accounting = Accounting::Exact;
@@ -554,6 +561,28 @@ mod tests {
         assert_eq!(o.commands[0].status.as_deref(), Some("failed"));
         let u = o.usage.unwrap();
         assert_eq!((u.uncached_input, u.cache_read, u.output), (400, 600, 120));
+    }
+
+    /// R23-21 (review 2026-10-23): counters that are not whole numbers (a float, a negative
+    /// number, a string — a field a CLI update retyped) are no exact usage. Was: read as 0 and
+    /// recorded as `Exact`, so the turn's tokens never reached the budget. Now `Unknown`, which
+    /// holds a reservation (R41).
+    #[test]
+    fn usage_counters_that_are_not_whole_numbers_are_unknown() {
+        for usage in [
+            r#"{"input_tokens":1000.0,"output_tokens":120}"#,
+            r#"{"input_tokens":1000,"output_tokens":-5}"#,
+            r#"{"input_tokens":"1000","output_tokens":120}"#,
+            r#"{"total":1120}"#,
+        ] {
+            let mut p = CodexParser::new();
+            p.feed_line(br#"{"type":"thread.started","thread_id":"th_1"}"#);
+            p.feed_line(format!(r#"{{"type":"turn.completed","usage":{usage}}}"#).as_bytes());
+            let o = p.finish(Some(0), CodexSubsets::default());
+            assert_eq!(o.accounting, Accounting::Unknown, "{usage}");
+            assert!(o.usage.is_none(), "{usage}");
+            assert!(o.raw_usage.is_some(), "the raw object is kept: {usage}");
+        }
     }
 
     #[test]

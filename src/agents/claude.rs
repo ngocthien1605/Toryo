@@ -417,9 +417,16 @@ impl ClaudeParser {
             .cloned()
             .unwrap_or_default();
         o.vendor_cost_usd = r.get("total_cost_usd").and_then(Value::as_f64);
+        // R23-21: a usage object whose counters are not whole numbers is no exact usage — the
+        // live provisional values (if any) stand, else the turn's usage is unknown (reserved)
+        let exact = r
+            .get("usage")
+            .filter(|u| crate::usage::usage_is_exact(u, crate::usage::CLAUDE_USAGE_KEYS));
         if let Some(u) = r.get("usage") {
-            o.usage = Some(claude_buckets(u));
             o.raw_usage = Some(u.clone());
+        }
+        if let Some(u) = exact {
+            o.usage = Some(claude_buckets(u));
             o.accounting = Accounting::Exact;
         } else if let Some(b) = self.usage.buckets() {
             o.usage = Some(b);
@@ -692,6 +699,35 @@ mod tests {
             "second result discarded and reported"
         );
         assert!(o.init.is_some());
+    }
+
+    /// R23-21 (review 2026-10-23): a result whose usage counters are not whole numbers is no
+    /// exact usage — the live provisional values stand (here: none, so the usage is unknown).
+    /// Was: read as 0 and recorded as `Exact`.
+    #[test]
+    fn usage_counters_that_are_not_whole_numbers_are_not_exact() {
+        let mut p = ClaudeParser::new();
+        feed(
+            &mut p,
+            &[
+                INIT,
+                r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s1","result":"x","usage":{"input_tokens":12.0,"output_tokens":"100"}}"#,
+            ],
+        );
+        let o = p.finish(Some(0));
+        assert_ne!(o.accounting, Accounting::Exact);
+        assert!(o.usage.is_none());
+        let mut p = ClaudeParser::new();
+        feed(
+            &mut p,
+            &[
+                INIT,
+                r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s1","result":"x","usage":{"input_tokens":12,"output_tokens":100}}"#,
+            ],
+        );
+        let o = p.finish(Some(0));
+        assert_eq!(o.accounting, Accounting::Exact);
+        assert_eq!(o.usage.unwrap().output, 100);
     }
 
     #[test]
