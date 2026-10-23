@@ -889,3 +889,26 @@ fn every_machine_caused_class_is_one_of_the_engine_constants() {
         );
     }
 }
+
+/// R23-26 (review 2026-10-23 A2): one spelling per class — every class reads back from its
+/// string, the strings are distinct, `MACHINE_CAUSED` is exactly the machine-caused classes,
+/// and a string that is no class is never machine-caused.
+#[test]
+fn escalation_classes_have_one_spelling() {
+    use std::collections::BTreeSet;
+    let all: BTreeSet<&str> = EscalationClass::ALL.iter().map(|c| c.as_str()).collect();
+    assert_eq!(all.len(), EscalationClass::ALL.len(), "distinct strings");
+    for c in EscalationClass::ALL {
+        assert_eq!(c.as_str().parse::<EscalationClass>(), Ok(c), "{c}");
+        assert_eq!(is_machine_caused(c.as_str()), c.is_machine_caused(), "{c}");
+    }
+    let machine: BTreeSet<&str> = EscalationClass::ALL
+        .iter()
+        .filter(|c| c.is_machine_caused())
+        .map(|c| c.as_str())
+        .collect();
+    assert_eq!(machine, MACHINE_CAUSED.into_iter().collect::<BTreeSet<_>>());
+    for s in ["max_fix_cycles", "timeout", "", "GateUnavailable"] {
+        assert!(!is_machine_caused(s), "{s}");
+    }
+}

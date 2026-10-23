@@ -39,7 +39,7 @@ pub const PACKAGES: [&str; 5] = [
 pub const DEFAULT_TIMEOUT_MIN: u64 = 90;
 
 /// The error class of a toolchain that cannot be used (a missing MSBuild or package).
-pub const UNAVAILABLE: &str = "xpp_toolchain_unavailable";
+pub const UNAVAILABLE: &str = super::state::EscalationClass::XppToolchainUnavailable.as_str();
 
 /// Added to the environment of every check gate and environment gate (M12-15, X23; it was an
 /// MSBuild run only): English messages whatever language pack Visual Studio has — the

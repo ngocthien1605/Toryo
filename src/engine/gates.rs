@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use crate::config::{CommandKind, CommandSpec};
 
 /// The escalation class of a check gate that cannot be started (machine-caused).
-pub const GATE_UNAVAILABLE: &str = "gate_unavailable";
+pub const GATE_UNAVAILABLE: &str = super::state::EscalationClass::GateUnavailable.as_str();
 
 /// Script extensions of an absolute argument that must exist (environment gates).
 const SCRIPT_EXTENSIONS: [&str; 8] = [".ps1", ".psm1", ".cmd", ".bat", ".sh", ".py", ".js", ".exe"];
@@ -158,7 +158,7 @@ pub fn env_gates_refusal(cfg: &crate::config::Effective) -> Option<String> {
 }
 
 /// The escalation class of an environment gate that waits for the owner's "yes" (M12-07, X17).
-pub const ENV_CONFIRM: &str = "environment_gate_confirm";
+pub const ENV_CONFIRM: &str = super::state::EscalationClass::EnvironmentGateConfirm.as_str();
 
 // M13-05 (X26): what the owner confirmed is a row of `deploy_confirmations` in the database
 // (`store::ask_deploys`, `store::confirm_deploys`, `store::deploy_confirmed`), bound to the gate,

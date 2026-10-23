@@ -53,13 +53,13 @@ pub const INLINE_MAX: usize = 8 * 1024;
 pub const TRUSTED_PACK: [&str; 2] = ["TASK.md", "PLAN.md"];
 
 /// M11-R5: a skill the turn needs does not resolve now — the turn is not started.
-pub const SKILL_UNAVAILABLE: &str = "skill_unavailable";
+pub const SKILL_UNAVAILABLE: &str = super::state::EscalationClass::SkillUnavailable.as_str();
 /// M11-R5: with its skills (never trimmed) and TASK.md / PLAN.md (never trimmed to make room
 /// for them) the context does not fit its budget.
-pub const CONTEXT_OVER_BUDGET: &str = "context_over_budget";
+pub const CONTEXT_OVER_BUDGET: &str = super::state::EscalationClass::ContextOverBudget.as_str();
 /// M12-10 (X22): a context file (instructions, culture, policy, `AGENTS.md`, `CLAUDE.md`, the
 /// global context, a task-pack file) exists and is not UTF-8 — the turn is not started.
-pub const CONTEXT_UNREADABLE: &str = "context_unreadable";
+pub const CONTEXT_UNREADABLE: &str = super::state::EscalationClass::ContextUnreadable.as_str();
 
 /// Whether a task-pack file (by its label) is trusted (R61). A file added to the pack later is
 /// untrusted unless it is listed in [`TRUSTED_PACK`].

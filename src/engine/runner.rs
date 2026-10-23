@@ -5217,7 +5217,7 @@ enum EnvGates {
 }
 
 /// The escalation class of an environment gate that ran into its timeout (M12-06, X18).
-pub const ENV_TIMEOUT: &str = "environment_gate_timeout";
+pub const ENV_TIMEOUT: &str = super::state::EscalationClass::EnvironmentGateTimeout.as_str();
 
 /// A time limit in words: `30 min`, `90 s`.
 fn fmt_limit(d: Duration) -> String {
@@ -5230,7 +5230,8 @@ fn fmt_limit(d: Duration) -> String {
 }
 
 /// The escalation class of an environment gate this machine cannot run (M11-E3).
-pub const ENV_UNAVAILABLE: &str = "environment_gate_unavailable";
+pub const ENV_UNAVAILABLE: &str =
+    super::state::EscalationClass::EnvironmentGateUnavailable.as_str();
 
 /// M11-R12 (item 2): the first `%NAME%` still in an environment gate's program or args — set
 /// only in a config frozen before M11 expanded them at load. Such a gate does not start.
@@ -5604,7 +5605,7 @@ fn same_vendor_reason(id: &str, same: &[&str], reviewer: &str, kind: &str) -> St
 }
 
 /// The escalation class of a same-vendor review refused before it starts (M11-C3).
-pub const SAME_VENDOR: &str = "same_vendor_review";
+pub const SAME_VENDOR: &str = super::state::EscalationClass::SameVendorReview.as_str();
 
 fn review_feedback(review: &Value) -> String {
     let mut f = String::new();
@@ -5788,7 +5789,7 @@ pub fn reject_now(
 }
 
 /// The class of the escalation that withdraws the final gate (§11, R32).
-pub const APPROVAL_MISMATCH: &str = "approval_mismatch";
+pub const APPROVAL_MISMATCH: &str = super::state::EscalationClass::ApprovalMismatch.as_str();
 
 /// R23-03: before `approve --gate final --force` opens the final gate — the task branch must
 /// point at the checkpoint, as for an approval; otherwise the reason (and nothing is opened).
@@ -5920,7 +5921,11 @@ pub fn next_action(t: &TaskRow) -> String {
         St::WaitingFinalApproval => format!("review the branch {} (REVIEW.md in the run store), then `toryo approve {id} --gate final` or `toryo reject {id} --gate final --reason \"…\"`", t.branch),
         St::Escalated => {
             let why = t.machine.reason().unwrap_or("");
-            if t.machine.reason_class() == Some(super::gates::ENV_CONFIRM) {
+            // R23-26: the stored class, typed; the reason's text only for a machine stored
+            // before it had one
+            use super::state::EscalationClass as C;
+            let class = t.machine.reason_class().and_then(|c| c.parse::<C>().ok());
+            if class == Some(C::EnvironmentGateConfirm) {
                 // M13-09: the question before a deploy — nothing to fix; what to look at, how
                 // to say yes, and how to say no
                 format!(
@@ -5928,7 +5933,7 @@ pub fn next_action(t: &TaskRow) -> String {
                     t.worktree.display(),
                     t.machine.checkpoint().map(short).unwrap_or("HEAD")
                 )
-            } else if t.machine.reason_class() == Some(APPROVAL_MISMATCH) {
+            } else if class == Some(C::ApprovalMismatch) {
                 // R23-03: `--force` would open the same gate, and the next approval would be
                 // refused again — the branch has to be at the checkpoint first
                 format!(
@@ -5936,17 +5941,15 @@ pub fn next_action(t: &TaskRow) -> String {
                     t.worktree.display(),
                     t.machine.checkpoint().map(short).unwrap_or("<checkpoint>")
                 )
-            } else if t
-                .machine
-                .reason_class()
-                .is_some_and(crate::engine::state::is_machine_caused)
-            {
+            } else if class.is_some_and(C::is_machine_caused) {
                 // M11-R11 (X8): the machine caused it — plain resume goes back into the stage.
                 // M11-R16: a fix in a config file is not used until the task is reloaded
                 format!("{why}\n  → fix the cause, then `toryo resume {id}` (no fix cycle; the stage is checked again). A fix in a config file (the machine config, toryo.yaml, a profile) is used only after `toryo task config {id} --reload` — the task runs on its frozen configuration")
-            } else if why.starts_with(protect::REASON) {
+            } else if class == Some(C::ProtectedConfigChanged) || why.starts_with(protect::REASON) {
                 format!("{why}\n  → restore the file(s) and `toryo resume {id}`, or `toryo resume {id} --accept-protected-change <path>` (recorded in DECISIONS.md)")
-            } else if why.starts_with("recovery_policy_violation") {
+            } else if class == Some(C::RecoveryPolicyViolation)
+                || why.starts_with(super::recovery::POLICY_VIOLATION)
+            {
                 format!("{why}\n  → `toryo resume {id} --discard-partial` (after a snapshot check) or fix the worktree by hand and `toryo resume {id} --keep-partial`")
             } else if policy_refusal(t.machine.reason_class(), why) {
                 // R62: the launch was refused before any process started — a configuration

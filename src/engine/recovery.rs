@@ -26,7 +26,7 @@ use crate::config::{Billing, Effective};
 use crate::git::GitCmd;
 
 /// `recovery_policy_violation` prefix of the escalation reason (§11).
-pub const POLICY_VIOLATION: &str = "recovery_policy_violation";
+pub const POLICY_VIOLATION: &str = super::state::EscalationClass::RecoveryPolicyViolation.as_str();
 
 /// M12-01 (H1): why `commit`, which carries Toryo's trailers, is **not** a commit Toryo made for
 /// this task — `None` when it may be taken. No check here asks who made it; three things must
