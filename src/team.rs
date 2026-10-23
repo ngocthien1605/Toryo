@@ -209,7 +209,15 @@ pub fn parse_duration(s: &str) -> Result<u64> {
     if n == 0 {
         return Err(bad());
     }
-    n.checked_mul(mult).ok_or_else(bad)
+    // R23-11: at most a week — a deadline further out overflows the clock of the turn or gate
+    let secs = n.checked_mul(mult).ok_or_else(bad)?;
+    if secs > crate::config::MAX_TIMEOUT_MIN * 60 {
+        anyhow::bail!(
+            "`{s}` is longer than a week ({} minutes) — a gate that runs that long is not waited for",
+            crate::config::MAX_TIMEOUT_MIN
+        );
+    }
+    Ok(secs)
 }
 
 /// Which repository file a text is, for the removed-key messages.

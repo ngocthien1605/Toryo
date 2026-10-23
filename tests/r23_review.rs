@@ -340,3 +340,26 @@ fn r23_10_no_follow_up_is_recorded_before_the_review_decision() {
     let dec = std::fs::read_to_string(t.artifacts().join("DECISIONS.md")).unwrap();
     assert_eq!(dec.matches("follow-ups").count(), 1, "{dec}");
 }
+
+/// R23-11: `budget set --tokens` is bounded as `pipeline.budget_tokens` is (the admission check
+/// multiplies the cap by 8 in an i64). Was: any u64, cast to i64.
+#[test]
+fn r23_11_a_token_cap_too_large_for_the_arithmetic_is_refused() {
+    let env = setup("codex-openai");
+    create(&env, "B-11");
+    let max = toryo::config::MAX_BUDGET_TOKENS;
+    let (code, err) = toryo(
+        &env,
+        &["budget", "set", "B-11", "--tokens", &(max + 1).to_string()],
+        &[],
+    );
+    assert_ne!(code, 0, "{err}");
+    assert!(err.contains("--tokens"), "{err}");
+    let (code, err) = toryo(
+        &env,
+        &["budget", "set", "B-11", "--tokens", &max.to_string()],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "B-11").budget_tokens, Some(max as i64));
+}

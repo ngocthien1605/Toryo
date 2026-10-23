@@ -1016,6 +1016,22 @@ pub const CODEX_WINDOWS_SANDBOXES: &[&str] = &["unelevated", "elevated"];
 /// `pipeline.budget_weights` keys: the four token buckets (R41).
 pub const BUDGET_WEIGHT_KEYS: &[&str] = &["uncached_input", "cache_read", "cache_write", "output"];
 
+/// R23-11: the longest time limit (minutes) a configuration may give an agent turn or a gate:
+/// a week. A larger one overflows the deadline arithmetic (a panic after the agent started).
+pub const MAX_TIMEOUT_MIN: u64 = 7 * 24 * 60;
+/// R23-11: the largest `context.budget_kb` (1 GB): `kb * 1024` must not wrap.
+pub const MAX_BUDGET_KB: u64 = 1024 * 1024;
+/// R23-11: the largest token admission cap (`pipeline.budget_tokens`, `toryo budget set`): the
+/// budget arithmetic multiplies it by 10 in an i64.
+pub const MAX_BUDGET_TOKENS: u64 = (i64::MAX / 10) as u64;
+
+/// A problem for `key` when `value` is above `max`.
+fn at_most(out: &mut Vec<String>, key: &str, value: Option<u64>, max: u64, what: &str) {
+    if let Some(v) = value.filter(|v| *v > max) {
+        out.push(format!("{key}: `{v}` is too large (at most {max} {what})"));
+    }
+}
+
 /// The pipeline's roles: the keys of `roles` and `context.budget_kb`.
 fn role_names() -> [&'static str; 3] {
     use crate::domain::Role as R;
@@ -1066,9 +1082,25 @@ fn problems(
         };
         known_key(&mut out, &section, name, "role", &roles);
     }
-    for name in repo.context.budget_kb.keys() {
+    for (name, kb) in &repo.context.budget_kb {
         known_key(&mut out, "context.budget_kb", name, "role", &roles);
+        let key = format!("context.budget_kb.{name}");
+        at_most(&mut out, &key, Some(*kb), MAX_BUDGET_KB, "KB");
     }
+    let t = &repo.timeouts;
+    for (key, v) in [
+        ("timeouts.agent_stall_min", t.agent_stall_min),
+        ("timeouts.agent_stage_max_min", t.agent_stage_max_min),
+    ] {
+        at_most(&mut out, key, v, MAX_TIMEOUT_MIN, "minutes, a week");
+    }
+    at_most(
+        &mut out,
+        "pipeline.budget_tokens",
+        repo.pipeline.budget_tokens,
+        MAX_BUDGET_TOKENS,
+        "tokens",
+    );
     for (name, w) in repo.pipeline.budget_weights.iter().flatten() {
         let section = "pipeline.budget_weights";
         known_key(&mut out, section, name, "bucket", BUDGET_WEIGHT_KEYS);
@@ -1114,6 +1146,14 @@ fn problems(
         }
         let key = format!("commands.verify[{i}] ({})", c.name);
         verify_command_problems(&mut out, &key, c, toolchains, machine);
+        let k = format!("{key}.timeout_min");
+        at_most(
+            &mut out,
+            &k,
+            c.timeout_min,
+            MAX_TIMEOUT_MIN,
+            "minutes, a week",
+        );
     }
     if let Some(x) = &toolchains.xpp {
         for (k, v) in [("msbuild", &x.msbuild), ("nugets", &x.nugets)] {
@@ -1883,6 +1923,34 @@ policy:
         );
         load_str(&ok).unwrap();
         load_str(&ok.replace("tokens: auto", "tokens: 150000")).unwrap();
+    }
+
+    /// R23-11: numbers that feed time and budget arithmetic are bounded at load. Was: a
+    /// `timeouts.agent_stage_max_min` of 2^64-1 wrapped `60 * min` and the turn's deadline
+    /// panicked (`Instant + Duration`) after the agent process had started; `context.budget_kb`
+    /// near 2^54 wrapped `kb * 1024` to a few bytes; a gate `timeout_min` the same.
+    #[test]
+    fn numbers_that_feed_arithmetic_are_bounded() {
+        let big = u64::MAX;
+        let e = load_err(&format!(
+            "{SAMPLE}timeouts: {{ agent_stall_min: {big}, agent_stage_max_min: 10081 }}\ncontext: {{ budget_kb: {{ implementer: 18014398509481985 }} }}\npipeline: {{ budget_tokens: {big} }}\n"
+        ));
+        for want in [
+            "timeouts.agent_stall_min: `18446744073709551615` is too large (at most 10080",
+            "timeouts.agent_stage_max_min: `10081` is too large",
+            "context.budget_kb.implementer: `18014398509481985` is too large (at most 1048576 KB)",
+            "pipeline.budget_tokens: `18446744073709551615` is too large",
+        ] {
+            assert!(e.contains(want), "{want:?} missing in:\n{e}");
+        }
+        load_str(&format!(
+            "{SAMPLE}timeouts: {{ agent_stall_min: 10080, agent_stage_max_min: 10080 }}\ncontext: {{ budget_kb: {{ implementer: 1048576 }} }}\npipeline: {{ budget_tokens: {MAX_BUDGET_TOKENS} }}\n"
+        ))
+        .unwrap();
+        // a gate's `timeout` (org chart) and `timeout_min`
+        assert!(crate::team::parse_duration("168h").is_ok());
+        let e = format!("{:#}", crate::team::parse_duration("169h").unwrap_err());
+        assert!(e.contains("longer than a week"), "{e}");
     }
 
     /// R23-02 (review 2026-10-23 C1): a budget weight JSON cannot carry (`.inf`, `.nan`) was

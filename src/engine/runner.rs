@@ -454,7 +454,8 @@ impl<'a> Engine<'a> {
             self.apply(Ev::BudgetExceeded)?;
             return Ok(false);
         }
-        if used * 10 >= b * 8 {
+        // (R23-11: saturating — a cap near i64::MAX must not wrap into a warning every turn)
+        if used.saturating_mul(10) >= b.saturating_mul(8) {
             self.rec.emit(EngineEvent::BudgetWarning { used, cap: b });
         }
         Ok(true)

@@ -149,7 +149,7 @@ pub enum BudgetCmd {
     Set {
         id: String,
         /// Tokens (weighted sum of the four buckets, R41)
-        #[arg(long, conflicts_with = "none")]
+        #[arg(long, conflicts_with = "none", value_parser = clap::value_parser!(u64).range(0..=toryo::config::MAX_BUDGET_TOKENS))]
         tokens: Option<u64>,
         /// Remove the cap
         #[arg(long)]

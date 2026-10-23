@@ -49,7 +49,7 @@ pub struct BuildArgs {
     #[arg(long)]
     low: bool,
     /// Time for all projects together, in minutes
-    #[arg(long, default_value_t = xpp::DEFAULT_TIMEOUT_MIN)]
+    #[arg(long, default_value_t = xpp::DEFAULT_TIMEOUT_MIN, value_parser = clap::value_parser!(u64).range(1..=toryo::config::MAX_TIMEOUT_MIN))]
     timeout_min: u64,
 }
 
