@@ -676,10 +676,7 @@ impl<'a> Engine<'a> {
                 },
             )?;
             // R35: the baseline version in force when the attempt started
-            tx.execute(
-                "UPDATE stage_attempts SET protected_manifest_id = (SELECT artifact_id FROM artifact_heads WHERE task_id = ?2 AND logical_name = 'protected') WHERE id = ?1",
-                rusqlite::params![a.id, i],
-            )?;
+            store::set_attempt_manifest(tx, &a.id, &i)?;
             Ok(a)
         })
     }
