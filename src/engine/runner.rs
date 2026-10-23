@@ -407,7 +407,9 @@ impl<'a> Engine<'a> {
     /// M16-AT (X39): after a turn that toryo ended before it finished — a stop request or a
     /// limit — `agent_killed` with the pid its `agent_spawned` had (the real agent's process
     /// tree ends with its Job).
-    fn agent_ended(&self, attempt: &AttemptRow, profile: &str, r: &StageOutcome) {
+    /// R23-14: `budget` when the R41 live interrupt ended the turn (it cancels through the stop
+    /// flag, so `r.cancelled` alone cannot tell it from a stop request).
+    fn agent_ended(&self, attempt: &AttemptRow, profile: &str, r: &StageOutcome, budget: bool) {
         if !(r.cancelled || r.timed_out) {
             return;
         }
@@ -417,7 +419,12 @@ impl<'a> Engine<'a> {
             attempt: attempt.attempt,
             profile: profile.to_string(),
             pid,
-            reason: if r.cancelled { "stop" } else { "limit" }.into(),
+            reason: match (budget, r.cancelled) {
+                (true, _) => "budget",
+                (false, true) => "stop",
+                (false, false) => "limit",
+            }
+            .into(),
         });
     }
 
@@ -979,7 +986,7 @@ impl<'a> Engine<'a> {
             hooks,
         )?;
         crash_point("implement:after_turn");
-        self.agent_ended(&a, &turn.profile, &r);
+        self.agent_ended(&a, &turn.profile, &r, budget_hit.load(Ordering::SeqCst));
         self.usage(&a, &turn.profile, &r, turn.model.as_deref())?;
         Ok(Some(ImplementRun {
             budget_hit: budget_hit.load(Ordering::SeqCst),
@@ -2912,7 +2919,7 @@ impl<'a> Engine<'a> {
         // skip the checks either — what the role wrote is undone before the error goes up
         let r = match r {
             Ok(r) => {
-                self.agent_ended(a, profile, &r);
+                self.agent_ended(a, profile, &r, budget_hit.load(Ordering::SeqCst));
                 r
             }
             Err(e) => {

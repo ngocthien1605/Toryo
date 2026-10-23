@@ -363,3 +363,27 @@ fn r23_11_a_token_cap_too_large_for_the_arithmetic_is_refused() {
     assert_eq!(code, 0, "{err}");
     assert_eq!(task(&env, "B-11").budget_tokens, Some(max as i64));
 }
+
+/// R23-14: the R41 live interrupt ends a turn through the stop flag. Was: its `agent_killed`
+/// said `reason: stop` — as if the owner had asked — although the engine knew it was the
+/// budget. Now `budget`.
+#[test]
+fn r23_14_a_budget_interrupt_is_named_in_agent_killed() {
+    let env = setup_with("codex-openai", "pipeline:\n  budget_tokens: 1000\n");
+    create(&env, "K-15");
+    let s = script(
+        &env,
+        "k15.json",
+        json!({
+            "planner": [turn(vec![json!({"kind": "usage", "input": 5000, "output": 10}), json!({"kind": "hang"})])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "K-15", "--fake-agents", &s], &[]);
+    assert_eq!(task(&env, "K-15").state, St::Paused, "{err}");
+    let ev = events(&env, "K-15");
+    let killed = ev
+        .iter()
+        .find(|e| e["type"] == "agent_killed")
+        .unwrap_or_else(|| panic!("an agent_killed event: {ev:?}"));
+    assert_eq!(killed["reason"], "budget", "{killed}");
+}
