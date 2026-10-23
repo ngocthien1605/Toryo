@@ -241,8 +241,10 @@ fn max_fix_cycles_escalates() {
     );
     assert_eq!(states(&env, "S-M").last().unwrap(), "Escalated");
     // M11-R17 (R11 AC-3, at the CLI): the fix-cycle bound is not a machine-caused stop — a
-    // plain `toryo resume` does nothing; the way on is `--note`
-    assert_eq!(t.machine.reason_class(), None);
+    // plain `toryo resume` does nothing; the way on is `--note`. (R23-08: the class is now
+    // stored — the one the `escalated` event names — and it is not a machine-caused one.)
+    assert_eq!(t.machine.reason_class(), Some("max_fix_cycles"));
+    assert!(!toryo::engine::state::is_machine_caused("max_fix_cycles"));
     let before = (states(&env, "S-M").len(), attempts(&env, "S-M").len());
     let (_, err) = toryo(&env, &["resume", "S-M", "--yes", "--fake-agents", &s], &[]);
     let t = task(&env, "S-M");

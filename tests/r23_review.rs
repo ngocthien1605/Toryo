@@ -9,6 +9,15 @@ use serde_json::json;
 use toryo::engine::store::{self, DeployAsk};
 use toryo::engine::PipelineState as St;
 
+fn events(env: &Env, id: &str) -> Vec<serde_json::Value> {
+    let p = task(env, id).run_store.join("events.jsonl");
+    std::fs::read_to_string(&p)
+        .unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{l}: {e}")))
+        .collect()
+}
+
 /// An escalated task (`gate_unavailable`: the build gate's program is not there) — a
 /// machine-caused stop from `Verifying`, which a plain `resume` takes back into the stage.
 fn escalated(env: &Env, id: &str) {
@@ -218,4 +227,34 @@ fn r23_07_the_stop_poll_never_waits_for_a_writer() {
     assert!(!watch.stopped());
     drop(watch);
     lock.release();
+}
+
+/// R23-08 (C8, C9): an escalation keeps its class on the machine, the same class its
+/// `escalated` event names. Was: only the escalations made through `escalate` and
+/// `finish_classed` stored one; every escalation that ended an attempt through `end_and` (an
+/// invalid plan, a protected change, a failed turn, a blocked review) had none, and `status`
+/// read the reason's text instead.
+#[test]
+fn r23_08_an_escalation_keeps_its_class_on_the_machine() {
+    let env = setup("codex-openai");
+    create(&env, "V-1");
+    let s = script(
+        &env,
+        "v1.json",
+        json!({ "planner": [turn(vec![json!({"kind": "complete", "structured": {"not": "a plan"}})])] }),
+    );
+    let (_, err) = toryo(&env, &["run", "V-1", "--fake-agents", &s], &[]);
+    let t = task(&env, "V-1");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(t.machine.reason_class(), Some("invalid_output"), "{err}");
+    let ev = events(&env, "V-1");
+    let escalated = ev
+        .iter()
+        .rfind(|e| e["type"] == "escalated")
+        .expect("an escalated event");
+    assert_eq!(escalated["reason_class"], "invalid_output");
+    // the classes a plain `resume` takes back into the stage are snake_case, as stored
+    for c in toryo::engine::state::MACHINE_CAUSED {
+        assert_eq!(toryo::engine::flight::snake_case(c), c);
+    }
 }

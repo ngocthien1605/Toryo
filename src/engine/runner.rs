@@ -2917,22 +2917,23 @@ impl<'a> Engine<'a> {
                 // mask the error of the turn: it is logged, the turn's own error goes up
                 match self.read_only_findings(t, &a.id, &before) {
                     Ok(Some((reason, class, _))) => {
-                        let (i, aid) = (self.id.clone(), a.id.clone());
+                        // R23-08: the same closer as every other attempt — `stage_finished`,
+                        // the `escalated` event and the class on the machine
                         let detail = format!("{reason} (the turn itself ended in an error: {e:#})");
-                        let class = class.to_string();
-                        self.store.call(move |tx| {
-                            store::finish_attempt(
-                                tx,
-                                &aid,
-                                AttemptStatus::Failed,
-                                &AttemptEnd {
-                                    error_class: Some(class),
-                                    error_detail: Some(detail),
-                                    ..Default::default()
-                                },
-                            )?;
-                            store::transition(tx, &i, Ev::Escalate { reason }).map(|_| ())
-                        })?;
+                        self.end_with(
+                            a,
+                            AttemptStatus::Failed,
+                            &StageOutcome::default(),
+                            AttemptEnd {
+                                error_class: Some(class.to_string()),
+                                error_detail: Some(detail),
+                                ..Default::default()
+                            },
+                            Some(Ev::Escalate { reason }),
+                            None,
+                            true,
+                            Some(class),
+                        )?;
                     }
                     Ok(None) => {}
                     Err(x) => crate::errln!(
@@ -3405,14 +3406,23 @@ impl<'a> Engine<'a> {
         let from = self.task()?.state;
         let name = e.as_ref().map(|e| e.name());
         let error_class = end.error_class.clone();
-        let class = class.map(str::to_string).or_else(|| error_class.clone());
+        let explicit = class.map(str::to_string);
+        let class = explicit.clone().or_else(|| error_class.clone());
+        let fallback = error_class.clone();
         let to = self.store.call(move |tx| {
             store::finish_attempt(tx, &aid, status, &end)?;
             if let Some(f) = feedback {
                 store::set_feedback(tx, &i, f.as_deref())?;
             }
             match e {
-                Some(e) => Ok(Some(store::transition(tx, &i, e)?)),
+                // R23-08: the escalation's class on the machine too, not only in the event
+                Some(e) => Ok(Some(store::transition_recorded(
+                    tx,
+                    &i,
+                    e,
+                    explicit.as_deref(),
+                    fallback.as_deref(),
+                )?)),
                 None => Ok(None),
             }
         })?;
