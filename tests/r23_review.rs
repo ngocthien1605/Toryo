@@ -593,3 +593,41 @@ fn r23_22_a_rejected_review_says_what_was_wrong() {
         a.error_detail
     );
 }
+
+/// R23-24 (N-11): `task cleanup --force` deletes the folders the task row names. Was: whatever
+/// they were — one changed column and a routine cleanup deleted a folder `task create` never
+/// made. Now the row's paths must be the task's own.
+#[test]
+fn r23_24_cleanup_deletes_only_what_task_create_made() {
+    let env = setup("codex-openai");
+    create(&env, "D-1");
+    let victim = env.root.join("victim");
+    std::fs::create_dir_all(&victim).unwrap();
+    std::fs::write(victim.join("keep.txt"), "mine\n").unwrap();
+    for column in ["worktree", "run_store"] {
+        let v = victim.display().to_string();
+        let sql = format!("UPDATE tasks SET {column} = ?1 WHERE id = 'D-1'");
+        db(&env)
+            .call(move |tx| Ok(tx.execute(&sql, [&v]).map(|_| ())?))
+            .unwrap();
+        let (code, err) = toryo(&env, &["task", "cleanup", "D-1", "--force"], &[]);
+        assert_ne!(code, 0, "{column}: {err}");
+        assert!(err.contains("nothing was deleted"), "{column}: {err}");
+        assert!(victim.join("keep.txt").exists(), "{column}: {err}");
+        // put the column back
+        let real = if column == "worktree" {
+            wt(&env, "D-1")
+        } else {
+            env.data.join("runs").join("D-1")
+        }
+        .display()
+        .to_string();
+        let sql = format!("UPDATE tasks SET {column} = ?1 WHERE id = 'D-1'");
+        db(&env)
+            .call(move |tx| Ok(tx.execute(&sql, [&real]).map(|_| ())?))
+            .unwrap();
+    }
+    let (code, err) = toryo(&env, &["task", "cleanup", "D-1", "--force"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!wt(&env, "D-1").exists() && victim.join("keep.txt").exists());
+}

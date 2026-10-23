@@ -321,9 +321,17 @@ fn config_is_frozen_until_reload() {
         "{err}"
     );
     assert_eq!(task(&env, "F-1").config_sha256, t.config_sha256);
+    // R23-24: and it leaves no history pair behind (was: `1-old-…`, `1-new-…`)
+    let history = |t: &toryo::engine::store::TaskRow| {
+        std::fs::read_dir(t.artifacts().join("config-history"))
+            .map(|d| d.count())
+            .unwrap_or(0)
+    };
+    assert_eq!(history(&t), 0, "a refused reload is no history");
     // --reload applies: diff shown, VERIFY_RESULT invalidated, the checkpoint is verified again
     let (code, err) = toryo(&env, &["task", "config", "F-1", "--reload"], &[]);
     assert_eq!(code, 0, "{err}");
+    assert_eq!(history(&task(&env, "F-1")), 2, "the pair of the reload");
     let t = task(&env, "F-1");
     assert_eq!(t.state, St::Verifying);
     let vr: Value =

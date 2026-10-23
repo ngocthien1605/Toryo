@@ -632,6 +632,9 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
                     None
                 }
             };
+            // R23-24 (N-11): the folders `cleanup` deletes are the ones `task create` made — the
+            // row's paths are checked before anything is deleted
+            cleanup_confined(&t, cfg.as_ref())?;
             let g = match &cfg {
                 Some(c) => task::task_git(c, &t.repo)?,
                 None => task::cleanup_git(&t.repo)?,
@@ -686,6 +689,40 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+/// R23-24: the run store of a task row is `<data dir>\runs\<id>`, and its worktree a folder
+/// named `<id>` (under the frozen `project.worktrees_root` when the configuration reads):
+/// what `task create` made. A row that names anything else — a changed database (N-11: nothing
+/// guards it from a process with the owner's token) — makes `task cleanup` refuse, before it
+/// deletes a folder it never made.
+fn cleanup_confined(t: &TaskRow, cfg: Option<&toryo::config::Effective>) -> Result<()> {
+    let id = &t.id;
+    let named = |p: &std::path::Path| p.file_name().is_some_and(|n| n == id.as_str());
+    let under = |p: &std::path::Path, root: &std::path::Path| {
+        let canon = |q: &std::path::Path| std::fs::canonicalize(q).unwrap_or(q.to_path_buf());
+        canon(p.parent().unwrap_or(p)) == canon(root)
+    };
+    if !(named(&t.run_store) && under(&t.run_store, &toryo::config::data_dir().join("runs"))) {
+        bail!(
+            "{id}: the run store of the task row is {}, not {} — `task cleanup` deletes only what `task create` made; nothing was deleted",
+            t.run_store.display(),
+            task::run_store_dir(id).display()
+        );
+    }
+    let root = cfg
+        .and_then(|c| toryo::config::expand_vars(&c.repo.project.worktrees_root).ok())
+        .map(PathBuf::from)
+        // (a relative root was read against the folder `task create` ran in: only the name counts)
+        .filter(|r| r.is_absolute());
+    let ok = named(&t.worktree) && root.is_none_or(|r| under(&t.worktree, &r));
+    if !ok {
+        bail!(
+            "{id}: the worktree of the task row is {}, not a folder `{id}` in project.worktrees_root — `task cleanup` deletes only what `task create` made; nothing was deleted",
+            t.worktree.display()
+        );
+    }
+    Ok(())
 }
 
 /// M12-12 (a): what `task cleanup` would delete that exists nowhere else — uncommitted changes
@@ -769,6 +806,11 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
         lock.release();
         return Ok(0);
     }
+    // R23-24: the refusals that need no diff come before the history pair is written (was: a
+    // refused reload left an orphan pair in `config-history`)
+    let g = task::task_git(&new, &t.repo)?; // R37 admission under the new machine config
+                                            // M18 (group E review): a reloaded gate script must be in the base commit too
+    task::check_entry_points(&new, &g, &t.repo, &t.base_commit)?;
     // diff of the pretty-printed configurations
     let dir = t.artifacts().join("config-history");
     std::fs::create_dir_all(&dir)?;
@@ -782,9 +824,6 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     );
     std::fs::write(&a, pretty(&old_text)?)?;
     std::fs::write(&b, pretty(&new_text)?)?;
-    let g = task::task_git(&new, &t.repo)?; // R37 admission under the new machine config
-                                            // M18 (group E review): a reloaded gate script must be in the base commit too
-    task::check_entry_points(&new, &g, &t.repo, &t.base_commit)?;
     let out = g.output(
         &toryo::git::Loc::Discover(dir.clone()),
         true,
@@ -807,6 +846,9 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     );
     if let Some(e) = expect {
         if !new_sha.starts_with(e) {
+            // R23-24: the diff was shown; the pair it was made from is no history of a reload
+            let _ = std::fs::remove_file(&a);
+            let _ = std::fs::remove_file(&b);
             bail!("subject_changed: the new configuration digest is {} — it does not start with --expect {e}; nothing was changed", short(&new_sha));
         }
     }
