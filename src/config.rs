@@ -598,7 +598,26 @@ pub struct Notify {
 impl MachineConfig {
     /// Read and parse a machine config file.
     pub fn load(path: &Path) -> Result<Self> {
-        let text = crate::textfile::read_text(path)?;
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        Self::from_bytes(path, &bytes)
+    }
+
+    /// [`Self::load`] of bytes already read (R23-19: `Effective::load` parses the bytes it
+    /// hashed, not a second read of the file).
+    pub fn from_bytes(path: &Path, bytes: &[u8]) -> Result<Self> {
+        let text = crate::textfile::decode(path, bytes)?;
+        // R23-19: the rules of a repository file — a duplicate key is refused (the typed parse
+        // would keep the last one silently), and so is a YAML tag
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let tags = tag_problems(&doc);
+        if !tags.is_empty() {
+            bail!(
+                "{}: YAML tags are not allowed in the machine config — remove them:\n  - {}",
+                path.display(),
+                tags.join("\n  - ")
+            );
+        }
         // M11-B3: an unknown key gets the friendly form with a "did you mean" hint
         let mut m: Self =
             serde_yaml::from_str(&text).map_err(|e| {
@@ -744,7 +763,7 @@ impl Effective {
             Some(mp) if mp.exists() => {
                 let b = std::fs::read(mp).with_context(|| format!("reading {}", mp.display()))?;
                 files.push(crate::team::FileRead::of("machine config", mp, &b));
-                Some((mp.to_path_buf(), MachineConfig::load(mp)?))
+                Some((mp.to_path_buf(), MachineConfig::from_bytes(mp, &b)?))
             }
             _ => None,
         };
@@ -1349,33 +1368,13 @@ pub fn untagged(v: &serde_yaml::Value) -> &serde_yaml::Value {
     }
 }
 
-/// C1: every YAML tag on a top-level key or value of a repository file (`!x profiles:`,
-/// `roles: !x {…}`), refused in one error that names the file and each key. A tag makes a key
-/// invisible to a lookup by name while a typed parse still reads it, so repository files —
+/// C1: every YAML tag of a repository file (`!x profiles:`, `roles: !x {…}`; R23-19: at every
+/// depth, `profile: !x evil` inside a role too), refused in one error that names the file and
+/// each key. A tag makes a key invisible to a lookup by name while a typed parse still reads it,
+/// so repository files —
 /// `toryo.yaml`, the org chart, the role files — carry none.
 pub fn refuse_tags(doc: &serde_yaml::Value, file: &Path) -> Result<()> {
-    let Some(map) = untagged(doc).as_mapping() else {
-        return Ok(());
-    };
-    let mut out = Vec::new();
-    if let serde_yaml::Value::Tagged(t) = doc {
-        out.push(format!("the document has the tag `{}`", t.tag));
-    }
-    for (k, v) in map {
-        let name = match untagged(k) {
-            serde_yaml::Value::String(s) => s.clone(),
-            other => serde_yaml::to_string(other)
-                .unwrap_or_default()
-                .trim()
-                .to_string(),
-        };
-        if let serde_yaml::Value::Tagged(t) = k {
-            out.push(format!("key `{name}` has the tag `{}`", t.tag));
-        }
-        if let serde_yaml::Value::Tagged(t) = v {
-            out.push(format!("the value of `{name}` has the tag `{}`", t.tag));
-        }
-    }
+    let out = tag_problems(doc);
     if out.is_empty() {
         return Ok(());
     }
@@ -1384,6 +1383,58 @@ pub fn refuse_tags(doc: &serde_yaml::Value, file: &Path) -> Result<()> {
         file.display(),
         out.join("\n  - ")
     )
+}
+
+/// Every YAML tag in `doc`, as a line naming where it is. R23-19: at every depth — the typed
+/// parse drops a nested tag silently (`roles: { planner: { profile: !x evil } }` is `evil`),
+/// and a later lookup by name on the untyped document would miss the tagged key (review C1).
+pub fn tag_problems(doc: &serde_yaml::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let serde_yaml::Value::Tagged(t) = doc {
+        out.push(format!("the document has the tag `{}`", t.tag));
+    }
+    tags_in(untagged(doc), "", &mut out);
+    out
+}
+
+fn tags_in(v: &serde_yaml::Value, at: &str, out: &mut Vec<String>) {
+    let join = |name: &str| {
+        if at.is_empty() {
+            name.to_string()
+        } else {
+            format!("{at}.{name}")
+        }
+    };
+    match v {
+        serde_yaml::Value::Mapping(map) => {
+            for (k, v) in map {
+                let name = join(&match untagged(k) {
+                    serde_yaml::Value::String(s) => s.clone(),
+                    other => serde_yaml::to_string(other)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string(),
+                });
+                if let serde_yaml::Value::Tagged(t) = k {
+                    out.push(format!("key `{name}` has the tag `{}`", t.tag));
+                }
+                if let serde_yaml::Value::Tagged(t) = v {
+                    out.push(format!("the value of `{name}` has the tag `{}`", t.tag));
+                }
+                tags_in(untagged(v), &name, out);
+            }
+        }
+        serde_yaml::Value::Sequence(items) => {
+            for (i, item) in items.iter().enumerate() {
+                let name = join(&format!("[{i}]"));
+                if let serde_yaml::Value::Tagged(t) = item {
+                    out.push(format!("the value of `{name}` has the tag `{}`", t.tag));
+                }
+                tags_in(untagged(item), &name, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The machine-only part of a repository `toryo.yaml` text; `None` when it has none (R60).
@@ -1765,6 +1816,26 @@ policy:
                 .keys,
             ["toolchains"]
         );
+    }
+
+    /// R23-19 (review 2026-10-23): a tag below the top level is refused too, with where it is.
+    /// Was: only the top level was looked at; the typed parse dropped a nested tag silently.
+    #[test]
+    fn a_nested_tag_is_refused() {
+        let doc: serde_yaml::Value = serde_yaml::from_str(
+            "version: 1\nroles:\n  planner: { profile: !x evil, skills: [ !y s1, s2 ] }\n",
+        )
+        .unwrap();
+        let e = format!("{:#}", refuse_tags(&doc, Path::new("t.yaml")).unwrap_err());
+        assert!(
+            e.contains("the value of `roles.planner.profile` has the tag `!x`")
+                && e.contains("the value of `roles.planner.skills.[0]` has the tag `!y`"),
+            "{e}"
+        );
+        let plain: serde_yaml::Value =
+            serde_yaml::from_str("version: 1\nroles:\n  planner: { profile: p, skills: [s1] }\n")
+                .unwrap();
+        refuse_tags(&plain, Path::new("t.yaml")).unwrap();
     }
 
     /// Review C1 (group A review): a tag on the whole document is refused too.

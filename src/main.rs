@@ -324,6 +324,12 @@ fn drive_with(cli: &Cli, d: &DriveArgs) -> DriveArgs {
 }
 
 fn run(cli: Cli) -> Result<i32> {
+    // R23-19: a machine config named on the command line must be there. The default one may be
+    // missing (no profiles, no environment gates); a mistyped `--machine-config` used to be the
+    // same silence, and the gates, skills and toasts of the real one quietly went away
+    if let Some(p) = cli.machine_config.as_deref().filter(|p| !p.exists()) {
+        bail!("--machine-config {}: no such file", p.display());
+    }
     match &cli.cmd {
         Cmd::Doctor {
             json,

@@ -475,3 +475,76 @@ fn r23_18_many_stores_open_a_fresh_database_at_once() {
         }
     }
 }
+
+/// R23-19: the machine config gets the rules of a repository file, and a machine config named
+/// on the command line must exist. Was: a duplicated key in the machine config kept the last
+/// value silently and a YAML tag in it passed; a mistyped `--machine-config` was "no machine
+/// config", and its profiles, gates and skills quietly went away.
+#[test]
+fn r23_19_the_machine_config_is_read_as_strictly_as_the_repository_file() {
+    let env = setup("codex-openai");
+    let m = std::fs::read_to_string(&env.machine).unwrap();
+    // a duplicated profile (the fixture's machine config is `--machine-config` of every call)
+    std::fs::write(
+        &env.machine,
+        format!("{m}profiles:\n  other: {{ kind: codex, billing: subscription, exe: x }}\n"),
+    )
+    .unwrap();
+    let (code, err) = toryo(&env, &["config", "show"], &[]);
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains("duplicate entry with key \"profiles\""),
+        "{err}"
+    );
+    // a tag, also below the top level
+    std::fs::write(
+        &env.machine,
+        m.replace("exe: codex-not-installed", "exe: !x codex-not-installed"),
+    )
+    .unwrap();
+    let (code, err) = toryo(&env, &["config", "show"], &[]);
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains("YAML tags are not allowed in the machine config")
+            && err.contains("profiles.codex-openai.exe"),
+        "{err}"
+    );
+    // a machine config named on the command line that is not there
+    std::fs::remove_file(&env.machine).unwrap();
+    let (code, err) = toryo(&env, &["config", "show"], &[]);
+    assert_ne!(code, 0, "{err}");
+    assert!(err.contains("no such file"), "{err}");
+}
+
+/// R23-19: a skill of the same name in the repository and in the machine's `skills_dir` — the
+/// repository's is delivered (D3); `doctor` now says so.
+#[test]
+fn r23_19_doctor_names_a_repository_skill_that_hides_a_machine_one() {
+    let env = setup_orgchart(
+        "codex-openai",
+        "",
+        &[(
+            ".toryo/skills/xpp-batch/SKILL.md",
+            "---\ndescription: d\n---\nREPO\n",
+        )],
+    );
+    let shared = env.root.join("machine-skills");
+    std::fs::create_dir_all(shared.join("xpp-batch")).unwrap();
+    std::fs::write(shared.join("xpp-batch/SKILL.md"), "MACHINE\n").unwrap();
+    std::fs::create_dir_all(shared.join("only-here")).unwrap();
+    std::fs::write(shared.join("only-here/SKILL.md"), "MACHINE\n").unwrap();
+    let m = std::fs::read_to_string(&env.machine).unwrap();
+    let fwd = shared.display().to_string().replace('\\', "/");
+    std::fs::write(&env.machine, format!("{m}skills_dir: '{fwd}'\n")).unwrap();
+    let o = command(&env, &["doctor"], &[]).output().unwrap();
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
+        out.contains("skill `xpp-batch` is in the repository")
+            && !out.contains("skill `only-here`"),
+        "{out}"
+    );
+}

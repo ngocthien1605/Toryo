@@ -269,12 +269,41 @@ pub fn skills_dir_checks(cfg: &Effective) -> Vec<Check> {
             ),
         )
     };
-    vec![Check {
+    let mut out = vec![Check {
         level,
         area: "skills_dir".into(),
         message,
         source: None,
-    }]
+    }];
+    // R23-19: a skill of the same name in the repository wins over the machine's (D3) — say so,
+    // or a commit that adds `.toryo/skills/<name>/` silently replaces the owner's text
+    let repo = crate::team::org_chart_root(&cfg.repo.project.root);
+    if let (Some(repo), Ok(entries)) = (repo, std::fs::read_dir(&dir)) {
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.path().join("SKILL.md").is_file())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        for name in names {
+            let candidates = crate::team::skill_candidates(&name, &repo, Some(&dir));
+            let Some((_, in_repo)) = candidates.first() else {
+                continue;
+            };
+            if in_repo.is_file() {
+                out.push(Check {
+                    level: Level::Warn,
+                    area: "skills_dir".into(),
+                    message: format!(
+                        "skill `{name}` is in the repository ({}) and in skills_dir — the repository's is the one delivered",
+                        in_repo.display()
+                    ),
+                    source: None,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Minimum Claude Code versions for flags the plan relies on (§14).
