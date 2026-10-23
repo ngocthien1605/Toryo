@@ -5347,8 +5347,20 @@ fn env_lock_poll_ms() -> u64 {
 }
 
 /// The error class of a prefixed reason: `artifact_tampered: …` → `artifact_tampered`.
+/// The class of an engine-made reason: its word before the first `:` (`artifact_tampered: …`).
+/// R23-12: only a snake_case word is a class; any other text (no colon, a sentence, nothing
+/// before the colon) is `default`, never a sentence-long class.
 fn reason_class(reason: &str, default: &str) -> String {
-    reason.split(':').next().unwrap_or(default).to_string()
+    reason
+        .split_once(':')
+        .map(|(c, _)| c)
+        .filter(|c| {
+            !c.is_empty()
+                && c.chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+        })
+        .unwrap_or(default)
+        .to_string()
 }
 
 /// The non-blocking issues of a review, one line each (R53).
@@ -7043,9 +7055,12 @@ mod tests {
         let cases = [
             ("artifact_tampered: TASK.md of T-1 …", "artifact_tampered"),
             ("verify_mutated_tree: a: b", "verify_mutated_tree"),
-            ("no colon at all", "no colon at all"),
-            (": leading", ""),
-            ("", ""),
+            // R23-12: was the whole sentence, an empty class and an empty class: a class is a
+            // snake_case word, else the default
+            ("no colon at all", "default"),
+            (": leading", "default"),
+            ("", "default"),
+            ("Two words: x", "default"),
         ];
         for (reason, want) in cases {
             assert_eq!(reason_class(reason, "default"), want, "{reason:?}");
