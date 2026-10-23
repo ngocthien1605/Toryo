@@ -583,10 +583,6 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn capture_env(&self) -> BTreeMap<String, String> {
-        BTreeMap::new()
-    }
-
     // ── Planning ─────────────────────────────────────────────────────────────────────
 
     fn plan(&mut self, t: &TaskRow) -> Result<Flow> {
@@ -2915,7 +2911,9 @@ impl<'a> Engine<'a> {
                 prompt: ask.prompt.to_string(),
                 label: ask.label,
                 echo: true,
-                env: self.capture_env(),
+                // (no TEMP/TMP of its own: R46 redirects the implementer's; R23-23 removed an empty
+                // `capture_env` that suggested otherwise)
+                env: BTreeMap::new(),
             },
             self.limits(),
             hooks,

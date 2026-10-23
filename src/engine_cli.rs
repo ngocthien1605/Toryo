@@ -1,5 +1,6 @@
 //! The engine commands (plan §15): `task`, `run`, `approve`, `reject`, `resume`, `stop`,
-//! `status`, `partial export`. Every command that mutates a task takes its lock first
+//! `status`, `watch`, `dashboard`, `usage`, `context`, `budget`, `task config`, `partial
+//! export`. Every command that mutates a task takes its lock first
 //! (R38) and exits with code 3 (`task_active`) if another process holds it.
 
 use std::path::PathBuf;

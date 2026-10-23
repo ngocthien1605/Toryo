@@ -332,7 +332,7 @@ pub fn env_wait(tx: &Transaction, task: &str) -> Result<Option<String>> {
         .optional()?)
 }
 
-/// Reservation held for a turn with no telemetry (R41), until M7 derives it per stage.
+/// Reservation held for a turn with no telemetry (R41) when no exact turn of the stage is known.
 pub const DEFAULT_UNKNOWN_RESERVATION: i64 = 200_000;
 
 pub fn now() -> String {
@@ -429,7 +429,7 @@ impl Store {
                     path.display()
                 ),
             }
-            // additive migrations within schema version 1
+            // additive migrations of the `tasks` table (columns added within schema version 1)
             let cols: Vec<String> = {
                 let mut st = tx.prepare("PRAGMA table_info(tasks)")?;
                 let rows = st.query_map([], |r| r.get::<_, String>(1))?;
@@ -801,9 +801,6 @@ fn gate_name(k: GateKind) -> &'static str {
     }
 }
 
-/// Apply `e` to the task's machine and persist it — state, projections, the event and the
-/// approvals rows (R44a) — in the caller's transaction. On a refused transition nothing is
-/// written.
 /// M11-R11: record the escalation class on the task's machine (the engine, right after it
 /// escalated with that class). No-op unless the task is `Escalated`.
 pub fn set_reason_class(tx: &Transaction, task_id: &str, class: &str) -> Result<()> {
@@ -864,6 +861,9 @@ pub fn transition_recorded(
     Ok(get_task(tx, task_id)?.machine)
 }
 
+/// Apply `e` to the task's machine and persist it — state, projections, the event and the
+/// approvals rows (R44a) — in the caller's transaction. On a refused transition nothing is
+/// written.
 pub fn transition(tx: &Transaction, task_id: &str, e: PipelineEvent) -> Result<Machine> {
     let t = get_task(tx, task_id)?;
     let before = t.machine.clone();
@@ -1232,7 +1232,7 @@ pub fn set_attempt_session(tx: &Transaction, id: &str, session: &str) -> Result<
     Ok(())
 }
 
-// ── usage (R41, minimal until M7) ────────────────────────────────────────────────────
+// ── usage (R41) ─────────────────────────────────────────────────────────────────────
 
 pub fn has_usage(tx: &Transaction, attempt: &str) -> Result<bool> {
     Ok(tx.query_row(

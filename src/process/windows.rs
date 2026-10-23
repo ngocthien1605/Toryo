@@ -528,7 +528,7 @@ fn env_block(env: &std::collections::BTreeMap<String, String>) -> Vec<u16> {
 }
 
 /// R36: verify commands at Low integrity, still suspended-create → Job → resume.
-/// Note (spike): inheritable handles are process-wide; M6 should switch to
+/// Note (spike): inheritable handles are process-wide; review M5 (STATUS O-34) is to switch to
 /// PROC_THREAD_ATTRIBUTE_HANDLE_LIST so concurrent spawns cannot leak handles.
 fn spawn_low_integrity(spec: &SpawnSpec) -> Result<Spawned> {
     let job = Job::new()?;

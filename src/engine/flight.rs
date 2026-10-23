@@ -5,7 +5,7 @@
 //! to its sinks:
 //! - the **flight recorder** ([`FileSink`]): one JSON object per line in
 //!   `<data_dir>\runs\<id>\events.jsonl`, next to `runstore\` and `captures\`;
-//! - the stderr renderer and the notifier (added by later M10 tasks).
+//! - the stderr renderer and the notifier.
 //!
 //! Free text (reasons) goes through the same redaction as captures (R26/R42) before any sink
 //! sees it. A sink error never fails the run: it is reported once on stderr.

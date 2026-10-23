@@ -1,7 +1,7 @@
-//! Agent launch lines and stream parsers used by the M0 spike (plan §6).
+//! Agent launch lines and stream parsers (plan §6).
 //!
-//! These are the pieces M1's `ClaudeOneShotAdapter` / `CodexExecAdapter` will
-//! wrap; in M0 they are driven by `toryo spike …` so the real CLIs can be
+//! The CLI adapter (`cli.rs`) runs them for the engine; `toryo spike …` (the M0 kit) still
+//! drives them directly, so the real CLIs can be
 //! exercised and their output captured as fixtures.
 
 pub mod adapter;
