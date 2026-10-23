@@ -940,6 +940,14 @@ pub fn approve(
         if !toryo::engine::runner::verify_current(&st, &t)? {
             bail!("{id}: no passing VERIFY_RESULT.json for the current checkpoint (e.g. the verify configuration was reloaded) — `toryo resume {id} --note \"…\"` to verify again");
         }
+        // R23-03: the gate this opens would refuse its approval — say so now
+        if let Some(reason) = toryo::engine::runner::force_final_mismatch(&t)? {
+            bail!(
+                "{reason} — the final gate was not opened: put the branch back at the checkpoint first (`git -C \"{}\" reset --hard {}`)",
+                t.worktree.display(),
+                t.machine.checkpoint().map(short).unwrap_or("<checkpoint>")
+            );
+        }
         let i = id.to_string();
         st.call(move |tx| store::transition(tx, &i, PipelineEvent::ForceFinal).map(|_| ()))?;
         toryo::engine::decisions::append(

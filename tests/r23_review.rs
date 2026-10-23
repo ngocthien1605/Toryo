@@ -115,3 +115,76 @@ fn r23_01_a_resume_of_every_task_never_confirms_a_deploy() {
         "{err}"
     );
 }
+
+/// A task at its final gate: planned, approved, implemented, verified, reviewed.
+fn at_final_gate(env: &Env, id: &str) {
+    create(env, id);
+    let s = script(
+        env,
+        &format!("{id}.json"),
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (_, err) = toryo(env, &["run", id, "--fake-agents", &s], &[]);
+    assert_eq!(task(env, id).state, St::WaitingPlanApproval, "{err}");
+    let (_, err) = toryo(
+        env,
+        &[
+            "approve",
+            id,
+            "--gate",
+            "plan",
+            "--continue",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(task(env, id).state, St::WaitingFinalApproval, "{err}");
+}
+
+/// R23-03 (C2): the branch moved while the final gate was open. Was: the escalation kept no
+/// class, `status` offered `approve --gate final --force`, which opened the same gate again,
+/// and the next approval was refused again — a loop, a DECISIONS.md line per lap. Now the class
+/// `approval_mismatch` is stored, `next:` says to put the branch back, and `--force` refuses
+/// while the branch is not at the checkpoint.
+#[test]
+fn r23_03_a_moved_branch_at_the_final_gate_is_no_loop() {
+    let env = setup("codex-openai");
+    at_final_gate(&env, "M-1");
+    let t = task(&env, "M-1");
+    let checkpoint = t.machine.checkpoint().unwrap().to_string();
+    git(
+        &t.worktree,
+        &["commit", "-q", "--allow-empty", "-m", "after the gate"],
+    );
+    let (code, err) = toryo(&env, &["approve", "M-1", "--gate", "final"], &[]);
+    assert_ne!(code, 0, "{err}");
+    assert!(err.contains("approval_mismatch"), "{err}");
+    let t = task(&env, "M-1");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(t.machine.reason_class(), Some("approval_mismatch"), "{err}");
+    let next = toryo::engine::runner::next_action(&t);
+    assert!(
+        next.contains("reset --hard") && next.contains(toryo::git::short(&checkpoint)),
+        "{next}"
+    );
+    // `--force` does not open a gate whose approval would be refused
+    let (code, err) = toryo(&env, &["approve", "M-1", "--gate", "final", "--force"], &[]);
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains("approval_mismatch") && err.contains("the final gate was not opened"),
+        "{err}"
+    );
+    assert_eq!(task(&env, "M-1").state, St::Escalated, "{err}");
+    // the way out that `next:` names
+    git(&t.worktree, &["reset", "-q", "--hard", &checkpoint]);
+    let (code, err) = toryo(&env, &["approve", "M-1", "--gate", "final", "--force"], &[]);
+    assert_eq!(code, 0, "{err}");
+    let (code, err) = toryo(&env, &["approve", "M-1", "--gate", "final"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "M-1").state, St::Completed, "{err}");
+}

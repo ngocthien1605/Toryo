@@ -5694,6 +5694,19 @@ pub fn reject_now(
     Ok(())
 }
 
+/// The class of the escalation that withdraws the final gate (§11, R32).
+pub const APPROVAL_MISMATCH: &str = "approval_mismatch";
+
+/// R23-03: before `approve --gate final --force` opens the final gate — the task branch must
+/// point at the checkpoint, as for an approval; otherwise the reason (and nothing is opened).
+pub fn force_final_mismatch(t: &TaskRow) -> Result<Option<String>> {
+    let Some(checkpoint) = t.machine.checkpoint() else {
+        return Ok(None);
+    };
+    let g = task_git(&frozen_config(t)?, &t.repo)?;
+    approval_mismatch(&g, t, checkpoint)
+}
+
 /// §11 `approval_mismatch` (R32, EC-11) of the final gate: the task branch must still point
 /// at the approved checkpoint — what the human merges is what was verified and reviewed.
 /// Returns the escalation reason.
@@ -5756,9 +5769,11 @@ fn uncommitted_note(changed: &[String], checkpoint: &str) -> Option<String> {
 /// Withdraw the open final gate with `e` (`Escalate`, `Reverify`): the approval is refused.
 fn withdraw_final(store: &Store, rec: &Recorder, t: &TaskRow, e: Ev) -> Result<()> {
     let (i, name) = (t.id.clone(), e.name());
-    // the only escalation that withdraws the final gate is §11 `approval_mismatch` (R32)
-    let class = matches!(e, Ev::Escalate { .. }).then_some("approval_mismatch");
-    let m = store.call(move |tx| store::transition(tx, &i, e))?;
+    // the only escalation that withdraws the final gate is §11 `approval_mismatch` (R32) — stored
+    // on the machine (R23-03), so `next_action` names the way out instead of `--force`, which
+    // would open the same gate again
+    let class = matches!(e, Ev::Escalate { .. }).then_some(APPROVAL_MISMATCH);
+    let m = store.call(move |tx| store::transition_classed(tx, &i, e, class))?;
     // the refusal is the command's error: the escalation reason is not printed twice
     rec.transition_classed(t.state, name, &m, true, false, class);
     Ok(())
@@ -5809,6 +5824,14 @@ pub fn next_action(t: &TaskRow) -> String {
                     "{why}\n  → look at the diff (`git -C \"{}\" show --stat {}`); yes: `toryo resume {id}`; no: `toryo resume {id} --note \"…\"` (one fix cycle) or `toryo task cleanup {id}`",
                     t.worktree.display(),
                     t.machine.checkpoint().map(short).unwrap_or("HEAD")
+                )
+            } else if t.machine.reason_class() == Some(APPROVAL_MISMATCH) {
+                // R23-03: `--force` would open the same gate, and the next approval would be
+                // refused again — the branch has to be at the checkpoint first
+                format!(
+                    "{why}\n  → put the branch back at the checkpoint (`git -C \"{}\" reset --hard {}` — what came after it was never verified), then `toryo approve {id} --gate final --force`; or `toryo resume {id} --note \"…\"` (another fix cycle), or give up: `toryo task cleanup {id}`",
+                    t.worktree.display(),
+                    t.machine.checkpoint().map(short).unwrap_or("<checkpoint>")
                 )
             } else if t
                 .machine
