@@ -3,9 +3,10 @@
 //! The effective configuration of a task is the repo `toryo.yaml` merged with the
 //! machine config, serialised canonically (sorted keys) and hashed. Agent profiles come
 //! only from the machine config (R60): a repository file that defines `profiles:` or
-//! `toolchains:` does not load. From M3 on it
-//! is frozen per task (`config.json` artifact); in the M0 spike it is loaded per run
-//! and its hash is printed so results can be tied to a configuration.
+//! `toolchains:` does not load. It is frozen per task (`config.json` artifact, R35).
+//!
+//! R23-33: the types, the effective configuration, its checks, the machine/repository guard,
+//! the Codex override policy, paths and variables, and secrets are modules of their own.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -14,1484 +15,20 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ProfileKind {
-    Claude,
-    Codex,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Billing {
-    Subscription,
-    Foundry,
-    Api,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct Project {
-    pub root: String,
-    pub worktrees_root: String,
-    #[serde(default = "default_runs_root")]
-    pub runs_root: String,
-    /// M12-08 (X19): the branch `task create` starts from when the file sets it; unset: the
-    /// checked-out branch. Written as `main` into the frozen configuration when unset, as
-    /// before (the digest of an existing configuration stays; the engine never reads it there).
-    #[serde(default, serialize_with = "serialize_base_branch")]
-    pub base_branch: Option<String>,
-}
-
-fn serialize_base_branch<S: serde::Serializer>(
-    v: &Option<String>,
-    s: S,
-) -> std::result::Result<S::Ok, S::Error> {
-    s.serialize_str(v.as_deref().unwrap_or("main"))
-}
-
-fn default_runs_root() -> String {
-    "%LOCALAPPDATA%\\toryo\\runs".into()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct CodexProvider {
-    pub id: String,
-    pub name: String,
-    pub base_url: String,
-    pub env_key: String,
-    #[serde(default = "default_wire_api")]
-    pub wire_api: String,
-}
-fn default_wire_api() -> String {
-    "responses".into()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CodexSettings {
-    #[serde(default = "default_sandbox_mode")]
-    pub sandbox_mode: String,
-    /// R18: `unelevated` or `elevated`. Without it the Windows sandbox is off.
-    pub windows_sandbox: Option<String>,
-    pub provider: Option<CodexProvider>,
-    pub project_doc_max_bytes: Option<u64>,
-    pub model_reasoning_effort: Option<String>,
-    /// Extra `-c key=value` overrides (value is a TOML literal), e.g. imported from a
-    /// `[profiles.<name>]` of the user's ~/.codex/config.toml by `toryo spike init-config`.
-    /// Passed on every exec AND exec resume, like everything else (R19).
-    #[serde(default)]
-    pub overrides: BTreeMap<String, String>,
-}
-fn default_sandbox_mode() -> String {
-    "workspace-write".into()
-}
-
-/// The same defaults as a `codex:` block that sets nothing: a Codex profile without a
-/// `codex:` block runs with `sandbox_mode = workspace-write`, not an empty value.
-impl Default for CodexSettings {
-    fn default() -> Self {
-        Self {
-            sandbox_mode: default_sandbox_mode(),
-            windows_sandbox: None,
-            provider: None,
-            project_doc_max_bytes: None,
-            model_reasoning_effort: None,
-            overrides: BTreeMap::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Profile {
-    pub kind: ProfileKind,
-    pub billing: Billing,
-    pub exe: String,
-    #[serde(default)]
-    pub version: Option<String>,
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
-    /// value = `credman:<target>` (Windows Credential Manager) or `env:<VAR>` (spike convenience).
-    #[serde(default)]
-    pub secret_env: BTreeMap<String, String>,
-    #[serde(default)]
-    pub codex: Option<CodexSettings>,
-    /// Default model for this profile (roles may override).
-    #[serde(default)]
-    pub model: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Role {
-    pub profile: String,
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Profiles to switch to, in order, when this role's profile is out of quota
-    /// (implementer only in the prototype). Absent: the engine falls back to the planner's
-    /// profile (R49); `[]`: no fallback (EC-23).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct Pipeline {
-    #[serde(default)]
-    pub max_fix_cycles: Option<u32>,
-    #[serde(default)]
-    pub budget_tokens: Option<u64>,
-    #[serde(default)]
-    pub budget_usd_est: Option<f64>,
-    #[serde(default)]
-    pub budget_weights: Option<BTreeMap<String, f64>>,
-    #[serde(default)]
-    pub unknown_turn_reservation_tokens: Option<serde_yaml::Value>,
-    #[serde(default)]
-    pub budget_live_interrupt: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct Policy {
-    #[serde(default)]
-    pub deny_paths: Vec<String>,
-    #[serde(default)]
-    pub protected_paths: Vec<String>,
-    #[serde(default)]
-    pub neutralize_untrusted_filters: bool,
-    #[serde(default)]
-    pub allow_submodules: bool,
-    #[serde(default)]
-    pub allow_codex_project_config: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Verify {
-    #[serde(default = "default_checkout")]
-    pub checkout: String,
-    #[serde(default = "default_boundary")]
-    pub boundary: String,
-    #[serde(default = "default_verify_root")]
-    pub verify_root: String,
-    #[serde(default = "default_true")]
-    pub final_clean: bool,
-}
-impl Default for Verify {
-    fn default() -> Self {
-        Self {
-            checkout: default_checkout(),
-            boundary: default_boundary(),
-            verify_root: default_verify_root(),
-            final_clean: true,
-        }
-    }
-}
-fn default_checkout() -> String {
-    "clean".into()
-}
-fn default_boundary() -> String {
-    "low_integrity".into()
-}
-fn default_verify_root() -> String {
-    "%LOCALAPPDATA%\\toryo-verify".into()
-}
-fn default_true() -> bool {
-    true
-}
-
-/// A `commands.verify[]` item: a repository program (`program` + `args`) or, since R59, a
-/// built-in kind (`tool: xpp` + `metadata` + `projects`) whose command line toryo writes from
-/// the machine's toolchain. [`problems`] makes sure an item is exactly one of the two. The
-/// new keys are serialised only when set, so a configuration without them keeps its hash.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CommandSpec {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub program: Option<String>,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub timeout_min: Option<u64>,
-    /// M11: a gate's `timeout` (`30s`, `20m`, `1h`) in seconds; wins over `timeout_min`.
-    /// Serialised only when set, so a configuration without gates keeps its hash.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_sec: Option<u64>,
-    /// R59: a built-in verify kind; `xpp` is the only one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool: Option<String>,
-    /// `tool: xpp`: the X++ source folder, relative to the repository (→ `MetadataDirectory`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<String>,
-    /// `tool: xpp`: one X++ project per package, relative to the repository, in build order.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub projects: Vec<String>,
-    /// A `program` command: how to read its output. `msbuild` parses MSBuild diagnostic lines
-    /// (`file(line,col): error CODE: message`) so the fix feedback names file, line and code
-    /// (`dotnet build`, a script wrapping MSBuild); `none` (the default) sends only the tail.
-    /// Serialised only when set, so a configuration without it keeps its hash.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub diagnostics: Option<String>,
-}
-
-/// The built-in verify kinds (`commands.verify[].tool`, R59).
-pub const VERIFY_TOOLS: &[&str] = &["xpp"];
-
-/// The output readers of a `program` command (`commands.verify[].diagnostics`).
-pub const DIAGNOSTICS_FORMATS: &[&str] = &["msbuild", "none"];
-
-/// What a verify command runs, as [`CommandSpec::kind`] reads a validated item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandKind<'a> {
-    /// A program (a PATH name, or a path in or outside the repository) with its arguments.
-    Program {
-        program: &'a str,
-        args: &'a [String],
-    },
-    /// `tool: xpp` (R59): MSBuild on each project, with the machine's `toolchains.xpp`.
-    Xpp {
-        metadata: &'a str,
-        projects: &'a [String],
-    },
-}
-
-impl CommandSpec {
-    /// A `program` command.
-    pub fn program(name: &str, program: &str, args: &[&str], timeout_min: Option<u64>) -> Self {
-        Self {
-            name: name.into(),
-            program: Some(program.into()),
-            args: args.iter().map(|a| a.to_string()).collect(),
-            timeout_min,
-            timeout_sec: None,
-            tool: None,
-            metadata: None,
-            projects: Vec::new(),
-            diagnostics: None,
-        }
-    }
-
-    /// A `tool: xpp` command (R59).
-    pub fn xpp(name: &str, metadata: &str, projects: &[&str], timeout_min: Option<u64>) -> Self {
-        Self {
-            name: name.into(),
-            program: None,
-            args: Vec::new(),
-            timeout_min,
-            timeout_sec: None,
-            tool: Some("xpp".into()),
-            metadata: Some(metadata.into()),
-            projects: projects.iter().map(|p| p.to_string()).collect(),
-            diagnostics: None,
-        }
-    }
-
-    /// True when a `program` command's output is read as MSBuild diagnostics.
-    pub fn reads_msbuild(&self) -> bool {
-        self.diagnostics.as_deref() == Some("msbuild")
-    }
-
-    /// What this command runs. Load-time validation guarantees exactly one of `program` and
-    /// `tool`; a frozen configuration from before R59 only has `program`.
-    pub fn kind(&self) -> CommandKind<'_> {
-        match &self.tool {
-            Some(_) => CommandKind::Xpp {
-                metadata: self.metadata.as_deref().unwrap_or_default(),
-                projects: &self.projects,
-            },
-            None => CommandKind::Program {
-                program: self.program.as_deref().unwrap_or_default(),
-                args: &self.args,
-            },
-        }
-    }
-
-    /// True for a built-in `tool: xpp` command.
-    pub fn is_xpp(&self) -> bool {
-        matches!(self.kind(), CommandKind::Xpp { .. })
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct Commands {
-    #[serde(default)]
-    pub verify: Vec<CommandSpec>,
-}
-
-/// ProjectContextLoader settings (plan §7).
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct ContextCfg {
-    /// Size budget per role in KB (`planner`, `implementer`, `reviewer`); default 40.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub budget_kb: BTreeMap<String, u64>,
-}
-
-impl ContextCfg {
-    pub fn is_default(&self) -> bool {
-        self == &Self::default()
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct Timeouts {
-    #[serde(default)]
-    pub agent_stall_min: Option<u64>,
-    #[serde(default)]
-    pub agent_stage_max_min: Option<u64>,
-}
-
-/// The repository `toryo.yaml` as written (review C1): exactly the keys a repository may set.
-/// It has no `profiles` / `toolchains` fields, so a key that slips past the raw-text check of
-/// [`machine_only_part`] (a YAML tag, an alias) is still an unknown field, never a profile.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RepoFile {
-    version: u32,
-    project: Project,
-    #[serde(default)]
-    roles: BTreeMap<String, Role>,
-    #[serde(default)]
-    pipeline: Pipeline,
-    #[serde(default)]
-    policy: Policy,
-    #[serde(default)]
-    verify: Verify,
-    #[serde(default)]
-    commands: Commands,
-    #[serde(default)]
-    timeouts: Timeouts,
-    #[serde(default)]
-    context: ContextCfg,
-}
-
-impl From<RepoFile> for RepoConfig {
-    fn from(f: RepoFile) -> Self {
-        Self {
-            version: f.version,
-            project: f.project,
-            profiles: BTreeMap::new(),
-            roles: f.roles,
-            pipeline: f.pipeline,
-            policy: f.policy,
-            verify: f.verify,
-            commands: f.commands,
-            timeouts: f.timeouts,
-            context: f.context,
-        }
-    }
-}
-
-/// Repo-level `toryo.yaml`, and — once merged — the effective configuration of a task.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RepoConfig {
-    pub version: u32,
-    pub project: Project,
-    /// The merged view only: the repository file may not define profiles (R60, checked on
-    /// its raw text by [`Effective::load`]); they come from the machine config and are
-    /// frozen with the task, so `from_frozen` reads them here.
-    #[serde(default)]
-    pub profiles: BTreeMap<String, Profile>,
-    #[serde(default)]
-    pub roles: BTreeMap<String, Role>,
-    #[serde(default)]
-    pub pipeline: Pipeline,
-    #[serde(default)]
-    pub policy: Policy,
-    #[serde(default)]
-    pub verify: Verify,
-    #[serde(default)]
-    pub commands: Commands,
-    #[serde(default)]
-    pub timeouts: Timeouts,
-    #[serde(default, skip_serializing_if = "ContextCfg::is_default")]
-    pub context: ContextCfg,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct TrustedFilter {
-    pub process: Option<String>,
-    pub clean: Option<String>,
-    pub smudge: Option<String>,
-    #[serde(default)]
-    pub required: bool,
-    #[serde(default)]
-    pub exe_sha256: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct MachineGit {
-    #[serde(default)]
-    pub trusted_filters: BTreeMap<String, TrustedFilter>,
-}
-
-/// `toolchains.xpp` (R59): the X++ build toolchain of this machine — MSBuild and the five
-/// CI/CD NuGet packages, extracted.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct XppToolchain {
-    /// MSBuild.exe (`%VAR%` expanded); `doctor` proposes the path `vswhere` finds.
-    pub msbuild: String,
-    /// The folder holding the five CI/CD packages, one folder each (`<id>` or `<id>.<version>`).
-    pub nugets: String,
-    /// Folders of binary packages the models reference (e.g. ISV), in this order.
-    #[serde(default)]
-    pub extra_references: Vec<String>,
-    /// `xppbp.exe` after the compile; refused until V08-VERIFY 4 (M9 B-later).
-    #[serde(default)]
-    pub bp_check: bool,
-    /// The UDE's `PackagesLocalDirectory`, for `doctor`'s version check only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ude_metadata: Option<String>,
-}
-
-/// `toolchains:` of the machine config (R59/R60): machine facts that `tool:` verify commands
-/// use. Frozen with the task like the profiles.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct Toolchains {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub xpp: Option<XppToolchain>,
-}
-
-impl Toolchains {
-    pub fn is_empty(&self) -> bool {
-        self.xpp.is_none()
-    }
-
-    /// The names of the defined toolchains.
-    pub fn names(&self) -> Vec<&'static str> {
-        self.xpp.iter().map(|_| "xpp").collect()
-    }
-}
-
-/// Machine config, outside every repository (R35/R37).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct MachineConfig {
-    #[serde(default)]
-    pub roles: BTreeMap<String, Role>,
-    /// M11: the new spelling of `roles:` — this machine's seat overrides (same fields). Both
-    /// in one file is an error ([`MachineConfig::load`]).
-    #[serde(default)]
-    pub seats: BTreeMap<String, Role>,
-    /// M11-R8: the file spelled its seat overrides `seats:` (they are moved to `roles`) — for
-    /// the messages.
-    #[serde(skip)]
-    pub seats_spelling: bool,
-    /// M11-D1: this machine's shared skills folder (`<skills_dir>/<name>/SKILL.md`), looked up
-    /// after the repository's `.toryo/skills/`.
-    #[serde(default)]
-    pub skills_dir: Option<String>,
-    /// M11-E3: the commands of the org chart's `kind: environment` gates. They run with the
-    /// owner's normal rights, so they are defined only here, out of every agent's reach.
-    #[serde(default)]
-    pub environment_gates: BTreeMap<String, EnvGate>,
-    #[serde(default)]
-    pub profiles: BTreeMap<String, Profile>,
-    /// R59/R60: only here, never in the repository file.
-    #[serde(default)]
-    pub toolchains: Toolchains,
-    #[serde(default)]
-    pub git: MachineGit,
-    /// M10-D1: how the owner is told that a task needs them. A machine setting like the
-    /// profiles' origins: not frozen with a task and not hashed.
-    #[serde(default)]
-    pub notify: Notify,
-    /// Review H2 (M11-A2): the machine's floor for the verify boundary and its verify root.
-    #[serde(default)]
-    pub verify: MachineVerify,
-}
-
-/// `environment_gates.<name>.confirm` (M12-07, X17): does the gate ask the owner before it
-/// deploys? `never` (the default, as before), `first` (once per task) or `always` (once per
-/// checkpoint commit). The question is a machine stop before any gate runs; a plain `toryo
-/// resume` is the "yes".
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Confirm {
-    #[default]
-    Never,
-    First,
-    Always,
-}
-
-impl Confirm {
-    pub fn is_never(&self) -> bool {
-        *self == Confirm::Never
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Confirm::Never => "never",
-            Confirm::First => "first",
-            Confirm::Always => "always",
-        }
-    }
-}
-
-/// `environment_gates.<name>` in the machine config (M11-E3): the command an org chart's
-/// `kind: environment` gate runs, with the owner's normal token, in an empty working directory
-/// (M11-R2); it deploys from a fresh export of the checkpoint commit (M11-R9, X6).
-/// Frozen and hashed with each task that uses it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EnvGate {
-    /// An absolute path or a bare PATH name.
-    pub program: String,
-    /// Every path-like argument absolute and outside the repository, the worktrees and the
-    /// verify root.
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// The machine-wide lock: one environment gate per lock name runs at a time.
-    pub lock: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub env: BTreeMap<String, String>,
-    /// `credman:<target>` or `env:<VAR>` references, resolved when the gate runs.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub secret_env: BTreeMap<String, String>,
-    /// M12-07 (X17): ask the owner before it deploys. Left out of the frozen configuration when
-    /// `never`, so an existing configuration keeps its hash.
-    #[serde(default, skip_serializing_if = "Confirm::is_never")]
-    pub confirm: Confirm,
-}
-
-/// `verify:` in the machine config (review H2, M11-A2): the repository chooses the sandbox its
-/// own code runs in only above this floor. Frozen and hashed with a task only when set.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MachineVerify {
-    /// The lowest `verify.boundary` a repository may ask for: `low_integrity` (the default
-    /// when unset) or `none` (this machine trusts the repositories' verify code).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_boundary: Option<String>,
-    /// Replaces the repository's `verify.verify_root`: where the Low-labelled checkouts live
-    /// and what toryo empties and removes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verify_root: Option<String>,
-}
-
-impl MachineVerify {
-    pub fn is_empty(&self) -> bool {
-        self.min_boundary.is_none() && self.verify_root.is_none()
-    }
-}
-
-/// `notify:` in the machine config (M10-D1).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Notify {
-    /// A Windows toast at a gate, an escalation, a pause and the end of a run. Default off.
-    #[serde(default)]
-    pub toast: bool,
-}
-
-impl MachineConfig {
-    /// Read and parse a machine config file.
-    pub fn load(path: &Path) -> Result<Self> {
-        let text = crate::textfile::read_text(path)?;
-        // M11-B3: an unknown key gets the friendly form with a "did you mean" hint
-        let mut m: Self =
-            serde_yaml::from_str(&text).map_err(|e| {
-                match crate::team::friendly_serde(&e.to_string()) {
-                    Some(f) => anyhow::anyhow!("{}: {f}", path.display()),
-                    None => anyhow::Error::new(e).context(format!("parsing {}", path.display())),
-                }
-            })?;
-        // M11: `seats:` is the new spelling of `roles:` — one of the two
-        if !m.seats.is_empty() {
-            if !m.roles.is_empty() {
-                bail!(
-                    "{}: both `roles:` and `seats:` are set — `seats:` is the new spelling of `roles:` (same fields); keep one of them",
-                    path.display()
-                );
-            }
-            m.roles = std::mem::take(&mut m.seats);
-            m.seats_spelling = true;
-        }
-        Ok(m)
-    }
-}
-
-/// Where an entry of the effective configuration came from (R60, shown by `doctor`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Origin {
-    /// The repository `toryo.yaml`.
-    Repo,
-    /// The machine config.
-    Machine,
-    /// Set in the repository file and replaced by the machine config (roles).
-    RepoOverriddenByMachine,
-}
-
-impl Origin {
-    pub fn describe(self) -> &'static str {
-        match self {
-            Origin::Repo => "repo",
-            Origin::Machine => "machine",
-            Origin::RepoOverriddenByMachine => "repo, overridden by machine",
-        }
-    }
-}
-
-/// The [`Origin`] of each profile and role of an effective configuration. Not part of the
-/// canonical JSON (so not of the config hash); empty for a frozen configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Origins {
-    pub profiles: BTreeMap<String, Origin>,
-    pub roles: BTreeMap<String, Origin>,
-    pub toolchains: BTreeMap<String, Origin>,
-    /// M11-A2: `boundary`, `min_boundary` and `verify_root` (the machine's replaces the
-    /// repository's).
-    pub verify: BTreeMap<String, Origin>,
-    /// M11-B2: each gate of the org chart — `Repo` (a check gate, or an environment gate this
-    /// machine does not define), `Machine` (an environment gate whose command is the machine's).
-    pub gates: BTreeMap<String, Origin>,
-    /// M11-B2: the machine's `skills_dir`, in org chart mode.
-    pub skills_dir: Option<Origin>,
-    /// M11-R8: how the machine config spelled its role overrides (`seats` or `roles`).
-    pub machine_roles_key: Option<&'static str>,
-}
-
-/// M11-R14 (X9): an entry script of a gate (a verify command) that is build output — missing at
-/// the task's base commit and ignored by the repository's ignore rules, so in the clean verify
-/// checkout only a gate can create it. It may exist in the task worktree (the implementer builds
-/// there); it may never be committed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BuildEntry {
-    /// The gate (verify command) that runs it.
-    pub gate: String,
-    /// Repository-relative, `/`.
-    pub path: String,
-}
-
-/// Effective configuration = repo config with machine overrides applied.
-#[derive(Debug, Clone, Serialize)]
-pub struct Effective {
-    pub repo: RepoConfig,
-    pub trusted_filters: BTreeMap<String, TrustedFilter>,
-    /// R59: the machine's toolchains, frozen and hashed with the task; left out of the
-    /// canonical JSON when empty, so a configuration without them keeps its hash.
-    #[serde(skip_serializing_if = "Toolchains::is_empty")]
-    pub toolchains: Toolchains,
-    /// M11-A2: the machine's `verify:` floor and root, frozen and hashed with the task; left
-    /// out of the canonical JSON when unset, so a configuration without it keeps its hash.
-    #[serde(skip_serializing_if = "MachineVerify::is_empty")]
-    pub machine_verify: MachineVerify,
-    /// M11-B2: org chart mode — the parsed `.toryo/` (gates, limits, checks, role files,
-    /// skill roots), frozen and hashed with the task; `None` (left out) in `toryo.yaml`-only
-    /// mode, so an M10 configuration keeps its hash.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub team: Option<crate::team::Team>,
-    /// M11-R14 (X9): the entry scripts admitted as build output at `task create` (missing at
-    /// the base commit and ignored by the repository) — set at admission, frozen and hashed
-    /// with the task; left out of the canonical JSON when empty, so every other configuration
-    /// keeps its hash. Never read from a file.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub build_entries: Vec<BuildEntry>,
-    #[serde(skip)]
-    pub repo_path: PathBuf,
-    #[serde(skip)]
-    pub machine_path: Option<PathBuf>,
-    /// Where each profile and role came from (R60); not hashed.
-    #[serde(skip)]
-    pub origins: Origins,
-    /// M10-D1: the machine's `notify:`; not frozen, not hashed.
-    #[serde(skip)]
-    pub notify: Notify,
-    /// M11-B2: the files read, with their SHA-256 (`config show`); empty when frozen.
-    #[serde(skip)]
-    pub files: Vec<crate::team::FileRead>,
-}
-
-impl Effective {
-    pub fn load(repo_path: &Path, machine_path: Option<&Path>) -> Result<Self> {
-        let bytes =
-            std::fs::read(repo_path).with_context(|| format!("reading {}", repo_path.display()))?;
-        let text = crate::textfile::decode(repo_path, &bytes)?;
-        // R60 (ARCH-05): the repository file never defines an agent's program, environment
-        // or secrets — checked on the raw text, before anything is merged
-        if let Some(part) =
-            machine_only_part(&text).with_context(|| format!("parsing {}", repo_path.display()))?
-        {
-            bail!(
-                "{}",
-                part.refusal(repo_path, &machine_config_hint(machine_path))
-            );
-        }
-        // C1: a YAML tag hides a key from lookups by name — refused before the typed parse
-        let doc: serde_yaml::Value = serde_yaml::from_str(&text)
-            .with_context(|| format!("parsing {}", repo_path.display()))?;
-        refuse_tags(&doc, repo_path)?;
-        let file: RepoFile = serde_yaml::from_str(&text)
-            .with_context(|| format!("parsing {}", repo_path.display()))?;
-        let mut repo = RepoConfig::from(file);
-        if repo.version != 1 {
-            bail!("unsupported toryo.yaml version {}", repo.version);
-        }
-        let mut files = vec![crate::team::FileRead::of("toryo.yaml", repo_path, &bytes)];
-        let machine = match machine_path {
-            Some(mp) if mp.exists() => {
-                let b = std::fs::read(mp).with_context(|| format!("reading {}", mp.display()))?;
-                files.push(crate::team::FileRead::of("machine config", mp, &b));
-                Some((mp.to_path_buf(), MachineConfig::load(mp)?))
-            }
-            _ => None,
-        };
-        // M11-B2: org chart mode when `<project.root>/.toryo/toryo-orgchart.yaml` exists
-        let mut team = None;
-        let mut team_problems = Vec::new();
-        if let Some(root) = crate::team::org_chart_root(&repo.project.root) {
-            let loaded = crate::team::load(
-                &root,
-                repo_path,
-                &doc,
-                machine.as_ref().map(|(_, m)| m),
-                &machine_config_hint(machine_path),
-            )?;
-            repo.roles = loaded.roles;
-            repo.commands.verify = loaded.verify;
-            repo.pipeline.max_fix_cycles = loaded.team.limits.max_fix_cycles;
-            files.extend(loaded.files);
-            team_problems = loaded.problems;
-            team = Some(loaded.team);
-        }
-        let mut trusted_filters = BTreeMap::new();
-        let mut toolchains = Toolchains::default();
-        let mut used_machine = None;
-        let mut origins = Origins::default();
-        let mut notify = Notify::default();
-        let mut machine_verify = MachineVerify::default();
-        for k in repo.roles.keys() {
-            origins.roles.insert(k.clone(), Origin::Repo);
-        }
-        for k in ["boundary", "verify_root"] {
-            origins.verify.insert(k.into(), Origin::Repo);
-        }
-        if let Some((mp, machine)) = machine {
-            origins.machine_roles_key = Some(if machine.seats_spelling {
-                "seats"
-            } else {
-                "roles"
-            });
-            for (k, mut v) in machine.roles {
-                // org chart mode: a machine seat has the org chart's fields — an omitted
-                // fallback is none (D7), never the planner's profile (group B review)
-                if team.is_some() && v.fallback.is_none() {
-                    v.fallback = Some(Vec::new());
-                }
-                let o = if repo.roles.contains_key(&k) {
-                    Origin::RepoOverriddenByMachine
-                } else {
-                    Origin::Machine
-                };
-                origins.roles.insert(k.clone(), o);
-                repo.roles.insert(k, v);
-            }
-            for (k, v) in machine.profiles {
-                origins.profiles.insert(k.clone(), Origin::Machine);
-                repo.profiles.insert(k, v);
-            }
-            trusted_filters = machine.git.trusted_filters;
-            toolchains = machine.toolchains;
-            notify = machine.notify;
-            machine_verify = machine.verify;
-            if machine_verify.min_boundary.is_some() {
-                origins
-                    .verify
-                    .insert("min_boundary".into(), Origin::Machine);
-            }
-            if machine_verify.verify_root.is_some() {
-                origins
-                    .verify
-                    .insert("verify_root".into(), Origin::RepoOverriddenByMachine);
-            }
-            for name in toolchains.names() {
-                origins.toolchains.insert(name.into(), Origin::Machine);
-            }
-            if team.is_some() && machine.skills_dir.is_some() {
-                origins.skills_dir = Some(Origin::Machine);
-            }
-            used_machine = Some(mp);
-        }
-        if let Some(t) = &team {
-            for (name, g) in &t.gates {
-                let o = match g.decl.kind {
-                    crate::team::GateType::Check => Origin::Repo,
-                    // declared in the repository, its command from the machine config
-                    crate::team::GateType::Environment if g.machine.is_some() => Origin::Machine,
-                    crate::team::GateType::Environment => Origin::Repo,
-                };
-                origins.gates.insert(name.clone(), o);
-            }
-        }
-        // in org chart mode the validation pass reports unknown seat profiles with the others
-        for (name, role) in repo.roles.iter().filter(|_| team.is_none()) {
-            for p in std::iter::once(&role.profile).chain(role.fallback.iter().flatten()) {
-                if !repo.profiles.contains_key(p) {
-                    bail!(
-                        "role `{name}` refers to unknown profile `{p}` — define it under `profiles:` in the machine config ({}) (R60)",
-                        machine_config_hint(machine_path)
-                    );
-                }
-            }
-        }
-        let eff = Self {
-            repo,
-            trusted_filters,
-            toolchains,
-            machine_verify,
-            team,
-            build_entries: Vec::new(),
-            repo_path: repo_path.to_path_buf(),
-            machine_path: used_machine,
-            origins,
-            notify,
-            files,
-        };
-        eff.validate_with(team_problems)
-            .with_context(|| match &eff.machine_path {
-                Some(m) => format!("{} (with {})", repo_path.display(), m.display()),
-                None => repo_path.display().to_string(),
-            })?;
-        Ok(eff)
-    }
-
-    /// The semantic checks serde cannot express (DES-05, EC-23, ARCH-05), all problems at
-    /// once: unknown role keys, enum-like strings outside their documented set, and
-    /// `codex.overrides` that would re-set what toryo sets itself. A frozen configuration
-    /// ([`Effective::from_frozen`]) is not re-checked: it is what its task was created with.
-    pub fn validate(&self) -> Result<()> {
-        self.validate_with(Vec::new())
-    }
-
-    /// [`Self::validate`] with the problems the org chart loader found (M11-B2), first.
-    fn validate_with(&self, mut problems: Vec<String>) -> Result<()> {
-        let hint = machine_config_hint(self.machine_path.as_deref());
-        problems.extend(self::problems(
-            &self.repo,
-            &self.toolchains,
-            &hint,
-            self.team.is_some(),
-            &self.origins,
-        ));
-        if let Some(b) = &self.machine_verify.min_boundary {
-            let key = format!("verify.min_boundary (machine config {hint})");
-            one_of(&mut problems, &key, b, VERIFY_BOUNDARIES);
-        }
-        // M11-B3: the org chart's cross-references, kinds and order
-        if let Some(root) = crate::team::org_chart_root(&self.repo.project.root) {
-            problems.extend(crate::team::problems(self, &root, &hint));
-        }
-        if self.team.is_some() {
-            // M11-B2: a machine seat override cannot give the planner or reviewer a fallback
-            for seat in ["planner", "reviewer"] {
-                let fb = self.repo.roles.get(seat).and_then(|r| r.fallback.as_ref());
-                if fb.is_some_and(|f| !f.is_empty())
-                    && self.origins.roles.get(seat) != Some(&Origin::Repo)
-                {
-                    problems.push(format!(
-                        "seats.{seat}.fallback (machine config {hint}): a fallback on the {seat} is not supported yet — only the implementer may switch profiles (R49); remove it"
-                    ));
-                }
-            }
-        }
-        if problems.is_empty() {
-            return Ok(());
-        }
-        bail!("invalid configuration:\n  - {}", problems.join("\n  - "))
-    }
-
-    /// Rebuild the configuration frozen by `toryo task create` (R35): a task never re-reads
-    /// `toryo.yaml`; the frozen copy hashes to the same `config_sha256`. Org chart mode comes
-    /// back from the frozen `team` section, without reading `.toryo/` again (M11-B2).
-    pub fn from_frozen(canonical_json: &str, origin: &Path) -> Result<Self> {
-        #[derive(Deserialize)]
-        struct Frozen {
-            repo: RepoConfig,
-            #[serde(default)]
-            trusted_filters: BTreeMap<String, TrustedFilter>,
-            #[serde(default)]
-            toolchains: Toolchains,
-            #[serde(default)]
-            machine_verify: MachineVerify,
-            #[serde(default)]
-            team: Option<crate::team::Team>,
-            #[serde(default)]
-            build_entries: Vec<BuildEntry>,
-        }
-        let f: Frozen =
-            serde_json::from_str(canonical_json).context("parsing the frozen config.json")?;
-        Ok(Self {
-            repo: f.repo,
-            trusted_filters: f.trusted_filters,
-            toolchains: f.toolchains,
-            machine_verify: f.machine_verify,
-            team: f.team,
-            build_entries: f.build_entries,
-            repo_path: origin.to_path_buf(),
-            machine_path: None,
-            origins: Origins::default(),
-            notify: Notify::default(),
-            files: Vec::new(),
-        })
-    }
-
-    /// Canonical JSON (sorted keys, no whitespace) — what gets frozen and hashed.
-    pub fn canonical_json(&self) -> String {
-        let v = serde_json::to_value(self).expect("config serialises");
-        // serde_json::Map is a BTreeMap without the preserve_order feature: keys are sorted.
-        serde_json::to_string(&v).expect("json")
-    }
-
-    /// M12-08 (X20): the keys of the repository file that are accepted and that no engine code
-    /// reads — set to something other than their default. Each is announced by `config show`,
-    /// `doctor` and `task create` as "accepted but has no effect in this version". The test
-    /// `keys_without_effect_are_read_nowhere` fails when one of them starts being used.
-    pub fn keys_without_effect(&self) -> Vec<&'static str> {
-        let mut out = Vec::new();
-        if self.repo.project.runs_root != default_runs_root() {
-            out.push("project.runs_root");
-        }
-        if !self.repo.verify.final_clean {
-            out.push("verify.final_clean");
-        }
-        if self.repo.pipeline.budget_usd_est.is_some() {
-            out.push("pipeline.budget_usd_est");
-        }
-        out
-    }
-
-    /// The line for one key of [`Self::keys_without_effect`].
-    pub fn no_effect_line(key: &str) -> String {
-        format!("`{key}` is accepted but has no effect in this version")
-    }
-
-    pub fn sha256(&self) -> String {
-        hex::encode(Sha256::digest(self.canonical_json().as_bytes()))
-    }
-
-    pub fn profile(&self, name: &str) -> Result<&Profile> {
-        self.repo
-            .profiles
-            .get(name)
-            .with_context(|| format!("unknown profile `{name}`"))
-    }
-}
-
-/// `verify.boundary` values v0.1 implements (R36; `separate_user` is not in v0.1).
-pub const VERIFY_BOUNDARIES: &[&str] = &["low_integrity", "none"];
-/// `verify.checkout` (R29).
-pub const VERIFY_CHECKOUTS: &[&str] = &["clean", "tracked"];
-/// `codex.sandbox_mode`: the plan runs Codex in `workspace-write` (R18/R19); `read-only` is
-/// stricter and runs with a warning. Anything else (`danger-full-access`) turns off the
-/// sandbox that R18 requires.
-pub const CODEX_SANDBOX_MODES: &[&str] = &["workspace-write", "read-only"];
-/// `codex.windows_sandbox` (R18).
-pub const CODEX_WINDOWS_SANDBOXES: &[&str] = &["unelevated", "elevated"];
-/// `pipeline.budget_weights` keys: the four token buckets (R41).
-pub const BUDGET_WEIGHT_KEYS: &[&str] = &["uncached_input", "cache_read", "cache_write", "output"];
-
-/// The pipeline's roles: the keys of `roles` and `context.budget_kb`.
-fn role_names() -> [&'static str; 3] {
-    use crate::domain::Role as R;
-    [R::Planner, R::Implementer, R::Reviewer].map(R::as_str)
-}
-
-/// A problem for `key` unless `value` is one of `valid` (the message lists them).
-fn one_of(out: &mut Vec<String>, key: &str, value: &str, valid: &[&str]) {
-    if !valid.contains(&value) {
-        let valid = valid.join(", ");
-        out.push(format!(
-            "{key}: `{value}` is not a valid value (valid: {valid})"
-        ));
-    }
-}
-
-/// A problem for the key `section.name` unless `name` is one of `valid`.
-fn known_key(out: &mut Vec<String>, section: &str, name: &str, what: &str, valid: &[&str]) {
-    if !valid.contains(&name) {
-        // M11-B3: a "did you mean" hint when one valid key is close
-        let hint = crate::team::hint(name, valid);
-        out.push(format!(
-            "{section}.{name}: unknown {what} (valid: {}){hint}",
-            valid.join(", ")
-        ));
-    }
-}
-
-/// Every semantic problem of a (merged) configuration, as `key: what is wrong`. `machine` names
-/// the machine config for the messages that send the reader there.
-fn problems(
-    repo: &RepoConfig,
-    toolchains: &Toolchains,
-    machine: &str,
-    team: bool,
-    origins: &Origins,
-) -> Vec<String> {
-    let mut out = Vec::new();
-    let roles = role_names();
-    for name in repo.roles.keys() {
-        // M11-R8: a role (seat) only the machine config names: that file, as it spells the key
-        let section = match origins.roles.get(name) {
-            Some(Origin::Machine) => format!(
-                "{machine}: {}",
-                origins.machine_roles_key.unwrap_or("roles")
-            ),
-            _ => "roles".into(),
-        };
-        known_key(&mut out, &section, name, "role", &roles);
-    }
-    for name in repo.context.budget_kb.keys() {
-        known_key(&mut out, "context.budget_kb", name, "role", &roles);
-    }
-    for name in repo.pipeline.budget_weights.iter().flat_map(|w| w.keys()) {
-        let section = "pipeline.budget_weights";
-        known_key(&mut out, section, name, "bucket", BUDGET_WEIGHT_KEYS);
-    }
-    // plan §14 (R41): `auto` = the largest exact turn of the stage, else a token count
-    if let Some(v) = &repo.pipeline.unknown_turn_reservation_tokens {
-        if v.as_u64().is_none() && v.as_str() != Some("auto") {
-            let shown = serde_yaml::to_string(v).unwrap_or_default();
-            out.push(format!(
-                "pipeline.unknown_turn_reservation_tokens: `{}` is not a valid value (valid: auto, or a number of tokens)",
-                shown.trim()
-            ));
-        }
-    }
-    let v = &repo.verify;
-    one_of(&mut out, "verify.boundary", &v.boundary, VERIFY_BOUNDARIES);
-    one_of(&mut out, "verify.checkout", &v.checkout, VERIFY_CHECKOUTS);
-    for (name, p) in &repo.profiles {
-        let Some(c) = &p.codex else { continue };
-        let key = format!("profiles.{name}.codex.sandbox_mode");
-        one_of(&mut out, &key, &c.sandbox_mode, CODEX_SANDBOX_MODES);
-        if let Some(ws) = &c.windows_sandbox {
-            let key = format!("profiles.{name}.codex.windows_sandbox");
-            one_of(&mut out, &key, ws, CODEX_WINDOWS_SANDBOXES);
-        }
-        let provider = c.provider.as_ref().map(|p| p.id.as_str());
-        for k in c.overrides.keys() {
-            if let Some(why) = denied_override(k, provider) {
-                out.push(format!("profiles.{name}.codex.overrides.{k}: {why}"));
-            }
-        }
-    }
-    for (i, c) in repo.commands.verify.iter().enumerate() {
-        if team {
-            break; // M11-B3: the check gates, checked as `gates.<name>` by `team::problems`
-        }
-        let key = format!("commands.verify[{i}] ({})", c.name);
-        verify_command_problems(&mut out, &key, c, toolchains, machine);
-    }
-    if let Some(x) = &toolchains.xpp {
-        for (k, v) in [("msbuild", &x.msbuild), ("nugets", &x.nugets)] {
-            if v.trim().is_empty() {
-                out.push(format!(
-                    "toolchains.xpp.{k}: empty (machine config {machine})"
-                ));
-            }
-        }
-        if x.bp_check {
-            out.push(format!("toolchains.xpp.bp_check: `true` is not supported yet — xppbp.exe waits for V08-VERIFY 4; set it to false (machine config {machine})"));
-        }
-    }
-    out
-}
-
-/// The problems of one `commands.verify[]` item (R59): exactly one of `program` and `tool`;
-/// `tool` is `xpp`; `tool: xpp` has `metadata` and projects, as relative paths inside the
-/// repository, and needs `toolchains.xpp` in the machine config.
-pub(crate) fn verify_command_problems(
-    out: &mut Vec<String>,
-    key: &str,
-    c: &CommandSpec,
-    toolchains: &Toolchains,
-    machine: &str,
-) {
-    let key = key.to_string();
-    let Some(tool) = &c.tool else {
-        if c.program.is_none() {
-            out.push(format!("{key}: needs `program` (with `args`) or `tool`"));
-        }
-        for (k, set) in [
-            ("metadata", c.metadata.is_some()),
-            ("projects", !c.projects.is_empty()),
-        ] {
-            if set {
-                out.push(format!(
-                    "{key}.{k}: only for `tool: xpp`, not for a `program` command"
-                ));
-            }
-        }
-        if let Some(d) = &c.diagnostics {
-            one_of(out, &format!("{key}.diagnostics"), d, DIAGNOSTICS_FORMATS);
-        }
-        return;
-    };
-    if c.diagnostics.is_some() {
-        out.push(format!(
-            "{key}.diagnostics: only for a `program` command — `tool: xpp` always reads MSBuild diagnostics"
-        ));
-    }
-    if c.program.is_some() {
-        out.push(format!("{key}: has both `program` and `tool` — use one"));
-    }
-    if !c.args.is_empty() {
-        out.push(format!("{key}.args: only for a `program` command — `tool: xpp` takes `metadata` and `projects`"));
-    }
-    one_of(out, &format!("{key}.tool"), tool, VERIFY_TOOLS);
-    if tool != "xpp" {
-        return;
-    }
-    match &c.metadata {
-        None => out.push(format!("{key}.metadata: required for `tool: xpp` (the X++ source folder, relative to the repository)")),
-        Some(m) => {
-            if let Some(why) = not_a_repo_path(m) {
-                out.push(format!("{key}.metadata: `{m}` {why}"));
-            }
-        }
-    }
-    if c.projects.is_empty() {
-        out.push(format!("{key}.projects: `tool: xpp` needs at least one project (one X++ project per package, in build order)"));
-    }
-    for p in &c.projects {
-        if let Some(why) = not_a_repo_path(p) {
-            out.push(format!("{key}.projects: `{p}` {why}"));
-        }
-    }
-    if toolchains.xpp.is_none() {
-        out.push(format!("{key}.tool: `tool: xpp` needs `toolchains.xpp` in the machine config ({machine}): msbuild, nugets (R59)"));
-    }
-}
-
-/// Why `p` is not a relative path inside the repository, or None: empty, absolute, rooted,
-/// with a drive, or with a `..` segment.
-pub fn not_a_repo_path(p: &str) -> Option<&'static str> {
-    let t = p.trim();
-    if t.is_empty() {
-        return Some("is empty");
-    }
-    let rooted = t.starts_with(['/', '\\']) || t.chars().nth(1) == Some(':');
-    if rooted || Path::new(t).is_absolute() {
-        return Some("must be relative to the repository");
-    }
-    if t.split(['/', '\\']).any(|c| c == "..") {
-        return Some("may not contain `..`");
-    }
-    None
-}
-
-/// The fields of `codex.provider` that toryo passes as `model_providers.<id>.<field>`.
-const PROVIDER_FIELDS: &[&str] = &["name", "base_url", "env_key", "wire_api"];
-
-/// Why a `codex.overrides` key is refused (ARCH-05), or None. The overrides are passed after
-/// toryo's own `-c` settings and Codex applies the last one, so exactly these are refused:
-/// what toryo sets itself or what switches the sandbox, approval or environment policy —
-/// `sandbox_mode`, the legacy `sandbox_permissions`, `windows` / `windows.*`,
-/// `approval_policy` and `shell_environment_policy*` (with their sub-keys); and, only when
-/// the profile has a `codex.provider` block (`provider_id`), the selector `model_provider`
-/// and `model_providers.<id>.{name, base_url, env_key, wire_api}` or a table holding them.
-/// Everything else is allowed: `sandbox_workspace_write.*`, the provider's other keys
-/// (`query_params`, `request_max_retries` …), and `model_provider*` without a provider
-/// block, which is how `toryo spike init-config` selects a translated profile's provider.
-/// The key is taken as Codex reads it: up to the first `=`, without whitespace or quotes,
-/// and compared in lower case.
-pub fn denied_override(key: &str, provider_id: Option<&str>) -> Option<&'static str> {
-    let k: String = key
-        .split('=')
-        .next()
-        .unwrap_or_default()
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
-        .collect::<String>()
-        .to_ascii_lowercase();
-    if ["sandbox_mode", "sandbox_permissions", "windows"]
-        .iter()
-        .any(|p| is_or_under(&k, p))
-    {
-        Some("re-sets the sandbox that toryo sets (codex.sandbox_mode / codex.windows_sandbox, R18/R19)")
-    } else if is_or_under(&k, "approval_policy") {
-        Some("re-sets the approval policy of the unattended `codex exec` turn")
-    } else if k.starts_with("shell_environment_policy") {
-        Some("re-sets the environment of Codex's commands, which toryo builds (R23)")
-    } else if k == "profile" || is_or_under(&k, "profiles") {
-        Some("selects or defines a Codex profile, whose settings would re-set the sandbox and provider that toryo sets")
-    } else if provider_id.is_some_and(|id| resets_provider(&k, id)) {
-        Some("re-sets the provider of codex.provider (change it there)")
-    } else {
-        None
-    }
-}
-
-/// `key` is `prefix` or one of its sub-keys (`prefix.…`).
-fn is_or_under(key: &str, prefix: &str) -> bool {
-    key.strip_prefix(prefix)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
-}
-
-/// `key` (normalised) re-sets what toryo passes for the provider `id`: the selector, a
-/// field of [`PROVIDER_FIELDS`], or a table holding them.
-fn resets_provider(key: &str, id: &str) -> bool {
-    let table = format!("model_providers.{}", id.to_ascii_lowercase());
-    key == "model_providers"
-        || key == table
-        || is_or_under(key, "model_provider")
-        || PROVIDER_FIELDS
-            .iter()
-            .any(|f| is_or_under(key, &format!("{table}.{f}")))
-}
-
-/// R60 (ARCH-05): the top-level keys only the machine config may hold. They name the
-/// programs toryo starts, their environment and secrets, and the sandbox they run in — so
-/// repository content (a teammate's commit, merged agent work) must not choose them.
-pub const MACHINE_ONLY_KEYS: [&str; 2] = ["profiles", "toolchains"];
-
-/// The machine-only keys found in a repository `toryo.yaml` (R60).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MachineOnlyPart {
-    /// The keys found, in [`MACHINE_ONLY_KEYS`] order.
-    pub keys: Vec<String>,
-    /// Those keys and their values as YAML, ready to paste into the machine config.
-    pub yaml: String,
-}
-
-impl MachineOnlyPart {
-    /// The load error: what is wrong, where the block goes, and the block itself.
-    pub fn refusal(&self, repo_path: &Path, machine_config: &str) -> String {
-        let keys: Vec<String> = self.keys.iter().map(|k| format!("`{k}:`")).collect();
-        format!(
-            "{repo}: {keys} may not be defined in the repository config (R60: agent profiles and toolchains come only from the machine config, so repository content cannot choose the programs toryo starts, their secrets or their sandbox).\nMove this block to {machine_config} (merge it with what is there) and delete it from {repo}:\n\n{yaml}",
-            repo = repo_path.display(),
-            keys = keys.join(" and "),
-            yaml = self.yaml.trim_end(),
-        )
-    }
-}
-
-/// The text of a YAML value with any tags taken off (`!x profiles` → `profiles`), for a
-/// lookup by name that a tag cannot hide from (review C1).
-pub fn untagged(v: &serde_yaml::Value) -> &serde_yaml::Value {
-    match v {
-        serde_yaml::Value::Tagged(t) => untagged(&t.value),
-        other => other,
-    }
-}
-
-/// C1: every YAML tag on a top-level key or value of a repository file (`!x profiles:`,
-/// `roles: !x {…}`), refused in one error that names the file and each key. A tag makes a key
-/// invisible to a lookup by name while a typed parse still reads it, so repository files —
-/// `toryo.yaml`, the org chart, the role files — carry none.
-pub fn refuse_tags(doc: &serde_yaml::Value, file: &Path) -> Result<()> {
-    let Some(map) = untagged(doc).as_mapping() else {
-        return Ok(());
-    };
-    let mut out = Vec::new();
-    if let serde_yaml::Value::Tagged(t) = doc {
-        out.push(format!("the document has the tag `{}`", t.tag));
-    }
-    for (k, v) in map {
-        let name = match untagged(k) {
-            serde_yaml::Value::String(s) => s.clone(),
-            other => serde_yaml::to_string(other)
-                .unwrap_or_default()
-                .trim()
-                .to_string(),
-        };
-        if let serde_yaml::Value::Tagged(t) = k {
-            out.push(format!("key `{name}` has the tag `{}`", t.tag));
-        }
-        if let serde_yaml::Value::Tagged(t) = v {
-            out.push(format!("the value of `{name}` has the tag `{}`", t.tag));
-        }
-    }
-    if out.is_empty() {
-        return Ok(());
-    }
-    bail!(
-        "{}: YAML tags are not allowed in a repository file (review C1: a tag hides a key from Toryo's checks) — remove them:\n  - {}",
-        file.display(),
-        out.join("\n  - ")
-    )
-}
-
-/// The machine-only part of a repository `toryo.yaml` text; `None` when it has none (R60).
-/// Only the top level counts: a key of that name inside another block is not one. A tagged
-/// key (`!x profiles:`) counts like the plain one (review C1).
-pub fn machine_only_part(text: &str) -> Result<Option<MachineOnlyPart>> {
-    let doc: serde_yaml::Value = serde_yaml::from_str(text)?;
-    let Some(map) = untagged(&doc).as_mapping() else {
-        return Ok(None);
-    };
-    let mut part = serde_yaml::Mapping::new();
-    let mut keys = Vec::new();
-    for key in MACHINE_ONLY_KEYS {
-        let found = map
-            .iter()
-            .find(|(k, _)| untagged(k).as_str() == Some(key))
-            .map(|(_, v)| v);
-        if let Some(v) = found {
-            part.insert(key.into(), v.clone());
-            keys.push(key.to_string());
-        }
-    }
-    if keys.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(MachineOnlyPart {
-        keys,
-        yaml: serde_yaml::to_string(&serde_yaml::Value::Mapping(part))?,
-    }))
-}
-
-/// How to name the machine config in a message: the path in use, else the default one.
-pub fn machine_config_hint(machine_path: Option<&Path>) -> String {
-    machine_path
-        .map(Path::to_path_buf)
-        .or_else(default_machine_config_path)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "%USERPROFILE%\\.toryo\\toryo.local.yaml".into())
-}
-
-/// `%USERPROFILE%\.toryo\toryo.local.yaml` (or `~/.toryo/toryo.local.yaml`).
-pub fn default_machine_config_path() -> Option<PathBuf> {
-    home_dir().map(|h| h.join(".toryo").join("toryo.local.yaml"))
-}
-
-pub fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-}
-
-/// `%LOCALAPPDATA%\toryo` (or `$XDG_DATA_HOME/toryo`, `~/.local/share/toryo`).
-pub fn data_dir() -> PathBuf {
-    if let Some(p) = std::env::var_os("TORYO_DATA_DIR") {
-        return PathBuf::from(p);
-    }
-    if let Some(p) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(p).join("toryo");
-    }
-    if let Some(p) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(p).join("toryo");
-    }
-    home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local")
-        .join("share")
-        .join("toryo")
-}
-
-/// A `%NAME%` reference, the name in group 1: names may contain `(` `)`, as in
-/// `%ProgramFiles(x86)%` (EC-28). One pattern for what [`expand_vars`] expands and for what
-/// `doctor` warns about where nothing is expanded (M13-07).
-pub const VAR_PATTERN: &str = r"%([A-Za-z_][A-Za-z0-9_()]*)%";
-
-/// Expand `%VAR%` (Windows style) and `${VAR}` / `$VAR`-free paths. Unknown variables are an error.
-/// Names may contain `(` `)`, as in `%ProgramFiles(x86)%` (EC-28).
-/// M11-R12: the first `%NAME%` token in `s`, if any — used to catch a `%VAR%` that survived
-/// [`expand_vars`] because a variable's own value contained it (it is never expanded again).
-pub fn residual_var(s: &str) -> Option<String> {
-    regex::Regex::new(VAR_PATTERN)
-        .expect("regex")
-        .captures(s)
-        .map(|c| c[1].to_string())
-}
-
-pub fn expand_vars(s: &str) -> Result<String> {
-    let re = regex::Regex::new(VAR_PATTERN).expect("regex");
-    let mut err = None;
-    let out = re.replace_all(s, |c: &regex::Captures| match std::env::var(&c[1]) {
-        Ok(v) => v,
-        Err(_) => {
-            // Fall back for the two locations toryo uses when running on non-Windows hosts.
-            match &c[1] {
-                "LOCALAPPDATA" => data_dir()
-                    .parent()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default(),
-                "USERPROFILE" => home_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default(),
-                other => {
-                    err = Some(other.to_string());
-                    String::new()
-                }
-            }
-        }
-    });
-    if let Some(v) = err {
-        bail!("environment variable %{v}% is not set (in `{s}`)");
-    }
-    Ok(out.into_owned())
-}
-
-/// Resolve a `secret_env` reference. Never logs the value.
-pub fn resolve_secret(reference: &str) -> Result<String> {
-    if let Some(var) = reference.strip_prefix("env:") {
-        // (R16–R17 review) never through `VarError`: its `NotUnicode` form prints the value
-        return match std::env::var(var) {
-            Ok(v) => Ok(v),
-            Err(std::env::VarError::NotPresent) => bail!("secret env var `{var}` is not set"),
-            Err(std::env::VarError::NotUnicode(_)) => {
-                bail!("secret env var `{var}` is not valid Unicode")
-            }
-        };
-    }
-    if let Some(target) = reference.strip_prefix("credman:") {
-        return resolve_credman(target);
-    }
-    bail!("unsupported secret reference `{reference}` (use credman:<target> or env:<VAR>)")
-}
-
-#[cfg(windows)]
-fn resolve_credman(target: &str) -> Result<String> {
-    // `toryo/claude-max-oauth` → service "toryo", user "claude-max-oauth"
-    let (service, user) = target.split_once('/').unwrap_or(("toryo", target));
-    let entry = keyring::Entry::new(service, user).context("opening Credential Manager entry")?;
-    entry
-        .get_password()
-        .with_context(|| format!("reading Credential Manager entry `{target}`"))
-}
-
-#[cfg(not(windows))]
-fn resolve_credman(target: &str) -> Result<String> {
-    bail!("credman:{target} is only available on Windows; use env:<VAR> on this host")
-}
-
-#[cfg(windows)]
-pub fn store_secret(target: &str, value: &str) -> Result<()> {
-    let (service, user) = target.split_once('/').unwrap_or(("toryo", target));
-    keyring::Entry::new(service, user)?.set_password(value)?;
-    Ok(())
-}
-
-#[cfg(not(windows))]
-pub fn store_secret(_target: &str, _value: &str) -> Result<()> {
-    bail!("Credential Manager is only available on Windows")
-}
-
-/// Resolve all secrets of a profile: returns (env name → value).
-pub fn resolve_profile_secrets(p: &Profile) -> Result<BTreeMap<String, String>> {
-    let mut out = BTreeMap::new();
-    for (k, r) in &p.secret_env {
-        out.insert(
-            k.clone(),
-            resolve_secret(r).with_context(|| format!("secret_env.{k}"))?,
-        );
-    }
-    Ok(out)
-}
+mod types;
+pub use types::*;
+mod effective;
+pub use effective::*;
+mod validate;
+pub use validate::*;
+mod codex_policy;
+pub use codex_policy::*;
+mod guard;
+pub use guard::*;
+mod env;
+pub use env::*;
+mod secrets;
+pub use secrets::*;
 
 #[cfg(test)]
 mod tests {
@@ -1689,6 +226,26 @@ policy:
         );
     }
 
+    /// R23-19 (review 2026-10-23): a tag below the top level is refused too, with where it is.
+    /// Was: only the top level was looked at; the typed parse dropped a nested tag silently.
+    #[test]
+    fn a_nested_tag_is_refused() {
+        let doc: serde_yaml::Value = serde_yaml::from_str(
+            "version: 1\nroles:\n  planner: { profile: !x evil, skills: [ !y s1, s2 ] }\n",
+        )
+        .unwrap();
+        let e = format!("{:#}", refuse_tags(&doc, Path::new("t.yaml")).unwrap_err());
+        assert!(
+            e.contains("the value of `roles.planner.profile` has the tag `!x`")
+                && e.contains("the value of `roles.planner.skills.[0]` has the tag `!y`"),
+            "{e}"
+        );
+        let plain: serde_yaml::Value =
+            serde_yaml::from_str("version: 1\nroles:\n  planner: { profile: p, skills: [s1] }\n")
+                .unwrap();
+        refuse_tags(&plain, Path::new("t.yaml")).unwrap();
+    }
+
     /// Review C1 (group A review): a tag on the whole document is refused too.
     #[test]
     fn a_tagged_document_is_refused() {
@@ -1739,9 +296,45 @@ policy:
 
     #[test]
     fn secret_reference_forms() {
-        std::env::set_var("TORYO_TEST_SECRET_X", "v");
-        assert_eq!(resolve_secret("env:TORYO_TEST_SECRET_X").unwrap(), "v");
+        // (R23-04: the value was `v`, which is now too short to be a secret — see below)
+        std::env::set_var("TORYO_TEST_SECRET_X", "value-of-x");
+        assert_eq!(
+            resolve_secret("env:TORYO_TEST_SECRET_X").unwrap(),
+            "value-of-x"
+        );
         assert!(resolve_secret("plain").is_err());
+    }
+
+    /// R23-04 (review 2026-10-23 C3): a secret of a few bytes (`1`, a placeholder in Credential
+    /// Manager, a selector put under `secret_env` instead of `env`) was redacted wherever those
+    /// bytes stood — in every JSON line of the agent's stream, which then no longer parsed, and
+    /// the turn failed as `ProcessCrashed` with no word why. It is refused where it is resolved,
+    /// with its name and length, never its value. A value of line breaks only stays what M13-03
+    /// made it: no secret, not redacted, not refused.
+    #[test]
+    fn a_secret_too_short_to_redact_is_refused() {
+        for v in ["1", "abc", "1234567"] {
+            std::env::set_var("TORYO_TEST_SECRET_SHORT", v);
+            let e = format!(
+                "{:#}",
+                resolve_secret("env:TORYO_TEST_SECRET_SHORT").unwrap_err()
+            );
+            assert!(
+                e.contains(&format!("{} byte(s)", v.len())) && e.contains("at least 8"),
+                "{v}: {e}"
+            );
+            assert!(
+                !e.contains(&format!("`{v}`")),
+                "the value is never shown: {e}"
+            );
+        }
+        std::env::set_var("TORYO_TEST_SECRET_SHORT", "12345678");
+        assert_eq!(
+            resolve_secret("env:TORYO_TEST_SECRET_SHORT").unwrap(),
+            "12345678"
+        );
+        std::env::set_var("TORYO_TEST_SECRET_SHORT", "\n");
+        assert_eq!(resolve_secret("env:TORYO_TEST_SECRET_SHORT").unwrap(), "\n");
     }
 
     /// Load `yaml` in the R60 layout: its profiles in a machine config (see `write_split`).
@@ -1809,6 +402,66 @@ policy:
         );
         load_str(&ok).unwrap();
         load_str(&ok.replace("tokens: auto", "tokens: 150000")).unwrap();
+    }
+
+    /// R23-11: numbers that feed time and budget arithmetic are bounded at load. Was: a
+    /// `timeouts.agent_stage_max_min` of 2^64-1 wrapped `60 * min` and the turn's deadline
+    /// panicked (`Instant + Duration`) after the agent process had started; `context.budget_kb`
+    /// near 2^54 wrapped `kb * 1024` to a few bytes; a gate `timeout_min` the same.
+    #[test]
+    fn numbers_that_feed_arithmetic_are_bounded() {
+        let big = u64::MAX;
+        let e = load_err(&format!(
+            "{SAMPLE}timeouts: {{ agent_stall_min: {big}, agent_stage_max_min: 10081 }}\ncontext: {{ budget_kb: {{ implementer: 18014398509481985 }} }}\npipeline: {{ budget_tokens: {big} }}\n"
+        ));
+        for want in [
+            "timeouts.agent_stall_min: `18446744073709551615` is too large (at most 10080",
+            "timeouts.agent_stage_max_min: `10081` is too large",
+            "context.budget_kb.implementer: `18014398509481985` is too large (at most 1048576 KB)",
+            "pipeline.budget_tokens: `18446744073709551615` is too large",
+        ] {
+            assert!(e.contains(want), "{want:?} missing in:\n{e}");
+        }
+        load_str(&format!(
+            "{SAMPLE}timeouts: {{ agent_stall_min: 10080, agent_stage_max_min: 10080 }}\ncontext: {{ budget_kb: {{ implementer: 1048576 }} }}\npipeline: {{ budget_tokens: {MAX_BUDGET_TOKENS} }}\n"
+        ))
+        .unwrap();
+        // a gate's `timeout` (org chart) and `timeout_min`
+        assert!(crate::team::parse_duration("168h").is_ok());
+        let e = format!("{:#}", crate::team::parse_duration("169h").unwrap_err());
+        assert!(e.contains("longer than a week"), "{e}");
+    }
+
+    /// R23-02 (review 2026-10-23 C1): a budget weight JSON cannot carry (`.inf`, `.nan`) was
+    /// frozen as `null` at `task create`, and every later
+    /// command of the task failed to read the frozen configuration back. A negative weight would
+    /// give budget back for spent tokens. Both are refused at load; 0 stays a valid weight.
+    #[test]
+    fn budget_weights_json_cannot_carry_are_refused() {
+        for bad in [".inf", "-.inf", ".nan", "-1", "-0.5"] {
+            let e = load_err(&format!(
+                "{SAMPLE}pipeline: {{ budget_weights: {{ output: {bad} }} }}\n"
+            ));
+            assert!(
+                e.contains("pipeline.budget_weights.output:")
+                    && e.contains("is not a valid weight"),
+                "{bad}: {e}"
+            );
+        }
+        load_str(&format!(
+            "{SAMPLE}pipeline: {{ budget_weights: {{ cache_read: 0, output: 1.5 }} }}\n"
+        ))
+        .unwrap();
+        // and a configuration that does not read back is never frozen
+        let mut cfg = load_str(SAMPLE).unwrap();
+        assert!(cfg.frozen_json().is_ok());
+        cfg.repo.pipeline.budget_weights = Some(
+            [("output".to_string(), f64::INFINITY)]
+                .into_iter()
+                .collect(),
+        );
+        let e = format!("{:#}", cfg.frozen_json().unwrap_err());
+        assert!(e.contains("cannot be frozen"), "{e}");
     }
 
     #[test]
@@ -2432,7 +1085,9 @@ commands:
         );
         let mut seen = 0;
         for f in files {
-            if f.file_name().is_some_and(|n| n == "config.rs") {
+            // the list itself lives in config/effective.rs (R23-33: it was config.rs)
+            if f.file_name().is_some_and(|n| n == "config.rs") || f.ends_with("config/effective.rs")
+            {
                 continue;
             }
             seen += 1;

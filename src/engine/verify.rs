@@ -31,8 +31,8 @@ use crate::git::{GitCmd, Loc};
 use crate::process::env::build_env;
 use crate::process::Boundary;
 
-pub const UNAVAILABLE: &str = "verify_boundary_unavailable";
-pub const MUTATED: &str = "verify_mutated_tree";
+pub const UNAVAILABLE: &str = super::state::EscalationClass::VerifyBoundaryUnavailable.as_str();
+pub const MUTATED: &str = super::state::EscalationClass::VerifyMutatedTree.as_str();
 
 /// M11-R16 (X8): why the verify stage cannot start — the boundary is unavailable or the checkout
 /// is not the checkpoint. The escalation **class** travels with the error, typed; the engine

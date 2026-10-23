@@ -280,10 +280,10 @@ a protected file that changed → restore it, or `resume --accept-protected-chan
 
 | Path | What |
 |---|---|
-| `src/engine/` | the engine: state machine, SQLite store, task lock, recovery and snapshots, context loader, protected-state scan, artifacts, verify checkout and boundary, gates, `tool: xpp`, flight recorder, views, usage |
+| `src/engine/` | the engine: state machine, SQLite store (`store/`: one module per table), task lock (`lock/`), the stages (`runner/`: plan, implement, checkpoint, verify, environment gates, review, budget, gate decisions), the library half of the CLI (`commands.rs`), recovery and snapshots, context loader, protected-state scan, artifacts, verify checkout and boundary, gates, `tool: xpp`, flight recorder, views, usage |
 | `src/agents/` | Claude and Codex adapters (exact launch lines, stream parsers), the fake agent, the hub |
 | `src/process/` | Job Objects, Low-integrity spawning, environment allowlist, secret redaction, output decoding |
-| `src/config.rs`, `src/team.rs` | machine and repository config, the org chart, skills |
+| `src/config.rs` + `src/config/`, `src/team.rs` + `src/team/` | machine and repository config (types, the effective configuration, checks, the machine/repository guard, secrets), the org chart, environment gates, skills |
 | `src/doctor.rs`, `src/evidence.rs` | `doctor` and the version-bound canary evidence |
 | `src/spike/` | the M0 kit and the reference `spike pipeline` (cargo feature `m0-kit`, on by default) |
 | `templates/` | starter configs: `toryo.yaml.example`, `d365fo/`, `dogfood/`, `prices.toml.example` |

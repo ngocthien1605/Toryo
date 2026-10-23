@@ -324,6 +324,12 @@ fn drive_with(cli: &Cli, d: &DriveArgs) -> DriveArgs {
 }
 
 fn run(cli: Cli) -> Result<i32> {
+    // R23-19: a machine config named on the command line must be there. The default one may be
+    // missing (no profiles, no environment gates); a mistyped `--machine-config` used to be the
+    // same silence, and the gates, skills and toasts of the real one quietly went away
+    if let Some(p) = cli.machine_config.as_deref().filter(|p| !p.exists()) {
+        bail!("--machine-config {}: no such file", p.display());
+    }
     match &cli.cmd {
         Cmd::Doctor {
             json,
@@ -481,7 +487,13 @@ fn main() -> ExitCode {
         .stack_size(CLI_STACK)
         .spawn(cli_main)
     {
-        Ok(h) => h.join().unwrap_or_else(|_| ExitCode::from(101)),
+        Ok(h) => {
+            let code = h.join().unwrap_or_else(|_| ExitCode::from(101));
+            // R23-16: also after a panic, which skipped the call in `cli_main` (a second call
+            // finds nothing left)
+            toryo::notify::wait_pending();
+            code
+        }
         Err(e) => {
             toryo::errln!("error: cannot start the CLI thread: {e}");
             ExitCode::from(2)

@@ -105,6 +105,20 @@ pub fn new_machine(cfg: &Effective, cli_max: Option<u32>) -> Result<Machine> {
 /// be written by the implementer before verify runs it. At `task create` and at `task config
 /// --reload` (group E review).
 /// Returns the entry scripts admitted as build output (M11-R14, X9), to freeze with the task.
+/// R23-37 (review 2026-10-23 A5): what this machine refuses of a configuration, the same for
+/// `task create` and `task config --reload` — the verify sandbox below the machine's floor
+/// (review H2, M11-A2), and an environment gate this machine cannot start (M12-05), like one it
+/// does not define.
+pub fn machine_admission(cfg: &Effective) -> Result<()> {
+    if let Some(reason) = super::verify::below_floor(cfg) {
+        bail!("{reason}");
+    }
+    if let Some(reason) = super::gates::env_gates_refusal(cfg) {
+        bail!("{reason}");
+    }
+    Ok(())
+}
+
 pub fn check_entry_points(
     cfg: &Effective,
     g: &GitCmd,
@@ -327,19 +341,9 @@ impl Drop for Made<'_> {
             return;
         }
         let repo = Loc::Discover(self.repo.clone());
-        if self.row {
-            let id = self.id.clone();
-            match self
-                .store
-                .call(move |tx| store::remove_created_task(tx, &id))
-            {
-                Ok(()) => crate::errln!("removed: the database row of {}", self.id),
-                Err(e) => crate::errln!(
-                    "WARNING: could not remove the database row of {}: {e:#}",
-                    self.id
-                ),
-            }
-        }
+        // R23-06: the worktree before the row — a worktree that stays needs the row, so that
+        // `toryo task cleanup <id> --force` can still remove it
+        let mut worktree_left = false;
         if let Some(wt) = &self.worktree {
             let existed = wt.exists();
             let w = wt.display().to_string().replace('\\', "/");
@@ -356,11 +360,36 @@ impl Drop for Made<'_> {
             }
             match (existed, wt.exists()) {
                 (true, false) => crate::errln!("removed: the worktree {}", wt.display()),
-                (_, true) => crate::errln!(
-                    "WARNING: could not remove the worktree {} — delete it by hand",
-                    wt.display()
-                ),
+                (_, true) => worktree_left = true,
                 (false, false) => {}
+            }
+        }
+        if self.row && worktree_left {
+            crate::errln!(
+                "WARNING: could not remove the worktree {} — the task {} is kept: `toryo task cleanup {} --force` removes it once nothing holds its files",
+                self.worktree.as_deref().unwrap_or(Path::new("?")).display(),
+                self.id,
+                self.id
+            );
+            return;
+        }
+        if worktree_left {
+            crate::errln!(
+                "WARNING: could not remove the worktree {} — delete it by hand",
+                self.worktree.as_deref().unwrap_or(Path::new("?")).display()
+            );
+        }
+        if self.row {
+            let id = self.id.clone();
+            match self
+                .store
+                .call(move |tx| store::remove_created_task(tx, &id))
+            {
+                Ok(()) => crate::errln!("removed: the database row of {}", self.id),
+                Err(e) => crate::errln!(
+                    "WARNING: could not remove the database row of {}: {e:#}",
+                    self.id
+                ),
             }
         }
         if let Some(b) = &self.branch {
@@ -434,19 +463,12 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         .map(|l| l.trim_start_matches("# ").trim().to_string())
         .unwrap_or_else(|| id.clone());
     let (planner, implementers, reviewer) = roles(cfg)?;
-    // review H2 (M11-A2): the repository chooses its verify sandbox only above the floor
-    if let Some(reason) = super::verify::below_floor(cfg) {
-        bail!("{reason}");
-    }
+    machine_admission(cfg)?;
     let machine = new_machine(cfg, a.max_fix_cycles)?;
 
     let g = task_git(cfg, &repo)?;
     // R36/R45 admission: the verify boundary must be available before anything is created
     super::verify::probe(cfg)?;
-    // M12-05: an environment gate this machine cannot start is refused, like one it does not define
-    if let Some(reason) = super::gates::env_gates_refusal(cfg) {
-        bail!("{reason}");
-    }
     // R59 admission: a `tool: xpp` command needs MSBuild and the five CI/CD packages here
     super::xpp::for_config(cfg)?;
     let repol = Loc::Discover(repo.clone());
@@ -531,6 +553,14 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     if store.call(move |tx| Ok(store::get_task(tx, &t).is_ok()))? {
         bail!("task {id} already exists (`toryo task show {id}`)");
     }
+    // R23-17: Windows file names ignore case — `a-1` would share the lock file, the run store
+    // and the worktree of a task `A-1`
+    let t = id.clone();
+    if let Some(other) = store.read(move |tx| store::task_id_in_other_case(tx, &t))? {
+        bail!(
+            "task {other} already exists and `{id}` differs from it only in case — they would share a lock file, a run store and a worktree on Windows; use another --id"
+        );
+    }
     let rs = run_store_dir(&id);
     if rs.exists() {
         bail!(
@@ -582,7 +612,7 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     std::fs::create_dir_all(&art)?;
     std::fs::create_dir_all(rs.join("captures"))?;
     std::fs::write(art.join("TASK.md"), &text)?;
-    let frozen = cfg.canonical_json();
+    let frozen = cfg.frozen_json()?;
     std::fs::write(art.join("config.json"), &frozen)?;
 
     std::fs::create_dir_all(&wt_root)
@@ -778,5 +808,72 @@ mod made_tests {
             .unwrap();
         made("toryo/ours", &first);
         assert!(!there("toryo/ours"), "ours: removed");
+    }
+
+    /// R23-06 (review 2026-10-23 C6): a `task create` that fails after its row exists, with a
+    /// worktree that cannot be removed (a file in it is held open). Was: the row went first,
+    /// then the worktree stayed — `task cleanup <id> --force`, the tool for it, said "no task"
+    /// and the same TASK.md could not be created again. Now the row stays with the worktree.
+    #[cfg(windows)]
+    #[test]
+    fn a_worktree_that_cannot_be_removed_keeps_its_task() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let (g, r, first, _) = repo(d.path());
+        let store = Store::open(&d.path().join("t.db")).unwrap();
+        let nt = NewTask {
+            id: "W-1".into(),
+            title: "t".into(),
+            task_sha256: "0".into(),
+            acceptance_ids: vec!["AC-1".into()],
+            run_store: d.path().join("rs"),
+            config_sha256: "0".into(),
+            worktree: d.path().join("wt"),
+            branch: "toryo/W-1".into(),
+            base_commit: first.clone(),
+            repo: r.clone(),
+            task_file: r.join("TASK.md"),
+            machine: Machine::new(1),
+            implementers: vec!["p".into()],
+            planner: "p".into(),
+            reviewer: "p".into(),
+            budget_tokens: None,
+        };
+        store.call(move |tx| store::insert_task(tx, &nt)).unwrap();
+        let wt = d.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .share_mode(0)
+            .open(wt.join("busy.txt"))
+            .unwrap();
+        let row = |store: &Store| {
+            store
+                .call(|tx| Ok(store::get_task(tx, "W-1").is_ok()))
+                .unwrap()
+        };
+        let made = |row: bool| {
+            drop(Made {
+                g: &g,
+                store: &store,
+                repo: r.clone(),
+                id: "W-1".into(),
+                run_store: None,
+                worktree: Some(wt.clone()),
+                branch: None,
+                base: first.clone(),
+                row,
+                kept: false,
+            })
+        };
+        made(true);
+        assert!(wt.exists(), "the file is held: the worktree stays");
+        assert!(row(&store), "the row stays with the worktree");
+        // once nothing holds it, the same rollback removes both
+        drop(held);
+        made(true);
+        assert!(!wt.exists() && !row(&store));
     }
 }

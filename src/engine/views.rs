@@ -255,6 +255,7 @@ mod tests {
             started_at: "t".into(),
             ended_at: None,
             context_sha256: None,
+            undo_pending: false,
         };
         let u = UsageLine {
             id: 7,

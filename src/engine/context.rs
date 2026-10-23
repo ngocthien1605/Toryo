@@ -53,13 +53,13 @@ pub const INLINE_MAX: usize = 8 * 1024;
 pub const TRUSTED_PACK: [&str; 2] = ["TASK.md", "PLAN.md"];
 
 /// M11-R5: a skill the turn needs does not resolve now — the turn is not started.
-pub const SKILL_UNAVAILABLE: &str = "skill_unavailable";
+pub const SKILL_UNAVAILABLE: &str = super::state::EscalationClass::SkillUnavailable.as_str();
 /// M11-R5: with its skills (never trimmed) and TASK.md / PLAN.md (never trimmed to make room
 /// for them) the context does not fit its budget.
-pub const CONTEXT_OVER_BUDGET: &str = "context_over_budget";
+pub const CONTEXT_OVER_BUDGET: &str = super::state::EscalationClass::ContextOverBudget.as_str();
 /// M12-10 (X22): a context file (instructions, culture, policy, `AGENTS.md`, `CLAUDE.md`, the
 /// global context, a task-pack file) exists and is not UTF-8 — the turn is not started.
-pub const CONTEXT_UNREADABLE: &str = "context_unreadable";
+pub const CONTEXT_UNREADABLE: &str = super::state::EscalationClass::ContextUnreadable.as_str();
 
 /// Whether a task-pack file (by its label) is trusted (R61). A file added to the pack later is
 /// untrusted unless it is listed in [`TRUSTED_PACK`].
@@ -208,10 +208,13 @@ struct Part {
 }
 
 /// M12-10: a missing file is `Ok(None)` (skipped and reported); a file that is not UTF-8 is
-/// `Err` with its name — never lossy text. A byte-order mark is ignored.
+/// `Err` with its name — never lossy text. A byte-order mark is ignored. R23-05: only a file
+/// that is not there is missing — one that is there and cannot be read (denied, in use, a
+/// folder of that name) is `Err` too, so its rules are never left out of a turn unseen.
 fn read(p: &Path) -> std::result::Result<Option<String>, String> {
     match std::fs::read(p) {
-        Err(_) => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: cannot be read: {e}", p.display())),
         Ok(b) => crate::textfile::decode(p, &b)
             .map(|t| Some(t.replace("\r\n", "\n")))
             .map_err(|e| format!("{e:#}")),
@@ -900,6 +903,27 @@ mod tests {
             }),
             ..req(repo, kind, role)
         }
+    }
+
+    /// R23-05 (review 2026-10-23 C4): a context source that is there but cannot be read — here
+    /// a folder named `CLAUDE.md` — is `unreadable` (a `context_unreadable` stop), never
+    /// "skipped, not found". Was: any read error was taken for a missing file, and the turn ran
+    /// without the owner's rules in it.
+    #[test]
+    fn a_context_file_that_cannot_be_read_is_unreadable_not_missing() {
+        let d = setup();
+        std::fs::remove_file(d.path().join("CLAUDE.md")).unwrap();
+        std::fs::create_dir_all(d.path().join("CLAUDE.md")).unwrap();
+        let c = assemble(&req(d.path(), ProfileKind::Claude, Role::Implementer)).unwrap();
+        assert!(
+            c.unreadable.iter().any(|u| u.contains("CLAUDE.md")),
+            "{:?}",
+            c.unreadable
+        );
+        // a file that is not there is still skipped
+        std::fs::remove_dir(d.path().join("CLAUDE.md")).unwrap();
+        let c = assemble(&req(d.path(), ProfileKind::Claude, Role::Implementer)).unwrap();
+        assert!(c.unreadable.is_empty(), "{:?}", c.unreadable);
     }
 
     /// M11-R5: with skill parts, the inlined TASK.md and PLAN.md of an implementer without the

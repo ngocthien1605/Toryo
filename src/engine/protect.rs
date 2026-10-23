@@ -32,7 +32,7 @@ use super::store::{self, Store, TaskRow};
 use super::task::sha256_hex;
 use crate::git::{GitCmd, Loc};
 
-pub const REASON: &str = "protected_config_changed";
+pub const REASON: &str = super::state::EscalationClass::ProtectedConfigChanged.as_str();
 pub const MAX_COPY: u64 = 1 << 20;
 pub const MAX_TOTAL: u64 = 16 << 20;
 const META: &str = "@git/";

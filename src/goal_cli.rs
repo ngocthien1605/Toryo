@@ -324,7 +324,10 @@ fn split(cli: &Cli, s: &Split) -> Result<i32> {
     let home = data_dir()
         .join("goals")
         .join(format!("{}-{stamp}", s.prefix));
-    std::fs::create_dir_all(&home)?;
+    // R23-23: made here, never found — a second split with the same stamp would take this one's
+    // folder, and its `Scratch::drop` would remove the first one's live checkout
+    std::fs::create_dir_all(data_dir().join("goals"))?;
+    std::fs::create_dir(&home).with_context(|| format!("creating {}", home.display()))?;
     // from here Ctrl+C ends the split through this process (the turn is cancelled, the
     // checkout removed), never by ending it with the checkout left behind
     watch_interrupt();

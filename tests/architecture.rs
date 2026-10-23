@@ -43,17 +43,28 @@ fn no_vendor_types_outside_adapters() {
     check("src/domain.rs", modules);
     check("src/agents/adapter.rs", modules);
     check("src/runner.rs", modules);
-    // every engine file, including the ones added later
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine");
+    // every engine file, including the ones added later — R23-27: also in its folders
+    // (`src/engine/runner/…`)
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut dirs = vec![root.join("src/engine")];
     let mut n = 0;
-    for e in std::fs::read_dir(dir).unwrap().flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        if name.ends_with(".rs") {
-            check(&format!("src/engine/{name}"), modules);
-            n += 1;
+    while let Some(dir) = dirs.pop() {
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                dirs.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                check(&rel, modules);
+                n += 1;
+            }
         }
     }
-    assert!(n >= 13, "engine files checked: {n}");
+    assert!(n >= 15, "engine files checked: {n}");
     check("src/spike/pipeline.rs", modules);
     // the hub picks an adapter (and passes the Claude launch mode through), nothing more
     check("src/agents/hub.rs", &["exec::", "events::"]);

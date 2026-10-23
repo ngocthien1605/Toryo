@@ -1,5 +1,6 @@
 //! The engine commands (plan §15): `task`, `run`, `approve`, `reject`, `resume`, `stop`,
-//! `status`, `partial export`. Every command that mutates a task takes its lock first
+//! `status`, `watch`, `dashboard`, `usage`, `context`, `budget`, `task config`, `partial
+//! export`. Every command that mutates a task takes its lock first
 //! (R38) and exits with code 3 (`task_active`) if another process holds it.
 
 use std::path::PathBuf;
@@ -25,6 +26,8 @@ use toryo::engine::worktree::Worktree;
 use toryo::engine::{GateKind, PipelineEvent, PipelineState};
 
 use crate::{load_config, Cli};
+
+pub use toryo::engine::commands::*;
 
 #[derive(Clone, Copy, ValueEnum)]
 pub enum Gate {
@@ -149,7 +152,7 @@ pub enum BudgetCmd {
     Set {
         id: String,
         /// Tokens (weighted sum of the four buckets, R41)
-        #[arg(long, conflicts_with = "none")]
+        #[arg(long, conflicts_with = "none", value_parser = clap::value_parser!(u64).range(0..=toryo::config::MAX_BUDGET_TOKENS))]
         tokens: Option<u64>,
         /// Remove the cap
         #[arg(long)]
@@ -189,24 +192,6 @@ pub enum PartialCmd {
         #[arg(long)]
         into: PathBuf,
     },
-}
-
-fn store() -> Result<Store> {
-    Store::open_default()
-}
-
-fn get(store: &Store, id: &str) -> Result<TaskRow> {
-    task::valid_task_id(id)?;
-    let i = id.to_string();
-    store.call(move |tx| store::get_task(tx, &i))
-}
-
-/// [`get`] in a read-only transaction (R6): for the commands that only look (`status`, `task
-/// show`, `usage`, `watch`).
-fn read_task(store: &Store, id: &str) -> Result<TaskRow> {
-    task::valid_task_id(id)?;
-    let i = id.to_string();
-    store.read(move |tx| store::get_task(tx, &i))
 }
 
 fn hub_for(t: &TaskRow, d: &DriveArgs) -> Result<AgentHub> {
@@ -296,61 +281,6 @@ fn recorded(rec: &Recorder, from: PipelineState, event: &str, now: &TaskRow) {
     }
 }
 
-fn st_attempts(store: &Store, id: &str) -> Result<Vec<store::AttemptRow>> {
-    let i = id.to_string();
-    store.call(move |tx| store::attempts(tx, &i))
-}
-
-/// R6: the attempts §10 recovery ended (they were `running` before it) get their
-/// `stage_finished`, and a killed turn's reservation its `turn_finished` — quiet events, like the
-/// engine's own.
-fn recovered_events(
-    store: &Store,
-    rec: &Recorder,
-    id: &str,
-    running: &[store::AttemptRow],
-    usage_before: &[i64],
-) -> Result<()> {
-    if running.is_empty() {
-        return Ok(());
-    }
-    let now = st_attempts(store, id)?;
-    let i = id.to_string();
-    let usage = store.call(move |tx| store::usage_rows(tx, &i))?;
-    for before in running {
-        let Some(a) = now
-            .iter()
-            .find(|a| a.id == before.id && a.status != store::AttemptStatus::Running)
-        else {
-            continue;
-        };
-        let reserved = usage
-            .iter()
-            // R7: only a row recovery inserted — the crashed process emitted its own rows
-            .find(|u| u.1 == a.id && u.3 == "unknown" && !usage_before.contains(&u.0))
-            .and_then(|u| u.5);
-        if let (Some(n), Some(p)) = (reserved, &a.profile) {
-            rec.emit_quiet(EngineEvent::TurnFinished {
-                stage: a.stage.clone(),
-                attempt: a.attempt,
-                profile: p.clone(),
-                success: false,
-                usage: None,
-                reserved_tokens: Some(n),
-                duration_ms: toryo::engine::flight::ms_since(&a.started_at),
-            });
-        }
-        rec.emit_quiet(EngineEvent::StageFinished {
-            stage: a.stage.clone(),
-            attempt: a.attempt,
-            status: a.status,
-            error_class: a.error_class.clone(),
-            duration_ms: toryo::engine::flight::ms_since(&a.started_at),
-        });
-    }
-    Ok(())
-}
-
 /// Recover (if needed) and run the locked task until it waits, finishes or is stopped. Every
 /// exit — also an error before the first stage (an unverified profile, a bad fake script, a
 /// Git or store error) — ends with one `run_ended` (R1): `watch` stops and the owner is told.
@@ -388,43 +318,6 @@ fn drive(store: &Store, lock: &TaskLock, rec: &Recorder, d: &DriveArgs) -> Resul
         exit_code,
     );
     res.map(|(code, _)| code)
-}
-
-/// X39: `run_ended.outcome` of how the engine ended the drive.
-fn end_outcome(end: &RunEnd) -> &'static str {
-    match end {
-        RunEnd::Done(_) => "done",
-        RunEnd::Waiting(_) => "waiting",
-        RunEnd::Stopped => "stopped",
-    }
-}
-
-/// Emit the one `run_ended` of a drive: state and next action re-read from the store, the last
-/// known state if it cannot be read.
-fn run_ended(
-    store: &Store,
-    rec: &Recorder,
-    task: &str,
-    from: Option<PipelineState>,
-    error: Option<String>,
-    outcome: &str,
-    exit_code: i32,
-) {
-    let (state, next) = match get(store, task) {
-        Ok(t) => (t.state, next_action(&t)),
-        Err(_) => (
-            from.unwrap_or(PipelineState::New),
-            format!("`toryo status {task}`"),
-        ),
-    };
-    rec.emit_quiet(EngineEvent::RunEnded {
-        state,
-        next_action: next,
-        from,
-        error,
-        outcome: Some(outcome.into()),
-        exit_code: Some(exit_code),
-    });
 }
 
 /// Emits `run_ended { error: "panicked" }` when a panic unwinds through the drive (R7).
@@ -631,6 +524,9 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
                     None
                 }
             };
+            // R23-24 (N-11): the folders `cleanup` deletes are the ones `task create` made — the
+            // row's paths are checked before anything is deleted
+            cleanup_confined(&t, cfg.as_ref())?;
             let g = match &cfg {
                 Some(c) => task::task_git(c, &t.repo)?,
                 None => task::cleanup_git(&t.repo)?,
@@ -687,33 +583,6 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
     }
 }
 
-/// M12-12 (a): what `task cleanup` would delete that exists nowhere else — uncommitted changes
-/// in the worktree and the partial snapshots of the run store (the branch is kept). Empty: a
-/// clean worktree and no snapshot. `Err`: Git could not say what the worktree holds (M13-07).
-fn cleanup_would_lose(g: &toryo::git::GitCmd, t: &TaskRow) -> Result<Vec<String>> {
-    let mut lost = Vec::new();
-    if t.worktree.exists() {
-        let n = toryo::engine::worktree::Worktree::new(g, &t.worktree)
-            .changed()?
-            .len();
-        if n > 0 {
-            lost.push(format!(
-                "{n} uncommitted change(s) in the worktree {}",
-                t.worktree.display()
-            ));
-        }
-    }
-    let partial = t.run_store.join("artifacts").join("partial");
-    let n = std::fs::read_dir(&partial).map_or(0, |d| d.flatten().count());
-    if n > 0 {
-        lost.push(format!(
-            "the partial snapshot(s) of {n} attempt(s) in {}",
-            partial.display()
-        ));
-    }
-    Ok(lost)
-}
-
 fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Result<i32> {
     use toryo::engine::artifacts;
     use toryo::engine::task::sha256_hex;
@@ -737,14 +606,8 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     let (old_path, old_text) = task::frozen_config_text(&t)?;
     let old = toryo::config::Effective::from_frozen(&old_text, &old_path)?;
     let mut new = load_config(cli)?;
-    // review H2 (M11-A2): a reload cannot go below the machine floor either
-    if let Some(reason) = toryo::engine::verify::below_floor(&new) {
-        bail!("{reason}");
-    }
-    // M12-05: an environment gate this machine cannot start is refused here too
-    if let Some(reason) = toryo::engine::gates::env_gates_refusal(&new) {
-        bail!("{reason}");
-    }
+    // review H2 (M11-A2), M12-05: what `task create` refuses, a reload refuses too
+    task::machine_admission(&new)?;
     // M11-R21: a changed `verify_root` is probed as `task create` and `doctor` do — a root
     // Low-integrity code can write would hand the export and the gate's folder to it
     if toryo::engine::verify::verify_root(&new) != toryo::engine::verify::verify_root(&old) {
@@ -758,7 +621,7 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
         &t.repo,
         &t.base_commit,
     )?;
-    let new_text = new.canonical_json();
+    let new_text = new.frozen_json()?;
     let new_sha = sha256_hex(new_text.as_bytes());
     if new_sha == t.config_sha256 {
         toryo::errln!(
@@ -768,6 +631,11 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
         lock.release();
         return Ok(0);
     }
+    // R23-24: the refusals that need no diff come before the history pair is written (was: a
+    // refused reload left an orphan pair in `config-history`)
+    let g = task::task_git(&new, &t.repo)?; // R37 admission under the new machine config
+                                            // M18 (group E review): a reloaded gate script must be in the base commit too
+    task::check_entry_points(&new, &g, &t.repo, &t.base_commit)?;
     // diff of the pretty-printed configurations
     let dir = t.artifacts().join("config-history");
     std::fs::create_dir_all(&dir)?;
@@ -781,9 +649,6 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     );
     std::fs::write(&a, pretty(&old_text)?)?;
     std::fs::write(&b, pretty(&new_text)?)?;
-    let g = task::task_git(&new, &t.repo)?; // R37 admission under the new machine config
-                                            // M18 (group E review): a reloaded gate script must be in the base commit too
-    task::check_entry_points(&new, &g, &t.repo, &t.base_commit)?;
     let out = g.output(
         &toryo::git::Loc::Discover(dir.clone()),
         true,
@@ -806,6 +671,9 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     );
     if let Some(e) = expect {
         if !new_sha.starts_with(e) {
+            // R23-24: the diff was shown; the pair it was made from is no history of a reload
+            let _ = std::fs::remove_file(&a);
+            let _ = std::fs::remove_file(&b);
             bail!("subject_changed: the new configuration digest is {} — it does not start with --expect {e}; nothing was changed", short(&new_sha));
         }
     }
@@ -940,6 +808,14 @@ pub fn approve(
         if !toryo::engine::runner::verify_current(&st, &t)? {
             bail!("{id}: no passing VERIFY_RESULT.json for the current checkpoint (e.g. the verify configuration was reloaded) — `toryo resume {id} --note \"…\"` to verify again");
         }
+        // R23-03: the gate this opens would refuse its approval — say so now
+        if let Some(reason) = toryo::engine::runner::force_final_mismatch(&t)? {
+            bail!(
+                "{reason} — the final gate was not opened: put the branch back at the checkpoint first (`git -C \"{}\" reset --hard {}`)",
+                t.worktree.display(),
+                t.machine.checkpoint().map(short).unwrap_or("<checkpoint>")
+            );
+        }
         let i = id.to_string();
         st.call(move |tx| store::transition(tx, &i, PipelineEvent::ForceFinal).map(|_| ()))?;
         toryo::engine::decisions::append(
@@ -988,132 +864,30 @@ pub fn reject(id: &str, gate: Gate, reason: &str) -> Result<i32> {
     if reason.trim().is_empty() {
         bail!("--reason must say what to change");
     }
-    let st = store()?;
-    let lock = TaskLock::acquire(&st, id)?;
-    let t = get(&st, id)?;
-    reject_now(&st, &recorder(&t, &lock), &t, gate.into(), reason)?;
-    let t = get(&st, id)?;
-    toryo::errln!("next: {}", next_action(&t));
-    lock.release();
-    Ok(0)
+    with_locked(id, |st, lock, t| {
+        reject_now(st, &recorder(&t, lock), &t, gate.into(), reason)?;
+        let t = get(st, id)?;
+        toryo::errln!("next: {}", next_action(&t));
+        Ok(0)
+    })
 }
 
-#[derive(Default)]
-pub struct ResumeArgs {
-    pub note: Option<String>,
-    pub discard_partial: bool,
-    pub keep_partial: bool,
-    pub accept_protected: Vec<String>,
-}
-
-/// `resume` of a task escalated with `protected_config_changed` (R35): re-compare; restored →
-/// back into the stage; accepted paths → new baseline + DECISIONS.md. Returns false when the
-/// change is still there and not accepted.
-fn resume_protected(st: &Store, t: &TaskRow, accept: &[String]) -> Result<bool> {
-    let cfg = frozen_config(t)?;
-    let (g, protect, _) = task_policy(t, &cfg)?;
-    let c = toryo::engine::protect::check(st, t, &g, &protect)?;
-    let bad: Vec<&toryo::engine::protect::Change> = c
-        .changes
-        .iter()
-        .filter(|x| x.is_hard() || !protect.is_allowed(&x.path))
-        .collect();
-    let i = t.id.clone();
-    if bad.is_empty() {
-        st.call(move |tx| {
-            store::event(
-                tx,
-                Some(&i),
-                None,
-                "protected_restored",
-                &serde_json::json!({}),
-            )?;
-            store::transition(tx, &i, PipelineEvent::ResumeStage).map(|_| ())
-        })?;
-        toryo::errln!(
-            "{}: protected state matches the baseline again — the stage continues",
-            t.id
-        );
-        return Ok(true);
-    }
-    let norm = |p: &str| p.replace('\\', "/").trim_start_matches("./").to_string();
-    let accepted: Vec<String> = accept.iter().map(|p| norm(p)).collect();
-    let missing: Vec<String> = bad
-        .iter()
-        .filter(|x| !accepted.contains(&x.path))
-        .map(|x| format!("{} {}", x.kind, x.path))
-        .collect();
-    if accept.is_empty() || !missing.is_empty() {
-        toryo::errln!(
-            "{}: protected state still differs from the baseline: {}
-  diff: {}
-  → restore, or `toryo resume {} --accept-protected-change <path>` for each",
-            t.id,
-            if accept.is_empty() {
-                bad.iter()
-                    .map(|x| format!("{} {}", x.kind, x.path))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            } else {
-                format!("not accepted: {}", missing.join(", "))
-            },
-            c.diff_path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "`git diff` in the worktree".into()),
-            t.id
-        );
-        return Ok(false);
-    }
-    let list: Vec<String> = bad
-        .iter()
-        .map(|x| format!("{} {}", x.kind, x.path))
-        .collect();
-    let m = toryo::engine::protect::take_baseline(
-        st,
-        t,
-        &g,
-        &protect,
-        &format!("accepted by the human: {}", list.join(", ")),
-    )?;
-    toryo::engine::decisions::append(
-        st,
-        t,
-        "protected change accepted (R35)",
-        &format!(
-            "Accepted out-of-band changes to protected state: {}.\nNew protected baseline v{}. Diff: {}",
-            list.join(", "),
-            m.version,
-            c.diff_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(tracked: git diff)".into())
-        ),
-    )?;
-    st.call(move |tx| store::transition(tx, &i, PipelineEvent::ResumeStage).map(|_| ()))?;
-    toryo::errln!(
-        "{}: accepted {} — protected baseline v{}",
-        t.id,
-        list.join(", "),
-        m.version
-    );
-    Ok(true)
-}
-
-/// M11-R11 (X8): the task is `Escalated` with a machine-caused class, from a running state — a
-/// plain `toryo resume` goes back into the stage (`ResumeStage`).
-fn machine_caused_stop(t: &TaskRow) -> bool {
-    t.state == PipelineState::Escalated
-        && t.machine
-            .reason_class()
-            .is_some_and(toryo::engine::state::is_machine_caused)
-        && t.machine.escalated_from().is_some_and(|s| s.is_running())
-}
-
-/// M12-07: the task is stopped with `environment_gate_confirm` — it waits for the owner's "yes".
-fn waits_for_a_deploy_yes(t: &TaskRow) -> bool {
-    machine_caused_stop(t) && t.machine.reason_class() == Some(toryo::engine::gates::ENV_CONFIRM)
-}
-
-fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
+/// `blanket`: this is one task of a `resume` of every task (no id). Its "waits for a deploy
+/// yes" check is made again here, on the row read under the lock (R23-01, X17): the loop's list
+/// was read before, and a task that stopped to ask since then must not take this resume for the
+/// owner's yes.
+fn resume_one(
+    st: &Store,
+    lock: &TaskLock,
+    r: &ResumeArgs,
+    d: &DriveArgs,
+    blanket: bool,
+) -> Result<i32> {
     let t = get(st, &lock.task)?;
+    if blanket && waits_for_a_deploy_yes(&t) {
+        toryo::errln!("{}", deploy_yes_note(&t.id));
+        return Ok(1);
+    }
     // M12-07 (X17): `--yes` never confirms a deploy — it is for the plan and the final gate
     if d.yes
         && waits_for_a_deploy_yes(&t)
@@ -1160,114 +934,6 @@ fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Res
     drive(st, lock, &rec, d)
 }
 
-/// What `resume` changes before the task is driven again: the protected-state check, a
-/// partial-work decision, a note, or the end of a pause. False: the protected change is still
-/// there and not accepted — the task is not driven.
-fn resume_before_drive(st: &Store, t: &TaskRow, r: &ResumeArgs, protected: bool) -> Result<bool> {
-    if protected && r.note.is_none() {
-        return resume_protected(st, t, &r.accept_protected);
-    } else if r.discard_partial || r.keep_partial {
-        let cfg = frozen_config(t)?;
-        let (g, protect, _) = task_policy(t, &cfg)?;
-        let rec = Recovery {
-            store: st,
-            g: &g,
-            protect: &protect,
-            cfg: &cfg,
-        };
-        let msg = if r.discard_partial {
-            rec.discard_partial(&t.id)?
-        } else {
-            rec.keep_partial(&t.id)?
-        };
-        toryo::errln!("↺ {msg}");
-        toryo::engine::decisions::append(
-            st,
-            t,
-            if r.discard_partial {
-                "partial work discarded (R31)"
-            } else {
-                "partial work kept (R31)"
-            },
-            &msg,
-        )?;
-    } else if let Some(note) = &r.note {
-        if t.state != PipelineState::Escalated {
-            bail!("--note leaves Escalated; {} is {:?}", t.id, t.state);
-        }
-        let (i, n) = (t.id.clone(), note.clone());
-        st.call(move |tx| {
-            store::set_feedback(tx, &i, Some(&format!("- HUMAN (resume note): {n}\n")))?;
-            store::transition(tx, &i, PipelineEvent::ResumeWithNote { note: n })?;
-            Ok(())
-        })?;
-        toryo::engine::decisions::append(
-            st,
-            t,
-            "resumed from Escalated with a note (R5)",
-            &format!(
-                "Escalation: {}\n\nNote: {note}",
-                t.machine.reason().unwrap_or("")
-            ),
-        )?;
-    } else if machine_caused_stop(t) {
-        // M11-R11 (X8): the machine caused this (a missing skill, a context over budget, a gate
-        // the machine cannot run) — a plain `toryo resume` goes back into the stage, which
-        // checks its precondition again. No fix cycle, no implementer turn for nothing.
-        let class = t.machine.reason_class().unwrap_or_default().to_string();
-        // M12-07 (X17): this resume is the owner's "yes" to the deploy the stop asked about.
-        // M13-05 (X26): the yes is written in the same transaction as the transition
-        let confirms = class == toryo::engine::gates::ENV_CONFIRM;
-        let i = t.id.clone();
-        let said = st.call(move |tx| {
-            let said = if confirms {
-                store::confirm_deploys(tx, &i)?
-            } else {
-                Vec::new()
-            };
-            store::transition(tx, &i, PipelineEvent::ResumeStage)?;
-            Ok(said)
-        })?;
-        if confirms {
-            toryo::errln!(
-                "{}: deploy confirmed ({})",
-                t.id,
-                said.iter()
-                    .map(|(gate, commit)| format!("{gate} @ {}", short(commit)))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        toryo::engine::decisions::append(
-            st,
-            t,
-            &format!("resumed after {class} (M11-R11)"),
-            t.machine.reason().unwrap_or(""),
-        )?;
-    } else if t.state == PipelineState::Paused {
-        // R49: after an implementer quota pause the chain starts again from the primary
-        let quota = t
-            .machine
-            .reason()
-            .is_some_and(|x| x.starts_with("implementer_quota"));
-        let i = t.id.clone();
-        st.call(move |tx| {
-            if quota {
-                store::set_implementer_index(tx, &i, 0)?;
-                store::event(
-                    tx,
-                    Some(&i),
-                    None,
-                    "implementer_chain_reset",
-                    &serde_json::json!({"index": 0}),
-                )?;
-            }
-            store::transition(tx, &i, PipelineEvent::Unpause).map(|_| ())
-        })?;
-    }
-    Ok(true)
-}
-
 pub fn resume(id: Option<&str>, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
     // M12-12 (b): these flags belong to one task — `resume --note "x"` used to be accepted
     // and then ignored
@@ -1286,7 +952,7 @@ pub fn resume(id: Option<&str>, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
     match id {
         Some(id) => {
             let lock = TaskLock::acquire(&st, id)?;
-            let code = resume_one(&st, &lock, r, d);
+            let code = resume_one(&st, &lock, r, d, false);
             lock.release();
             code
         }
@@ -1302,11 +968,9 @@ pub fn resume(id: Option<&str>, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
                 }
                 // M12-07 (review): a stop that asks before a deploy is answered by `resume <id>`
                 // — never by a resume of everything
+                // (asked again under the lock, R23-01: this list may be old by then)
                 if waits_for_a_deploy_yes(&t) {
-                    toryo::errln!(
-                        "\n{}: waits for your yes before it deploys — look at it, then `toryo resume {}`",
-                        t.id, t.id
-                    );
+                    toryo::errln!("\n{}", deploy_yes_note(&t.id));
                     code = code.max(1);
                     continue;
                 }
@@ -1315,7 +979,7 @@ pub fn resume(id: Option<&str>, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
                         toryo::errln!("\n▶ resume {}", t.id);
                         // M12-12 (b): one failing task does not stop the others; the exit
                         // code says that one failed
-                        match resume_one(&st, &lock, &ResumeArgs::default(), d) {
+                        match resume_one(&st, &lock, &ResumeArgs::default(), d, true) {
                             Ok(c) => code = code.max(c),
                             Err(e) => {
                                 toryo::errln!("{}: error: {e:#}", t.id);
@@ -1355,73 +1019,10 @@ pub fn stop(id: &str, wait: u64) -> Result<i32> {
     })
 }
 
-/// What `status` shows of a task besides its row: the lock owner while another process holds
-/// the lock, compile-only verify (R59), and the next action (the cleaned-up variant once the
-/// worktree and the run store are gone).
-fn facts(st: &Store, t: &TaskRow) -> Result<TaskFacts> {
-    facts_with(st, t, compile_only(t))
-}
-
-/// R59 for [`facts`]: `null` when the frozen configuration cannot be read (after `task cleanup`).
-fn compile_only(t: &TaskRow) -> Option<bool> {
-    task::frozen_config(t)
-        .ok()
-        .map(|c| toryo::engine::xpp::compile_only(&c))
-}
-
-/// [`facts`] with `compile_only` known — `dashboard` keeps it per task and frozen configuration
-/// instead of reading and parsing that configuration on every frame (M16-R2).
-fn facts_with(st: &Store, t: &TaskRow, compile_only: Option<bool>) -> Result<TaskFacts> {
-    // R6: from the recorded owner, never a lock probe; `None`, never an empty label
-    let active_owner = driven_owner(st, &t.id)?;
-    let next_action = if t.state.is_terminal() && !t.run_store.exists() && !t.worktree.exists() {
-        toryo::engine::runner::cleaned_up_action(t)
-    } else {
-        next_action(t)
-    };
-    Ok(TaskFacts {
-        active_owner,
-        compile_only,
-        next_action,
-    })
-}
-
 /// Print one JSON document on stdout (`--json`, DES-10).
 fn print_json(v: &serde_json::Value) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
-}
-
-/// M11-E3: what each environment lock's environment holds — every lock, or only the locks
-/// `task` deployed to — with its status in words and whether that task's final gate is
-/// approved.
-fn environments(
-    st: &Store,
-    task: Option<&str>,
-) -> Result<Vec<(store::Deployment, &'static str, bool)>> {
-    let rows = st.read(store::deployments)?;
-    let mut out = Vec::new();
-    for d in rows
-        .into_iter()
-        .filter(|d| task.is_none_or(|i| d.task == i))
-    {
-        let i = d.task.clone();
-        let holder = st.read(move |tx| {
-            Ok(store::get_task(tx, &i)
-                .ok()
-                .map(|t| (t.state, t.machine.checkpoint().map(str::to_string))))
-        })?;
-        let state = holder.as_ref().map(|h| h.0);
-        // M11-R8: the head the holder's final gate approved — only a completed task has one
-        let approved = holder
-            .as_ref()
-            .filter(|h| h.0 == PipelineState::Completed)
-            .and_then(|h| h.1.clone());
-        let active = driven_owner(st, &d.task).ok().flatten().is_some();
-        let status = views::deployment_status(&d, state, approved.as_deref(), active);
-        out.push((d, status, status == "approved"));
-    }
-    Ok(out)
 }
 
 pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
@@ -1504,38 +1105,6 @@ pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
         toryo::outln!("environment    {}", views::deployment_line(d, s));
     }
     Ok(0)
-}
-
-/// The usage rows of a task as `task show` prints them.
-fn usage_lines(st: &Store, id: &str) -> Result<Vec<views::UsageLine>> {
-    let i = id.to_string();
-    let rows = st.read(move |tx| store::usage_rows(tx, &i))?;
-    Ok(rows
-        .into_iter()
-        .map(
-            |(
-                id,
-                attempt,
-                profile,
-                accounting,
-                budget_tokens,
-                reservation_tokens,
-                reconciled_by,
-                includes_unreported,
-            )| {
-                views::UsageLine {
-                    id,
-                    attempt,
-                    profile,
-                    accounting,
-                    budget_tokens,
-                    reservation_tokens,
-                    reconciled_by,
-                    includes_unreported,
-                }
-            },
-        )
-        .collect())
 }
 
 fn show(id: &str, json: bool) -> Result<i32> {
@@ -1630,9 +1199,12 @@ pub fn budget(cmd: &BudgetCmd) -> Result<i32> {
     if tokens.is_none() && !none {
         bail!("give --tokens N or --none");
     }
-    let st = store()?;
-    let lock = TaskLock::acquire(&st, id)?;
-    let t = get(&st, id)?;
+    with_locked(id, |st, _, t| budget_set(st, &t, *tokens))
+}
+
+/// `budget set` under the task's lock.
+fn budget_set(st: &Store, t: &TaskRow, tokens: Option<u64>) -> Result<i32> {
+    let id = &t.id;
     if t.state.is_terminal() {
         bail!("{id} is {:?}", t.state);
     }
@@ -1650,8 +1222,8 @@ pub fn budget(cmd: &BudgetCmd) -> Result<i32> {
     })?;
     let used = t.spent_tokens + t.reserved_tokens;
     toryo::engine::decisions::append(
-        &st,
-        &t,
+        st,
+        t,
         "budget set (R41)",
         &format!(
             "Admission cap {} → {} ({} tokens used: {} spent + ~{} reserved).",
@@ -1673,7 +1245,6 @@ pub fn budget(cmd: &BudgetCmd) -> Result<i32> {
             String::new()
         }
     );
-    lock.release();
     Ok(0)
 }
 
@@ -1852,29 +1423,6 @@ fn interrupted_during(d: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(50));
     }
     INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-/// Does a live process drive the task? From the recorded lock owner (its PID and creation
-/// time), never by taking the lock: a probe could refuse a `toryo run` starting at that moment.
-fn driven(st: &Store, id: &str) -> Result<bool> {
-    Ok(driven_owner(st, id)?.is_some())
-}
-
-/// The recorded lock owner, while its process (PID and creation time) is alive — never by
-/// taking the lock (R6: a probe could refuse a `toryo run` starting at that moment).
-fn driven_owner(st: &Store, id: &str) -> Result<Option<String>> {
-    let i = id.to_string();
-    let owner = st.read(move |tx| store::lock_owner(tx, &i))?;
-    Ok(match owner {
-        Some((label, _, Some(pid), Some(created))) if store::identity_alive(pid, &created) => {
-            Some(if label.trim().is_empty() {
-                format!("pid {pid}")
-            } else {
-                label
-            })
-        }
-        _ => None,
-    })
 }
 
 /// `toryo watch` (B2): the task's flight recorder like `tail -f`, without the task lock. The

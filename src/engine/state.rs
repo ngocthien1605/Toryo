@@ -42,21 +42,133 @@ pub const MAX_PLAN_AUTO_REJECTIONS: u32 = 2;
 /// over budget, or a gate/toolchain/boundary the machine cannot provide. Leaving one costs no
 /// fix cycle: a plain `toryo resume <id>` goes back into the stage, which checks its
 /// precondition again (a cause still there escalates again, no turn and no cycle).
-pub const MACHINE_CAUSED: [&str; 9] = [
-    "gate_unavailable",
-    "environment_gate_timeout",
-    "environment_gate_confirm",
-    "skill_unavailable",
-    "context_over_budget",
-    "environment_gate_unavailable",
-    "xpp_toolchain_unavailable",
-    "verify_boundary_unavailable",
-    "context_unreadable",
-];
+pub const MACHINE_CAUSED: [&str; 9] = {
+    use EscalationClass as C;
+    [
+        C::GateUnavailable.as_str(),
+        C::EnvironmentGateTimeout.as_str(),
+        C::EnvironmentGateConfirm.as_str(),
+        C::SkillUnavailable.as_str(),
+        C::ContextOverBudget.as_str(),
+        C::EnvironmentGateUnavailable.as_str(),
+        C::XppToolchainUnavailable.as_str(),
+        C::VerifyBoundaryUnavailable.as_str(),
+        C::ContextUnreadable.as_str(),
+    ]
+};
 
 /// M11-R11: whether `class` is [`MACHINE_CAUSED`].
 pub fn is_machine_caused(class: &str) -> bool {
-    MACHINE_CAUSED.contains(&class)
+    class
+        .parse::<EscalationClass>()
+        .is_ok_and(EscalationClass::is_machine_caused)
+}
+
+/// R23-26 (review 2026-10-23 A2, N-10): the escalation classes the engine names itself, in
+/// one place — the strings the machine stores and the `escalated` event carries. The modules
+/// keep their constants (`gates::GATE_UNAVAILABLE`, `protect::REASON`, …) as aliases of these,
+/// so a class has one spelling. A class that is not here (an agent's `ErrorClass` in snake
+/// case, `max_fix_cycles`, …) is still a string: it is never machine-caused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EscalationClass {
+    GateUnavailable,
+    EnvironmentGateTimeout,
+    EnvironmentGateConfirm,
+    EnvironmentGateUnavailable,
+    SkillUnavailable,
+    ContextOverBudget,
+    ContextUnreadable,
+    XppToolchainUnavailable,
+    VerifyBoundaryUnavailable,
+    ProtectedConfigChanged,
+    RecoveryPolicyViolation,
+    PolicyViolation,
+    ApprovalMismatch,
+    SameVendorReview,
+    ImplementerFailed,
+    InvalidOutput,
+    VerifyMutatedTree,
+    ArtifactTampered,
+}
+
+impl EscalationClass {
+    pub const ALL: [EscalationClass; 18] = {
+        use EscalationClass as C;
+        [
+            C::GateUnavailable,
+            C::EnvironmentGateTimeout,
+            C::EnvironmentGateConfirm,
+            C::EnvironmentGateUnavailable,
+            C::SkillUnavailable,
+            C::ContextOverBudget,
+            C::ContextUnreadable,
+            C::XppToolchainUnavailable,
+            C::VerifyBoundaryUnavailable,
+            C::ProtectedConfigChanged,
+            C::RecoveryPolicyViolation,
+            C::PolicyViolation,
+            C::ApprovalMismatch,
+            C::SameVendorReview,
+            C::ImplementerFailed,
+            C::InvalidOutput,
+            C::VerifyMutatedTree,
+            C::ArtifactTampered,
+        ]
+    };
+
+    pub const fn as_str(self) -> &'static str {
+        use EscalationClass as C;
+        match self {
+            C::GateUnavailable => "gate_unavailable",
+            C::EnvironmentGateTimeout => "environment_gate_timeout",
+            C::EnvironmentGateConfirm => "environment_gate_confirm",
+            C::EnvironmentGateUnavailable => "environment_gate_unavailable",
+            C::SkillUnavailable => "skill_unavailable",
+            C::ContextOverBudget => "context_over_budget",
+            C::ContextUnreadable => "context_unreadable",
+            C::XppToolchainUnavailable => "xpp_toolchain_unavailable",
+            C::VerifyBoundaryUnavailable => "verify_boundary_unavailable",
+            C::ProtectedConfigChanged => "protected_config_changed",
+            C::RecoveryPolicyViolation => "recovery_policy_violation",
+            C::PolicyViolation => "policy_violation",
+            C::ApprovalMismatch => "approval_mismatch",
+            C::SameVendorReview => "same_vendor_review",
+            C::ImplementerFailed => "implementer_failed",
+            C::InvalidOutput => "invalid_output",
+            C::VerifyMutatedTree => "verify_mutated_tree",
+            C::ArtifactTampered => "artifact_tampered",
+        }
+    }
+
+    /// X8: the machine caused it — a plain `toryo resume` goes back into the stage, no fix cycle.
+    pub const fn is_machine_caused(self) -> bool {
+        use EscalationClass as C;
+        matches!(
+            self,
+            C::GateUnavailable
+                | C::EnvironmentGateTimeout
+                | C::EnvironmentGateConfirm
+                | C::EnvironmentGateUnavailable
+                | C::SkillUnavailable
+                | C::ContextOverBudget
+                | C::ContextUnreadable
+                | C::XppToolchainUnavailable
+                | C::VerifyBoundaryUnavailable
+        )
+    }
+}
+
+impl std::str::FromStr for EscalationClass {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        Self::ALL.into_iter().find(|c| c.as_str() == s).ok_or(())
+    }
+}
+
+impl std::fmt::Display for EscalationClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -130,6 +242,17 @@ impl PipelineState {
 pub enum GateKind {
     Plan,
     Final,
+}
+
+impl GateKind {
+    /// The gate's name in approval rows, `gate_opened` events, `[state]` lines and DECISIONS.md
+    /// (R23-31: one place, was three copies).
+    pub const fn name(self) -> &'static str {
+        match self {
+            GateKind::Plan => "plan",
+            GateKind::Final => "final",
+        }
+    }
 }
 
 /// One gate occurrence (R44a): opened on every entry into a waiting-for-approval state,
@@ -221,9 +344,13 @@ pub enum PipelineEvent {
     /// --reload` changed the verify configuration, R35): the checkpoint is verified again —
     /// from the final gate, `Escalated`, or `Reviewing` before the review starts (EC-10).
     Reverify,
-    /// A stop that needs a human (max cycles, InvalidOutput, quota, tampering, …).
+    /// A stop that needs a human (max cycles, InvalidOutput, quota, tampering, …). `class`: the
+    /// typed class of the escalation when the engine names it (R23-35, review A2) — set on the
+    /// machine by the transition itself; absent (and not serialised) otherwise.
     Escalate {
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        class: Option<String>,
     },
     Cancel,
     /// Unrecoverable error.
@@ -485,7 +612,10 @@ impl Machine {
                 m.reason_class = None;
                 m.state = S::Cancelled;
             }
-            (s, E::Escalate { reason }) if s != S::Escalated => m.escalate(s, reason.clone()),
+            (s, E::Escalate { reason, class }) if s != S::Escalated => {
+                m.escalate(s, reason.clone());
+                m.reason_class = class.clone();
+            }
             (s, E::BudgetExceeded) if s.is_running() => {
                 m.paused_from = Some(s);
                 m.reason = Some("budget".into());

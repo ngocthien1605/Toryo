@@ -168,20 +168,35 @@ pub(crate) fn run_many(
     let mut running: Vec<(usize, Child)> = Vec::new();
     let mut codes: Vec<Option<i32>> = vec![None; ids.len()];
     let mut said_stop = false;
-    let print = |l: Line| match l {
-        Line::Err(i, t) => toryo::errln!("{:<width$} │ {t}", ids[i]),
-        Line::Out(i, t) => toryo::outln!("{:<width$} │ {t}", ids[i]),
+    // R23-16: a stream this process can no longer write (`toryo run A B | head`) stops its
+    // printing, never the process — a panic here would close the children's pipes, and each
+    // would die at its next line, mid-task. The lines are still read and dropped.
+    let silent = std::cell::Cell::new(false);
+    let print = |l: Line| {
+        if silent.get() {
+            return;
+        }
+        let (s, i, t) = match l {
+            Line::Err(i, t) => (toryo::term::Stream::Err, i, t),
+            Line::Out(i, t) => (toryo::term::Stream::Out, i, t),
+        };
+        if toryo::term::try_line(s, &format!("{:<width$} │ {t}", ids[i])).is_err() {
+            silent.set(true);
+        }
     };
     while !queue.is_empty() || !running.is_empty() {
         if interrupted() {
             if !said_stop && !queue.is_empty() {
-                toryo::errln!(
-                    "■ Ctrl+C — the running tasks stop; not started: {}",
-                    queue
-                        .iter()
-                        .map(|i| ids[*i].as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                let _ = toryo::term::try_line(
+                    toryo::term::Stream::Err,
+                    &format!(
+                        "■ Ctrl+C — the running tasks stop; not started: {}",
+                        queue
+                            .iter()
+                            .map(|i| ids[*i].as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
                 );
             }
             said_stop = true;
@@ -225,13 +240,22 @@ pub(crate) fn run_many(
         }
         let mut k = 0;
         while k < running.len() {
-            match running[k].1.try_wait()? {
-                Some(status) => {
+            // (R23-16: an error is that child's, not a reason to leave the others unwatched)
+            match running[k].1.try_wait().map_err(|e| e.to_string()) {
+                Ok(Some(status)) => {
                     let (i, _) = running.remove(k);
                     // the code as the child ended (shown); what it counts is `counted`
                     codes[i] = Some(status.code().unwrap_or(-1));
                 }
-                None => k += 1,
+                Ok(None) => k += 1,
+                Err(e) => {
+                    let (i, _) = running.remove(k);
+                    let _ = toryo::term::try_line(
+                        toryo::term::Stream::Err,
+                        &format!("{:<width$} │ error: cannot wait for the child: {e}", ids[i]),
+                    );
+                    codes[i] = Some(2);
+                }
             }
         }
     }
@@ -278,7 +302,9 @@ pub(crate) fn run_many(
     } else {
         "Escalated"
     };
-    toryo::term::end_block(&title, colour, &lines);
+    if !silent.get() {
+        toryo::term::end_block(&title, colour, &lines);
+    }
     Ok(if all_done { worst } else { worst.max(1) })
 }
 

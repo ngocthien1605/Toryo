@@ -70,7 +70,10 @@ fn samples() -> Vec<E> {
         E::Pause { reason: s("quota") },
         E::Unpause,
         E::Reverify,
-        E::Escalate { reason: s("x") },
+        E::Escalate {
+            reason: s("x"),
+            class: None,
+        },
         E::Cancel,
         E::Fail { error: s("x") },
     ]
@@ -371,6 +374,7 @@ fn escalated_before_plan_approval_resumes_planning_not_fixing() {
     m.apply(E::Start).unwrap();
     m.apply(E::Escalate {
         reason: "planner InvalidOutput".into(),
+        class: None,
     })
     .unwrap();
     assert_eq!(
@@ -533,6 +537,7 @@ fn resume_stage_returns_to_the_escalated_stage_without_a_cycle() {
     let mut m = at(S::Implementing);
     m.apply(E::Escalate {
         reason: "recovery_policy_violation".into(),
+        class: None,
     })
     .unwrap();
     assert_eq!(m.escalated_from(), Some(S::Implementing));
@@ -540,7 +545,11 @@ fn resume_stage_returns_to_the_escalated_stage_without_a_cycle() {
     assert_eq!(m.fix_cycle(), 0);
     // an escalation from a waiting state has no stage to go back to
     let mut m = at(S::WaitingPlanApproval);
-    m.apply(E::Escalate { reason: "x".into() }).unwrap();
+    m.apply(E::Escalate {
+        reason: "x".into(),
+        class: None,
+    })
+    .unwrap();
     assert!(m.apply(E::ResumeStage).is_err());
 }
 
@@ -768,6 +777,7 @@ fn a_machine_caused_class_is_recorded_and_cleared_on_resume() {
     to_verifying(&mut m, "c1");
     m.apply(E::Escalate {
         reason: "environment_gate_unavailable: …".into(),
+        class: None,
     })
     .unwrap();
     // absent until the engine sets it; not serialised
@@ -785,6 +795,7 @@ fn a_machine_caused_class_is_recorded_and_cleared_on_resume() {
     to_verifying(&mut n, "c1");
     n.apply(E::Escalate {
         reason: "skill_unavailable: …".into(),
+        class: None,
     })
     .unwrap();
     n.set_reason_class("skill_unavailable");
@@ -809,6 +820,7 @@ fn the_escalation_class_is_cleared_on_every_way_out() {
         }
         m.apply(E::Escalate {
             reason: "environment_gate_unavailable: x".into(),
+            class: None,
         })
         .unwrap();
         m.set_reason_class("environment_gate_unavailable");
@@ -842,6 +854,7 @@ fn the_escalation_class_is_cleared_on_every_way_out() {
     m.apply(E::Reverify).unwrap();
     m.apply(E::Escalate {
         reason: "verify_mutated_tree: x".into(),
+        class: None,
     })
     .unwrap();
     assert_eq!(m.reason_class(), None);
@@ -888,4 +901,52 @@ fn every_machine_caused_class_is_one_of_the_engine_constants() {
             "{c} must not be left by a plain resume"
         );
     }
+}
+
+/// R23-26 (review 2026-10-23 A2): one spelling per class — every class reads back from its
+/// string, the strings are distinct, `MACHINE_CAUSED` is exactly the machine-caused classes,
+/// and a string that is no class is never machine-caused.
+#[test]
+fn escalation_classes_have_one_spelling() {
+    use std::collections::BTreeSet;
+    let all: BTreeSet<&str> = EscalationClass::ALL.iter().map(|c| c.as_str()).collect();
+    assert_eq!(all.len(), EscalationClass::ALL.len(), "distinct strings");
+    for c in EscalationClass::ALL {
+        assert_eq!(c.as_str().parse::<EscalationClass>(), Ok(c), "{c}");
+        assert_eq!(is_machine_caused(c.as_str()), c.is_machine_caused(), "{c}");
+    }
+    let machine: BTreeSet<&str> = EscalationClass::ALL
+        .iter()
+        .filter(|c| c.is_machine_caused())
+        .map(|c| c.as_str())
+        .collect();
+    assert_eq!(machine, MACHINE_CAUSED.into_iter().collect::<BTreeSet<_>>());
+    for s in ["max_fix_cycles", "timeout", "", "GateUnavailable"] {
+        assert!(!is_machine_caused(s), "{s}");
+    }
+}
+
+/// R23-35 (review 2026-10-23 A2): the class rides in the `Escalate` event and the transition sets
+/// it — no second step; an event stored before it had a class reads back without one.
+#[test]
+fn an_escalation_event_carries_its_class() {
+    let mut m = Machine::new(1);
+    m.apply(E::Start).unwrap();
+    m.apply(E::Escalate {
+        reason: "skill_unavailable: x".into(),
+        class: Some("skill_unavailable".into()),
+    })
+    .unwrap();
+    assert_eq!(m.reason_class(), Some("skill_unavailable"));
+    let old: PipelineEvent =
+        serde_json::from_str(r#"{"event":"escalate","reason":"r"}"#).expect("an old payload");
+    assert_eq!(
+        old,
+        E::Escalate {
+            reason: "r".into(),
+            class: None
+        }
+    );
+    let json = serde_json::to_string(&old).unwrap();
+    assert!(!json.contains("class"), "{json}");
 }

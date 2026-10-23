@@ -78,6 +78,36 @@ fn get(v: &Value, k: &str) -> u64 {
     v.get(k).and_then(Value::as_u64).unwrap_or(0)
 }
 
+/// The Anthropic usage counters [`claude_buckets`] reads.
+pub const CLAUDE_USAGE_KEYS: &[&str] = &[
+    "input_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "output_tokens",
+];
+/// The Codex usage counters [`codex_buckets`] reads.
+pub const CODEX_USAGE_KEYS: &[&str] = &[
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+];
+
+/// R23-21: can a vendor usage object be taken as exact? An object with at least one of `keys`,
+/// and every one of them that is there a whole number of 0 or more. Was: a counter that is a
+/// float, negative or a string (a field renamed or retyped by a CLI update) was read as 0, and
+/// the turn was recorded as `Exact` — its tokens never reached the budget.
+pub fn usage_is_exact(v: &Value, keys: &[&str]) -> bool {
+    let Some(o) = v.as_object() else {
+        return false;
+    };
+    keys.iter().any(|k| o.contains_key(*k))
+        && keys
+            .iter()
+            .filter_map(|k| o.get(*k))
+            .all(|n| n.as_u64().is_some())
+}
+
 /// Anthropic usage object: `input_tokens` already EXCLUDES cache reads/writes.
 pub fn claude_buckets(usage: &Value) -> Buckets {
     Buckets {

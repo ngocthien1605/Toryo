@@ -60,6 +60,12 @@ pub async fn run_to_completion(
 /// How often a stop request and the max limit are checked while a turn runs.
 const LIMITS_POLL: Duration = Duration::from_millis(200);
 
+/// R23-21: how long a session has to deliver its terminal event after `interrupt()`. The CLI
+/// adapter needs up to about 11 s for it on a loaded machine (the stop poll, 1 s; the drain of
+/// its output, 5 s; the wait for its pipes, 5 s) — with 10 s the `TurnFailed` detail and the
+/// permission denials of a stopped turn could be lost.
+const INTERRUPT_GRACE: Duration = Duration::from_secs(15);
+
 /// Called with the external session id as soon as it is known.
 pub type SessionHook = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -118,7 +124,7 @@ pub async fn run_to_completion_with(
         let now = tokio::time::Instant::now();
         let mut wait = match interrupted_at {
             // after an interrupt, give the session a moment to deliver its terminal event
-            Some(t) => (t + Duration::from_secs(10)).saturating_duration_since(now),
+            Some(t) => (t + INTERRUPT_GRACE).saturating_duration_since(now),
             None => limit_at(last_event, command_running).saturating_duration_since(now),
         };
         if cancel.is_some() && interrupted_at.is_none() {
