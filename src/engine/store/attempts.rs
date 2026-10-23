@@ -59,9 +59,12 @@ pub struct AttemptRow {
     pub started_at: String,
     pub ended_at: Option<String>,
     pub context_sha256: Option<String>,
+    /// R23-36: a read-only role's write that could not be undone yet (X32) — the next writing
+    /// attempt and recovery undo it first.
+    pub undo_pending: bool,
 }
 
-pub(super) const ATTEMPT_COLS: &str = "id, task_id, stage, attempt, kind, fallback_from, profile, external_session_id, pid, pid_created_at, status, error_class, error_detail, git_head_before, git_head_after, subject_commit, partial_commit, checkpoint_kind, partial_snapshot_id, correction_turns, started_at, ended_at, context_sha256";
+pub(super) const ATTEMPT_COLS: &str = "id, task_id, stage, attempt, kind, fallback_from, profile, external_session_id, pid, pid_created_at, status, error_class, error_detail, git_head_before, git_head_after, subject_commit, partial_commit, checkpoint_kind, partial_snapshot_id, correction_turns, started_at, ended_at, context_sha256, undo_pending";
 
 pub(super) fn attempt_from_row(r: &rusqlite::Row) -> rusqlite::Result<AttemptRow> {
     Ok(AttemptRow {
@@ -88,6 +91,7 @@ pub(super) fn attempt_from_row(r: &rusqlite::Row) -> rusqlite::Result<AttemptRow
         started_at: r.get(20)?,
         ended_at: r.get(21)?,
         context_sha256: r.get(22)?,
+        undo_pending: r.get::<_, i64>(23)? != 0,
     })
 }
 
@@ -181,7 +185,15 @@ pub struct AttemptEnd {
     pub partial_commit: Option<String>,
     pub partial_snapshot_id: Option<String>,
     pub correction_turns: Option<u32>,
+    /// R23-36: set the attempt's `undo_pending` (once set it stays: a later end of the same
+    /// attempt — the checkpoint's commit on the writing attempt — does not clear it).
+    pub undo_pending: bool,
 }
+
+/// R23-36: the words of a reason whose undo is still pending (X32). Up to schema version 2 they
+/// were the only record of it; the migration to version 3 sets `undo_pending` by them.
+pub const UNDO_PENDING_WORDS: &str =
+    "the next `toryo resume` undoes what the role committed and puts back what it wrote first";
 
 pub fn finish_attempt(
     tx: &Transaction,
@@ -194,7 +206,8 @@ pub fn finish_attempt(
            external_session_id = COALESCE(?5, external_session_id), git_head_after = COALESCE(?6, git_head_after),
            checkpoint_kind = COALESCE(?7, checkpoint_kind), partial_commit = COALESCE(?8, partial_commit),
            partial_snapshot_id = COALESCE(?9, partial_snapshot_id), correction_turns = COALESCE(?10, correction_turns),
-           ended_at = CASE WHEN ?2 = 'running' THEN NULL ELSE ?11 END
+           ended_at = CASE WHEN ?2 = 'running' THEN NULL ELSE ?11 END,
+           undo_pending = CASE WHEN ?12 THEN 1 ELSE undo_pending END
          WHERE id = ?1",
         params![
             id,
@@ -207,7 +220,8 @@ pub fn finish_attempt(
             end.partial_commit,
             end.partial_snapshot_id,
             end.correction_turns.map(|c| c as i64),
-            now()
+            now(),
+            end.undo_pending
         ],
     )?;
     let a = get_attempt(tx, id)?;

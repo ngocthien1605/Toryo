@@ -1012,6 +1012,7 @@ mod tests {
             started_at: String::new(),
             ended_at: None,
             context_sha256: None,
+            undo_pending: false,
         }
     }
 

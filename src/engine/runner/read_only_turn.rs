@@ -73,7 +73,7 @@ impl<'a> Engine<'a> {
                 // before the undo removes it — and a failure of the checks themselves must not
                 // mask the error of the turn: it is logged, the turn's own error goes up
                 match self.read_only_findings(t, &a.id, &before) {
-                    Ok(Some((reason, class, _))) => {
+                    Ok(Some((reason, class, _, pending))) => {
                         // R23-08: the same closer as every other attempt — `stage_finished`,
                         // the `escalated` event and the class on the machine
                         let detail = format!("{reason} (the turn itself ended in an error: {e:#})");
@@ -81,6 +81,7 @@ impl<'a> Engine<'a> {
                         let end = AttemptEnd {
                             error_class: Some(class.to_string()),
                             error_detail: Some(detail),
+                            undo_pending: pending,
                             ..Default::default()
                         };
                         self.close(
@@ -219,7 +220,7 @@ impl<'a> Engine<'a> {
         r: &StageOutcome,
         before: &TreeState,
     ) -> Result<Option<Flow>> {
-        if let Some((reason, class, undone)) = self.read_only_findings(t, &a.id, before)? {
+        if let Some((reason, class, undone, pending)) = self.read_only_findings(t, &a.id, before)? {
             self.end_and(
                 a,
                 AttemptStatus::Failed,
@@ -228,6 +229,7 @@ impl<'a> Engine<'a> {
                     error_class: Some(class.into()),
                     // (a protected change alone has always ended the attempt without a detail)
                     error_detail: (undone || class != protect::REASON).then(|| reason.clone()),
+                    undo_pending: pending,
                     ..Default::default()
                 },
                 Some(Ev::Escalate {
@@ -241,7 +243,8 @@ impl<'a> Engine<'a> {
         Ok(None)
     }
 
-    /// What the checks after a read-only turn found — `(reason, class, the undo found a write)`.
+    /// What the checks after a read-only turn found — `(reason, class, the undo found a write,
+    /// the undo is still pending)`.
     /// M13-R4 (X32): the protected check runs first (it records what it found), and then the
     /// undo runs all the same — a protected change is no reason to leave the role's other
     /// writes in the tree, where the next fix cycle would commit them. M13-R7: the same code
@@ -251,14 +254,14 @@ impl<'a> Engine<'a> {
         t: &TaskRow,
         attempt: &str,
         before: &TreeState,
-    ) -> Result<Option<(String, &'static str, bool)>> {
+    ) -> Result<Option<(String, &'static str, bool, bool)>> {
         let protected = self.protected_violation(t, false)?;
         let wt = Worktree::new(&self.g, &t.worktree);
         let undone = undo_read_only_write(&wt, t, attempt, before)?;
         Ok(match (protected, undone) {
-            (Some(p), Some(u)) => Some((format!("{p}; {u}"), protect::REASON, true)),
-            (Some(p), None) => Some((p, protect::REASON, false)),
-            (None, Some(u)) => Some((u, "policy_violation", true)),
+            (Some(p), Some(u)) => Some((format!("{p}; {u}"), protect::REASON, true, u.pending)),
+            (Some(p), None) => Some((p, protect::REASON, false, false)),
+            (None, Some(u)) => Some((u.reason, "policy_violation", true, u.pending)),
             (None, None) => None,
         })
     }

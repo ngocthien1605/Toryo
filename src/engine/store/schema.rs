@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS stage_attempts (
   context_sha256 TEXT,
   argv_sha256 TEXT,
   correction_turns INTEGER NOT NULL DEFAULT 0,
+  undo_pending INTEGER NOT NULL DEFAULT 0,
   started_at TEXT NOT NULL, ended_at TEXT,
   UNIQUE (task_id, stage, attempt)
 );

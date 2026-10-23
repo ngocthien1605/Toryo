@@ -91,7 +91,7 @@ pub(in crate::engine) fn undo_read_only_write(
     t: &TaskRow,
     attempt: &str,
     before: &TreeState,
-) -> Result<Option<String>> {
+) -> Result<Option<Undone>> {
     let mut after = TreeState::read(wt)?;
     let Some(mut reason) = read_only_write(before, &after) else {
         return Ok(None);
@@ -108,7 +108,12 @@ pub(in crate::engine) fn undo_read_only_write(
         }
     }
     if before.head != after.head {
-        return Ok(Some(could_not_undo(wt, t, attempt, before, &after, reason)));
+        // (no commit to go back to, ever: nothing is pending)
+        let pending = before.head.is_some();
+        return Ok(Some(Undone {
+            reason: could_not_undo(wt, t, attempt, before, &after, reason),
+            pending,
+        }));
     }
     // (again, written): changed before the turn and changed again / clean or absent before it
     let split = |after: &TreeState| -> (Vec<String>, Vec<String>) {
@@ -120,7 +125,7 @@ pub(in crate::engine) fn undo_read_only_write(
     };
     let (again, written) = split(&after);
     if written.is_empty() && again.is_empty() {
-        return Ok(Some(reason));
+        return Ok(Some(Undone::done(reason)));
     }
     // AC-3: nothing is copied, put back or deleted through a link or junction — Git lists the
     // files behind a junction like any folder's. A link the role made is removed as a link; one
@@ -226,11 +231,35 @@ pub(in crate::engine) fn undo_read_only_write(
     if !not_copied.is_empty() {
         reason.push_str(&format!("; no copy kept of: {}", not_copied.join(", ")));
     }
-    Ok(Some(reason))
+    Ok(Some(Undone::done(reason)))
+}
+
+/// What the undo of a read-only role's write found: the reason for the escalation, and whether
+/// the undo is still `pending` (R23-36: a typed flag the attempt keeps, `undo_pending`; was the
+/// sentence [`UNDO_PENDING`] searched for in its `error_detail`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::engine) struct Undone {
+    pub(in crate::engine) reason: String,
+    pub(in crate::engine) pending: bool,
+}
+
+impl Undone {
+    fn done(reason: String) -> Self {
+        Self {
+            reason,
+            pending: false,
+        }
+    }
+}
+
+impl std::fmt::Display for Undone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
 }
 
 /// M13-R4 (X32): the newest attempt is a read-only one that ended with "could not be put back
-/// yet" ([`UNDO_PENDING`] in its detail), and HEAD is on the task branch again with no Git
+/// yet" (its `undo_pending`, R23-36), and HEAD is on the task branch again with no Git
 /// operation unfinished: run the undo with the state that attempt saved before its turn.
 /// `None`: nothing was pending (or it cannot be done yet).
 pub(in crate::engine) fn finish_pending_undo(
@@ -238,16 +267,11 @@ pub(in crate::engine) fn finish_pending_undo(
     t: &TaskRow,
     attempts: &[AttemptRow],
     wt: &Worktree,
-) -> Result<Option<String>> {
+) -> Result<Option<Undone>> {
     let Some(a) = attempts.last() else {
         return Ok(None);
     };
-    if a.status != AttemptStatus::Failed
-        || !a
-            .error_detail
-            .as_deref()
-            .is_some_and(|d| d.contains(UNDO_PENDING))
-    {
+    if a.status != AttemptStatus::Failed || !a.undo_pending {
         return Ok(None);
     }
     let on_branch = wt.head_ref().ok().flatten() == Some(format!("refs/heads/{}", t.branch));
@@ -261,9 +285,10 @@ pub(in crate::engine) fn finish_pending_undo(
 }
 
 /// The tail of a reason that says a read-only role's write could not be undone yet (M13-R4,
-/// X32): the next writing attempt, and recovery, look for it and run the undo first.
-pub(in crate::engine) const UNDO_PENDING: &str =
-    "the next `toryo resume` undoes what the role committed and puts back what it wrote first";
+/// X32), for the owner; the attempt's `undo_pending` is what the next writing attempt and
+/// recovery read (R23-36). The words live with the store, which migrates a database of schema
+/// version 2 by them.
+pub(in crate::engine) const UNDO_PENDING: &str = store::UNDO_PENDING_WORDS;
 
 /// M13-R4 (X32): the role moved HEAD and it cannot be reset now (HEAD is off the task branch, or
 /// a Git operation is unfinished). Nothing is reset or put back — a reset would move another

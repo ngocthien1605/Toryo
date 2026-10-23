@@ -17,7 +17,7 @@ use serde_json::json;
 
 use super::checks::Protected;
 use super::protect;
-use super::runner::{partial_trailers, writing_stage, FailedTurn, HeadGuard};
+use super::runner::{partial_trailers, writing_stage, FailedTurn, HeadGuard, Undone};
 use super::snapshot;
 use super::state::{PipelineEvent as Ev, PipelineState as St};
 use super::store::{self, AttemptEnd, AttemptRow, AttemptStatus, Store, TaskRow};
@@ -76,20 +76,21 @@ pub(super) fn foreign_commit(
 }
 
 /// How a read-only attempt that was `Running` when its owner died ends (M13-R4, X32): when the
-/// undo of its write could not be done yet ([`super::runner::UNDO_PENDING`] in `undone`) it
-/// ends `Failed` with that reason, so that the next writing attempt finds it and finishes the
-/// undo; otherwise as always, `Interrupted`.
+/// undo of its write could not be done yet (`pending`, R23-36) it ends `Failed` with that
+/// reason and `undo_pending`, so that the next writing attempt finds it and finishes the undo;
+/// otherwise as always, `Interrupted`.
 fn read_only_end(
-    undone: &Option<String>,
+    undone: &Option<Undone>,
     class: Option<String>,
     detail: &str,
 ) -> (AttemptStatus, AttemptEnd) {
     match undone {
-        Some(u) if u.contains(super::runner::UNDO_PENDING) => (
+        Some(u) if u.pending => (
             AttemptStatus::Failed,
             AttemptEnd {
                 error_class: class.or_else(|| Some("policy_violation".into())),
-                error_detail: Some(u.clone()),
+                error_detail: Some(u.reason.clone()),
+                undo_pending: true,
                 ..Default::default()
             },
         ),
@@ -195,7 +196,7 @@ impl<'a> Recovery<'a> {
         t: &TaskRow,
         atts: &[AttemptRow],
         wt: &Worktree,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<Undone>> {
         if !matches!(t.state, St::Planning | St::Reviewing) {
             return Ok(None);
         }
@@ -211,10 +212,11 @@ impl<'a> Recovery<'a> {
             Ok(None) => Ok(None),
             Err(e) => {
                 let paths: Vec<String> = wt.changed()?.into_iter().map(|c| c.1).collect();
-                Ok((!paths.is_empty()).then(|| {
-                    format!(
+                Ok((!paths.is_empty()).then(|| Undone {
+                    reason: format!(
                         "the record of the tree before the read-only turn cannot be read ({e:#}), so nothing could be told apart: {paths:?} — not put back"
-                    )
+                    ),
+                    pending: false,
                 }))
             }
         }
@@ -363,7 +365,7 @@ impl<'a> Recovery<'a> {
                     notes.push(format!("{}: interrupted (read-only stage, re-run; Claude resumes its session, R48)", a.id));
                 }
                 if saved {
-                    if let Some(reason) = undone {
+                    if let Some(Undone { reason, .. }) = undone {
                         let i = id.to_string();
                         self.store.call(move |tx| {
                             store::transition(

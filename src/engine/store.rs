@@ -20,9 +20,10 @@ use crate::config::data_dir;
 use crate::domain::TokenUsage;
 use crate::usage::{Accounting, Buckets, Weights};
 
-/// 2 (M13-05): `deploy_confirmations`. A database of version 1 is opened and raised (the table is
-/// created, nothing else changes); one of a higher version is refused.
-pub const SCHEMA_VERSION: i64 = 2;
+/// 2 (M13-05): `deploy_confirmations`; 3 (R23-36): `stage_attempts.undo_pending`. A database of
+/// an older version is opened and raised (the tables are created, the column added and set from
+/// the words it replaces, nothing else changes); one of a higher version is refused.
+pub const SCHEMA_VERSION: i64 = 3;
 
 mod schema;
 use schema::SCHEMA;
@@ -131,6 +132,22 @@ impl Store {
                 if !cols.iter().any(|x| x == c) {
                     tx.execute_batch(&format!("ALTER TABLE tasks ADD COLUMN {c} {ty}"))?;
                 }
+            }
+            // R23-36 (version 3): `stage_attempts.undo_pending`; a database of version 2 kept a
+            // pending undo only as words of the attempt's detail — they set the flag, once
+            let cols: Vec<String> = {
+                let mut st = tx.prepare("PRAGMA table_info(stage_attempts)")?;
+                let rows = st.query_map([], |r| r.get::<_, String>(1))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if !cols.iter().any(|x| x == "undo_pending") {
+                tx.execute_batch(
+                    "ALTER TABLE stage_attempts ADD COLUMN undo_pending INTEGER NOT NULL DEFAULT 0",
+                )?;
+                tx.execute(
+                    "UPDATE stage_attempts SET undo_pending = 1 WHERE status = 'failed' AND instr(error_detail, ?1) > 0",
+                    [UNDO_PENDING_WORDS],
+                )?;
             }
             tx.commit()?;
         }
@@ -259,9 +276,10 @@ mod tests {
 
     /// M13-05 AC-4: the schema version is raised (2: `deploy_confirmations`), a database of
     /// version 1 opens and is raised without losing a row, and one a newer toryo wrote is refused.
+    /// (R23-36: the version is 3 now — the assertions on "2" became "3", and the newer one "4".)
     #[test]
     fn an_older_database_opens_and_is_raised() {
-        assert_eq!(SCHEMA_VERSION, 2);
+        assert_eq!(SCHEMA_VERSION, 3);
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("toryo.db");
         // a version-1 database with a task in it: no `deploy_confirmations` table
@@ -288,7 +306,7 @@ mod tests {
         }
         assert_eq!(version(&p), "1");
         let st = Store::open(&p).unwrap();
-        assert_eq!(version(&p), "2");
+        assert_eq!(version(&p), "3");
         assert_eq!(
             st.call(|tx| get_task(tx, "OLD-1")).unwrap().id,
             "OLD-1",
@@ -323,13 +341,77 @@ mod tests {
         // a database a newer toryo wrote
         Connection::open(&p)
             .unwrap()
-            .execute_batch("UPDATE meta SET value='3' WHERE key='schema_version';")
+            .execute_batch("UPDATE meta SET value='4' WHERE key='schema_version';")
             .unwrap();
         let e = Store::open(&p).err().expect("refused").to_string();
         assert!(
-            e.contains("schema version 3") && e.contains("expects 2"),
+            e.contains("schema version 4") && e.contains("expects 3"),
             "{e}"
         );
+    }
+
+    /// R23-36: a database of version 2 kept a pending undo of a read-only role's write (X32) only
+    /// as words of the attempt's detail. Raised to 3, those attempts get `undo_pending`, and no
+    /// other attempt does.
+    #[test]
+    fn a_version_2_database_keeps_its_pending_undo() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("toryo.db");
+        {
+            let st = Store::open(&p).unwrap();
+            st.call(|tx| insert_task(tx, &new_task("U-1"))).unwrap();
+            for (stage, detail) in [
+                (
+                    "review",
+                    format!("policy_violation: x; could NOT be put back: {UNDO_PENDING_WORDS}"),
+                ),
+                ("plan", "policy_violation: x".to_string()),
+            ] {
+                st.call(move |tx| {
+                    let a = begin_attempt(
+                        tx,
+                        "U-1",
+                        &NewAttempt {
+                            stage,
+                            kind: "agent",
+                            profile: None,
+                            fallback_from: None,
+                            head_before: None,
+                            subject_commit: None,
+                        },
+                    )?;
+                    finish_attempt(
+                        tx,
+                        &a.id,
+                        AttemptStatus::Failed,
+                        &AttemptEnd {
+                            error_detail: Some(detail),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .unwrap();
+            }
+        }
+        // as version 2 had it: no column
+        Connection::open(&p)
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE stage_attempts DROP COLUMN undo_pending; UPDATE meta SET value='2' WHERE key='schema_version';",
+            )
+            .unwrap();
+        let st = Store::open(&p).unwrap();
+        let atts = st.call(|tx| attempts(tx, "U-1")).unwrap();
+        let pending: Vec<(&str, bool)> = atts
+            .iter()
+            .map(|a| (a.stage.as_str(), a.undo_pending))
+            .collect();
+        assert_eq!(pending, [("review", true), ("plan", false)]);
+        // and the flag stays when the attempt is ended again with the default end
+        let id = atts[0].id.clone();
+        st.call(move |tx| finish_attempt(tx, &id, AttemptStatus::Failed, &AttemptEnd::default()))
+            .unwrap();
+        assert!(st.call(|tx| attempts(tx, "U-1")).unwrap()[0].undo_pending);
     }
 
     /// Review of M13-05: "asked again: the configuration changed since your last yes" is said
