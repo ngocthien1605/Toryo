@@ -387,3 +387,44 @@ fn r23_14_a_budget_interrupt_is_named_in_agent_killed() {
         .unwrap_or_else(|| panic!("an agent_killed event: {ev:?}"));
     assert_eq!(killed["reason"], "budget", "{killed}");
 }
+
+/// R23-16: `toryo run A B` whose own stderr is closed (`| head`, a reader that went away).
+/// Was: the parent panicked at its next line ("failed printing to stderr"); its pipes from the
+/// children closed with it, and each child died at its next line — mid-task. Now the parent
+/// stops printing, keeps reading and waits; the tasks run to their end.
+#[test]
+fn r23_16_a_closed_stream_ends_no_task_of_a_multi_run() {
+    let env = setup("codex-openai");
+    create(&env, "P-1");
+    create(&env, "P-2");
+    let s = script(
+        &env,
+        "p.json",
+        json!({
+            "planner": [turn(vec![json!({"kind": "delay", "ms": 3000}), plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let mut c = command(
+        &env,
+        &["run", "P-1", "P-2", "--yes", "--fake-agents", &s],
+        &[],
+    );
+    c.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    // read the first line, then close the pipe
+    let mut err = child.stderr.take().unwrap();
+    let mut first = [0u8; 64];
+    let _ = std::io::Read::read(&mut err, &mut first).unwrap();
+    drop(err);
+    let status = child.wait().unwrap();
+    for id in ["P-1", "P-2"] {
+        assert_eq!(
+            task(&env, id).state,
+            St::Completed,
+            "{id} (the parent ended with {status:?})"
+        );
+    }
+}

@@ -481,7 +481,13 @@ fn main() -> ExitCode {
         .stack_size(CLI_STACK)
         .spawn(cli_main)
     {
-        Ok(h) => h.join().unwrap_or_else(|_| ExitCode::from(101)),
+        Ok(h) => {
+            let code = h.join().unwrap_or_else(|_| ExitCode::from(101));
+            // R23-16: also after a panic, which skipped the call in `cli_main` (a second call
+            // finds nothing left)
+            toryo::notify::wait_pending();
+            code
+        }
         Err(e) => {
             toryo::errln!("error: cannot start the CLI thread: {e}");
             ExitCode::from(2)
