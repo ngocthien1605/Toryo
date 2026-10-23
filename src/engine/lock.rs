@@ -231,8 +231,12 @@ fn install_interrupt_handler() {
                 return 0;
             }
             if INTERRUPTS.fetch_add(1, Ordering::SeqCst) == 0 {
-                // (the system calls the handler on a thread of its own: printing is safe)
-                eprint!("{INTERRUPT_NOTE}");
+                // (the system calls the handler on a thread of its own: printing is safe).
+                // R23-15: never `eprint!` — it panics when stderr is closed (a `run A B` child
+                // whose parent is gone), and a panic cannot leave an `extern "system"` frame:
+                // the process would abort instead of stopping its task
+                use std::io::Write;
+                let _ = std::io::stderr().write_all(INTERRUPT_NOTE.as_bytes());
                 return 1;
             }
             // the second time: not handled here — the default handler ends the process
