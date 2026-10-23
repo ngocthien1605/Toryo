@@ -115,7 +115,7 @@ pub struct Recovery<'a> {
 impl<'a> Recovery<'a> {
     fn task(&self, id: &str) -> Result<TaskRow> {
         let i = id.to_string();
-        self.store.call(move |tx| store::get_task(tx, &i))
+        self.store.read(move |tx| store::get_task(tx, &i))
     }
 
     fn finish(

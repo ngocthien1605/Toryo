@@ -188,3 +188,34 @@ fn r23_03_a_moved_branch_at_the_final_gate_is_no_loop() {
     assert_eq!(code, 0, "{err}");
     assert_eq!(task(&env, "M-1").state, St::Completed, "{err}");
 }
+
+/// R23-07 (C7): the stop poll of a running task is a read. Was: `stop_requested` (and the
+/// `StopWatch` thread, once a second, and `toryo stop`) asked through `Store::call`, a
+/// `BEGIN IMMEDIATE` transaction: while another process held the write lock, the poll waited
+/// in SQLite's busy handler (15 s) and then failed the drive with "database is locked". A
+/// read in WAL mode never waits for a writer.
+#[test]
+fn r23_07_the_stop_poll_never_waits_for_a_writer() {
+    let env = setup("codex-openai");
+    create(&env, "S-1");
+    // (this process takes the task lock itself: its data folder is the fixture's)
+    std::env::set_var("TORYO_DATA_DIR", &env.data);
+    let st = db(&env);
+    let lock = toryo::engine::lock::TaskLock::acquire(&st, "S-1").unwrap();
+    // another process (here: another connection) holds the write lock
+    let other = rusqlite::Connection::open(env.data.join("toryo.db")).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    let asked = lock.stop_requested();
+    let took = started.elapsed();
+    other.execute_batch("ROLLBACK").unwrap();
+    assert!(matches!(asked, Ok(false)), "{asked:?}");
+    assert!(
+        took < std::time::Duration::from_secs(3),
+        "the poll waited {took:?}"
+    );
+    let watch = lock.watch_stop();
+    assert!(!watch.stopped());
+    drop(watch);
+    lock.release();
+}

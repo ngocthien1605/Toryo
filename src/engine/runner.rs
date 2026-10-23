@@ -489,7 +489,7 @@ impl<'a> Engine<'a> {
         let (t, g) = (self.id.clone(), self.lock.generation);
         let by = self
             .store
-            .call(move |tx| store::pending_stop_by(tx, &t, g))?
+            .read(move |tx| store::pending_stop_by(tx, &t, g))?
             .unwrap_or_default();
         self.rec.emit_quiet(EngineEvent::CancelRequested {
             source: if by.ends_with("(Ctrl+C)") {
@@ -2484,8 +2484,13 @@ impl<'a> Engine<'a> {
             if !waiting {
                 waiting = true;
                 let (i, l) = (t.id.clone(), lock.to_string());
-                let holder = self.store.call(move |tx| {
-                    store::set_env_wait(tx, &i, Some(&l))?;
+                {
+                    let (i, l) = (i.clone(), l.clone());
+                    self.store
+                        .call(move |tx| store::set_env_wait(tx, &i, Some(&l)))?;
+                }
+                // R23-07: a lookup, never the write lock
+                let holder = self.store.read(move |tx| {
                     Ok(store::deployments(tx)?
                         .into_iter()
                         .find(|d| d.lock == l && d.finished_at.is_none() && d.task != i)

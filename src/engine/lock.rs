@@ -72,7 +72,7 @@ impl TaskLock {
         let t = task.to_string();
         let owner_now = move |st: &Store| {
             let t = t.clone();
-            st.call(move |tx| store::lock_owner(tx, &t)).ok().flatten()
+            st.read(move |tx| store::lock_owner(tx, &t)).ok().flatten()
         };
         let mut tries = 0;
         loop {
@@ -118,7 +118,7 @@ impl TaskLock {
         let (t, g) = (self.task.clone(), self.generation);
         Ok(self
             .store
-            .call(move |tx| store::pending_stop(tx, &t, g))?
+            .read(move |tx| store::pending_stop(tx, &t, g))?
             .is_some())
     }
 
@@ -146,7 +146,7 @@ impl TaskLock {
                 // M13-12 (X29): a Ctrl+C becomes the row `toryo stop` writes, found just below
                 interrupt_to_stop(&st, &t, g);
                 let (t2, g2) = (t.clone(), g);
-                if let Ok(Some(_)) = st.call(move |tx| store::pending_stop(tx, &t2, g2)) {
+                if let Ok(Some(_)) = st.read(move |tx| store::pending_stop(tx, &t2, g2)) {
                     f2.store(true, Ordering::SeqCst);
                     return;
                 }
@@ -569,7 +569,7 @@ pub enum StopOutcome {
 pub fn stop(store: &Store, task: &str, wait: Duration) -> Result<StopOutcome> {
     let by = owner_label();
     let t = task.to_string();
-    let mut generation = store.call(move |tx| store::lock_generation(tx, &t))?;
+    let mut generation = store.read(move |tx| store::lock_generation(tx, &t))?;
     if probe_free(task)? {
         let (t, b) = (task.to_string(), by.clone());
         let id = store.call(move |tx| store::insert_stop(tx, &t, generation, &b))?;
@@ -581,14 +581,14 @@ pub fn stop(store: &Store, task: &str, wait: Duration) -> Result<StopOutcome> {
     let started = Instant::now();
     while started.elapsed() < wait {
         std::thread::sleep(Duration::from_millis(250));
-        let row = store.call(move |tx| store::control_request(tx, id))?;
+        let row = store.read(move |tx| store::control_request(tx, id))?;
         if let Some(o) = row.outcome {
             if o != "expired" {
                 return Ok(StopOutcome::Stopped(o));
             }
         }
         let t = task.to_string();
-        let g = store.call(move |tx| store::lock_generation(tx, &t))?;
+        let g = store.read(move |tx| store::lock_generation(tx, &t))?;
         if g != generation {
             // a new owner took the task: re-address the stop once per generation
             generation = g;
@@ -598,7 +598,7 @@ pub fn stop(store: &Store, task: &str, wait: Duration) -> Result<StopOutcome> {
         }
         if probe_free(task)? {
             // the owner exited without handling it (finished or crashed)
-            let row = store.call(move |tx| store::control_request(tx, id))?;
+            let row = store.read(move |tx| store::control_request(tx, id))?;
             if let Some(o) = row.outcome {
                 if o != "expired" {
                     return Ok(StopOutcome::Stopped(o));
