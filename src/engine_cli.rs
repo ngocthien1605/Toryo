@@ -1112,8 +1112,28 @@ fn waits_for_a_deploy_yes(t: &TaskRow) -> bool {
     machine_caused_stop(t) && t.machine.reason_class() == Some(toryo::engine::gates::ENV_CONFIRM)
 }
 
-fn resume_one(st: &Store, lock: &TaskLock, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
+/// The message of a task that waits for the owner's "yes" before a deploy, which a `resume` of
+/// every task never gives (M12-07 review).
+fn deploy_yes_note(id: &str) -> String {
+    format!("{id}: waits for your yes before it deploys — look at it, then `toryo resume {id}`")
+}
+
+/// `blanket`: this is one task of a `resume` of every task (no id). Its "waits for a deploy
+/// yes" check is made again here, on the row read under the lock (R23-01, X17): the loop's list
+/// was read before, and a task that stopped to ask since then must not take this resume for the
+/// owner's yes.
+fn resume_one(
+    st: &Store,
+    lock: &TaskLock,
+    r: &ResumeArgs,
+    d: &DriveArgs,
+    blanket: bool,
+) -> Result<i32> {
     let t = get(st, &lock.task)?;
+    if blanket && waits_for_a_deploy_yes(&t) {
+        toryo::errln!("{}", deploy_yes_note(&t.id));
+        return Ok(1);
+    }
     // M12-07 (X17): `--yes` never confirms a deploy — it is for the plan and the final gate
     if d.yes
         && waits_for_a_deploy_yes(&t)
@@ -1286,7 +1306,7 @@ pub fn resume(id: Option<&str>, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
     match id {
         Some(id) => {
             let lock = TaskLock::acquire(&st, id)?;
-            let code = resume_one(&st, &lock, r, d);
+            let code = resume_one(&st, &lock, r, d, false);
             lock.release();
             code
         }
@@ -1302,11 +1322,9 @@ pub fn resume(id: Option<&str>, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
                 }
                 // M12-07 (review): a stop that asks before a deploy is answered by `resume <id>`
                 // — never by a resume of everything
+                // (asked again under the lock, R23-01: this list may be old by then)
                 if waits_for_a_deploy_yes(&t) {
-                    toryo::errln!(
-                        "\n{}: waits for your yes before it deploys — look at it, then `toryo resume {}`",
-                        t.id, t.id
-                    );
+                    toryo::errln!("\n{}", deploy_yes_note(&t.id));
                     code = code.max(1);
                     continue;
                 }
@@ -1315,7 +1333,7 @@ pub fn resume(id: Option<&str>, r: &ResumeArgs, d: &DriveArgs) -> Result<i32> {
                         toryo::errln!("\n▶ resume {}", t.id);
                         // M12-12 (b): one failing task does not stop the others; the exit
                         // code says that one failed
-                        match resume_one(&st, &lock, &ResumeArgs::default(), d) {
+                        match resume_one(&st, &lock, &ResumeArgs::default(), d, true) {
                             Ok(c) => code = code.max(c),
                             Err(e) => {
                                 toryo::errln!("{}: error: {e:#}", t.id);
