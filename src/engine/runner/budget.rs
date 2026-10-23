@@ -5,11 +5,7 @@ use super::*;
 
 impl<'a> Engine<'a> {
     pub(super) fn billing(&self, profile: &str) -> &'static str {
-        match self.cfg.profile(profile).map(|p| p.billing) {
-            Ok(Billing::Foundry) => "foundry",
-            Ok(Billing::Api) => "api",
-            _ => "subscription",
-        }
+        self.cfg.billing_of(profile)
     }
 
     pub(super) fn weights(&self) -> Weights {

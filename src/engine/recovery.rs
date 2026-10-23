@@ -22,7 +22,7 @@ use super::snapshot;
 use super::state::{PipelineEvent as Ev, PipelineState as St};
 use super::store::{self, AttemptEnd, AttemptRow, AttemptStatus, Store, TaskRow};
 use super::worktree::Worktree;
-use crate::config::{Billing, Effective};
+use crate::config::Effective;
 use crate::git::GitCmd;
 
 /// `recovery_policy_violation` prefix of the escalation reason (§11).
@@ -139,11 +139,7 @@ impl<'a> Recovery<'a> {
         let (stage, sess) = (a.stage.clone(), a.external_session_id.clone());
         let killed = (a.status == AttemptStatus::Running && a.kind == "agent").then(|| {
             let p = a.profile.clone().unwrap_or_default();
-            let billing = match self.cfg.profile(&p).map(|x| x.billing) {
-                Ok(Billing::Foundry) => "foundry",
-                Ok(Billing::Api) => "api",
-                _ => "subscription",
-            };
+            let billing = self.cfg.billing_of(&p);
             let model = super::usage_report::configured_model(self.cfg, &a.stage, &p);
             (p, billing, model)
         });

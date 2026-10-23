@@ -29,6 +29,17 @@ pub enum Billing {
     Api,
 }
 
+impl Billing {
+    /// The name in a usage row and in the configuration (`rename_all = "lowercase"`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Billing::Subscription => "subscription",
+            Billing::Foundry => "foundry",
+            Billing::Api => "api",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Project {
@@ -1019,6 +1030,14 @@ impl Effective {
             .profiles
             .get(name)
             .with_context(|| format!("unknown profile `{name}`"))
+    }
+
+    /// The billing kind of `profile` as a usage row and `toryo usage` name it; `subscription`
+    /// for a profile this configuration does not know (R23-31: one place, was two copies).
+    pub fn billing_of(&self, profile: &str) -> &'static str {
+        self.profile(profile)
+            .map(|p| p.billing.as_str())
+            .unwrap_or("subscription")
     }
 }
 

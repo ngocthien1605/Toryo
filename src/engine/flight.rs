@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::state::{GateKind, Machine, PipelineState as St};
+use super::state::{Machine, PipelineState as St};
 use super::store::{AttemptStatus, TaskRow};
 use crate::config::Effective;
 use crate::process::redact::{Redactions, Secret};
@@ -815,11 +815,7 @@ pub fn transition_events(
     if from != to && matches!(to, St::WaitingPlanApproval | St::WaitingFinalApproval) {
         if let Some(g) = m.gate() {
             out.push(EngineEvent::GateOpened {
-                gate: match g.kind {
-                    GateKind::Plan => "plan",
-                    GateKind::Final => "final",
-                }
-                .into(),
+                gate: g.kind.name().into(),
                 occurrence: g.occurrence,
             });
         }

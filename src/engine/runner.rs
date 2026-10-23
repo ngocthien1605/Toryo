@@ -48,7 +48,7 @@ use super::worktree::{rel, Worktree, T_AGENT, T_ATTEMPT, T_NO_CHANGE, T_PARTIAL,
 use super::xpp;
 use crate::agents::adapter::TurnHooks;
 use crate::agents::hub::AgentHub;
-use crate::config::{expand_vars, Billing, CommandKind, CommandSpec, Effective, ProfileKind};
+use crate::config::{expand_vars, CommandKind, CommandSpec, Effective, ProfileKind};
 use crate::domain::{ErrorClass, OpenSession, Role, StageOutcome, Tri, TurnInput, TurnLimits};
 use crate::git::GitCmd;
 use crate::process::Boundary;

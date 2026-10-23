@@ -244,6 +244,17 @@ pub enum GateKind {
     Final,
 }
 
+impl GateKind {
+    /// The gate's name in approval rows, `gate_opened` events, `[state]` lines and DECISIONS.md
+    /// (R23-31: one place, was three copies).
+    pub const fn name(self) -> &'static str {
+        match self {
+            GateKind::Plan => "plan",
+            GateKind::Final => "final",
+        }
+    }
+}
+
 /// One gate occurrence (R44a): opened on every entry into a waiting-for-approval state,
 /// closed by the decision. `subject` is what is being approved: the plan digest (R32) or
 /// the checkpoint SHA.

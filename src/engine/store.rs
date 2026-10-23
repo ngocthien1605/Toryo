@@ -794,13 +794,6 @@ pub fn events(tx: &Transaction, task: &str) -> Result<Vec<(i64, String, Value, S
     Ok(out)
 }
 
-fn gate_name(k: GateKind) -> &'static str {
-    match k {
-        GateKind::Plan => "plan",
-        GateKind::Final => "final",
-    }
-}
-
 /// M11-R11: record the escalation class on the task's machine (the engine, right after it
 /// escalated with that class). No-op unless the task is `Escalated`.
 pub fn set_reason_class(tx: &Transaction, task_id: &str, class: &str) -> Result<()> {
@@ -902,7 +895,7 @@ pub fn transition(tx: &Transaction, task_id: &str, e: PipelineEvent) -> Result<M
             tx.execute(
                 "UPDATE approvals SET status = ?4, reason = ?5, resolved_at = ?6, approved_by = CASE WHEN ?4 = 'approved' THEN ?7 ELSE NULL END
                  WHERE task_id = ?1 AND gate = ?2 AND occurrence = ?3 AND status = 'open'",
-                params![task_id, gate_name(old.kind), old.occurrence as i64, status, reason, at, whoami()],
+                params![task_id, old.kind.name(), old.occurrence as i64, status, reason, at, whoami()],
             )?;
         }
     }
@@ -916,9 +909,9 @@ pub fn transition(tx: &Transaction, task_id: &str, e: PipelineEvent) -> Result<M
                 "INSERT INTO approvals (id, task_id, gate, occurrence, status, requested_at, subject_kind, subject_sha256, subject_commit, verify_head, subject_digest)
                  VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
-                    format!("{task_id}/{}/{}", gate_name(g.kind), g.occurrence),
+                    format!("{task_id}/{}/{}", g.kind.name(), g.occurrence),
                     task_id,
-                    gate_name(g.kind),
+                    g.kind.name(),
                     g.occurrence as i64,
                     at,
                     kind,

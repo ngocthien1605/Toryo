@@ -228,10 +228,7 @@ pub(super) fn withdraw_final(store: &Store, rec: &Recorder, t: &TaskRow, e: Ev) 
 
 /// The gate's name in approval rows, `[state]` lines and DECISIONS.md.
 pub(super) fn gate_name(kind: GateKind) -> &'static str {
-    match kind {
-        GateKind::Plan => "plan",
-        GateKind::Final => "final",
-    }
+    kind.name()
 }
 
 pub fn gate_digest(store: &Store, task: &str, kind: GateKind, occurrence: u32) -> Result<String> {
