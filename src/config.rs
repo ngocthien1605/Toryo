@@ -954,6 +954,20 @@ impl Effective {
         serde_json::to_string(&v).expect("json")
     }
 
+    /// [`Self::canonical_json`] for a configuration that is about to be frozen (`task create`,
+    /// `task config --reload`): an error unless the text reads back as this configuration
+    /// (R23-02). JSON has no place for some values (a non-finite number becomes `null`): a frozen
+    /// text that cannot be read back would leave a task that no command but `cleanup` can open.
+    pub fn frozen_json(&self) -> Result<String> {
+        let text = self.canonical_json();
+        let back = Self::from_frozen(&text, &self.repo_path)
+            .context("the configuration cannot be frozen: it does not read back")?;
+        if back.canonical_json() != text {
+            bail!("the configuration cannot be frozen: it does not read back as itself");
+        }
+        Ok(text)
+    }
+
     /// M12-08 (X20): the keys of the repository file that are accepted and that no engine code
     /// reads — set to something other than their default. Each is announced by `config show`,
     /// `doctor` and `task create` as "accepted but has no effect in this version". The test
@@ -1055,9 +1069,16 @@ fn problems(
     for name in repo.context.budget_kb.keys() {
         known_key(&mut out, "context.budget_kb", name, "role", &roles);
     }
-    for name in repo.pipeline.budget_weights.iter().flat_map(|w| w.keys()) {
+    for (name, w) in repo.pipeline.budget_weights.iter().flatten() {
         let section = "pipeline.budget_weights";
         known_key(&mut out, section, name, "bucket", BUDGET_WEIGHT_KEYS);
+        // R23-02: `.inf`, `.nan` or `1e400` would be frozen as `null`, which the task can never
+        // read back; a negative weight would make spending tokens give budget back
+        if !w.is_finite() || *w < 0.0 {
+            out.push(format!(
+                "{section}.{name}: `{w}` is not a valid weight (a finite number, 0 or more)"
+            ));
+        }
     }
     // plan §14 (R41): `auto` = the largest exact turn of the stage, else a token count
     if let Some(v) = &repo.pipeline.unknown_turn_reservation_tokens {
@@ -1809,6 +1830,38 @@ policy:
         );
         load_str(&ok).unwrap();
         load_str(&ok.replace("tokens: auto", "tokens: 150000")).unwrap();
+    }
+
+    /// R23-02 (review 2026-10-23 C1): a budget weight JSON cannot carry (`.inf`, `.nan`) was
+    /// frozen as `null` at `task create`, and every later
+    /// command of the task failed to read the frozen configuration back. A negative weight would
+    /// give budget back for spent tokens. Both are refused at load; 0 stays a valid weight.
+    #[test]
+    fn budget_weights_json_cannot_carry_are_refused() {
+        for bad in [".inf", "-.inf", ".nan", "-1", "-0.5"] {
+            let e = load_err(&format!(
+                "{SAMPLE}pipeline: {{ budget_weights: {{ output: {bad} }} }}\n"
+            ));
+            assert!(
+                e.contains("pipeline.budget_weights.output:")
+                    && e.contains("is not a valid weight"),
+                "{bad}: {e}"
+            );
+        }
+        load_str(&format!(
+            "{SAMPLE}pipeline: {{ budget_weights: {{ cache_read: 0, output: 1.5 }} }}\n"
+        ))
+        .unwrap();
+        // and a configuration that does not read back is never frozen
+        let mut cfg = load_str(SAMPLE).unwrap();
+        assert!(cfg.frozen_json().is_ok());
+        cfg.repo.pipeline.budget_weights = Some(
+            [("output".to_string(), f64::INFINITY)]
+                .into_iter()
+                .collect(),
+        );
+        let e = format!("{:#}", cfg.frozen_json().unwrap_err());
+        assert!(e.contains("cannot be frozen"), "{e}");
     }
 
     #[test]

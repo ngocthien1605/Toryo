@@ -582,7 +582,7 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     std::fs::create_dir_all(&art)?;
     std::fs::create_dir_all(rs.join("captures"))?;
     std::fs::write(art.join("TASK.md"), &text)?;
-    let frozen = cfg.canonical_json();
+    let frozen = cfg.frozen_json()?;
     std::fs::write(art.join("config.json"), &frozen)?;
 
     std::fs::create_dir_all(&wt_root)

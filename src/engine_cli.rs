@@ -758,7 +758,7 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
         &t.repo,
         &t.base_commit,
     )?;
-    let new_text = new.canonical_json();
+    let new_text = new.frozen_json()?;
     let new_sha = sha256_hex(new_text.as_bytes());
     if new_sha == t.config_sha256 {
         toryo::errln!(
