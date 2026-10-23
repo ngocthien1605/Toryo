@@ -548,3 +548,48 @@ fn r23_19_doctor_names_a_repository_skill_that_hides_a_machine_one() {
         "{out}"
     );
 }
+
+/// R23-22: a review still invalid after its correction turns. Was: the escalation said only
+/// "the review was rejected 3 times" — not which criterion or which rule — and the owner's
+/// ways on (`--note`, `--force`) were chosen blind. Now the reason says what was still wrong,
+/// and the attempt keeps all of it.
+#[test]
+fn r23_22_a_rejected_review_says_what_was_wrong() {
+    let env = setup("codex-openai");
+    create(&env, "RV-1");
+    let mut bad = approved();
+    bad["structured"]["acceptance_criteria"] = json!([
+        {"id": "AC-1", "met": true, "evidence": "e1"},
+        {"id": "AC-2", "met": true, "evidence": "e2"}
+    ]);
+    let s = script(
+        &env,
+        "rv1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![bad.clone()]), turn(vec![bad.clone()]), turn(vec![bad])],
+        }),
+    );
+    let (_, err) = toryo(&env, &["run", "RV-1", "--yes", "--fake-agents", &s], &[]);
+    let t = task(&env, "RV-1");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    let why = t.machine.reason().unwrap_or_default().to_string();
+    assert!(
+        why.starts_with("InvalidOutput: the review was rejected 3 times")
+            && why.contains("still wrong:")
+            && why.contains("AC-3"),
+        "{why}"
+    );
+    let a = attempts(&env, "RV-1")
+        .into_iter()
+        .rfind(|a| a.stage == "review")
+        .unwrap();
+    assert!(
+        a.error_detail
+            .as_deref()
+            .is_some_and(|d| d.contains("AC-3")),
+        "{:?}",
+        a.error_detail
+    );
+}

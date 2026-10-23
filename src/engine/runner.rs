@@ -2657,10 +2657,12 @@ impl<'a> Engine<'a> {
         let fresh = review_prompt(&head, &t.acceptance_ids, false);
         match self.review_turns(t, &a, &ctx, &stop, prompt, resume, &fresh)? {
             ReviewTurns::Valid(valid) => self.decide_review(t, &a, &head, valid),
-            ReviewTurns::Rejected { last } => {
+            ReviewTurns::Rejected { last, violations } => {
+                // R23-22: what was still wrong, in the reason and the attempt (was: a count only)
                 let reason = format!(
-                    "InvalidOutput: the review was rejected {} times (R22)",
-                    MAX_CORRECTIONS + 1
+                    "InvalidOutput: the review was rejected {} times (R22); still wrong: {}",
+                    MAX_CORRECTIONS + 1,
+                    rejected_words(&violations)
                 );
                 self.end_and(
                     &a,
@@ -2668,6 +2670,7 @@ impl<'a> Engine<'a> {
                     &last,
                     AttemptEnd {
                         error_class: Some("InvalidOutput".into()),
+                        error_detail: Some(violations.join("\n")),
                         correction_turns: Some(MAX_CORRECTIONS),
                         ..Default::default()
                     },
@@ -2770,7 +2773,10 @@ impl<'a> Engine<'a> {
                 corrections + 1
             );
             if corrections == MAX_CORRECTIONS {
-                return Ok(ReviewTurns::Rejected { last });
+                return Ok(ReviewTurns::Rejected {
+                    last,
+                    violations: viol.clone(),
+                });
             }
             corrections += 1;
             prompt = correction_prompt(&viol);
@@ -4258,12 +4264,30 @@ struct ValidReview {
     corrections: u32,
 }
 
+/// R23-22: the violations of a rejected review for its escalation reason — at most five, then
+/// how many there are (the attempt's `error_detail` has them all).
+fn rejected_words(violations: &[String]) -> String {
+    const SHOWN: usize = 5;
+    let mut s = violations
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    if violations.len() > SHOWN {
+        s.push_str(&format!("; … ({} in all)", violations.len()));
+    }
+    s
+}
+
 /// How the turns of a review attempt ended.
 enum ReviewTurns {
     Valid(ValidReview),
-    /// Still invalid after the correction turns (R22); `last` is the final turn.
+    /// Still invalid after the correction turns (R22); `last` is the final turn, `violations`
+    /// what was still wrong with it (R23-22).
     Rejected {
         last: StageOutcome,
+        violations: Vec<String>,
     },
     /// The last turn failed for good (EC-01, EC-14): at once, or after the retries.
     Failed {
@@ -4633,13 +4657,15 @@ pub(super) fn undo_read_only_write(
             written.into_iter().partition(|p| now.contains(p));
         if !back.is_empty() {
             crate::errln!(
-                "   put back (written by the read-only role): {back:?} — a copy is in {}",
+                "   put back (written by the read-only role): {} — a copy is in {}",
+                paths_words(&back),
                 keep.display()
             );
         }
         if !left.is_empty() {
             reason.push_str(&format!(
-                "; could NOT be put back: {left:?} — Git refused (look at `git -C \"{}\" status`); put them back by hand, or they go into the next checkpoint",
+                "; could NOT be put back: {} — Git refused (look at `git -C \"{}\" status`); put them back by hand, or they go into the next checkpoint",
+                paths_words(&left),
                 t.worktree.display()
             ));
         }
@@ -4650,13 +4676,15 @@ pub(super) fn undo_read_only_write(
         .partition(|p| std::fs::symlink_metadata(t.worktree.join(p)).is_err());
     if !again.is_empty() {
         reason.push_str(&format!(
-            "; not put back: {again:?} — changed already before the turn, so Toryo cannot tell your edit from the role's (what is there now is copied to {})",
+            "; not put back: {} — changed already before the turn, so Toryo cannot tell your edit from the role's (what is there now is copied to {})",
+            paths_words(&again),
             keep.display()
         ));
     }
     if !again_gone.is_empty() {
         reason.push_str(&format!(
-            "; not put back: {again_gone:?} — changed already before the turn and gone now, so Toryo cannot tell your edit from the role's; gone, nothing to copy"
+            "; not put back: {} — changed already before the turn and gone now, so Toryo cannot tell your edit from the role's; gone, nothing to copy",
+            paths_words(&again_gone),
         ));
     }
     if !not_copied.is_empty() {
@@ -4828,6 +4856,20 @@ fn content_hash(p: &Path) -> String {
     hash.unwrap_or_else(|e| format!("unreadable ({})", e.kind()))
 }
 
+/// R23-22: paths for a reason — all of them as a list up to [`PATHS_SHOWN`], else the first
+/// ones and how many there are. Was: every path: a reviewer that ran a build leaving ten
+/// thousand files put megabytes into `tasks.machine`, the console and SUMMARY.md.
+fn paths_words(paths: &[String]) -> String {
+    if paths.len() <= PATHS_SHOWN {
+        format!("{paths:?}")
+    } else {
+        format!("{:?} … ({} in all)", &paths[..PATHS_SHOWN], paths.len())
+    }
+}
+
+/// How many paths a reason lists.
+const PATHS_SHOWN: usize = 20;
+
 /// EC-31: a read-only role changed the worktree during its turn (tracked or untracked, not
 /// ignored: a path new, gone or different since `before`) or moved HEAD — a policy violation
 /// (the wording of recovery's check). What was already there before the turn is not its
@@ -4840,7 +4882,8 @@ fn read_only_write(before: &TreeState, after: &TreeState) -> Option<String> {
         .collect();
     if !changed.is_empty() {
         return Some(format!(
-            "policy_violation: the worktree changed during a read-only stage: {changed:?}"
+            "policy_violation: the worktree changed during a read-only stage: {}",
+            paths_words(&changed)
         ));
     }
     (before.head != after.head).then(|| {
@@ -7065,6 +7108,32 @@ mod tests {
             gates_that_run_again(&["seed", "import"], "dbsync"),
             "every environment gate again: `seed`, `import` (finished — the deployment record says so — and deploys again), then `dbsync`"
         );
+    }
+
+    /// R23-22: a reason lists at most 20 paths, then how many there are.
+    #[test]
+    fn a_reason_lists_twenty_paths_at_most() {
+        let few: Vec<String> = (0..3).map(|i| format!("f{i}")).collect();
+        assert_eq!(paths_words(&few), r#"["f0", "f1", "f2"]"#);
+        let many: Vec<String> = (0..10_000).map(|i| format!("build/obj/{i}.o")).collect();
+        let w = paths_words(&many);
+        assert!(
+            w.ends_with("… (10000 in all)") && w.len() < 600,
+            "{}",
+            w.len()
+        );
+        let reason = read_only_write(
+            &TreeState::default(),
+            &TreeState {
+                head: None,
+                entries: many
+                    .iter()
+                    .map(|p| (p.clone(), ("??".into(), "h".into())))
+                    .collect(),
+            },
+        )
+        .unwrap();
+        assert!(reason.len() < 700, "{}", reason.len());
     }
 
     #[test]
