@@ -299,3 +299,44 @@ fn r23_09_a_lock_let_go_a_moment_ago_is_taken() {
     let e = format!("{:#}", again.err().expect("the first one still holds it"));
     assert!(e.contains("is active"), "{e}");
 }
+
+/// R23-10 (C11): a crash between the review and its recorded decision. Was: the follow-ups
+/// of an approval ("approved with these open issues") were appended to DECISIONS.md — which is
+/// append-only — before the decision was recorded; after the crash the task was still
+/// `Reviewing`, the resumed reviewer could answer differently, and the record stood. Now the
+/// follow-ups are written after the decision.
+#[test]
+fn r23_10_no_follow_up_is_recorded_before_the_review_decision() {
+    let env = setup("codex-openai");
+    create(&env, "F-1");
+    let mut review = approved();
+    review["structured"]["issues"] = json!([
+        {"id": "I-1", "severity": "low", "blocking": false, "description": "rename later"}
+    ]);
+    let s = script(
+        &env,
+        "f1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![review.clone()]), turn(vec![review])],
+        }),
+    );
+    let (code, err) = toryo(
+        &env,
+        &["run", "F-1", "--yes", "--fake-agents", &s],
+        &[("TORYO_TEST_CRASH_AT", "review:before_decision")],
+    );
+    assert_eq!(code, 86, "crashed at the point: {err}");
+    let t = task(&env, "F-1");
+    assert_eq!(t.state, St::Reviewing, "{err}");
+    let dec = std::fs::read_to_string(t.artifacts().join("DECISIONS.md")).unwrap_or_default();
+    assert!(!dec.contains("follow-ups"), "{dec}");
+    // the resumed review records them, once
+    let (code, err) = toryo(&env, &["resume", "F-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "F-1");
+    assert_eq!(t.state, St::Completed, "{err}");
+    let dec = std::fs::read_to_string(t.artifacts().join("DECISIONS.md")).unwrap();
+    assert_eq!(dec.matches("follow-ups").count(), 1, "{dec}");
+}

@@ -2804,8 +2804,25 @@ impl<'a> Engine<'a> {
         let (i, h) = (self.id.clone(), head.to_string());
         self.store
             .call(move |tx| store::set_last_reviewed(tx, &i, &h))?;
+        let feedback = (verdict.decision == ReviewDecision::ChangesRequested)
+            .then(|| untrusted::wrap("review", None, &review_feedback(&review)));
+        crash_point("review:before_decision");
+        self.end_and(
+            a,
+            AttemptStatus::Succeeded,
+            &last,
+            AttemptEnd {
+                correction_turns: Some(corrections),
+                ..Default::default()
+            },
+            Some(verdict.decision.event(head)),
+            feedback.map(Some),
+        )?;
+        // R53: non-blocking issues survive an approval as follow-ups. R23-10: after the
+        // decision is recorded — DECISIONS.md is append-only, and a crash before the decision
+        // must not leave "approved with these open issues" for a review the resumed reviewer
+        // may answer differently (the final gate lists them from the review either way)
         if verdict.decision == ReviewDecision::Approved {
-            // R53: non-blocking issues survive an approval as follow-ups
             let nb = non_blocking(&review);
             if !nb.is_empty() {
                 super::decisions::append(
@@ -2820,19 +2837,6 @@ impl<'a> Engine<'a> {
                 )?;
             }
         }
-        let feedback = (verdict.decision == ReviewDecision::ChangesRequested)
-            .then(|| untrusted::wrap("review", None, &review_feedback(&review)));
-        self.end_and(
-            a,
-            AttemptStatus::Succeeded,
-            &last,
-            AttemptEnd {
-                correction_turns: Some(corrections),
-                ..Default::default()
-            },
-            Some(verdict.decision.event(head)),
-            feedback.map(Some),
-        )?;
         Ok(Flow::Next)
     }
 
