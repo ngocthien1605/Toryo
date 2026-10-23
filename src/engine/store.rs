@@ -676,6 +676,17 @@ pub fn get_task(tx: &Transaction, id: &str) -> Result<TaskRow> {
     .ok_or_else(|| anyhow!("no task `{id}`"))
 }
 
+/// R23-17: the id of a task that differs from `id` only in (ASCII) case, if one exists.
+pub fn task_id_in_other_case(tx: &Transaction, id: &str) -> Result<Option<String>> {
+    Ok(tx
+        .query_row(
+            "SELECT id FROM tasks WHERE lower(id) = lower(?1) AND id <> ?1 LIMIT 1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 pub fn list_tasks(tx: &Transaction) -> Result<Vec<TaskRow>> {
     let mut st = tx.prepare(&format!(
         "SELECT {TASK_COLS} FROM tasks ORDER BY created_at, id"

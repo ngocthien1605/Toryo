@@ -546,6 +546,14 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     if store.call(move |tx| Ok(store::get_task(tx, &t).is_ok()))? {
         bail!("task {id} already exists (`toryo task show {id}`)");
     }
+    // R23-17: Windows file names ignore case — `a-1` would share the lock file, the run store
+    // and the worktree of a task `A-1`
+    let t = id.clone();
+    if let Some(other) = store.read(move |tx| store::task_id_in_other_case(tx, &t))? {
+        bail!(
+            "task {other} already exists and `{id}` differs from it only in case — they would share a lock file, a run store and a worktree on Windows; use another --id"
+        );
+    }
     let rs = run_store_dir(&id);
     if rs.exists() {
         bail!(

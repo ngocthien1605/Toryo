@@ -428,3 +428,24 @@ fn r23_16_a_closed_stream_ends_no_task_of_a_multi_run() {
         );
     }
 }
+
+/// R23-17: task ids that differ only in case. Was: `a-1` next to `A-1` was refused only by
+/// the file system on Windows, with "run store … already exists — remove it" (the live task's
+/// run store), and accepted where the folders were gone — two rows, one lock file. Now refused
+/// by the id, before anything is made.
+#[test]
+fn r23_17_a_task_id_that_differs_only_in_case_is_refused() {
+    let env = setup("codex-openai");
+    create(&env, "Case-1");
+    let (code, err) = toryo(
+        &env,
+        &["task", "create", "--file", "TASK.md", "--id", "CASE-1"],
+        &[],
+    );
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains("task Case-1 already exists") && err.contains("only in case"),
+        "{err}"
+    );
+    assert!(!err.contains("remove it"), "{err}");
+}
