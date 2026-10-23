@@ -1724,7 +1724,7 @@ fn plain_resume_after_an_unavailable_gate_costs_no_fix_cycle() {
     let (code, err) = toryo(
         &env,
         &["resume", "RS-E", "--yes", "--fake-agents", &s],
-        &[("TORYO_M11_RS_SECRET", "ok")],
+        &[("TORYO_M11_RS_SECRET", "resolvable-secret")],
     );
     assert_eq!(code, 0, "{err}");
     let t = task(&env, "RS-E");
@@ -1922,7 +1922,7 @@ fn a_crash_right_after_a_machine_caused_escalation_keeps_its_class() {
     let (code, err) = toryo(
         &env,
         &["resume", "R16-C", "--yes", "--fake-agents", &s],
-        &[("TORYO_M11_R16_SECRET", "ok")],
+        &[("TORYO_M11_R16_SECRET", "resolvable-secret")],
     );
     assert_eq!(code, 0, "{err}");
     let t = task(&env, "R16-C");

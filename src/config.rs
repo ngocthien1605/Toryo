@@ -1457,8 +1457,25 @@ pub fn expand_vars(s: &str) -> Result<String> {
     Ok(out.into_owned())
 }
 
+/// R23-04: the fewest bytes a secret value may have. Every occurrence of a secret's bytes is
+/// redacted from what the agents and the gates print; a value of a few bytes (`1`) would be
+/// found inside every line — the agent's JSON stream would no longer parse.
+pub const MIN_SECRET_BYTES: usize = 8;
+
 /// Resolve a `secret_env` reference. Never logs the value.
 pub fn resolve_secret(reference: &str) -> Result<String> {
+    let v = resolve_secret_value(reference)?;
+    // M13-03: a value of line breaks only is no secret (not redacted, noted by the redactor)
+    if v.len() < MIN_SECRET_BYTES && !v.bytes().all(|b| b == b'\n') {
+        bail!(
+            "the value of `{reference}` is {} byte(s); a secret needs at least {MIN_SECRET_BYTES} — every occurrence of its bytes would be redacted from the agents' and the gates' output (a value that is no secret belongs under `env:`, not `secret_env:`)",
+            v.len()
+        );
+    }
+    Ok(v)
+}
+
+fn resolve_secret_value(reference: &str) -> Result<String> {
     if let Some(var) = reference.strip_prefix("env:") {
         // (R16–R17 review) never through `VarError`: its `NotUnicode` form prints the value
         return match std::env::var(var) {
@@ -1760,9 +1777,45 @@ policy:
 
     #[test]
     fn secret_reference_forms() {
-        std::env::set_var("TORYO_TEST_SECRET_X", "v");
-        assert_eq!(resolve_secret("env:TORYO_TEST_SECRET_X").unwrap(), "v");
+        // (R23-04: the value was `v`, which is now too short to be a secret — see below)
+        std::env::set_var("TORYO_TEST_SECRET_X", "value-of-x");
+        assert_eq!(
+            resolve_secret("env:TORYO_TEST_SECRET_X").unwrap(),
+            "value-of-x"
+        );
         assert!(resolve_secret("plain").is_err());
+    }
+
+    /// R23-04 (review 2026-10-23 C3): a secret of a few bytes (`1`, a placeholder in Credential
+    /// Manager, a selector put under `secret_env` instead of `env`) was redacted wherever those
+    /// bytes stood — in every JSON line of the agent's stream, which then no longer parsed, and
+    /// the turn failed as `ProcessCrashed` with no word why. It is refused where it is resolved,
+    /// with its name and length, never its value. A value of line breaks only stays what M13-03
+    /// made it: no secret, not redacted, not refused.
+    #[test]
+    fn a_secret_too_short_to_redact_is_refused() {
+        for v in ["1", "abc", "1234567"] {
+            std::env::set_var("TORYO_TEST_SECRET_SHORT", v);
+            let e = format!(
+                "{:#}",
+                resolve_secret("env:TORYO_TEST_SECRET_SHORT").unwrap_err()
+            );
+            assert!(
+                e.contains(&format!("{} byte(s)", v.len())) && e.contains("at least 8"),
+                "{v}: {e}"
+            );
+            assert!(
+                !e.contains(&format!("`{v}`")),
+                "the value is never shown: {e}"
+            );
+        }
+        std::env::set_var("TORYO_TEST_SECRET_SHORT", "12345678");
+        assert_eq!(
+            resolve_secret("env:TORYO_TEST_SECRET_SHORT").unwrap(),
+            "12345678"
+        );
+        std::env::set_var("TORYO_TEST_SECRET_SHORT", "\n");
+        assert_eq!(resolve_secret("env:TORYO_TEST_SECRET_SHORT").unwrap(), "\n");
     }
 
     /// Load `yaml` in the R60 layout: its profiles in a machine config (see `write_split`).
