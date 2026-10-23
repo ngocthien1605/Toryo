@@ -81,7 +81,9 @@ impl TaskLock {
                 Err(TryLockError::WouldBlock) => {
                     let o = owner_now(store);
                     let dead = matches!(&o, Some((_, _, Some(pid), Some(c))) if !store::identity_alive(*pid, c));
-                    if dead && tries < 15 {
+                    // R23-09: no owner recorded is the same window — an owner that ended cleanly
+                    // cleared its columns first, and the OS lets its lock go a moment later
+                    if (dead || o.is_none()) && tries < 15 {
                         tries += 1;
                         std::thread::sleep(Duration::from_millis(200));
                         continue;
@@ -185,8 +187,10 @@ impl TaskLock {
 
 impl Drop for TaskLock {
     fn drop(&mut self) {
-        // the owner columns first: the OS lock (`_file`) is released after this, with the fields
+        // the owner columns first, then the OS lock — explicitly, not only by closing the handle
+        // (review L9, R23-09: Windows may release a closed handle's lock asynchronously)
         self.clear_owner();
+        let _ = self._file.unlock();
     }
 }
 

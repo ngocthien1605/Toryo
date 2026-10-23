@@ -9,6 +9,9 @@ use serde_json::json;
 use toryo::engine::store::{self, DeployAsk};
 use toryo::engine::PipelineState as St;
 
+/// The tests that take a task lock in this process set `TORYO_DATA_DIR` for it: one at a time.
+static IN_PROCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn events(env: &Env, id: &str) -> Vec<serde_json::Value> {
     let p = task(env, id).run_store.join("events.jsonl");
     std::fs::read_to_string(&p)
@@ -208,6 +211,8 @@ fn r23_07_the_stop_poll_never_waits_for_a_writer() {
     let env = setup("codex-openai");
     create(&env, "S-1");
     // (this process takes the task lock itself: its data folder is the fixture's)
+    // (the data folder of this process is one variable: one such test at a time)
+    let _one = IN_PROCESS.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("TORYO_DATA_DIR", &env.data);
     let st = db(&env);
     let lock = toryo::engine::lock::TaskLock::acquire(&st, "S-1").unwrap();
@@ -257,4 +262,40 @@ fn r23_08_an_escalation_keeps_its_class_on_the_machine() {
     for c in toryo::engine::state::MACHINE_CAUSED {
         assert_eq!(toryo::engine::flight::snake_case(c), c);
     }
+}
+
+/// R23-09 (C10): the task lock is still held by the OS for a moment after its owner let it go
+/// (Windows releases a lock lazily) and no owner is recorded any more. Was: the retry for a
+/// dead owner did not run — no owner is not a dead one — and `toryo resume` right after a
+/// `toryo run` that ended normally was refused at once: `task_active (owner ?, since ?)`.
+#[test]
+fn r23_09_a_lock_let_go_a_moment_ago_is_taken() {
+    let env = setup("codex-openai");
+    create(&env, "L-9");
+    // (the data folder of this process is one variable: one such test at a time)
+    let _one = IN_PROCESS.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("TORYO_DATA_DIR", &env.data);
+    let st = db(&env);
+    // the OS lock is held, no owner is in the row — and it goes a second later
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(toryo::engine::lock::lock_path("L-9"))
+        .or_else(|_| {
+            std::fs::create_dir_all(env.data.join("locks"))?;
+            std::fs::File::create(toryo::engine::lock::lock_path("L-9"))
+        })
+        .unwrap();
+    f.lock().unwrap();
+    let held = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        f.unlock().unwrap();
+    });
+    let got = toryo::engine::lock::TaskLock::acquire(&st, "L-9");
+    held.join().unwrap();
+    assert!(got.is_ok(), "{:?}", got.err());
+    // a lock that stays held is still refused, once the retry is over
+    let again = toryo::engine::lock::TaskLock::acquire(&st, "L-9");
+    let e = format!("{:#}", again.err().expect("the first one still holds it"));
+    assert!(e.contains("is active"), "{e}");
 }
