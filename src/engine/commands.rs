@@ -622,7 +622,10 @@ mod tests {
         ];
         let escalated = |class: Option<&str>| {
             let mut ev = to_verify.clone();
-            ev.push(Ev::Escalate { reason: "r".into() });
+            ev.push(Ev::Escalate {
+                reason: "r".into(),
+                class: None,
+            });
             task_in(&ev, class)
         };
         let confirm = escalated(Some(crate::engine::gates::ENV_CONFIRM));

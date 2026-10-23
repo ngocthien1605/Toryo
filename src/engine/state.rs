@@ -344,9 +344,13 @@ pub enum PipelineEvent {
     /// --reload` changed the verify configuration, R35): the checkpoint is verified again —
     /// from the final gate, `Escalated`, or `Reviewing` before the review starts (EC-10).
     Reverify,
-    /// A stop that needs a human (max cycles, InvalidOutput, quota, tampering, …).
+    /// A stop that needs a human (max cycles, InvalidOutput, quota, tampering, …). `class`: the
+    /// typed class of the escalation when the engine names it (R23-35, review A2) — set on the
+    /// machine by the transition itself; absent (and not serialised) otherwise.
     Escalate {
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        class: Option<String>,
     },
     Cancel,
     /// Unrecoverable error.
@@ -608,7 +612,10 @@ impl Machine {
                 m.reason_class = None;
                 m.state = S::Cancelled;
             }
-            (s, E::Escalate { reason }) if s != S::Escalated => m.escalate(s, reason.clone()),
+            (s, E::Escalate { reason, class }) if s != S::Escalated => {
+                m.escalate(s, reason.clone());
+                m.reason_class = class.clone();
+            }
             (s, E::BudgetExceeded) if s.is_running() => {
                 m.paused_from = Some(s);
                 m.reason = Some("budget".into());

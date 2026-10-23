@@ -413,7 +413,10 @@ mod tests {
             transition_classed(
                 tx,
                 "T-1",
-                E::Escalate { reason: "x".into() },
+                E::Escalate {
+                    reason: "x".into(),
+                    class: None,
+                },
                 Some("environment_gate_unavailable"),
             )?;
             anyhow::bail!("the process died here")
@@ -429,7 +432,10 @@ mod tests {
                 transition_classed(
                     tx,
                     "T-1",
-                    E::Escalate { reason: "x".into() },
+                    E::Escalate {
+                        reason: "x".into(),
+                        class: None,
+                    },
                     Some("environment_gate_unavailable"),
                 )
             })

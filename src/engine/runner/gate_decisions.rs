@@ -52,6 +52,7 @@ pub fn approve_now(
                     t,
                     Ev::Escalate {
                         reason: reason.clone(),
+                        class: None,
                     },
                 )?;
                 bail!("{reason}");

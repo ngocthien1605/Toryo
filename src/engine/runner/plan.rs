@@ -97,7 +97,10 @@ impl<'a> Engine<'a> {
                         error_class: Some("InvalidOutput".into()),
                         ..Default::default()
                     },
-                    Some(Ev::Escalate { reason }),
+                    Some(Ev::Escalate {
+                        reason,
+                        class: None,
+                    }),
                     None,
                 )?;
                 return Ok(Flow::Next);

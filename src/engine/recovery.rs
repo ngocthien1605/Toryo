@@ -247,7 +247,15 @@ impl<'a> Recovery<'a> {
                 }
                 let (i, r) = (id.to_string(), reason.clone());
                 self.store.call(move |tx| {
-                    store::transition(tx, &i, Ev::Escalate { reason: r }).map(|_| ())
+                    store::transition(
+                        tx,
+                        &i,
+                        Ev::Escalate {
+                            reason: r,
+                            class: None,
+                        },
+                    )
+                    .map(|_| ())
                 })?;
                 notes.push(format!("escalated before anything else: {reason}"));
                 let (i, n) = (id.to_string(), notes.clone());
@@ -276,7 +284,15 @@ impl<'a> Recovery<'a> {
                 if t.state != St::Escalated {
                     let (i, p) = (id.to_string(), problem.clone());
                     self.store.call(move |tx| {
-                        store::transition(tx, &i, Ev::Escalate { reason: p }).map(|_| ())
+                        store::transition(
+                            tx,
+                            &i,
+                            Ev::Escalate {
+                                reason: p,
+                                class: None,
+                            },
+                        )
+                        .map(|_| ())
                     })?;
                 }
                 notes.push(format!("escalated: {problem}"));
@@ -350,7 +366,15 @@ impl<'a> Recovery<'a> {
                     if let Some(reason) = undone {
                         let i = id.to_string();
                         self.store.call(move |tx| {
-                            store::transition(tx, &i, Ev::Escalate { reason }).map(|_| ())
+                            store::transition(
+                                tx,
+                                &i,
+                                Ev::Escalate {
+                                    reason,
+                                    class: None,
+                                },
+                            )
+                            .map(|_| ())
                         })?;
                         notes.push(
                             "escalated: the read-only role changed the worktree (put back)".into(),
@@ -365,7 +389,15 @@ impl<'a> Recovery<'a> {
                         let reason = format!("policy_violation: the worktree changed during a read-only stage: {paths:?}");
                         let i = id.to_string();
                         self.store.call(move |tx| {
-                            store::transition(tx, &i, Ev::Escalate { reason }).map(|_| ())
+                            store::transition(
+                                tx,
+                                &i,
+                                Ev::Escalate {
+                                    reason,
+                                    class: None,
+                                },
+                            )
+                            .map(|_| ())
                         })?;
                         notes.push("escalated: dirty worktree after a read-only stage".into());
                     }
@@ -522,7 +554,10 @@ impl<'a> Recovery<'a> {
                     error_class: Some(POLICY_VIOLATION.into()),
                     ..Default::default()
                 },
-                Some(Ev::Escalate { reason }),
+                Some(Ev::Escalate {
+                    reason,
+                    class: None,
+                }),
                 None,
             )?;
             notes.push(format!(
@@ -582,6 +617,7 @@ impl<'a> Recovery<'a> {
             },
             Some(Ev::Escalate {
                 reason: reason.to_string(),
+                class: None,
             }),
             None,
         )?;
@@ -609,7 +645,10 @@ impl<'a> Recovery<'a> {
                 partial_snapshot_id: snapshot,
                 ..f.end(sha)
             },
-            escalation.clone().map(|reason| Ev::Escalate { reason }),
+            escalation.clone().map(|reason| Ev::Escalate {
+                reason,
+                class: None,
+            }),
             Some(f.note(a, sha)),
         )?;
         notes.push(match escalation {

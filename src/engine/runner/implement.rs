@@ -248,7 +248,10 @@ impl<'a> Engine<'a> {
                         error_detail: Some(reason.clone()),
                         ..Default::default()
                     },
-                    Some(Ev::Escalate { reason }),
+                    Some(Ev::Escalate {
+                        reason,
+                        class: None,
+                    }),
                     None,
                 )?;
                 Ok(Flow::Next)
@@ -262,7 +265,10 @@ impl<'a> Engine<'a> {
                         error_class: Some(protect::REASON.into()),
                         ..Default::default()
                     },
-                    Some(Ev::Escalate { reason }),
+                    Some(Ev::Escalate {
+                        reason,
+                        class: None,
+                    }),
                     None,
                 )?;
                 Ok(Flow::Next)
@@ -315,7 +321,13 @@ impl<'a> Engine<'a> {
                 self.close(
                     a,
                     Close::of_turn(AttemptStatus::Failed, r, AttemptEnd::default())
-                        .then(Some(Ev::Escalate { reason }), None)
+                        .then(
+                            Some(Ev::Escalate {
+                                reason,
+                                class: None,
+                            }),
+                            None,
+                        )
                         .class(Some("implementer_failed")),
                 )?;
                 Ok(Flow::Next)
@@ -389,7 +401,14 @@ impl<'a> Engine<'a> {
             store::finish_attempt(tx, &aid, AttemptStatus::Failed, &end)?;
             store::set_handoff(tx, &i, Some(&note))?;
             match escalation {
-                Some(reason) => Ok(Some(store::transition(tx, &i, Ev::Escalate { reason })?)),
+                Some(reason) => Ok(Some(store::transition(
+                    tx,
+                    &i,
+                    Ev::Escalate {
+                        reason,
+                        class: None,
+                    },
+                )?)),
                 None => Ok(None),
             }
         })?;

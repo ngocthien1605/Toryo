@@ -81,7 +81,10 @@ impl<'a> Engine<'a> {
                         correction_turns: Some(MAX_CORRECTIONS),
                         ..Default::default()
                     },
-                    Some(Ev::Escalate { reason }),
+                    Some(Ev::Escalate {
+                        reason,
+                        class: None,
+                    }),
                     None,
                 )?;
                 Ok(Flow::Next)

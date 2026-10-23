@@ -309,20 +309,31 @@ pub fn set_reason_class(tx: &Transaction, task_id: &str, class: &str) -> Result<
 /// M11-R16: [`transition`] and — for an escalation — its typed class on the machine, in the
 /// caller's transaction: there is no moment at which a crash leaves an escalation without its
 /// class (a later plain `toryo resume` reads it). For any other event `class` is ignored.
+/// R23-35: the class rides in the event ([`with_class`]); the transition sets it.
 pub fn transition_classed(
     tx: &Transaction,
     task_id: &str,
     e: PipelineEvent,
     class: Option<&str>,
 ) -> Result<Machine> {
-    let escalation = matches!(e, PipelineEvent::Escalate { .. });
-    let m = transition(tx, task_id, e)?;
-    match class.filter(|_| escalation) {
-        Some(c) => {
-            set_reason_class(tx, task_id, c)?;
-            Ok(get_task(tx, task_id)?.machine)
-        }
-        None => Ok(m),
+    transition(tx, task_id, with_class(e, class))
+}
+
+/// R23-35: `e` with the escalation class `class` when it is an `Escalate` that names none yet;
+/// any other event as it is.
+pub fn with_class(e: PipelineEvent, class: Option<&str>) -> PipelineEvent {
+    match (e, class) {
+        (
+            PipelineEvent::Escalate {
+                reason,
+                class: None,
+            },
+            Some(c),
+        ) => PipelineEvent::Escalate {
+            reason,
+            class: Some(c.to_string()),
+        },
+        (e, _) => e,
     }
 }
 
@@ -341,7 +352,7 @@ pub fn transition_recorded(
 ) -> Result<(PipelineState, Machine)> {
     let name = e.name();
     let before = get_task(tx, task_id)?.state;
-    let m = transition(tx, task_id, e)?;
+    let m = transition(tx, task_id, with_class(e, class))?;
     if m.state() != PipelineState::Escalated || before == PipelineState::Escalated {
         return Ok((before, m));
     }

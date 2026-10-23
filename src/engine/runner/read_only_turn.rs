@@ -86,7 +86,7 @@ impl<'a> Engine<'a> {
                         self.close(
                             a,
                             Close::of_turn(AttemptStatus::Failed, &none, end)
-                                .then(Some(Ev::Escalate { reason }), None)
+                                .then(Some(Ev::Escalate { reason, class: None }), None)
                                 .class(Some(class)),
                         )?;
                     }
@@ -172,7 +172,10 @@ impl<'a> Engine<'a> {
                 correction_turns: Some(corrections),
                 ..Default::default()
             },
-            Some(Ev::Escalate { reason }),
+            Some(Ev::Escalate {
+                reason,
+                class: None,
+            }),
             None,
         )?;
         Ok(Flow::Next)
@@ -227,7 +230,10 @@ impl<'a> Engine<'a> {
                     error_detail: (undone || class != protect::REASON).then(|| reason.clone()),
                     ..Default::default()
                 },
-                Some(Ev::Escalate { reason }),
+                Some(Ev::Escalate {
+                    reason,
+                    class: None,
+                }),
                 None,
             )?;
             return Ok(Some(Flow::Next));

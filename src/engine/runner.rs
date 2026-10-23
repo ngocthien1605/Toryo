@@ -256,7 +256,10 @@ impl<'a> Engine<'a> {
     fn escalate(&self, class: &str, reason: String) -> Result<St> {
         let i = self.id.clone();
         let from = self.task()?.state;
-        let e = Ev::Escalate { reason };
+        let e = Ev::Escalate {
+            reason,
+            class: None,
+        };
         let name = e.name();
         let c = class.to_string();
         let m = self
@@ -789,7 +792,13 @@ impl<'a> Engine<'a> {
         self.close(
             a,
             Close::of(AttemptStatus::Failed, end)
-                .then(Some(Ev::Escalate { reason }), None)
+                .then(
+                    Some(Ev::Escalate {
+                        reason,
+                        class: None,
+                    }),
+                    None,
+                )
                 .class(Some(&class)),
         )?;
         crash_point("escalate:after");
@@ -2112,6 +2121,7 @@ mod tests {
                 Ev::Start,
                 Ev::Escalate {
                     reason: format!("{class}: x"),
+                    class: None,
                 },
             ]);
             t.machine.set_reason_class(class);
@@ -2126,6 +2136,7 @@ mod tests {
             Ev::Start,
             Ev::Escalate {
                 reason: "environment_gate_confirm: x".into(),
+                class: None,
             },
         ]);
         t.machine
@@ -2143,6 +2154,7 @@ mod tests {
             Ev::Start,
             Ev::Escalate {
                 reason: "skill_unavailable: x".into(),
+                class: None,
             },
         ]);
         assert!(next_action(&t).contains("--note"), "{}", next_action(&t));
@@ -2196,6 +2208,7 @@ mod tests {
                 Ev::Start,
                 Ev::Escalate {
                     reason: reason.into(),
+                    class: None,
                 },
             ]
         };

@@ -330,7 +330,14 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
                     r.error_class,
                     r.error_detail.clone().unwrap_or_default()
                 );
-                step(&mut sm, &mut trail, Ev::Escalate { reason })?;
+                step(
+                    &mut sm,
+                    &mut trail,
+                    Ev::Escalate {
+                        reason,
+                        class: None,
+                    },
+                )?;
                 return Ok(escalated(&sm));
             };
             let plan_json = p;
@@ -489,7 +496,14 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
                     "all implementers are out of quota ({}); the worktree keeps any partial changes — rerun later with another --id, or add a fallback profile",
                     imps.chain.join(" → ")
                 );
-                step(&mut sm, &mut trail, Ev::Escalate { reason })?;
+                step(
+                    &mut sm,
+                    &mut trail,
+                    Ev::Escalate {
+                        reason,
+                        class: None,
+                    },
+                )?;
                 return Ok(escalated(&sm));
             };
             if cfg.profile(&implementer)?.kind == cfg.profile(&a.reviewer_profile)?.kind
@@ -560,7 +574,14 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
                     imp.error_class,
                     imp.error_detail.clone().unwrap_or_default()
                 );
-                step(&mut sm, &mut trail, Ev::Escalate { reason })?;
+                step(
+                    &mut sm,
+                    &mut trail,
+                    Ev::Escalate {
+                        reason,
+                        class: None,
+                    },
+                )?;
                 return Ok(escalated(&sm));
             }
             // checkpoint (toryo owns commits; no-change → empty checkpoint, R40)
@@ -730,7 +751,14 @@ pub fn pipeline(cfg: &Effective, hub: &AgentHub, a: PipelineArgs) -> Result<bool
                 eprintln!("!! invalid review (correction {}/2): {viol:?}", corr + 1);
                 if corr == 2 {
                     let reason = format!("InvalidOutput: review rejected 3 times: {viol:?}");
-                    step(&mut sm, &mut trail, Ev::Escalate { reason })?;
+                    step(
+                        &mut sm,
+                        &mut trail,
+                        Ev::Escalate {
+                            reason,
+                            class: None,
+                        },
+                    )?;
                     return Ok(escalated(&sm));
                 }
                 rprompt = format!("Your previous final response was rejected and was not used. Validation error: {}. Return only a corrected JSON object matching the schema.", viol.join("; "));

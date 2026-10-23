@@ -1706,6 +1706,7 @@ mod tests {
             Ev::Start,
             Ev::Escalate {
                 reason: "protected_config_changed: .toryo/x".into(),
+                class: None,
             },
         ]);
         let ev = transition_events(St::Planning, "escalate", &m, None);
@@ -1793,6 +1794,7 @@ mod tests {
             Ev::Start,
             Ev::Escalate {
                 reason: "no prefix here".into(),
+                class: None,
             },
         ]);
         let ev = transition_events(St::Planning, "escalate", &m, Some("policy_violation"));
