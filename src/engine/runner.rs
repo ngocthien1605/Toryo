@@ -5841,6 +5841,16 @@ pub fn verify_current(store: &Store, t: &TaskRow) -> Result<bool> {
         && v["head"].as_str() == t.machine.checkpoint())
 }
 
+/// R62: the launch was refused before any process started. R23-13: read from the class, or
+/// from the start of the reason Toryo wrote (`PolicyRefusal: the … turn failed`, `implementer
+/// failed: PolicyRefusal — …`) — never from anywhere in it: the detail after it is the CLI's
+/// or the vendor's text.
+fn policy_refusal(class: Option<&str>, why: &str) -> bool {
+    class == Some("policy_refusal")
+        || why.starts_with("PolicyRefusal:")
+        || why.starts_with("implementer failed: PolicyRefusal")
+}
+
 /// What the human does next, for `status` and the end of `run`.
 pub fn next_action(t: &TaskRow) -> String {
     let id = &t.id;
@@ -5877,7 +5887,7 @@ pub fn next_action(t: &TaskRow) -> String {
                 format!("{why}\n  → restore the file(s) and `toryo resume {id}`, or `toryo resume {id} --accept-protected-change <path>` (recorded in DECISIONS.md)")
             } else if why.starts_with("recovery_policy_violation") {
                 format!("{why}\n  → `toryo resume {id} --discard-partial` (after a snapshot check) or fix the worktree by hand and `toryo resume {id} --keep-partial`")
-            } else if why.contains("PolicyRefusal") {
+            } else if policy_refusal(t.machine.reason_class(), why) {
                 // R62: the launch was refused before any process started — a configuration
                 // problem, which another turn with the frozen configuration cannot fix
                 format!("{why}\n  → fix the profile in the configuration, `toryo task config {id} --reload`, then `toryo resume {id} --note \"…\"`; or give up: `toryo task cleanup {id}`")
@@ -7208,6 +7218,15 @@ mod tests {
             (
                 escalated("implementer failed: PolicyRefusal — preflight: codex.windows_sandbox is not set"),
                 "implementer failed: PolicyRefusal — preflight: codex.windows_sandbox is not set\n  → fix the profile in the configuration, `toryo task config T-1 --reload`, then `toryo resume T-1 --note \"…\"`; or give up: `toryo task cleanup T-1`".to_string(),
+            ),
+            (
+                escalated("PolicyRefusal: the planner turn failed (preflight: x); a failed turn is never used"),
+                "PolicyRefusal: the planner turn failed (preflight: x); a failed turn is never used\n  → fix the profile in the configuration, `toryo task config T-1 --reload`, then `toryo resume T-1 --note \"…\"`; or give up: `toryo task cleanup T-1`".to_string(),
+            ),
+            // R23-13: "PolicyRefusal" in the CLI's own text (after Toryo's words) is no refusal
+            (
+                escalated("implementer failed: ProcessCrashed — stderr: PolicyRefusal in the log"),
+                "implementer failed: ProcessCrashed — stderr: PolicyRefusal in the log\n  → `toryo resume T-1 --note \"…\"` (another fix cycle), `toryo approve T-1 --gate final --force`, or give up: `toryo task cleanup T-1`".to_string(),
             ),
             (
                 escalated("the reviewer blocked the task"),
