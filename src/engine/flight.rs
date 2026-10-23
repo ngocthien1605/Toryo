@@ -192,12 +192,23 @@ pub enum EngineEvent {
 /// An error in `run_ended` is shortened to this many characters.
 pub const ERROR_MAX: usize = 400;
 
-/// At most `max` characters; an ellipsis marks a cut.
+/// At most `max` characters; an ellipsis marks a cut. R23-20: never right after a letter whose
+/// combining marks (U+0300–U+036F, U+1AB0–U+1AFF, U+1DC0–U+1DFF, U+20D0–U+20FF, U+FE20–U+FE2F)
+/// or the zero-width joiner of an emoji sequence would come next — the cut goes before that
+/// letter (an NFD `Việt` loses the whole `ệ`, not its circumflex).
 pub fn shorten(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    let joins = |c: char| matches!(c, '\u{0300}'..='\u{036F}' | '\u{1AB0}'..='\u{1AFF}' | '\u{1DC0}'..='\u{1DFF}' | '\u{20D0}'..='\u{20FF}' | '\u{FE20}'..='\u{FE2F}' | '\u{200D}');
+    let chars: Vec<char> = s.chars().collect();
+    let mut keep = max.saturating_sub(1);
+    // the first char dropped belongs to the one before it, or the last kept is a joiner: the
+    // cut moves back until it falls between two characters that stand apart
+    while keep > 0 && (joins(chars[keep]) || chars[keep - 1] == '\u{200D}') {
+        keep -= 1;
+    }
+    let mut out: String = chars[..keep].iter().collect();
     out.push('…');
     out
 }
@@ -1133,6 +1144,20 @@ mod tests {
     use super::*;
     use crate::engine::state::PipelineEvent as Ev;
     use std::sync::{Arc, Mutex};
+
+    /// R23-20 (review 2026-10-23): `shorten` cut between a letter and its combining marks (an
+    /// NFD `ệ` became `e` + a dangling dot below) and inside an emoji's ZWJ sequence.
+    #[test]
+    fn shorten_never_tears_a_letter_from_its_marks() {
+        assert_eq!(shorten("Vie\u{323}\u{302}t Nam", 5), "Vi…");
+        assert_eq!(shorten("Việt Nam", 5), "Việt…");
+        assert_eq!(
+            shorten("ab\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}", 4),
+            "ab…"
+        );
+        assert_eq!(shorten("abcdef", 4), "abc…");
+        assert_eq!(shorten("abc", 3), "abc");
+    }
 
     /// Records what it receives.
     #[derive(Clone, Default)]

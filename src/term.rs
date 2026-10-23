@@ -30,6 +30,9 @@ fn unsafe_char(c: char) -> bool {
     match c {
         '\n' | '\t' => false,
         '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => true,
+        // R23-20: the other invisible ones of the same kind — the Arabic letter mark (a bidi
+        // control), the word joiner and the zero-width no-break space (a BOM inside a text)
+        '\u{061C}' | '\u{2060}' | '\u{FEFF}' => true,
         c => c.is_control(),
     }
 }
@@ -231,6 +234,28 @@ macro_rules! outln {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R23-20 (review 2026-10-23): X33 says "every zero-width or direction-changing
+    /// character"; U+061C, U+2060 and U+FEFF passed. Vietnamese (NFC and NFD) and CJK text is
+    /// untouched.
+    #[test]
+    fn the_other_invisible_characters_are_marked_too() {
+        for c in ['\u{061C}', '\u{2060}', '\u{FEFF}'] {
+            assert_eq!(
+                text(&format!("a{c}b")),
+                format!("a{MARK}b"),
+                "{:X}",
+                c as u32
+            );
+        }
+        for s in [
+            "Cảm ơn, tiếng Việt",
+            "Vie\u{323}\u{302}t Nam",
+            "日本語のテキスト",
+        ] {
+            assert_eq!(text(s), s);
+        }
+    }
 
     #[test]
     fn plain_text_is_unchanged() {
