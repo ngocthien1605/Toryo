@@ -833,7 +833,7 @@ pub fn transition_classed(
     }
 }
 
-/// R23-08: [`transition`], and when it escalates the task, the class its `escalated` event
+/// R23-08: [`transition`] (with the state before it, R23-25), and when it escalates the task, the class its `escalated` event
 /// carries ([`super::flight::escalation_class`] of `class`, else the event and the reason) on
 /// the machine — the machine and the flight recorder name one class. A machine-caused class
 /// ([`super::state::MACHINE_CAUSED`], which lets a plain `resume` go back into the stage) is
@@ -845,20 +845,20 @@ pub fn transition_recorded(
     e: PipelineEvent,
     class: Option<&str>,
     error_class: Option<&str>,
-) -> Result<Machine> {
+) -> Result<(PipelineState, Machine)> {
     let name = e.name();
     let before = get_task(tx, task_id)?.state;
     let m = transition(tx, task_id, e)?;
     if m.state() != PipelineState::Escalated || before == PipelineState::Escalated {
-        return Ok(m);
+        return Ok((before, m));
     }
     let named = class.or(error_class);
     let c = super::flight::escalation_class(name, named, m.reason().unwrap_or(""));
     if super::state::is_machine_caused(&c) && class.is_none() {
-        return Ok(m);
+        return Ok((before, m));
     }
     set_reason_class(tx, task_id, &c)?;
-    Ok(get_task(tx, task_id)?.machine)
+    Ok((before, get_task(tx, task_id)?.machine))
 }
 
 /// Apply `e` to the task's machine and persist it — state, projections, the event and the

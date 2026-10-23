@@ -39,7 +39,7 @@ use super::flight::{EngineEvent, Recorder, TurnUsage};
 use super::gates::GATE_UNAVAILABLE;
 use super::lock::{EnvLock, StopWatch, TaskLock, VerifyLock};
 use super::protect;
-use super::state::{GateKind, Machine, PipelineEvent as Ev, PipelineState as St};
+use super::state::{GateKind, PipelineEvent as Ev, PipelineState as St};
 use super::store::{self, AttemptEnd, AttemptRow, AttemptStatus, NewAttempt, Store, TaskRow};
 use super::task::{frozen_config, sha256_hex, task_git};
 use super::untrusted;
@@ -474,19 +474,16 @@ impl<'a> Engine<'a> {
         crate::errln!(
             "!! budget reached during the turn — interrupted (R41 live interrupt), the task pauses"
         );
-        self.end_with(
+        let end = AttemptEnd {
+            error_class: Some("budget".into()),
+            error_detail: Some("budget reached during the turn (R41 live interrupt)".into()),
+            ..Default::default()
+        };
+        self.close(
             a,
-            AttemptStatus::Interrupted,
-            r,
-            AttemptEnd {
-                error_class: Some("budget".into()),
-                error_detail: Some("budget reached during the turn (R41 live interrupt)".into()),
-                ..Default::default()
-            },
-            Some(Ev::BudgetExceeded),
-            None,
-            false,
-            None,
+            Close::of_turn(AttemptStatus::Interrupted, r, end)
+                .then(Some(Ev::BudgetExceeded), None)
+                .quiet(),
         )?;
         Ok(Flow::Next)
     }
@@ -514,7 +511,14 @@ impl<'a> Engine<'a> {
 
     /// A stop request cancelled the turn (R38): the attempt is `interrupted`.
     fn stopped_turn(&self, a: &AttemptRow, r: &StageOutcome) -> Result<Flow> {
-        self.end(a, AttemptStatus::Interrupted, r, AttemptEnd::default())?;
+        self.end_and(
+            a,
+            AttemptStatus::Interrupted,
+            r,
+            AttemptEnd::default(),
+            None,
+            None,
+        )?;
         self.stopped()
     }
 
@@ -1145,7 +1149,14 @@ impl<'a> Engine<'a> {
                     r.error_class,
                     wait.as_secs()
                 );
-                self.end(a, AttemptStatus::Failed, r, AttemptEnd::default())?;
+                self.end_and(
+                    a,
+                    AttemptStatus::Failed,
+                    r,
+                    AttemptEnd::default(),
+                    None,
+                    None,
+                )?;
                 // a stop request cuts the backoff short (EC-17, R38); the run loop then
                 // stops at this stage boundary, before the retry starts
                 if backoff(&run.stop.flag, wait) {
@@ -1230,15 +1241,11 @@ impl<'a> Engine<'a> {
             }
             ImplementOutcome::Failed { reason } => {
                 r.print_summary();
-                self.end_with(
+                self.close(
                     a,
-                    AttemptStatus::Failed,
-                    r,
-                    AttemptEnd::default(),
-                    Some(Ev::Escalate { reason }),
-                    None,
-                    true,
-                    Some("implementer_failed"),
+                    Close::of_turn(AttemptStatus::Failed, r, AttemptEnd::default())
+                        .then(Some(Ev::Escalate { reason }), None)
+                        .class(Some("implementer_failed")),
                 )?;
                 Ok(Flow::Next)
             }
@@ -2936,19 +2943,17 @@ impl<'a> Engine<'a> {
                         // R23-08: the same closer as every other attempt — `stage_finished`,
                         // the `escalated` event and the class on the machine
                         let detail = format!("{reason} (the turn itself ended in an error: {e:#})");
-                        self.end_with(
+                        let none = StageOutcome::default();
+                        let end = AttemptEnd {
+                            error_class: Some(class.to_string()),
+                            error_detail: Some(detail),
+                            ..Default::default()
+                        };
+                        self.close(
                             a,
-                            AttemptStatus::Failed,
-                            &StageOutcome::default(),
-                            AttemptEnd {
-                                error_class: Some(class.to_string()),
-                                error_detail: Some(detail),
-                                ..Default::default()
-                            },
-                            Some(Ev::Escalate { reason }),
-                            None,
-                            true,
-                            Some(class),
+                            Close::of_turn(AttemptStatus::Failed, &none, end)
+                                .then(Some(Ev::Escalate { reason }), None)
+                                .class(Some(class)),
                         )?;
                     }
                     Ok(None) => {}
@@ -3369,16 +3374,6 @@ impl<'a> Engine<'a> {
         });
     }
 
-    fn end(
-        &self,
-        a: &AttemptRow,
-        status: AttemptStatus,
-        r: &StageOutcome,
-        end: AttemptEnd,
-    ) -> Result<()> {
-        self.end_and(a, status, r, end, None, None)
-    }
-
     /// Finish the attempt, optionally set the feedback and apply a transition — one
     /// transaction. An escalation's or pause's reason is printed (`!! reason`) before the
     /// `[state]` line.
@@ -3391,69 +3386,12 @@ impl<'a> Engine<'a> {
         e: Option<Ev>,
         feedback: Option<Option<String>>,
     ) -> Result<()> {
-        self.end_with(a, status, r, end, e, feedback, true, None)
+        self.close(a, Close::of_turn(status, r, end).then(e, feedback))
     }
 
-    /// [`Self::end_and`]; `reason_line: false` only for a stop whose reason another line already
-    /// says — the budget pauses print `!! budget reached during the turn …` or `!! admission cap
-    /// reached …` themselves. The rule (M10-R5): every transition into `Escalated` or `Paused`
-    /// prints its reason exactly once, before its `[state]` line; no caller prints `!! reason` itself.
-    /// `class`: the escalation's class when it is not the attempt's error class (R6).
-    #[allow(clippy::too_many_arguments)]
-    fn end_with(
-        &self,
-        a: &AttemptRow,
-        status: AttemptStatus,
-        r: &StageOutcome,
-        mut end: AttemptEnd,
-        e: Option<Ev>,
-        feedback: Option<Option<String>>,
-        reason_line: bool,
-        class: Option<&str>,
-    ) -> Result<()> {
-        if end.error_class.is_none() {
-            end.error_class = r.error_class.map(|c| format!("{c:?}"));
-        }
-        if end.error_detail.is_none() {
-            end.error_detail = r.error_detail.clone();
-        }
-        end.external_session_id = r.session_id.clone();
-        let (i, aid) = (self.id.clone(), a.id.clone());
-        let from = self.task()?.state;
-        let name = e.as_ref().map(|e| e.name());
-        let error_class = end.error_class.clone();
-        let explicit = class.map(str::to_string);
-        let class = explicit.clone().or_else(|| error_class.clone());
-        let fallback = error_class.clone();
-        let to = self.store.call(move |tx| {
-            store::finish_attempt(tx, &aid, status, &end)?;
-            if let Some(f) = feedback {
-                store::set_feedback(tx, &i, f.as_deref())?;
-            }
-            match e {
-                // R23-08: the escalation's class on the machine too, not only in the event
-                Some(e) => Ok(Some(store::transition_recorded(
-                    tx,
-                    &i,
-                    e,
-                    explicit.as_deref(),
-                    fallback.as_deref(),
-                )?)),
-                None => Ok(None),
-            }
-        })?;
-        self.stage_finished(a, status, error_class);
-        if let (Some(m), Some(name)) = (to, name) {
-            self.rec
-                .transition_classed(from, name, &m, true, reason_line, class.as_deref());
-        }
-        Ok(())
-    }
-
-    /// Finish the attempt with `end` as given, optionally set the feedback and apply a
-    /// transition — one transaction. Unlike `end_and` there is no turn outcome to take the
-    /// error or the session from, and no `[state]` line is printed (the escalation reason of
-    /// `escalate_attempt` is).
+    /// Finish the attempt with `end` as given (no turn outcome to take the error or the session
+    /// from), optionally set the feedback and apply a transition — one transaction; no `[state]`
+    /// line is printed, an escalation's reason is.
     fn finish_and(
         &self,
         a: &AttemptRow,
@@ -3462,43 +3400,62 @@ impl<'a> Engine<'a> {
         feedback: Option<Option<String>>,
         e: Option<Ev>,
     ) -> Result<()> {
-        self.finish_classed(a, status, end, feedback, e, None)
+        self.close(a, Close::of(status, end).then(e, feedback))
     }
 
-    /// [`Self::finish_and`]; `escalation`: the typed class of an escalation, stored on the
-    /// machine in the same transaction (M11-R16).
-    fn finish_classed(
-        &self,
-        a: &AttemptRow,
-        status: AttemptStatus,
-        end: AttemptEnd,
-        feedback: Option<Option<String>>,
-        e: Option<Ev>,
-        escalation: Option<String>,
-    ) -> Result<()> {
+    /// R23-25 (review 2026-10-23 A1): how every attempt of the engine ends — the attempt row,
+    /// the feedback, the transition and the class of an escalation in **one** transaction; then
+    /// `stage_finished` and the recorder's events. One rule for the class: the one the caller
+    /// names, else the attempt's error class; the machine stores what the `escalated` event
+    /// names (R23-08). The rule for the lines (M10-R5): every transition into `Escalated` or
+    /// `Paused` prints its reason exactly once, before its `[state]` line; no caller prints
+    /// `!! reason` itself — `reason_line: false` only for a stop whose reason another line
+    /// already says (the budget pauses).
+    fn close(&self, a: &AttemptRow, c: Close<'_>) -> Result<()> {
+        let Close {
+            status,
+            mut end,
+            outcome,
+            feedback,
+            event,
+            class,
+            state_line,
+            reason_line,
+        } = c;
+        if let Some(r) = outcome {
+            if end.error_class.is_none() {
+                end.error_class = r.error_class.map(|c| format!("{c:?}"));
+            }
+            if end.error_detail.is_none() {
+                end.error_detail = r.error_detail.clone();
+            }
+            end.external_session_id = r.session_id.clone();
+        }
         let (i, aid) = (self.id.clone(), a.id.clone());
-        let from = self.task()?.state;
-        let name = e.as_ref().map(|e| e.name());
-        let class = end.error_class.clone();
-        let to: Option<Machine> = self.store.call(move |tx| {
+        let name = event.as_ref().map(|e| e.name());
+        let error_class = end.error_class.clone();
+        let named = class.clone().or_else(|| error_class.clone());
+        let fallback = error_class.clone();
+        let to = self.store.call(move |tx| {
             store::finish_attempt(tx, &aid, status, &end)?;
             if let Some(f) = feedback {
                 store::set_feedback(tx, &i, f.as_deref())?;
             }
-            match e {
-                Some(e) => Ok(Some(store::transition_classed(
+            match event {
+                Some(e) => Ok(Some(store::transition_recorded(
                     tx,
                     &i,
                     e,
-                    escalation.as_deref(),
+                    class.as_deref(),
+                    fallback.as_deref(),
                 )?)),
                 None => Ok(None),
             }
         })?;
-        self.stage_finished(a, status, class.clone());
-        if let (Some(m), Some(name)) = (to, name) {
+        self.stage_finished(a, status, error_class);
+        if let (Some((from, m)), Some(name)) = (to, name) {
             self.rec
-                .transition_classed(from, name, &m, false, true, class.as_deref());
+                .transition_classed(from, name, &m, state_line, reason_line, named.as_deref());
         }
         Ok(())
     }
@@ -3507,19 +3464,75 @@ impl<'a> Engine<'a> {
     /// the typed class on the machine included (M11-R16); its reason is printed with the
     /// escalation (R5).
     fn escalate_attempt(&self, a: &AttemptRow, class: String, reason: String) -> Result<()> {
-        self.finish_classed(
+        let end = AttemptEnd {
+            error_class: Some(class.clone()),
+            ..Default::default()
+        };
+        self.close(
             a,
-            AttemptStatus::Failed,
-            AttemptEnd {
-                error_class: Some(class.clone()),
-                ..Default::default()
-            },
-            None,
-            Some(Ev::Escalate { reason }),
-            Some(class),
+            Close::of(AttemptStatus::Failed, end)
+                .then(Some(Ev::Escalate { reason }), None)
+                .class(Some(&class)),
         )?;
         crash_point("escalate:after");
         Ok(())
+    }
+}
+
+/// R23-25: how an attempt ends — see [`Engine::close`]. Built with [`Close::of_turn`] (after an
+/// agent turn: its outcome fills the error, its detail and the session; a `[state]` line is
+/// printed) or [`Close::of`] (no turn: the end as given, no `[state]` line).
+struct Close<'r> {
+    status: AttemptStatus,
+    end: AttemptEnd,
+    outcome: Option<&'r StageOutcome>,
+    feedback: Option<Option<String>>,
+    event: Option<Ev>,
+    /// The escalation's class when it is not the attempt's error class.
+    class: Option<String>,
+    state_line: bool,
+    reason_line: bool,
+}
+
+impl<'r> Close<'r> {
+    fn of_turn(status: AttemptStatus, r: &'r StageOutcome, end: AttemptEnd) -> Self {
+        Self {
+            outcome: Some(r),
+            state_line: true,
+            ..Self::of(status, end)
+        }
+    }
+
+    fn of(status: AttemptStatus, end: AttemptEnd) -> Self {
+        Self {
+            status,
+            end,
+            outcome: None,
+            feedback: None,
+            event: None,
+            class: None,
+            state_line: false,
+            reason_line: true,
+        }
+    }
+
+    /// The transition and the feedback that come with the end.
+    fn then(mut self, event: Option<Ev>, feedback: Option<Option<String>>) -> Self {
+        self.event = event;
+        self.feedback = feedback;
+        self
+    }
+
+    /// The escalation's class (stored on the machine, named by the event).
+    fn class(mut self, class: Option<&str>) -> Self {
+        self.class = class.map(str::to_string);
+        self
+    }
+
+    /// No reason line: another line already said why (the budget pauses).
+    fn quiet(mut self) -> Self {
+        self.reason_line = false;
+        self
     }
 }
 
