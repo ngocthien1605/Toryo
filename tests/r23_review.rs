@@ -300,6 +300,46 @@ fn r23_09_a_lock_let_go_a_moment_ago_is_taken() {
     assert!(e.contains("is active"), "{e}");
 }
 
+/// R23-16, the opening line: the pipe is closed before the parent prints anything. Was: the
+/// line `▶ run …` was still printed with `errln!`, which panics when it cannot write; the
+/// parent ended with 101 and the children died with its pipes before their first stage. The
+/// same happened by chance in the test above when its read closed the pipe between that
+/// line's text and its line feed (CI on Windows, `main` @ `4813720`). Now the opening line
+/// stops the printing like every other line, and the tasks run to their end.
+#[test]
+fn r23_16_a_stream_closed_before_the_first_line_ends_no_task() {
+    let env = setup("codex-openai");
+    create(&env, "P-3");
+    create(&env, "P-4");
+    let s = script(
+        &env,
+        "p34.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let mut c = command(
+        &env,
+        &["run", "P-3", "P-4", "--yes", "--fake-agents", &s],
+        &[],
+    );
+    c.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    // closed before the parent has started up and written its first line
+    drop(child.stderr.take().unwrap());
+    let status = child.wait().unwrap();
+    for id in ["P-3", "P-4"] {
+        assert_eq!(
+            task(&env, id).state,
+            St::Completed,
+            "{id} (the parent ended with {status:?})"
+        );
+    }
+}
+
 /// R23-10 (C11): a crash between the review and its recorded decision. Was: the follow-ups
 /// of an approval ("approved with these open issues") were appended to DECISIONS.md — which is
 /// append-only — before the decision was recorded; after the crash the task was still
@@ -630,4 +670,47 @@ fn r23_24_cleanup_deletes_only_what_task_create_made() {
     let (code, err) = toryo(&env, &["task", "cleanup", "D-1", "--force"], &[]);
     assert_eq!(code, 0, "{err}");
     assert!(!wt(&env, "D-1").exists() && victim.join("keep.txt").exists());
+}
+
+/// N-22 (review 2026-10-23): `toryo stop` asked "is anyone running the task?" by taking the
+/// task's OS lock for an instant — an `acquire` landing in that instant found it held. Now it
+/// asks the recorded owner, as `status` does, and never touches the OS lock: a live recorded
+/// owner is addressed although the OS lock is free right now, and an OS lock held with no
+/// owner recorded (an owner that has just let go) is no owner.
+#[test]
+fn n22_stop_reads_the_recorded_owner_and_never_takes_the_lock() {
+    use toryo::engine::lock::{self, StopOutcome};
+    let env = setup("codex-openai");
+    create(&env, "S-2");
+    let _one = IN_PROCESS.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("TORYO_DATA_DIR", &env.data);
+    let st = db(&env);
+    // a live owner (this process) is recorded; the OS lock is not held
+    let g = st
+        .call(|tx| store::claim_lock(tx, "S-2", "test owner"))
+        .unwrap();
+    let wait = std::time::Duration::from_millis(600);
+    let got = lock::stop(&st, "S-2", wait).unwrap();
+    assert_eq!(got, StopOutcome::Pending, "addressed to the recorded owner");
+    let pending = st
+        .read(move |tx| store::pending_stop(tx, "S-2", g))
+        .unwrap();
+    assert!(pending.is_some(), "the stop row waits for generation {g}");
+    // no owner recorded, the OS lock still held: no owner, at once
+    st.call(move |tx| store::release_lock(tx, "S-2", g))
+        .unwrap();
+    std::fs::create_dir_all(env.data.join("locks")).unwrap();
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock::lock_path("S-2"))
+        .unwrap();
+    f.lock().unwrap();
+    let started = std::time::Instant::now();
+    let got = lock::stop(&st, "S-2", wait).unwrap();
+    assert_eq!(got, StopOutcome::NoOwner);
+    assert!(started.elapsed() < wait, "{:?}", started.elapsed());
+    f.unlock().unwrap();
 }

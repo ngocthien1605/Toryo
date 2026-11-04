@@ -475,6 +475,9 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
                 None => root,
             };
             let st = store()?;
+            // N-22: from here on the first Ctrl+C ends the creation at its next step and X28
+            // takes back what was made (the second one ends the process, as in X29)
+            lock::catch_interrupt();
             let t = task::create(
                 &cfg,
                 &st,

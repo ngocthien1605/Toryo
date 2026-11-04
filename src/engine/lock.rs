@@ -222,17 +222,15 @@ impl Drop for StopWatch {
 mod machine;
 pub use machine::*;
 
-/// Is the task lock free right now? A probe: taken and released at once, never a mutation.
-pub fn probe_free(task: &str) -> Result<bool> {
-    let f = open_lock_file(task)?;
-    match f.try_lock() {
-        Ok(()) => {
-            let _ = f.unlock();
-            Ok(true)
-        }
-        Err(TryLockError::WouldBlock) => Ok(false),
-        Err(TryLockError::Error(e)) => Err(e.into()),
-    }
+/// Is a live owner recorded for the task? (N-22: read from the row, as `status` does — never by
+/// taking the OS lock, which an `acquire` landing in that instant would find held.) An owner
+/// that ended cleanly cleared the row; one that crashed is recorded with a dead process.
+fn owner_alive(store: &Store, task: &str) -> Result<bool> {
+    let t = task.to_string();
+    Ok(matches!(
+        store.read(move |tx| store::lock_owner(tx, &t))?,
+        Some((_, _, Some(pid), Some(c))) if store::identity_alive(pid, &c)
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,7 +248,7 @@ pub fn stop(store: &Store, task: &str, wait: Duration) -> Result<StopOutcome> {
     let by = owner_label();
     let t = task.to_string();
     let mut generation = store.read(move |tx| store::lock_generation(tx, &t))?;
-    if probe_free(task)? {
+    if !owner_alive(store, task)? {
         let (t, b) = (task.to_string(), by.clone());
         let id = store.call(move |tx| store::insert_stop(tx, &t, generation, &b))?;
         store.call(move |tx| store::set_control_outcome(tx, id, "no_owner"))?;
@@ -276,7 +274,7 @@ pub fn stop(store: &Store, task: &str, wait: Duration) -> Result<StopOutcome> {
             id = store.call(move |tx| store::insert_stop(tx, &t, g, &b))?;
             continue;
         }
-        if probe_free(task)? {
+        if !owner_alive(store, task)? {
             // the owner exited without handling it (finished or crashed)
             let row = store.read(move |tx| store::control_request(tx, id))?;
             if let Some(o) = row.outcome {

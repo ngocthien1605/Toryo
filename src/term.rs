@@ -181,26 +181,64 @@ pub fn stdout_is_terminal() -> bool {
 /// painted like any other block when `paint` — with every line erasing the rest of its row,
 /// then the rest of the screen erased. The cursor moves and erasures are the only escape
 /// sequences besides the colours, and they are Toryo's, never the text's.
-pub fn frame_text(blocks: &[String], paint: bool) -> String {
-    let mut s = String::from("\u{1b}[H");
+///
+/// `rows`, the console's height (N-18): a frame of more than `rows - 1` lines (a line feed on
+/// the bottom row scrolls the terminal, and the next frame would draw under this one) keeps
+/// its first `rows - 2` and says how many more there are. `None`: the height is unknown.
+pub fn frame_text(blocks: &[String], paint: bool, rows: Option<usize>) -> String {
+    let mut lines = Vec::new();
     for b in blocks {
         let t = text(b);
         let t = if paint { paint::block(&t) } else { t };
-        for l in t.split('\n') {
-            s.push_str(l);
-            s.push_str("\u{1b}[K\n");
+        lines.extend(t.split('\n').map(str::to_string));
+    }
+    if let Some(rows) = rows.filter(|r| *r >= 2) {
+        if lines.len() > rows - 1 {
+            let hidden = lines.len() - (rows - 2);
+            lines.truncate(rows - 2);
+            lines.push(format!(
+                "… {hidden} more lines: a taller window or `--hide-done` shows them"
+            ));
         }
+    }
+    let mut s = String::from("\u{1b}[H");
+    for l in lines {
+        s.push_str(&l);
+        s.push_str("\u{1b}[K\n");
     }
     s.push_str("\u{1b}[J");
     s
 }
 
+/// The height of the console stdout is, in rows; `None` when it is not a console or not known.
+#[cfg(windows)]
+fn console_rows() -> Option<usize> {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_OUTPUT_HANDLE,
+    };
+    // SAFETY: a handle of this process and a struct the call fills
+    let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &mut info) };
+    let rows = i32::from(info.srWindow.Bottom) - i32::from(info.srWindow.Top) + 1;
+    (ok != 0 && rows > 0).then_some(rows as usize)
+}
+
+/// The height of the terminal stdout is, in rows; `None` when it is not a terminal or not known.
+#[cfg(unix)]
+fn console_rows() -> Option<usize> {
+    // SAFETY: TIOCGWINSZ fills the struct it is given
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    (ok == 0 && ws.ws_row > 0).then_some(usize::from(ws.ws_row))
+}
+
 /// Draw `blocks` as the whole screen of a live view (`toryo dashboard`, M16-01) over the
-/// previous frame, without the flicker of a full clear. Only for a terminal
-/// ([`stdout_is_terminal`]): into a pipe or a file a view prints its blocks once, as text.
+/// previous frame, without the flicker of a full clear, cut to the console's height (N-18).
+/// Only for a terminal ([`stdout_is_terminal`]): into a pipe or a file a view prints its blocks
+/// once, as text.
 pub fn screen(blocks: &[String]) -> std::io::Result<()> {
     use std::io::Write;
-    let s = frame_text(blocks, painted(Stream::Out));
+    let s = frame_text(blocks, painted(Stream::Out), console_rows());
     // `always`: on Windows this turns on the console's escape-sequence mode
     let mut out = anstream::AutoStream::always(std::io::stdout().lock());
     out.write_all(s.as_bytes())?;
@@ -319,7 +357,7 @@ mod tests {
             "T-1            Escalated              fix 0/3 · tokens 5".to_string(),
             "evil\u{1b}]52;c;QUJD\u{7} \u{1b}[2J\rgone".to_string(),
         ];
-        let f = frame_text(&blocks, false);
+        let f = frame_text(&blocks, false, None);
         assert!(
             f.starts_with("\u{1b}[H") && f.ends_with("\u{1b}[J"),
             "{f:?}"
@@ -335,9 +373,40 @@ mod tests {
             "T-1            Escalated              fix 0/3 · tokens 5\nevil gone\n"
         );
         // painted: only colours are added — with every sequence removed it is the same text
-        let p = frame_text(&blocks, true);
+        let p = frame_text(&blocks, true, None);
         assert_eq!(crate::process::strip_ansi(&p), body);
         assert!(p.contains("\u{1b}["), "the state is painted");
+    }
+
+    /// N-18 (review 2026-10-23): a frame taller than the console scrolled the terminal, and the
+    /// next frame's cursor-home drew under the old one instead of over it. A frame is cut to
+    /// `rows - 1` line feeds (a line feed on the bottom row scrolls), the last kept line says
+    /// how many were cut; a frame that fits is unchanged.
+    #[test]
+    fn a_frame_taller_than_the_console_is_cut_to_its_height() {
+        let blocks: Vec<String> = (1..=30).map(|i| format!("T-{i}")).collect();
+        let f = frame_text(&blocks, false, Some(10));
+        assert_eq!(f.matches('\n').count(), 9, "{f:?}");
+        assert!(
+            f.contains("T-8\u{1b}[K\n") && !f.contains("T-9\u{1b}"),
+            "{f:?}"
+        );
+        assert!(f.contains("22 more lines"), "{f:?}");
+        assert!(
+            f.starts_with("\u{1b}[H") && f.ends_with("\u{1b}[J"),
+            "{f:?}"
+        );
+        // a block of several lines counts each of them; painted, the same lines are kept
+        let tall = vec!["a\nb\nc".to_string(); 5];
+        let p = frame_text(&tall, true, Some(6));
+        assert_eq!(p.matches('\n').count(), 5, "{p:?}");
+        assert!(crate::process::strip_ansi(&p).contains("11 more lines"));
+        // fits, or the height is unknown: nothing is cut
+        assert_eq!(
+            frame_text(&blocks[..9], false, Some(10)),
+            frame_text(&blocks[..9], false, None)
+        );
+        assert_eq!(frame_text(&blocks, false, None).matches('\n').count(), 30);
     }
 
     #[test]
