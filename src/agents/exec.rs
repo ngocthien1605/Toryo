@@ -165,7 +165,7 @@ pub fn run_turn(
         run_dir,
         label,
         opts,
-        &mut |_| {},
+        &mut |_, _| {},
     )
 }
 
@@ -187,8 +187,8 @@ fn not_started(e: anyhow::Error) -> anyhow::Error {
     anyhow::Error::new(NotStarted(format!("{e:#}")))
 }
 
-/// `run_turn`, calling `on_line` with every complete (redacted) stdout line as it arrives —
-/// the adapters turn these into live `AgentEvent`s.
+/// `run_turn`, calling `on_line` with every complete (redacted) stdout line as it arrives, and
+/// the line parsed as JSON (`None`: not JSON) — the adapters turn these into live `AgentEvent`s.
 #[allow(clippy::too_many_arguments)]
 pub fn run_turn_with(
     profile_name: &str,
@@ -199,7 +199,7 @@ pub fn run_turn_with(
     run_dir: &Path,
     label: &str,
     opts: TurnOpts,
-    on_line: &mut (dyn FnMut(&[u8]) + Send),
+    on_line: &mut (dyn FnMut(&[u8], Option<&serde_json::Value>) + Send),
 ) -> Result<TurnRun> {
     let (mut env, red, secret_keys) = profile_env(profile_name, profile).map_err(not_started)?;
     for (k, v) in &opts.env {
@@ -291,14 +291,7 @@ pub fn run_turn_with(
         Chunk::Stdout(b) => {
             out_file.write(&b);
             for line in splitter.push(&b) {
-                if echo {
-                    echo_line(kind, &line);
-                }
-                on_line(&line);
-                match kind {
-                    ProfileKind::Claude => claude.feed_line(&line),
-                    ProfileKind::Codex => codex.feed_line(&line),
-                }
+                take_line(kind, echo, &line, on_line, &mut claude, &mut codex);
             }
         }
         Chunk::Stderr(b) => {
@@ -310,11 +303,7 @@ pub fn run_turn_with(
         }
     })?;
     if let Some(rest) = splitter.finish() {
-        on_line(&rest);
-        match kind {
-            ProfileKind::Claude => claude.feed_line(&rest),
-            ProfileKind::Codex => codex.feed_line(&rest),
-        }
+        take_line(kind, false, &rest, on_line, &mut claude, &mut codex);
     }
     let mut outcome = match kind {
         ProfileKind::Claude => claude.finish(exit.code),
@@ -394,8 +383,30 @@ fn stderr_last_lines(bytes: &[u8], n: usize) -> Option<String> {
     })
 }
 
-fn echo_line(kind: ProfileKind, line: &[u8]) {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+/// One complete stdout line of a turn, parsed as JSON once (review 2026-10-23: up to three
+/// times): echoed (when asked), handed to `on_line` (the live events) and fed to the vendor's
+/// parser.
+fn take_line(
+    kind: ProfileKind,
+    echo: bool,
+    line: &[u8],
+    on_line: &mut (dyn FnMut(&[u8], Option<&serde_json::Value>) + Send),
+    claude: &mut ClaudeParser,
+    codex: &mut CodexParser,
+) {
+    let v = crate::agents::events::parse_line(line);
+    if echo {
+        echo_line(kind, v.as_ref());
+    }
+    on_line(line, v.as_ref());
+    match kind {
+        ProfileKind::Claude => claude.feed_parsed(line, v.as_ref()),
+        ProfileKind::Codex => codex.feed_parsed(line, v.as_ref()),
+    }
+}
+
+fn echo_line(kind: ProfileKind, v: Option<&serde_json::Value>) {
+    let Some(v) = v else {
         return;
     };
     match kind {
@@ -469,6 +480,59 @@ pub fn print_summary(r: &TurnRun) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review 2026-10-23 (performance): every stdout line of a turn was parsed as JSON once by
+    /// the live events and once more by the vendor's parser (a third time when echoed). The
+    /// captured streams, fed as a running turn feeds them, parse each line once.
+    #[test]
+    fn a_stream_line_is_parsed_once() {
+        use crate::agents::events::{parses_on_this_thread, LiveEvents};
+        const REPEAT: usize = 20;
+        let streams = [
+            (
+                ProfileKind::Claude,
+                include_str!("../../fixtures/captured/claude-implementer.jsonl"),
+            ),
+            (
+                ProfileKind::Codex,
+                include_str!("../../fixtures/captured/codex-implement.jsonl"),
+            ),
+        ];
+        let (mut lines, mut events) = (0usize, 0usize);
+        let before = parses_on_this_thread();
+        let t = Instant::now();
+        for (kind, text) in streams {
+            for _ in 0..REPEAT {
+                let mut live = LiveEvents::for_process(kind);
+                let mut on_line =
+                    |_: &[u8], v: Option<&serde_json::Value>| events += live.feed_parsed(v).len();
+                let (mut claude, mut codex) = (ClaudeParser::new(), CodexParser::new());
+                for l in text.lines() {
+                    take_line(
+                        kind,
+                        false,
+                        l.as_bytes(),
+                        &mut on_line,
+                        &mut claude,
+                        &mut codex,
+                    );
+                    lines += 1;
+                }
+                let o = match kind {
+                    ProfileKind::Claude => claude.finish(Some(0)),
+                    ProfileKind::Codex => codex.finish(Some(0), CodexSubsets::default()),
+                };
+                assert!(o.success, "{o:?}");
+            }
+        }
+        let parses = parses_on_this_thread() - before;
+        eprintln!(
+            "{lines} lines ({events} events): {parses} JSON parses, {:?}",
+            t.elapsed()
+        );
+        assert!(events >= lines);
+        assert_eq!(parses as usize, lines, "one parse per line");
+    }
 
     /// M12-14: the last 10 non-empty lines, colour codes stripped, long lines cut.
     #[test]

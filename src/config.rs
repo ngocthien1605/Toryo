@@ -1397,4 +1397,19 @@ commands:
         // not a variable reference: left alone
         assert_eq!(expand_vars("50% (approx)").unwrap(), "50% (approx)");
     }
+
+    /// Review 2026-10-23 (performance): `expand_vars`/`residual_var` compiled their regex on
+    /// every call. 4000 calls now compile it at most once in the whole test process.
+    #[test]
+    fn the_var_pattern_is_compiled_once_not_per_call() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let t = std::time::Instant::now();
+        for _ in 0..2000 {
+            assert_eq!(expand_vars("C:\\no\\vars").unwrap(), "C:\\no\\vars");
+            assert_eq!(residual_var("a %B% c").as_deref(), Some("B"));
+        }
+        let n = VAR_REGEX_COMPILES.load(Relaxed);
+        eprintln!("4000 calls: {n} compiles of VAR_PATTERN, {:?}", t.elapsed());
+        assert!(n <= 1, "compiled {n} times");
+    }
 }

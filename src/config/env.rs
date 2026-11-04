@@ -46,19 +46,32 @@ pub fn data_dir() -> PathBuf {
 /// `doctor` warns about where nothing is expanded (M13-07).
 pub const VAR_PATTERN: &str = r"%([A-Za-z_][A-Za-z0-9_()]*)%";
 
+/// How many times [`VAR_PATTERN`] was compiled in this process (tests only).
+#[cfg(test)]
+pub(crate) static VAR_REGEX_COMPILES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// [`VAR_PATTERN`] compiled once for the process (review 2026-10-23: it was compiled on every
+/// call of [`expand_vars`] and [`residual_var`]).
+fn var_regex() -> &'static regex::Regex {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        #[cfg(test)]
+        VAR_REGEX_COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        regex::Regex::new(VAR_PATTERN).expect("regex")
+    });
+    &RE
+}
+
 /// M11-R12: the first `%NAME%` token in `s`, if any — used to catch a `%VAR%` that survived
 /// [`expand_vars`] because a variable's own value contained it (it is never expanded again).
 pub fn residual_var(s: &str) -> Option<String> {
-    regex::Regex::new(VAR_PATTERN)
-        .expect("regex")
-        .captures(s)
-        .map(|c| c[1].to_string())
+    var_regex().captures(s).map(|c| c[1].to_string())
 }
 
 /// Expand `%VAR%` (Windows style). Unknown variables are an error. Names may contain `(` `)`,
 /// as in `%ProgramFiles(x86)%` (EC-28).
 pub fn expand_vars(s: &str) -> Result<String> {
-    let re = regex::Regex::new(VAR_PATTERN).expect("regex");
+    let re = var_regex();
     let mut err = None;
     let out = re.replace_all(s, |c: &regex::Captures| match std::env::var(&c[1]) {
         Ok(v) => v,

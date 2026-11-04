@@ -302,8 +302,8 @@ impl AgentSession for CliSession {
         self.task = Some(tokio::task::spawn_blocking(move || {
             let tx_lines = tx.clone();
             let mut live = LiveEvents::for_process(kind);
-            let mut on_line = move |line: &[u8]| {
-                for e in live.feed(line) {
+            let mut on_line = move |_: &[u8], v: Option<&serde_json::Value>| {
+                for e in live.feed_parsed(v) {
                     let _ = tx_lines.send(e);
                 }
             };

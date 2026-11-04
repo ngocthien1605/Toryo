@@ -50,6 +50,48 @@ fn run_ok(env: &Env, args: &[&str]) -> String {
 
 // ── R35: protected state on the filesystem ───────────────────────────────────────────
 
+/// Review 2026-10-23 (performance): accepting a protected change walked the worktree and
+/// hashed the protected state twice — `protect::check`, then `take_baseline` — with nothing
+/// changed in between. The new baseline is now made from the scan the check just compared.
+#[test]
+fn accepting_a_protected_change_scans_the_protected_state_once() {
+    use toryo::engine::protect;
+    let env = setup("codex-openai");
+    commit_repo(&env, &[(".gitignore", ".claude/\n")], "ignore local config");
+    create(&env, "P-5");
+    const SETTINGS: &str = ".claude/settings.local.json";
+    let s = script(
+        &env,
+        "p5.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![
+                write("src/Calculator.psm1", DIVIDE),
+                write(SETTINGS, "{\"permissions\":{}}\n"),
+                implementation(),
+            ])],
+        }),
+    );
+    let err = run_ok(&env, &["run", "P-5", "--yes", "--fake-agents", &s]);
+    let t = task(&env, "P-5");
+    assert_eq!(t.state, St::Escalated, "{err}");
+
+    let st = db(&env);
+    let before = protect::scans_on_this_thread();
+    let ok = toryo::engine::commands::resume_protected(&st, &t, &[SETTINGS.to_string()]).unwrap();
+    let scans = protect::scans_on_this_thread() - before;
+    eprintln!("accept a protected change: {scans} scan(s) of the protected state");
+    assert!(ok, "accepted");
+    assert_eq!(scans, 1, "check and the new baseline share one scan");
+    // the new baseline holds the state the check saw
+    let m: Value =
+        serde_json::from_slice(&std::fs::read(t.artifacts().join("protected/2.json")).unwrap())
+            .unwrap();
+    let want =
+        toryo::engine::task::sha256_hex(&std::fs::read(wt(&env, "P-5").join(SETTINGS)).unwrap());
+    assert_eq!(m["entries"][SETTINGS]["sha256"], want.as_str(), "{m:#}");
+}
+
 #[test]
 fn protected_ignored_files() {
     let env = setup_with(

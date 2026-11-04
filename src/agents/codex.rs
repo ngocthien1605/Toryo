@@ -225,15 +225,18 @@ impl CodexParser {
     }
 
     pub fn feed_line(&mut self, line: &[u8]) {
+        let v = super::events::parse_line(line);
+        self.feed_parsed(line, v.as_ref());
+    }
+
+    /// [`Self::feed_line`] for a line already parsed (`v`: `None` when it is not JSON).
+    pub fn feed_parsed(&mut self, line: &[u8], v: Option<&Value>) {
         if line.iter().all(u8::is_ascii_whitespace) {
             return;
         }
-        let v: Value = match serde_json::from_slice(line) {
-            Ok(v) => v,
-            Err(_) => {
-                self.malformed += 1;
-                return;
-            }
+        let Some(v) = v else {
+            self.malformed += 1;
+            return;
         };
         match v.get("type").and_then(Value::as_str).unwrap_or("") {
             "thread.started" => {
