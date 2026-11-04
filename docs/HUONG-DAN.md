@@ -6,7 +6,8 @@
 > Dành cho: anh Thiện — D365FO technical consultant, dùng PowerShell 7, Claude Code và Codex.
 > Thuật ngữ kỹ thuật giữ nguyên tiếng Anh.
 
-> **Bản này khớp với `main` @ `f37a863` (2026-10-07, version 0.12.0).** Lệnh chính là engine: `toryo task create` →
+> **Bản này khớp với `main` @ `4813720` (2026-10-23, version 0.12.0: M16, bản sửa của review 2026-10-23 — R23,
+> X39–X46; SQL schema version 3).** Lệnh chính là engine: `toryo task create` →
 > `toryo run` → `toryo approve`. Tham chiếu ngắn bằng tiếng Anh: `README.md`; hiện trạng và danh sách việc còn mở:
 > `docs/STATUS.md`; các quy tắc đang có hiệu lực: `docs/DECISIONS.md`.
 > Các mã như `R51`, `X13`, `M12-07` là số hiệu yêu cầu / quyết định / task trong các file đó và trong `docs/M*-NOTES.md` —
@@ -146,6 +147,11 @@ gate) tính 1 vòng. Giới hạn mặc định là 2: `pipeline.max_fix_cycles`
 
 > **Build lại sau mỗi lần `git pull`.** `toryo --version` in commit mà exe được build từ đó; nếu commit đó cũ hơn `main`
 > thì exe thiếu tính năng mới (ví dụ: `toryo gate` chỉ có từ commit `53427bf`; exe cũ hơn báo `unrecognized subcommand 'gate'`).
+>
+> **Database chỉ đi một chiều (schema version 3, X46).** Lần đầu một `toryo.exe` từ `main` hiện tại mở `toryo.db`, nó nâng
+> database lên version 3 (không mất dòng nào). Sau đó một `toryo.exe` **cũ hơn** sẽ từ chối database đó (`database … has schema
+> version 3; this toryo expects 2 (a newer toryo wrote it: use that one)`). Giống nâng cấp database của môi trường D365FO: đã
+> chạy bản mới thì không quay lại bản cũ — cất exe cũ đi, đừng chạy nó trên cùng thư mục dữ liệu.
 
 Thiết lập cho phiên PowerShell (hoặc thêm vào `$PROFILE` để dùng lâu dài):
 
@@ -227,7 +233,14 @@ context:
 `## Allow protected` trong TASK.md.
 
 Khoá được nhận nhưng **chưa có tác dụng** ở bản này (ví dụ `verify.final_clean`, `project.runs_root`) được `toryo config show`,
-`toryo doctor` và `task create` báo ra. YAML tag bị từ chối; mọi file phải là UTF-8.
+`toryo doctor` và `task create` báo ra. YAML tag (ở mọi độ sâu, lỗi nêu đúng chỗ) và khoá ghi hai lần bị từ chối — ở
+`toryo.yaml`, org chart, role file **và cả machine config** (X45); mọi file phải là UTF-8.
+
+**Các con số bị giới hạn lúc nạp (X43)** — để phép tính thời gian và budget không bao giờ tràn số: mọi giới hạn thời gian
+(`timeouts.agent_stage_max_min`, `agent_stall_min`, `timeout_min` / `timeout:` của gate) tối đa **một tuần**;
+`context.budget_kb` tối đa 1 GB (1 048 576 KB); trần token (`pipeline.budget_tokens`, `budget set --tokens`) tối đa
+`i64::MAX / 10`; trọng số trong `pipeline.budget_weights` phải là số hữu hạn ≥ 0 (`.inf`, `.nan`, số âm bị từ chối; `0` được).
+Vượt → lỗi nạp nêu đúng khoá; trước đây một giá trị như vậy có thể làm hỏng task sau khi đã đóng băng.
 
 Muốn dùng Codex qua **Foundry (API)**: khai một profile `codex-foundry` trong machine config (mẫu có sẵn trong
 `templates\d365fo\toryo.local.yaml.example`), lưu key bằng `toryo secrets set toryo/<tên>`, rồi ghi tên profile vào
@@ -235,7 +248,9 @@ Muốn dùng Codex qua **Foundry (API)**: khai một profile `codex-foundry` tro
 
 ### 4.2 Machine config — nơi DUY NHẤT khai báo profile (R60)
 
-`%USERPROFILE%\.toryo\toryo.local.yaml` (nằm ngoài mọi repo; đổi đường dẫn bằng `--machine-config`):
+`%USERPROFILE%\.toryo\toryo.local.yaml` (nằm ngoài mọi repo; đổi đường dẫn bằng `--machine-config`). File mặc định có thể
+không tồn tại (khi đó: không profile, không gate môi trường); còn file anh **ghi trên dòng lệnh** bằng `--machine-config` thì
+phải tồn tại — gõ nhầm tên là lỗi `--machine-config <path>: no such file`, không còn lặng lẽ chạy như không có machine config (X45):
 
 ```yaml
 profiles:                                 # "tài khoản" để chạy agent — chỉ được khai báo ở đây
@@ -266,6 +281,12 @@ Vì sao? Repo có thể bị người khác (hoặc code do agent viết đã me
 `exe`/`env`/`secret_env`, repo sẽ quyết định chương trình nào nhận secret trong Credential
 Manager, hoặc nới sandbox của Codex (ARCH-05). Giống D365FO: model chỉ nói *cần build gì*, còn
 server build dùng compiler nào, account nào là cấu hình môi trường — không nằm trong source.
+
+**Secret phải dài ít nhất 8 byte (X42).** Giá trị của một `secret_env` (lấy từ Credential Manager) bị che (`[REDACTED:…]`) ở
+**mọi chỗ** byte của nó xuất hiện. Một "secret" như `1` hay `ok` (giá trị giữ chỗ, hoặc một tham số thường đặt nhầm dưới
+`secret_env`) sẽ bị che ngay giữa từng dòng JSON của agent → stream hỏng, lượt chết mà không rõ lý do. Vì vậy giá trị ngắn hơn
+8 byte bị từ chối, lỗi nêu tên tham chiếu và độ dài, **không bao giờ** nêu giá trị: `toryo doctor` báo FAIL, gate môi trường
+dừng với `environment_gate_unavailable`. Giá trị không bí mật thì đặt dưới `env:`.
 
 **Chuyển đổi config cũ (làm 1 lần):** chạy `toryo doctor` → lỗi sẽ in đúng khối `profiles:` →
 dán vào `%USERPROFILE%\.toryo\toryo.local.yaml` (gộp với nội dung đang có) → xoá khối đó khỏi
@@ -376,6 +397,12 @@ Mỗi lượt agent được lưu đầy đủ prompt + stream JSON (đã che se
 `toryo task cleanup <ID>` xoá worktree, run store và verify checkout của task; **branch và bản ghi task được giữ**.
 Chưa có cơ chế tự dọn theo thời gian — task xong thì nhớ `task cleanup`.
 
+`task cleanup` **chỉ xoá những gì `task create` đã tạo** (X44): run store phải là `<data dir>\runs\<ID>` và worktree phải là
+thư mục `<ID>` (dưới `project.worktrees_root` đã đóng băng, khi đó là đường dẫn tuyệt đối). Bản ghi task trỏ tới chỗ khác (ví dụ
+DB bị sửa tay) → lệnh từ chối **trước khi xoá bất cứ thứ gì** (`… task cleanup deletes only what task create made; nothing was
+deleted`). Ngược lại, `task create` hỏng giữa chừng mà không xoá được worktree (file đang bị editor hay antivirus giữ) thì
+**giữ lại** bản ghi task và run store, cảnh báo nêu `toryo task cleanup <ID> --force` — lệnh đó dọn nốt.
+
 ---
 
 ## 5. Các lệnh chính
@@ -389,11 +416,11 @@ Chưa có cơ chế tự dọn theo thời gian — task xong thì nhớ `task c
 | `toryo config show [--json]` | file nào được đọc, mỗi ghế / profile / gate / thiết lập verify đến từ đâu (repo hay machine) |
 | `toryo task create --file TASK.md [--id ID] [--repo R] [--base B] [--max-fix-cycles N]` | chụp TASK.md, đóng băng config, tạo worktree + branch `toryo/<ID>`; in `base: <branch> @ <sha>` |
 | 🔒 `toryo run ID` | chạy tới một cổng duyệt, một escalation, một lần dừng, hoặc xong |
-| 🔒 `toryo run ID ID … [--jobs N]` | chạy nhiều task cùng lúc (M16-02): mỗi task một tiến trình `toryo run <id>` riêng, tối đa `--jobs` (mặc định: tất cả, tối đa 4; 1–8) cùng lúc, phần còn lại xếp hàng. Mỗi dòng in ra có ID task ở đầu (`A │ …`), cuối cùng một khối tóm tắt trạng thái + `next:` của từng task; exit code = cao nhất. Ctrl+C dừng mọi task đang chạy, không khởi động task đang chờ. Hai task **không verify cùng lúc**: check gate chạy dưới khoá verify của máy (`status` hiện `waiting for lock machine:verify (held by …)`) — vì thư mục verify của mọi task đều ghi được ở mức Low (O-23) |
+| 🔒 `toryo run ID ID … [--jobs N]` | chạy nhiều task cùng lúc (M16-02): mỗi task một tiến trình `toryo run <id>` riêng, tối đa `--jobs` (mặc định: tất cả, tối đa 4; 1–8) cùng lúc, phần còn lại xếp hàng. Mỗi dòng in ra có ID task ở đầu (`A │ …`), cuối cùng một khối tóm tắt trạng thái + `next:` của từng task; exit code = cao nhất. Ctrl+C dừng mọi task đang chạy, không khởi động task đang chờ. Hai task **không verify cùng lúc**: check gate chạy dưới khoá verify của máy (`status` hiện `waiting for lock machine:verify (held by …)`) — vì thư mục verify của mọi task đều ghi được ở mức Low (O-23). Output của lệnh cha bị đóng giữa chừng (`toryo run A B 2>&1 \| Select-Object -First 5`) không làm chết task nào: lệnh cha thôi in, vẫn đọc và bỏ dòng của các task con và chờ chúng chạy xong (R23-16). Nhiều task con mở cùng một database mới cùng lúc cũng không còn lỗi `database is locked` (R23-18) |
 | `toryo goal split --file GOAL.md --out DIR --prefix P [--max-tasks N] [--profile P] [--base B]` | tách một mục tiêu thành nhiều file task (M16-03): planner đọc repo **trong một bản checkout tạm** của base (xoá ngay sau đó, không đụng thư mục của anh) và đề xuất tối đa `--max-tasks` (mặc định 8, tối đa 20) task. Toryo tự đặt ID `P-1`, `P-2`, … (không được trùng task đã có), chỉ cho phụ thuộc vào task đứng trước, làm "trơ" chữ của planner và kiểm tra từng file bằng đúng parser của `task create` trước khi ghi; câu trả lời không dùng được thì không ghi gì. Kết quả: `DIR\P-1.md` … và `GOAL-SPLIT.json` (các "đợt" — wave). **Không tạo task nào**: đọc từng file, rồi `toryo task create --file DIR\P-1.md` và `toryo run P-1 P-3` theo từng đợt; task phụ thuộc thì tạo sau khi phần nó cần đã được merge |
 | 🔒 `toryo approve ID --gate plan\|final [--continue] [--expect DIGEST] [--force]` | duyệt cổng đang mở; `--continue` = duyệt rồi chạy tiếp; `--force` = từ Escalated mở cổng cuối, bỏ qua review của AI |
 | 🔒 `toryo reject ID --gate plan\|final --reason "…"` | từ chối kèm lý do (plan: lập lại; final: một vòng sửa) — sau đó `toryo run ID` để chạy tiếp |
-| 🔒 `toryo resume [ID] [--note "…" \| --discard-partial \| --keep-partial \| --accept-protected-change PATH]` | tiếp tục sau crash / dừng / escalation / pause. Không có ID: mọi task đang chờ mà lock rảnh |
+| 🔒 `toryo resume [ID] [--note "…" \| --discard-partial \| --keep-partial \| --accept-protected-change PATH]` | tiếp tục sau crash / dừng / escalation / pause. Không có ID: mọi task đang chờ mà lock rảnh — **không bao giờ** là "đồng ý deploy": task đang chờ `environment_gate_confirm` bị bỏ qua, kể cả task vừa dừng để hỏi trong lúc vòng lặp đang chạy task khác (Toryo hỏi lại trên bản ghi đọc dưới lock của task, X40) |
 | `toryo stop ID` | yêu cầu lệnh đang chạy task dừng lại (Ctrl+C trong cửa sổ `toryo run` cũng vậy) |
 | `toryo status [ID] [--json]` · `toryo task list` · `toryo task show ID` | trạng thái và `next:` — đúng lệnh cần gõ tiếp |
 | `toryo watch ID` · `toryo usage ID` | theo dõi trực tiếp; token và chi phí ước tính (mục 5.8) |
@@ -526,7 +553,9 @@ toryo task cleanup BR-003                          # sau khi merge: xoá worktre
 **TASK.md và cấu hình bị đóng băng lúc `task create`.** Sửa TASK.md sau đó không đổi gì (muốn đổi thì tạo task mới); sửa
 `toryo.yaml`, machine config, org chart hay role file thì task đang dở chỉ thấy sau `toryo task config ID --reload` (rồi
 `toryo resume ID`). **Id là vĩnh viễn**: mỗi id dùng một lần (chữ, số, `_`, `-`, tối đa 64 ký tự). Không ghi `--id` thì
-Toryo lấy từ heading `# BR-003 — …`, nếu không có thì lấy tên file.
+Toryo lấy từ heading `# BR-003 — …`, nếu không có thì lấy tên file. Id **chỉ khác chữ hoa / chữ thường** với một task đã có
+(`br-003` khi đã có `BR-003`) bị từ chối, nêu task đó: trên Windows hai id như vậy sẽ dùng chung một file lock, một run store và
+một worktree.
 
 | Tình huống | Toryo làm gì | Anh làm gì |
 |---|---|---|
@@ -535,11 +564,12 @@ Toryo lấy từ heading `# BR-003 — …`, nếu không có thì lấy tên fi
 | Kill ngay sau commit checkpoint | tìm commit theo trailer `Toryo-Task` / `Toryo-Stage` / `Toryo-Attempt` → không commit lần hai; không bao giờ nhận một commit Toryo không tự tạo | không |
 | Phần sửa dở có đụng file protected (TASK.md, AGENTS.md…) hoặc ngoài hàng rào ghi | **Escalated** `recovery_policy_violation`, không commit gì | `toryo resume ID --discard-partial` (bỏ phần dở, snapshot vẫn giữ) hoặc tự sửa worktree rồi `toryo resume ID --keep-partial` |
 | Muốn lấy lại phần đã bỏ | — | `toryo partial export ID --attempt 1 --into C:\temp\x` |
-| Muốn dừng task đang chạy | lượt hoặc gate đang chạy được kết thúc, attempt thành `interrupted` | `toryo stop BR-003` ở cửa sổ khác, hoặc Ctrl+C **một lần** trong cửa sổ đang chạy (Ctrl+C lần hai kết thúc tiến trình ngay; `toryo resume` phục hồi) |
+| Muốn dừng task đang chạy | lượt hoặc gate đang chạy được kết thúc, attempt thành `interrupted` | `toryo stop BR-003` ở cửa sổ khác, hoặc Ctrl+C **một lần** trong cửa sổ đang chạy (Ctrl+C lần hai kết thúc tiến trình ngay; `toryo resume` phục hồi). Ctrl+C vẫn có tác dụng cả khi toryo được khởi động từ một tiến trình đã tắt Ctrl+C cho con của nó (`start /b`, một runner, một shell) — toryo tự lấy lại phím này (M16-R3) |
 | Planner / reviewer ghi vào worktree (hai ghế chỉ-đọc) | những gì đã ghi được trả lại như cũ, task **Escalated** `policy_violation` | làm theo `next:` |
 | Task đang `Escalated` và anh chấp nhận kết quả mà không cần review của AI | — | `toryo approve ID --gate final --force` (mở cổng cuối, ghi "reviewer skipped"; cần một lần verify đã pass), rồi `toryo approve ID --gate final` |
 | Bỏ task (xoá worktree và run store; branch được giữ) | — | `toryo task cleanup ID`; cần **`--force`** khi task chưa kết thúc, khi worktree có thay đổi chưa commit hoặc run store có snapshot phục hồi — lệnh nói rõ sẽ mất gì |
 | Chạy lệnh 🔒 trên task đang chạy ở cửa sổ khác | **từ chối**, exit code 3 `task_active` | chờ, hoặc `toryo stop` |
+| Chạy lệnh 🔒 **ngay sau** khi một `toryo run` vừa kết thúc bình thường | Windows nhả lock của file chậm một chút sau khi tiến trình đóng nó; Toryo thử lại tối đa ~3 giây khi lock còn bị giữ mà không ghi chủ nào (R23-09) — không còn `task_active (owner ?, since ?)` | không cần làm gì |
 
 Nhiều task chạy song song được: mỗi task một cửa sổ, mỗi task một lock và một worktree.
 
@@ -608,7 +638,9 @@ checkout và `build/cache/tmp/home` bên cạnh. Script sửa file đã track ho
 **Paused (budget)**, lượt đó không chạy. Codex chỉ báo token khi xong lượt nên có thể vượt tối đa một lượt; Claude
 bị ngắt ngay khi chạm trần. Lượt bị kill không có số liệu → ghi dạng *unknown* với một khoản **giữ chỗ (reservation)**,
 không bao giờ ghi 0: bằng lượt lớn nhất đã biết chính xác của cùng stage, chưa có thì 200 000 token (hoặc con số anh đặt
-ở `pipeline.unknown_turn_reservation_tokens`).
+ở `pipeline.unknown_turn_reservation_tokens`). Số liệu usage mà CLI báo **không phải số nguyên không âm** (số thực, số âm,
+chuỗi — ví dụ một bản cập nhật CLI đổi tên hay kiểu một trường) không bao giờ được ghi là *exact* 0: Toryo giữ số tạm thời
+(provisional) của Claude nếu có, không thì ghi *unknown* với khoản giữ chỗ như trên (R23-21); object gốc vẫn được lưu.
 
 ```powershell
 toryo budget set BR-004 --tokens 3000000   # nâng trần, rồi:
@@ -676,7 +708,18 @@ cùng run store. Các dòng engine in ra stderr (`[state] …`, tiêu đề stag
 đúng một lần ngay trước dòng `[state]` — vd. `!! the reviewer
 blocked the task`, `!! not accepted after 1 fix cycle(s) (last: verify failed)`. Mỗi lần chạy luôn kết thúc
 bằng sự kiện `run_ended`, kể cả khi dừng vì lỗi trước stage đầu tiên (kèm trường `error`); `escalated` có
-`reason_class` dạng snake_case (`max_fix_cycles`, `review_blocked`, `protected_config_changed`, …).
+`reason_class` dạng snake_case (`max_fix_cycles`, `review_blocked`, `protected_config_changed`, …) — đúng lớp đó cũng được
+lưu vào trạng thái của task trong DB, cùng transaction với lần chuyển trạng thái (X41), nên `status` / `next:` đọc lớp đã lưu
+chứ không đoán từ chữ của lý do.
+
+**Sự kiện chẩn đoán (X39)** — cũng nằm trong `events.jsonl` nhưng **không bao giờ in ra**, không có trong `watch` thường (20 sự
+kiện lịch sử không tính chúng) và không thành `last:` của dashboard; chỉ thấy bằng `toryo watch <ID> --json` hoặc đọc file. Dùng
+khi cần "khám nghiệm" một lần chạy: `lock_acquired` / `lock_released` (khoá verify `machine:verify` hoặc khoá của gate môi
+trường; `released` luôn được ghi **trước** khi nhả khoá, nên `acquired` của task kế tiếp luôn đứng sau), `cancel_requested`
+(`source`: `ctrl_c` hoặc `stop`), `agent_spawned` (`stage`, `attempt`, `profile`, `pid` của CLI thật — `null` với agent giả),
+`agent_killed` khi Toryo kết thúc lượt (`reason`: `stop` = anh yêu cầu dừng, `limit` = quá giờ / im lặng quá lâu, `budget` = ngắt
+giữa lượt vì chạm trần token); `run_started` có thêm `pid` của lệnh chạy task, `run_ended` có `outcome` (`done`, `waiting`,
+`stopped`, `error`, `panicked`) và `exit_code`. Trong một tiến trình, `ts` luôn tăng.
 
 **Theo dõi trực tiếp** — mở cửa sổ thứ hai trong lúc `toryo run` đang chạy (không cần lock, không làm phiền
 lần chạy):
@@ -1426,6 +1469,10 @@ CI chạy: `cargo fmt --check`, `clippy -D warnings` (có và không có M0 kit)
   lại giữa các lần verify của một task nên nhanh hơn nhiều. (`verify.final_clean` được nhận nhưng chưa có tác dụng
   ở bản này — Toryo chưa tự chạy thêm một lần verify `clean` trước final gate; M12-08.) Lần verify đầu tải crate
   vào cache Low-IL, lâu hơn.
+- **Kiểm thử nghiệm thu M16** (chỉ Windows, PowerShell 7 + Pester 5+, không chạy trong CI): `pwsh -NoProfile -File
+  scripts\test-e2e.ps1 [-Repeat N]` build, chạy `cargo test`, từng test pseudo-console (`tests\e2e_m16.rs`, `#[ignore]`: Ctrl+C
+  gửi thật vào một ConPTY — AT-5, 6, 7, 9) và test Pester (`tests\e2e\M16.Tests.ps1`: `toryo run A B C --jobs 2` — AT-1, 2, 3, 4,
+  8), mỗi test trong một workspace mới; ghi `test-results\summary.md`, exit 0 chỉ khi mọi lần lặp đều pass. Không gọi agent thật.
 - **Codex có thể không chạy được cargo trong sandbox** (ghi vào `%USERPROFILE%\.cargo` bị chặn). Không sao: Verify
   build và test hộ, lỗi được gửi lại ở vòng fix.
 - **Không bao giờ thêm `.cargo` vào `writable_roots`** của Codex: agent khi đó sửa được source crate trong cache,
@@ -1450,6 +1497,8 @@ Danh sách đầy đủ, có mức ưu tiên: `docs/STATUS.md` mục 4. Những 
 | Evidence canary chỉ gắn với version CLI | Đổi `exe`, `env`, sandbox của profile → tự chạy lại `toryo doctor --canaries` |
 | File mà script gate tự nạp (dot-source, import) không được bảo vệ tự động | Giữ script trong một file, hoặc liệt kê file phụ trong `policy.protected_paths` và `never:` |
 | Không tự dọn run store, verify checkout, gate log theo thời gian | `toryo task cleanup <ID>` sau mỗi task |
+| Ctrl+C trong lúc `task create` kết thúc tiến trình mà không dọn (STATUS N-22) | Đừng nhấn Ctrl+C lúc tạo task. Nếu lỡ: xem `toryo task list` và `git worktree list`; task có trong danh sách thì `toryo task cleanup <ID> --force` |
+| Ctrl+C chỉ mới được thử qua pseudo-console (test AT-5/6/7/9), **chưa** bằng tay trên console thật (STATUS N-16) | Lần chạy thật đầu tiên: nhấn Ctrl+C một lần để chắc nó dừng đúng như mục 5.4 |
 | Protected paths dùng glob đơn giản (`*`, `**`, `?`) | Ghi rõ quy tắc trong `AGENTS.md` để agent tự tránh |
 | `toryo spike pipeline` là prototype: không resume, verify **không cách ly** | Không dùng trên repo thật; dùng `task create` + `run` |
 
@@ -1469,7 +1518,9 @@ Một cách nói thẳng, để anh không hiểu nhầm "Low integrity" thành 
 - **40 dòng cuối output của gate được gửi cho nhà cung cấp mô hình** (làm phản hồi cho implementer), và chỉ giá trị `secret_env`
   bị che. Đừng in connection string, key hay token; toàn bộ output nằm ở `<run store>\gate-logs\`.
 - Chữ do agent, nhà cung cấp hay gate viết ra **màn hình của anh** là chữ "trơ": chuỗi escape bị bỏ, ký tự về đầu dòng (`\r`)
-  bị bỏ, các ký tự điều khiển và ký tự đảo chiều chữ khác hiện thành `�`. Một plan hay một lý do escalate không thể ghi vào
+  bị bỏ, các ký tự điều khiển, ký tự đảo chiều chữ và ký tự vô hình khác (kể cả U+061C, U+2060 word joiner, U+FEFF — R23-20)
+  hiện thành `�`; chữ tiếng Việt (dựng sẵn hay tổ hợp) và chữ Nhật không đổi, và khi Toryo rút gọn một dòng nó không bao giờ cắt
+  rời một chữ khỏi dấu của nó (`ệ` không thành `e` + dấu chấm lơ lửng). Một plan hay một lý do escalate không thể ghi vào
   clipboard, đổi tiêu đề cửa sổ hay vẽ một dòng "Completed" giả. Output `--json` là dữ liệu nên giữ nguyên (JSON tự escape);
   `toryo context show` giữ nguyên từng byte khi pipe và là chữ trơ khi in ra terminal.
 
@@ -1489,19 +1540,19 @@ Có sáu dạng `next:` cho một task `Escalated`; cột "gõ gì" nói dạng 
 - **[xác nhận]** (`environment_gate_confirm`) — xem diff; đồng ý: `toryo resume <id>` trơn; không đồng ý: `toryo resume <id> --note "…"` hoặc `toryo task cleanup <id>`.
 - **[bảo vệ]** (`protected_config_changed`) — khôi phục file rồi `toryo resume <id>`, hoặc `toryo resume <id> --accept-protected-change <path>` (ghi vào `DECISIONS.md`).
 - **[phục hồi]** — `toryo resume <id> --discard-partial` (sau khi kiểm tra snapshot) hoặc tự sửa worktree rồi `toryo resume <id> --keep-partial`.
-- **[cấu hình]** (lý do có `PolicyRefusal`) — sửa profile trong config, `toryo task config <id> --reload`, rồi `toryo resume <id> --note "…"`; hoặc bỏ: `toryo task cleanup <id>`.
+- **[cấu hình]** (lớp `policy_refusal`, hoặc lý do **do Toryo viết** bắt đầu bằng `PolicyRefusal: …` / `implementer failed: PolicyRefusal — …`; chữ `PolicyRefusal` nằm trong phần stderr của CLI mà lý do trích lại thì không tính — R23-13) — sửa profile trong config, `toryo task config <id> --reload`, rồi `toryo resume <id> --note "…"`; hoặc bỏ: `toryo task cleanup <id>`.
 - **[chung]** — `toryo resume <id> --note "…"` (thêm một vòng sửa cho implementer), `toryo approve <id> --gate final --force`
   (mở cổng cuối **không** có review của AI), hoặc bỏ: `toryo task cleanup <id>`. Với các lớp này, `toryo resume <id>` trơn không làm gì.
 
 | Lớp (`reason_class`) | Nghĩa | Gõ gì |
 |---|---|---|
 | `gate_unavailable` | chương trình của một **check gate** không có trên máy này (không ở trên PATH, đường dẫn tuyệt đối không tồn tại) — kiểm tra **trước khi** gate nào chạy; `doctor` báo trước ở dòng `gates`. Script mà check gate chạy (`-File scripts/build.ps1`) là file của repo: **không** kiểm tra ở đây — script thiếu thì gate chạy và thất bại như mọi gate | [máy]: cài chương trình / đặt script lại → `toryo resume`; sửa `commands.verify` hoặc gate trong org chart → `task config --reload` |
-| `environment_gate_unavailable` | máy không chạy được **gate môi trường**: secret thiếu, chương trình không tìm thấy hoặc nằm trong repo/worktrees/verify root, script thiếu, hoặc bản xuất commit không khớp byte-exact — kiểm tra trước các check gate (không tốn một lần build) | [máy]: thêm secret vào Credential Manager, cài chương trình → `toryo resume`; sửa `environment_gates.<tên>` → `task config --reload` |
+| `environment_gate_unavailable` | máy không chạy được **gate môi trường**: secret thiếu hoặc ngắn hơn 8 byte (X42), chương trình không tìm thấy hoặc nằm trong repo/worktrees/verify root, script thiếu, hoặc bản xuất commit không khớp byte-exact — kiểm tra trước các check gate (không tốn một lần build) | [máy]: thêm secret vào Credential Manager, cài chương trình → `toryo resume`; sửa `environment_gates.<tên>` → `task config --reload` |
 | `environment_gate_timeout` | gate môi trường chạy quá `timeout:` và bị kill giữa chừng — môi trường có thể đã đổi một nửa; Toryo **không** tự thử lại | [máy]: xem môi trường, rồi `toryo resume` (chạy lại Verify và **mọi** gate môi trường của task: các gate đã xong trước nó cũng deploy lại, các gate sau nó chạy lần đầu; lý do trong escalation kể tên từng gate) |
 | `environment_gate_confirm` | `confirm: first/always` — Toryo hỏi **trước khi deploy** (xem commit, gate, lock, `git diff --stat`, lệnh trong lý do); không tốn vòng sửa | [xác nhận]: **`toryo resume <id>` trơn là "đồng ý"**; `--yes` không bao giờ đồng ý (`resume <id> --yes` bị từ chối; `resume` không id bỏ qua task này). **Không đồng ý:** `toryo resume <id> --note "…"` (implementer nhận ghi chú của bạn; tốn một vòng sửa) hoặc `toryo task cleanup <id>` (bỏ task) |
 | `skill_unavailable` | skill cần cho lượt này không tìm thấy (lý do nêu cả hai đường dẫn đã tìm), hoặc `SKILL.md` không phải UTF-8 — chưa chạy lượt nào, không tốn token | [máy]: đặt skill lại / lưu UTF-8 → `toryo resume`; đổi `skills` trong role file / `skills_dir` → `task config --reload` |
 | `context_over_budget` | ngữ cảnh kèm skill vẫn quá `context.budget_kb.<role>` (skill, TASK.md, PLAN.md không bao giờ bị cắt) | [máy]: chọn ít skill hơn hoặc nâng `context.budget_kb.<role>` → `task config --reload` → `toryo resume` |
-| `context_unreadable` | một file ngữ cảnh (global, `AGENTS.md`/`CLAUDE.md`, `.toryo\context\*.md`, culture, instructions, file của task pack) **không phải UTF-8** (UTF-16 hoặc code page) — lý do nêu tên file; không tốn lượt | [máy]: lưu file thành UTF-8 → `toryo resume` |
+| `context_unreadable` | một file ngữ cảnh (global, `AGENTS.md`/`CLAUDE.md`, `.toryo\context\*.md`, culture, instructions, file của task pack) **không phải UTF-8** (UTF-16 hoặc code page), hoặc **có mà không đọc được** (bị từ chối quyền, đang bị khoá, là một thư mục trùng tên — X45; trước đây bị coi là "không có" và lượt chạy thiếu quy tắc của anh) — lý do nêu tên file; không tốn lượt. Chỉ file thật sự không tồn tại mới được bỏ qua | [máy]: lưu file thành UTF-8 / sửa quyền, đóng chương trình đang giữ file → `toryo resume` |
 | `xpp_toolchain_unavailable` | `tool: xpp` không dùng được: thiếu MSBuild hoặc một gói NuGet CI/CD | [máy]: cài/khai báo `toolchains.xpp` → `toryo resume` (sửa file config → `task config --reload`) |
 | `verify_boundary_unavailable` | không lập được ranh giới Low integrity: `verify_root` không gán được Low label (thiếu `WRITE_OWNER`), hoặc `verify_root` nằm trong cây thư mục mà tiến trình Low ghi được (ví dụ dưới `AppData\LocalLow`). Toryo không tự hạ xuống chạy không cách ly; `toryo doctor` nêu nguyên nhân | [máy]: để `verify.verify_root` mặc định `%LOCALAPPDATA%\toryo-verify` → `task config --reload` → `toryo resume` |
 | `protected_config_changed` | một file được bảo vệ (config, script gate, `AGENTS.md`, `.claude\`, `.git\config`, hooks…) khác baseline — không chạy thêm process nào; lý do nêu file và diff | [bảo vệ] |
@@ -1514,13 +1565,13 @@ Có sáu dạng `next:` cho một task `Escalated`; cột "gõ gì" nói dạng 
 | `plan_policy` | sau 2 lần tự lập lại, kế hoạch vẫn liệt kê file ngoài hàng rào / được bảo vệ / bị cấm, hoặc chọn skill ngoài thực đơn / quá ngân sách ngữ cảnh | [chung]: sửa `writes:` / `skills:` / TASK.md (`## Allow protected`) hoặc `--note` |
 | `policy_violation` | vi phạm path policy: planner/reviewer **ghi** vào worktree trong stage chỉ-đọc (trừ `.vs\`, `.idea\`; phần đã ghi được trả lại như cũ), hoặc sau lượt implementer: branch khác, HEAD detached, thao tác Git dở, file ngoài hàng rào | [chung]: làm theo gợi ý trong lý do (checkout lại `toryo/<id>`, abort merge, khôi phục file), rồi `resume --note` |
 | `recovery_policy_violation` | sau crash, phần implementer sửa dở đụng file bị bảo vệ hoặc ngoài hàng rào; không commit gì | [phục hồi] |
-| `approval_mismatch` | khi duyệt, branch `toryo/<id>` không còn ở checkpoint đã duyệt (có commit mới) — không duyệt gì | đưa branch về checkpoint, hoặc `toryo resume <id> --note "…"` ([chung]) |
+| `approval_mismatch` | khi duyệt, branch `toryo/<id>` không còn ở checkpoint đã duyệt (có commit mới) — không duyệt gì | `next:` ghi sẵn: đưa branch về checkpoint (`git -C <worktree> reset --hard <checkpoint>` — phần sau nó chưa từng được verify), rồi `toryo approve <id> --gate final --force`; hoặc `toryo resume <id> --note "…"` (một vòng sửa), hoặc bỏ: `toryo task cleanup <id>`. `approve --force` bị từ chối khi branch chưa về checkpoint (R23-03: trước đây thành vòng lặp duyệt → từ chối) |
 | `implementer_failed` | một lượt **implementer** lỗi — lớp luôn là `implementer_failed`, còn lỗi của agent (`Timeout`, `Auth`, `InvalidOutput`…) nằm trong lý do: `implementer failed: <lỗi agent> — chi tiết`. Lượt hỏng mà không đổi file nào → escalate ngay; có đổi file → phần dở được giữ trong recovery checkpoint và chạy lại một lần (trừ lỗi auth, quyền, bad request, policy refusal) | [chung]; lý do có `PolicyRefusal` → [cấu hình] |
 | `process_crashed` · `timeout` · `network` · `unknown` · `context_window_exceeded` | lượt **planner / reviewer** chết / quá giờ / lỗi mạng / lỗi không phân loại / prompt quá lớn — Toryo **tự** chạy lại (crash, mạng: resume rồi phiên mới; timeout, context window: phiên mới một lần) rồi mới escalate; lý do ghi "also after N retries"; khi CLI chết không có kết quả, 10 dòng cuối **stderr của CLI** nằm trong lý do | [chung]; xem `<label>.stderr.txt` trong `captures\` |
-| `bad_request` · `invalid_output` | planner / reviewer: agent báo request sai / trả output không đúng schema (reviewer: sau 2 lượt sửa; plan sai schema: escalate ngay) | [chung]; `invalid_output`: đọc `captures\` xem agent trả gì |
+| `bad_request` · `invalid_output` | planner / reviewer: agent báo request sai / trả output không đúng schema (reviewer: sau 2 lượt sửa; plan sai schema: escalate ngay). Review vẫn sai sau 2 lượt sửa: lý do ghi `the review was rejected 3 times (R22); still wrong: …` (tối đa 5 lỗi, rồi số còn lại; đủ danh sách trong `error_detail` của attempt — R23-22) | [chung]; `invalid_output`: đọc lý do và `captures\` xem agent trả gì |
 | `auth` · `permission_denied` | planner / reviewer: chưa đăng nhập hoặc token hết hạn / agent bị từ chối quyền — escalate ngay, không thử lại | chạy `claude`/`codex` một lần để đăng nhập, rồi [chung] |
 | `policy_refusal` | Toryo từ chối **khởi động** Codex: `preflight: …` (thiếu `windows_sandbox: unelevated` hoặc `sandbox_mode` không an toàn) | [cấu hình] |
-| `other` | lý do không có tiền tố dạng `lớp:` | đọc lý do; [chung] |
+| `other` | lý do không có tiền tố dạng `lớp:` mà lớp là **một từ snake_case** (R23-12: một câu không có `:`, hay `Hai từ: …`, đều là `other` — không bao giờ cả câu thành tên lớp) | đọc lý do; [chung] |
 
 **`Paused`** (không phải escalation; exit code 1): `budget` → `toryo budget set <id> --tokens N`, rồi `toryo resume <id>`;
 `implementer_quota` (hết quota và hết agent dự phòng, hoặc `--no-fallback`; worktree giữ phần sửa dở) / `planner_quota` /
@@ -1545,13 +1596,21 @@ rồi chuyển agent dự phòng (mục 5.1), hết thì `Paused`.
 - `snapshot_incomplete` — snapshot phục hồi thiếu manifest hoặc file: đừng xoá thư mục `artifacts\partial\`;
   `toryo partial export` cho thấy cái gì còn.
 - `--yes never confirms a deploy` — `resume <id> --yes` trên task đang chờ `environment_gate_confirm`: bỏ `--yes`.
-- `task config --reload` ngoài trạng thái chờ — chỉ reload được khi task ở cổng duyệt, `Escalated` hoặc `Paused`.
+- `task config --reload` ngoài trạng thái chờ — chỉ reload được khi task ở cổng duyệt, `Escalated` hoặc `Paused`. Reload bị từ
+  chối (script đầu vào chưa có trong commit gốc, `--expect` sai) không để lại cặp lịch sử cấu hình nào (R23-24).
+- `--machine-config <path>: no such file` — file ghi trên dòng lệnh không tồn tại (gõ nhầm?); file mặc định thì được phép thiếu.
+- `the value of … is N byte(s); a secret needs at least 8` — secret quá ngắn để che (mục 4.2): đổi giá trị trong Credential
+  Manager, hoặc chuyển tham số không bí mật sang `env:`.
+- `task X already exists and … differs from it only in case` — chọn id khác (mục 5.4).
+- `task cleanup deletes only what task create made; nothing was deleted` — bản ghi task trỏ tới một thư mục mà `task create`
+  không tạo (mục 4.3): kiểm tra đường dẫn được nêu, tự xoá tay nếu đúng là rác.
 
 ### 9.2 Triệu chứng khác
 
 | Triệu chứng | Cách xử lý |
 |---|---|
 | `unrecognized subcommand 'gate'` (hoặc một lệnh / khoá config trong tài liệu này không được nhận) | `toryo.exe` cũ hơn `main`: `toryo --version` in commit; `cargo build --release --locked` lại |
+| `database … has schema version 3; this toryo expects 2 (a newer toryo wrote it: use that one)` | Một `toryo.exe` mới hơn đã nâng database (mục 3). Dùng exe mới; không có cách hạ version |
 | `task <ID> already exists` / `worktree … already exists` / `branch toryo/<ID> already exists` | Id là vĩnh viễn: dùng id khác (`--id BR-001b`). Worktree / branch còn sót của một task đã bỏ: `toryo task cleanup <ID>`, rồi `git branch -D toryo/<ID>` |
 | `TASK.md has no AC-<n>: items` | Cần heading `## Acceptance criteria` và dòng `- AC-1: …` (hoặc `1. AC-1: …`). Heading con `###` trong mục này vẫn được; id nằm trong khối code bị bỏ qua. `AC-01` là lỗi — viết `AC-1`. Sau id: `:`, `.`, `)`, `：` hoặc ` — ` / ` – ` / ` - `; bullet `-`, `*`, `+`, `•`, `・`. Dòng bắt đầu bằng `AC` + chữ số mà không đúng dạng (hàng bảng `\| AC-6 \| … \|`, chữ số full-width `AC-５`) bị từ chối kèm số dòng — không bị bỏ qua im lặng |
 | Lỗi khi load config: `unknown role …` / `not a valid value (valid: …)` / `unknown key … Did you mean …?` | Sửa đúng key được nêu: role / seat chỉ gồm `planner`, `implementer`, `reviewer`; giá trị hợp lệ có trong thông báo; mọi lỗi được báo một lần |
