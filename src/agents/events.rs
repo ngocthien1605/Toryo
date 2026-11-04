@@ -22,13 +22,29 @@ fn short(s: &str, n: usize) -> String {
     }
 }
 
+thread_local! {
+    static PARSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many stream lines [`parse_line`] parsed on this thread: a probe for tests.
+#[doc(hidden)]
+pub fn parses_on_this_thread() -> u64 {
+    PARSES.with(std::cell::Cell::get)
+}
+
+/// One stream line as JSON; `None` when it is not JSON.
+pub fn parse_line(line: &[u8]) -> Option<Value> {
+    PARSES.with(|n| n.set(n.get() + 1));
+    serde_json::from_slice(line).ok()
+}
+
 /// The events one stream line maps to on its own (non-terminal events only; the terminal
 /// ones come from the parser's final outcome, see `terminal_events`). A running turn uses
 /// [`LiveEvents`], which adds live usage and heartbeats.
 pub fn line_events(kind: ProfileKind, line: &[u8]) -> Vec<AgentEvent> {
-    match serde_json::from_slice::<Value>(line) {
-        Ok(v) => value_events(kind, &v),
-        Err(_) => Vec::new(),
+    match parse_line(line) {
+        Some(v) => value_events(kind, &v),
+        None => Vec::new(),
     }
 }
 
@@ -78,10 +94,16 @@ impl LiveEvents {
 
     /// The events of the next stdout line: at least one.
     pub fn feed(&mut self, line: &[u8]) -> Vec<AgentEvent> {
+        self.feed_parsed(parse_line(line).as_ref())
+    }
+
+    /// [`Self::feed`] for a line already parsed (`None`: not JSON) — a running turn parses each
+    /// line once, for these events and for the vendor's parser.
+    pub fn feed_parsed(&mut self, line: Option<&Value>) -> Vec<AgentEvent> {
         let mut out = Vec::new();
-        if let Ok(v) = serde_json::from_slice::<Value>(line) {
-            out = value_events(self.kind, &v);
-            if self.kind == ProfileKind::Claude && self.usage.observe(&v) {
+        if let Some(v) = line {
+            out = value_events(self.kind, v);
+            if self.kind == ProfileKind::Claude && self.usage.observe(v) {
                 let now = self.usage.buckets();
                 if now.is_some() && now != self.reported {
                     self.reported = now;
@@ -91,7 +113,7 @@ impl LiveEvents {
                     }));
                 }
             }
-            if let Some(running) = self.command_transition(&v) {
+            if let Some(running) = self.command_transition(v) {
                 out.push(AgentEvent::CommandRunning(running));
             }
         }
