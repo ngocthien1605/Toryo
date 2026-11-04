@@ -311,6 +311,15 @@ pub fn cleanup_git(repo: &Path) -> Result<GitCmd> {
     Ok(g)
 }
 
+/// N-22: a Ctrl+C pressed during `task create` ends it at the next step; the error drops
+/// [`Made`], which removes what was made.
+fn not_interrupted() -> Result<()> {
+    if super::lock::interrupted() {
+        bail!("interrupted (Ctrl+C): the task was not created");
+    }
+    Ok(())
+}
+
 /// M13-11 (X28): what `task create` has made so far. Dropped without [`Made::keep`] — any error
 /// after the first of them — it removes them again in reverse order, best effort, one line
 /// each: the same `TASK.md` can then be created again. The error that ended the creation is
@@ -614,6 +623,7 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     std::fs::write(art.join("TASK.md"), &text)?;
     let frozen = cfg.frozen_json()?;
     std::fs::write(art.join("config.json"), &frozen)?;
+    not_interrupted()?;
 
     std::fs::create_dir_all(&wt_root)
         .with_context(|| format!("creating project.worktrees_root {}", wt_root.display()))?;
@@ -624,6 +634,7 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         false,
         &["worktree", "add", "-q", "-b", &branch, &fwd(&wt), &base],
     )?;
+    not_interrupted()?;
     // R46: per-task TEMP inside the worktree, invisible to Git (info/exclude of the common dir)
     let w = Worktree::new(&g, &wt);
     let common = g.run_str(
@@ -671,6 +682,7 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
         reviewer,
         budget_tokens: cfg.repo.pipeline.budget_tokens.map(|b| b as i64),
     };
+    not_interrupted()?;
     let t = store.call(move |tx| {
         store::insert_task(tx, &nt)?;
         store::get_task(tx, &nt.id)
@@ -700,6 +712,7 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     // R35: protected baseline v1 — after the info/exclude line (R46), before any agent runs
     let (_, protect, _) = super::runner::task_policy(&t, cfg)?;
     super::protect::take_baseline(store, &t, &g, &protect, "v1 (task created)")?;
+    not_interrupted()?;
     made.keep();
     Ok(t)
 }

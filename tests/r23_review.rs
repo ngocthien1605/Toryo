@@ -631,3 +631,46 @@ fn r23_24_cleanup_deletes_only_what_task_create_made() {
     assert_eq!(code, 0, "{err}");
     assert!(!wt(&env, "D-1").exists() && victim.join("keep.txt").exists());
 }
+
+/// N-22 (review 2026-10-23): `toryo stop` asked "is anyone running the task?" by taking the
+/// task's OS lock for an instant — an `acquire` landing in that instant found it held. Now it
+/// asks the recorded owner, as `status` does, and never touches the OS lock: a live recorded
+/// owner is addressed although the OS lock is free right now, and an OS lock held with no
+/// owner recorded (an owner that has just let go) is no owner.
+#[test]
+fn n22_stop_reads_the_recorded_owner_and_never_takes_the_lock() {
+    use toryo::engine::lock::{self, StopOutcome};
+    let env = setup("codex-openai");
+    create(&env, "S-2");
+    let _one = IN_PROCESS.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("TORYO_DATA_DIR", &env.data);
+    let st = db(&env);
+    // a live owner (this process) is recorded; the OS lock is not held
+    let g = st
+        .call(|tx| store::claim_lock(tx, "S-2", "test owner"))
+        .unwrap();
+    let wait = std::time::Duration::from_millis(600);
+    let got = lock::stop(&st, "S-2", wait).unwrap();
+    assert_eq!(got, StopOutcome::Pending, "addressed to the recorded owner");
+    let pending = st
+        .read(move |tx| store::pending_stop(tx, "S-2", g))
+        .unwrap();
+    assert!(pending.is_some(), "the stop row waits for generation {g}");
+    // no owner recorded, the OS lock still held: no owner, at once
+    st.call(move |tx| store::release_lock(tx, "S-2", g))
+        .unwrap();
+    std::fs::create_dir_all(env.data.join("locks")).unwrap();
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock::lock_path("S-2"))
+        .unwrap();
+    f.lock().unwrap();
+    let started = std::time::Instant::now();
+    let got = lock::stop(&st, "S-2", wait).unwrap();
+    assert_eq!(got, StopOutcome::NoOwner);
+    assert!(started.elapsed() < wait, "{:?}", started.elapsed());
+    f.unlock().unwrap();
+}

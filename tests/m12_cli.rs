@@ -248,6 +248,42 @@ fn m13_11_a_create_that_fails_after_the_worktree_removes_branch_and_worktree() {
     assert_eq!(task(&env, "N-2").state, St::New);
 }
 
+/// N-22 (review 2026-10-23): Ctrl+C during `task create`. Was: no handler was installed — a
+/// press ended the process at once, with no X28 rollback (run store, worktree, branch stayed
+/// and the retry was refused); with the test hook nothing is pressed and the creation
+/// finishes. Now the first press ends the creation at its next step and what was made is
+/// removed; the same `TASK.md` creates again.
+#[test]
+fn n22_ctrl_c_during_task_create_takes_back_what_was_made() {
+    let env = setup("codex-openai");
+    let mut c = command(
+        &env,
+        &["task", "create", "--file", "TASK.md", "--id", "N-3"],
+        &[("TORYO_TEST_INTERRUPT_AFTER_MS", "0")],
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: a console of its own
+    }
+    let o = c.output().unwrap();
+    let err = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(
+        o.status.code().is_some_and(|c| c != 0),
+        "ended by itself, as a failure: {:?}\n{err}",
+        o.status
+    );
+    // (on Windows the key also reaches a Git child of the console: it may be what fails)
+    #[cfg(unix)]
+    assert!(
+        err.contains("removed: the run store") && err.contains("Ctrl+C"),
+        "{err}"
+    );
+    assert_nothing_left(&env, "N-3", &err);
+    create(&env, "N-3");
+    assert_eq!(task(&env, "N-3").state, St::New);
+}
+
 // ── M13-12 (X29): Ctrl+C on `toryo run` is a stop request ─────────────────────────────────
 
 /// `toryo run <id>` that presses Ctrl+C on itself at `presses` (milliseconds after its start;
