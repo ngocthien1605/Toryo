@@ -300,6 +300,46 @@ fn r23_09_a_lock_let_go_a_moment_ago_is_taken() {
     assert!(e.contains("is active"), "{e}");
 }
 
+/// R23-16, the opening line: the pipe is closed before the parent prints anything. Was: the
+/// line `▶ run …` was still printed with `errln!`, which panics when it cannot write; the
+/// parent ended with 101 and the children died with its pipes before their first stage. The
+/// same happened by chance in the test above when its read closed the pipe between that
+/// line's text and its line feed (CI on Windows, `main` @ `4813720`). Now the opening line
+/// stops the printing like every other line, and the tasks run to their end.
+#[test]
+fn r23_16_a_stream_closed_before_the_first_line_ends_no_task() {
+    let env = setup("codex-openai");
+    create(&env, "P-3");
+    create(&env, "P-4");
+    let s = script(
+        &env,
+        "p34.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let mut c = command(
+        &env,
+        &["run", "P-3", "P-4", "--yes", "--fake-agents", &s],
+        &[],
+    );
+    c.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    // closed before the parent has started up and written its first line
+    drop(child.stderr.take().unwrap());
+    let status = child.wait().unwrap();
+    for id in ["P-3", "P-4"] {
+        assert_eq!(
+            task(&env, id).state,
+            St::Completed,
+            "{id} (the parent ended with {status:?})"
+        );
+    }
+}
+
 /// R23-10 (C11): a crash between the review and its recorded decision. Was: the follow-ups
 /// of an approval ("approved with these open issues") were appended to DECISIONS.md — which is
 /// append-only — before the decision was recorded; after the crash the task was still

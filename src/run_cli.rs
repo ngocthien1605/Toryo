@@ -155,11 +155,19 @@ pub(crate) fn run_many(
         .clamp(1, MAX_JOBS);
     let exe: PathBuf = std::env::current_exe()?;
     let width = ids.iter().map(|i| i.chars().count()).max().unwrap_or(0);
-    toryo::errln!(
+    // R23-16: a stream this process can no longer write (`toryo run A B | head`) stops its
+    // printing, never the process — a panic here would close the children's pipes, and each
+    // would die at its next line, mid-task. The lines are still read and dropped. The opening
+    // line too: closed before or while it is written, it was a panic before any child started.
+    let silent = std::cell::Cell::new(false);
+    let opening = format!(
         "▶ run {} — {} at a time (`toryo dashboard` shows them all)",
         ids.join(" "),
         jobs
     );
+    if toryo::term::try_line(toryo::term::Stream::Err, &opening).is_err() {
+        silent.set(true);
+    }
     // Ctrl+C goes to every process of the console: the children stop their tasks; this
     // process only stops starting new ones
     watch_interrupt();
@@ -168,10 +176,6 @@ pub(crate) fn run_many(
     let mut running: Vec<(usize, Child)> = Vec::new();
     let mut codes: Vec<Option<i32>> = vec![None; ids.len()];
     let mut said_stop = false;
-    // R23-16: a stream this process can no longer write (`toryo run A B | head`) stops its
-    // printing, never the process — a panic here would close the children's pipes, and each
-    // would die at its next line, mid-task. The lines are still read and dropped.
-    let silent = std::cell::Cell::new(false);
     let print = |l: Line| {
         if silent.get() {
             return;
