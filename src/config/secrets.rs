@@ -76,3 +76,142 @@ pub fn resolve_profile_secrets(p: &Profile) -> Result<BTreeMap<String, String>> 
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    //! What a `secret_env` reference resolves to, and every way it is refused — always naming
+    //! the reference, never showing the value. Each test uses environment variables of its own
+    //! (tests run in parallel in one process). A variable that is not Unicode is not tested here:
+    //! set in this process, it would make every other test that lists the environment panic.
+    use super::*;
+
+    /// A profile whose `secret_env` is `refs` (`NAME → reference`).
+    fn profile(refs: &[(&str, &str)]) -> Profile {
+        let mut p: Profile =
+            serde_yaml::from_str("{ kind: codex, billing: foundry, exe: codex }").unwrap();
+        p.secret_env = refs
+            .iter()
+            .map(|(k, r)| (k.to_string(), r.to_string()))
+            .collect();
+        p
+    }
+
+    /// An `env:` reference to a variable that is not set names the variable; it is never an
+    /// empty secret.
+    #[test]
+    fn an_unset_variable_is_named_never_an_empty_secret() {
+        std::env::remove_var("TORYO_TEST_SECRETS_UNSET");
+        let e = format!(
+            "{:#}",
+            resolve_secret("env:TORYO_TEST_SECRETS_UNSET").unwrap_err()
+        );
+        assert!(
+            e.contains("secret env var `TORYO_TEST_SECRETS_UNSET` is not set"),
+            "{e}"
+        );
+    }
+
+    /// Only the two documented forms resolve; anything else (another scheme, a bare value, the
+    /// prefix in another case) is refused, naming both forms.
+    #[test]
+    fn a_reference_of_another_form_names_the_two_that_exist() {
+        std::env::set_var("TORYO_TEST_SECRETS_CASE", "a-long-enough-value");
+        for r in [
+            "file:C:/secret.txt",
+            "a-long-enough-value",
+            "ENV:TORYO_TEST_SECRETS_CASE",
+            "",
+        ] {
+            let e = format!("{:#}", resolve_secret(r).unwrap_err());
+            assert!(
+                e.contains(&format!("unsupported secret reference `{r}`"))
+                    && e.contains("use credman:<target> or env:<VAR>"),
+                "{r}: {e}"
+            );
+        }
+    }
+
+    /// The limit of X42 counts bytes, not characters: eight bytes of UTF-8 are enough even when
+    /// they are four letters, six bytes are not.
+    #[test]
+    fn the_shortest_secret_is_counted_in_bytes() {
+        std::env::set_var("TORYO_TEST_SECRETS_BYTES", "éééé");
+        assert_eq!(
+            resolve_secret("env:TORYO_TEST_SECRETS_BYTES").unwrap(),
+            "éééé"
+        );
+        std::env::set_var("TORYO_TEST_SECRETS_BYTES", "ééé");
+        let e = format!(
+            "{:#}",
+            resolve_secret("env:TORYO_TEST_SECRETS_BYTES").unwrap_err()
+        );
+        assert!(e.contains("is 6 byte(s)"), "{e}");
+        // a value of several line breaks is still no secret (M13-03), whatever its length
+        std::env::set_var("TORYO_TEST_SECRETS_BYTES", "\n\n\n");
+        assert_eq!(
+            resolve_secret("env:TORYO_TEST_SECRETS_BYTES").unwrap(),
+            "\n\n\n"
+        );
+    }
+
+    /// Off Windows there is no Credential Manager: a `credman:` reference says so and points at
+    /// `env:`, and storing a secret is refused — never a silent empty value.
+    #[cfg(not(windows))]
+    #[test]
+    fn off_windows_credential_manager_is_refused_with_the_way_out() {
+        let e = format!(
+            "{:#}",
+            resolve_secret("credman:toryo/foundry-openai").unwrap_err()
+        );
+        assert!(
+            e.contains("credman:toryo/foundry-openai is only available on Windows")
+                && e.contains("use env:<VAR> on this host"),
+            "{e}"
+        );
+        let e = format!(
+            "{:#}",
+            store_secret("toryo/foundry-openai", "a-long-enough-value").unwrap_err()
+        );
+        assert!(e.contains("only available on Windows"), "{e}");
+    }
+
+    /// A profile's secrets resolve to `NAME → value`; the first one that cannot resolve fails
+    /// them all, its `secret_env.NAME` in the message (so the owner knows which entry), its
+    /// value nowhere.
+    #[test]
+    fn a_profile_resolves_every_secret_or_names_the_one_that_fails() {
+        std::env::set_var("TORYO_TEST_SECRETS_P_KEY", "key-0123456789");
+        std::env::set_var("TORYO_TEST_SECRETS_P_TOKEN", "token-0123456789");
+        let ok = resolve_profile_secrets(&profile(&[
+            ("API_KEY", "env:TORYO_TEST_SECRETS_P_KEY"),
+            ("TOKEN", "env:TORYO_TEST_SECRETS_P_TOKEN"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            ok.into_iter().collect::<Vec<_>>(),
+            [
+                ("API_KEY".to_string(), "key-0123456789".to_string()),
+                ("TOKEN".to_string(), "token-0123456789".to_string()),
+            ]
+        );
+        std::env::set_var("TORYO_TEST_SECRETS_P_SHORT", "pin42");
+        let e = format!(
+            "{:#}",
+            resolve_profile_secrets(&profile(&[
+                ("API_KEY", "env:TORYO_TEST_SECRETS_P_KEY"),
+                ("PIN", "env:TORYO_TEST_SECRETS_P_SHORT"),
+            ]))
+            .unwrap_err()
+        );
+        assert!(
+            e.starts_with("secret_env.PIN: ") && e.contains("is 5 byte(s)"),
+            "{e}"
+        );
+        assert!(
+            !e.contains("pin42") && !e.contains("key-0123456789"),
+            "no value is shown: {e}"
+        );
+        // no secrets: an empty map, nothing resolved
+        assert!(resolve_profile_secrets(&profile(&[])).unwrap().is_empty());
+    }
+}
