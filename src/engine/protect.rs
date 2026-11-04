@@ -242,8 +242,20 @@ fn hash_file(p: &Path) -> Result<(u64, String, Option<String>)> {
     Ok((b.len() as u64, sha256_hex(&b), None))
 }
 
+thread_local! {
+    static SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times [`scan`] ran on this thread: a probe for tests (each scan walks the worktree
+/// and hashes every protected file).
+#[doc(hidden)]
+pub fn scans_on_this_thread() -> u64 {
+    SCANS.with(std::cell::Cell::get)
+}
+
 /// Walk the worktree + Git metadata now.
 pub fn scan(g: &GitCmd, wt: &Path, protect: &Protected) -> Result<Scan> {
+    SCANS.with(|n| n.set(n.get() + 1));
     let mut found = Vec::new();
     walk(wt, wt, protect, &mut found)?;
     let tracked: BTreeSet<String> = {
@@ -399,7 +411,17 @@ pub fn take_baseline(
     protect: &Protected,
     reason: &str,
 ) -> Result<PManifest> {
-    let now = scan(g, &t.worktree, protect)?;
+    take_baseline_from(store, t, scan(g, &t.worktree, protect)?, reason)
+}
+
+/// [`take_baseline`] from a scan already made — the one a [`check`] just compared, when nothing
+/// can have changed since (review 2026-10-23: the state was walked and hashed twice).
+pub fn take_baseline_from(
+    store: &Store,
+    t: &TaskRow,
+    now: Scan,
+    reason: &str,
+) -> Result<PManifest> {
     let version = super::artifacts::next_version(store, t, "protected")?;
     let mut total = 0u64;
     let mut entries = BTreeMap::new();
@@ -560,11 +582,29 @@ pub struct Check {
     pub changes: Vec<Change>,
     /// Written to the run store when there are hard changes.
     pub diff_path: Option<PathBuf>,
+    /// The state compared; `None` when it could not be read (then `changes` says so).
+    pub scan: Option<Scan>,
 }
 
 impl Check {
     pub fn hard(&self) -> Vec<&Change> {
         self.changes.iter().filter(|c| c.is_hard()).collect()
+    }
+
+    /// Take a new baseline from the state this check compared (see [`take_baseline_from`]); a
+    /// check that could not read it scans again.
+    pub fn take_baseline(
+        &mut self,
+        store: &Store,
+        t: &TaskRow,
+        g: &GitCmd,
+        protect: &Protected,
+        reason: &str,
+    ) -> Result<PManifest> {
+        match self.scan.take() {
+            Some(now) => take_baseline_from(store, t, now, reason),
+            None => take_baseline(store, t, g, protect, reason),
+        }
     }
 }
 
@@ -622,6 +662,7 @@ pub fn check(store: &Store, t: &TaskRow, g: &GitCmd, protect: &Protected) -> Res
                     tracked: false,
                 }],
                 diff_path: None,
+                scan: None,
             });
         }
     };
@@ -647,6 +688,7 @@ pub fn check(store: &Store, t: &TaskRow, g: &GitCmd, protect: &Protected) -> Res
         baseline_id: id,
         changes,
         diff_path,
+        scan: Some(now),
     })
 }
 

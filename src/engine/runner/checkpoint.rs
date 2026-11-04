@@ -139,7 +139,7 @@ impl<'a> Engine<'a> {
             found,
         });
         // R35: a committed tracked protected change allowed by TASK.md becomes the new baseline
-        let c = protect::check(self.store, t, &self.g, &self.protect)?;
+        let mut c = protect::check(self.store, t, &self.g, &self.protect)?;
         let allowed: Vec<String> = c
             .changes
             .iter()
@@ -147,7 +147,7 @@ impl<'a> Engine<'a> {
             .map(|x| x.path.clone())
             .collect();
         if !allowed.is_empty() && c.hard().is_empty() {
-            protect::take_baseline(
+            c.take_baseline(
                 self.store,
                 t,
                 &self.g,

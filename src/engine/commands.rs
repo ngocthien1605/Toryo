@@ -217,7 +217,7 @@ pub struct ResumeArgs {
 pub fn resume_protected(st: &Store, t: &TaskRow, accept: &[String]) -> Result<bool> {
     let cfg = frozen_config(t)?;
     let (g, protect, _) = task_policy(t, &cfg)?;
-    let c = crate::engine::protect::check(st, t, &g, &protect)?;
+    let mut c = crate::engine::protect::check(st, t, &g, &protect)?;
     let bad: Vec<&crate::engine::protect::Change> = c
         .changes
         .iter()
@@ -274,7 +274,7 @@ pub fn resume_protected(st: &Store, t: &TaskRow, accept: &[String]) -> Result<bo
         .iter()
         .map(|x| format!("{} {}", x.kind, x.path))
         .collect();
-    let m = crate::engine::protect::take_baseline(
+    let m = c.take_baseline(
         st,
         t,
         &g,
