@@ -298,3 +298,121 @@ fn an_environment_gate_is_listed_and_never_run_here() {
         "{stderr}"
     );
 }
+
+/// A `program` gate **without** `diagnostics: msbuild`: `gate run` reads nothing out of the
+/// output — no error count, no parsed lines — and a failure shows the output's last lines
+/// instead (where `Build FAILED.` stands); a pass shows no output at all.
+#[test]
+fn gate_run_without_diagnostics_shows_the_last_output_of_a_failure() {
+    let env = setup_build("", None);
+    let (code, stdout, stderr) = run_out(&env, &["gate", "run", "build"]);
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert!(stdout.contains("✘ build (exit 1"), "{stdout}");
+    assert!(
+        !stdout.contains("error(s)"),
+        "no count without diagnostics: {stdout}"
+    );
+    let tail = stdout
+        .split("last output:\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no last output: {stdout}"));
+    assert!(tail.contains("Build FAILED."), "{stdout}");
+    assert!(
+        tail.contains("src/Calculator.xml(12,5): error XPP0101"),
+        "the raw lines, as printed: {stdout}"
+    );
+    std::fs::write(env.repo.join("src").join("FIXED"), "1").unwrap();
+    let (code, stdout, stderr) = run_out(&env, &["gate", "run", "build"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("✔ build (exit 0"), "{stdout}");
+    assert!(!stdout.contains("last output:"), "{stdout}");
+}
+
+/// `gate list` says a gate's limit as written: a limit that is not whole minutes in seconds
+/// (`90s` → `90 s`), whole minutes in minutes.
+#[test]
+fn gate_list_says_a_limit_that_is_not_whole_minutes_in_seconds() {
+    let org = ORGCHART
+        .replace("IMPLEMENTER", "codex-openai")
+        .replace("timeout: 5m", "timeout: 90s")
+        .replace(
+            "seats:",
+            "  quick: { kind: check, program: git, args: [--version], timeout: 2m }\nseats:",
+        );
+    let env = setup_orgchart(
+        "codex-openai",
+        "",
+        &[
+            (".toryo/toryo-orgchart.yaml", &org),
+            (
+                ".toryo/roles/implementer/toryo-role.yaml",
+                "toryo: 1\npurpose: Change the code.\nbefore_handoff: [divide-present, quick]\n",
+            ),
+        ],
+    );
+    let (code, stdout, stderr) = run_out(&env, &["gate", "list"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("  divide-present  [90 s]  git grep"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  quick  [2 min]  git --version"),
+        "{stdout}"
+    );
+    // listed in the order Verify runs them (before_handoff)
+    let (a, b) = (
+        stdout.find("divide-present").unwrap(),
+        stdout.find("quick").unwrap(),
+    );
+    assert!(a < b, "{stdout}");
+}
+
+/// No check gate at all — no `commands.verify` and a repository without `scripts/build.ps1` or
+/// `scripts/test.ps1` (the fallback): `gate list` says Verify has nothing to run and how to add a
+/// gate, and `gate run` refuses any name with that same fact (not a list of zero names). (An org
+/// chart cannot get here: it must declare a check gate.)
+#[test]
+fn with_no_check_gate_list_says_so_and_run_refuses_every_name() {
+    let env = setup("codex-openai");
+    let bare = env.root.join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    let cfg = std::fs::read_to_string(&env.config).unwrap();
+    let divide = "commands:\n  verify:\n    - { name: divide-present, program: git, args: [\"grep\", \"-q\", \"Divide-Numbers\", \"--\", \"src\"] }\n";
+    let root = format!("root: \"{}\"", fwd(&env.repo));
+    assert!(cfg.contains(divide) && cfg.contains(&root), "{cfg}");
+    std::fs::write(
+        &env.config,
+        cfg.replace(divide, "")
+            .replace(&root, &format!("root: \"{}\"", fwd(&bare))),
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run_out(&env, &["gate", "list"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("no check gate configured — Verify has nothing to run (skipped)"),
+        "{stdout}"
+    );
+    let (code, _, stderr) = run_out(&env, &["gate", "run", "build"]);
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("no gate `build`: no check gate is configured (`toryo gate list`)"),
+        "{stderr}"
+    );
+}
+
+/// `gate run --repo` names the folder the gate runs in: one that is not a folder is refused
+/// before anything runs (the fake build tool would leave its marker).
+#[test]
+fn gate_run_refuses_a_repo_that_is_not_a_folder() {
+    let env = setup_build("", Some("ran.marker"));
+    let missing = env.root.join("no-such-repo");
+    let (code, _, stderr) = run_out(
+        &env,
+        &["gate", "run", "build", "--repo", missing.to_str().unwrap()],
+    );
+    assert_ne!(code, 0);
+    assert!(stderr.contains("is not a folder (--repo)"), "{stderr}");
+    assert!(!env.repo.join("ran.marker").exists());
+    assert!(!missing.exists());
+}

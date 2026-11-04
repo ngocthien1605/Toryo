@@ -829,3 +829,209 @@ fn json_views_say_compile_only_for_an_xpp_verify() {
         assert_eq!(t["compile_only"], true, "{args:?}: {t}");
     }
 }
+
+/// `xpp build` with a machine config that has no `toolchains.xpp` stops before anything runs and
+/// says which file to complete (R59) — the compiler is a fact of the machine, never guessed.
+#[test]
+fn xpp_build_without_a_toolchain_names_the_machine_config() {
+    let env = setup("codex-openai");
+    let repo = env.repo.display().to_string();
+    let (code, stdout, stderr) = run_out(
+        &env,
+        &[
+            "xpp",
+            "build",
+            "--repo",
+            &repo,
+            "--project",
+            "Projects/Pkg/Calc.Build.rnrproj",
+            "--print-only",
+        ],
+    );
+    assert_ne!(code, 0, "{stdout}");
+    assert!(
+        stderr.contains(&format!(
+            "no toolchains.xpp in {} (R59): add msbuild and nugets",
+            env.machine.display()
+        )),
+        "{stderr}"
+    );
+    assert!(stdout.is_empty(), "nothing printed or built: {stdout}");
+}
+
+/// A failed build whose output holds no line in MSBuild's error format still tells the owner
+/// why: `0 error(s)`, then the last lines of the output (where the tool said what went wrong).
+#[test]
+fn xpp_build_failing_without_parsable_errors_prints_the_last_output() {
+    let x = setup_xpp(
+        &["Calc.Build"],
+        "Calc.Build",
+        "Restoring packages…\nThe reference assembly Contoso.Licensing could not be loaded.\n",
+        false,
+    );
+    let env = &x.env;
+    let repo = env.repo.display().to_string();
+    let (code, stdout, stderr) = run_out(
+        env,
+        &[
+            "xpp",
+            "build",
+            "--repo",
+            &repo,
+            "--project",
+            "Projects/Pkg/Calc.Build.rnrproj",
+            "--metadata",
+            "src",
+        ],
+    );
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("✘ build/Calc.Build (exit 1")
+            && stdout.contains("0 error(s), 0 warning(s)"),
+        "{stdout}"
+    );
+    let tail = stdout
+        .split("last output:\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no last output: {stdout}"));
+    assert!(
+        tail.contains("The reference assembly Contoso.Licensing could not be loaded."),
+        "{stdout}"
+    );
+}
+
+/// More errors than a fix prompt carries: `xpp build` lists the first 50 (each once), counts
+/// them all, says how many are not shown, and counts the warnings without listing them.
+#[test]
+fn xpp_build_lists_the_first_errors_and_says_how_many_more_there_are() {
+    let max = toryo::engine::xpp::DIAGNOSTICS_MAX;
+    let mut output = String::new();
+    for i in 1..=max + 3 {
+        output.push_str(&format!(
+            "src/F{i}.xml({i},1): error XPP{i:04}: problem {i}\n"
+        ));
+    }
+    // a repeated error counts once; a warning is counted, not listed
+    output.push_str("src/F1.xml(1,1): error XPP0001: problem 1\n");
+    output.push_str("src/W.xml(2,3): warning XPP9000: unused variable\n");
+    output.push_str("Build FAILED.\n");
+    let x = setup_xpp(&["Calc.Build"], "Calc.Build", &output, false);
+    let env = &x.env;
+    let repo = env.repo.display().to_string();
+    let (code, stdout, stderr) = run_out(
+        env,
+        &[
+            "xpp",
+            "build",
+            "--repo",
+            &repo,
+            "--project",
+            "Projects/Pkg/Calc.Build.rnrproj",
+            "--metadata",
+            "src",
+        ],
+    );
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains(&format!("{} error(s), 1 warning(s)", max + 3)),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  src/F1.xml(1,1): error XPP0001: problem 1"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "  src/F{max}.xml({max},1): error XPP{max:04}: problem {max}"
+        )),
+        "{stdout}"
+    );
+    let next = max + 1;
+    assert!(
+        !stdout.contains(&format!("problem {next}\n")),
+        "only the first {max} are listed: {stdout}"
+    );
+    assert!(stdout.contains("  … and 3 more"), "{stdout}");
+    assert!(!stdout.contains("unused variable"), "{stdout}");
+    assert!(
+        !stdout.contains("last output:"),
+        "the errors say why; no tail: {stdout}"
+    );
+}
+
+/// `--repo` may be relative (to where `toryo` runs): the command line it prints is the one of
+/// the same repository named by its absolute path.
+#[test]
+fn xpp_build_takes_a_relative_repo_as_the_same_repository() {
+    let x = setup_xpp(&["Calc.Build"], "nothing", "Build succeeded.\n", false);
+    let env = &x.env;
+    let rel = env
+        .repo
+        .strip_prefix(&env.root)
+        .unwrap()
+        .display()
+        .to_string();
+    let abs = env.repo.display().to_string();
+    let print = |repo: &str| {
+        let (code, stdout, stderr) = run_out(
+            env,
+            &[
+                "xpp",
+                "build",
+                "--repo",
+                repo,
+                "--project",
+                "Projects/Pkg/Calc.Build.rnrproj",
+                "--metadata",
+                "src",
+                "--print-only",
+            ],
+        );
+        assert_eq!(code, 0, "{repo}: {stderr}");
+        stdout
+    };
+    let (from_rel, from_abs) = (print(&rel), print(&abs));
+    assert!(from_abs.contains("# build/Calc.Build"), "{from_abs}");
+    assert_eq!(from_rel, from_abs);
+}
+
+/// A `tool: xpp` check gate is listed by `gate list` with its inputs, and `gate run` builds it
+/// through the same code as `xpp build` — `--print-only` prints the MSBuild line of each
+/// project under the gate's own name.
+#[test]
+fn an_xpp_gate_is_listed_and_run_by_gate_run() {
+    let x = setup_xpp(
+        &["Calc.Build", "Ext.Build"],
+        "nothing",
+        "Build succeeded.\n",
+        false,
+    );
+    let env = &x.env;
+    let (code, stdout, stderr) = run_out(env, &["gate", "list"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains(
+            "  build  [5 min]  tool: xpp  metadata: src  projects: Projects/Pkg/Calc.Build.rnrproj, Projects/Pkg/Ext.Build.rnrproj"
+        ),
+        "{stdout}"
+    );
+    let before = built(&x).len();
+    let (code, stdout, stderr) = run_out(env, &["gate", "run", "build", "--print-only"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("# build/Calc.Build (Projects/Pkg/Calc.Build.rnrproj)")
+            && stdout.contains("# build/Ext.Build (Projects/Pkg/Ext.Build.rnrproj)"),
+        "{stdout}"
+    );
+    assert_eq!(built(&x).len(), before, "--print-only builds nothing");
+    let (code, stdout, stderr) = run_out(env, &["gate", "run", "build"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("✔ build/Calc.Build") && stdout.contains("✔ build/Ext.Build"),
+        "{stdout}"
+    );
+    assert_eq!(
+        built(&x)[before..],
+        ["Calc.Build.rnrproj", "Ext.Build.rnrproj"]
+    );
+}
