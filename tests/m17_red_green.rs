@@ -1220,7 +1220,19 @@ fn m17_ec11_a_program_missing_when_red_starts_is_gate_unavailable() {
         env.root.join("MOVE_ONCE").exists(),
         std::path::Path::new(&format!("{runner}.gone")).exists()
     );
-    assert_eq!(t.machine.reason_class(), Some("gate_unavailable"), "{err}");
+    assert_eq!(
+        t.machine.reason_class(),
+        Some("gate_unavailable"),
+        "class {:?}, fix cycle {}, reason: {}\n{err}",
+        t.machine.reason_class(),
+        t.fix_cycle,
+        t.machine
+            .reason()
+            .unwrap_or_default()
+            .lines()
+            .next()
+            .unwrap_or_default()
+    );
     assert_eq!(t.fix_cycle, 0, "no fix cycle");
     // put the program back: a plain resume re-enters Verify and passes
     std::fs::rename(format!("{runner}.gone"), &runner).unwrap();

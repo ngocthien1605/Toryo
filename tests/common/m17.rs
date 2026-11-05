@@ -147,9 +147,11 @@ pub fn rg_runner(root: &Path, r: Runner) -> String {
         let mut s = String::from("@echo off\r\nif \"%~1\"==\"suite\" exit /b 0\r\ngit grep -q -F -e \"%~1\" -- src\r\nif errorlevel 1 goto red\r\n");
         if r.move_once {
             // the runner's own path spelled with `\`: cmd's `move` and `del` can read a `/` as a
-            // switch, and `%~f0` keeps the spelling the runner was started with
+            // switch, and `%~f0` keeps the spelling the runner was started with. `exit 0`, not
+            // `exit /b 0`: cmd ends at once — returning from a batch file that is gone makes it
+            // say "The batch file cannot be found." and exit 1
             s.push_str(&format!(
-                "if exist \"{m}\" ( del \"{m}\" & move \"{me}\" \"{me}.gone\" >nul & exit /b 0 )\r\n",
+                "if exist \"{m}\" ( del \"{m}\" & move \"{me}\" \"{me}.gone\" >nul & exit 0 )\r\n",
                 m = marker("MOVE_ONCE"),
                 me = p.display()
             ));
