@@ -221,6 +221,23 @@ impl Effective {
         if let Some(root) = crate::team::org_chart_root(&self.repo.project.root) {
             problems.extend(crate::team::problems(self, &root, &hint));
         }
+        // M17-A3 (X48): one proof map per checkpoint, so one red-green gate — a test id of one
+        // runner is no test id of another
+        let rg: Vec<&str> = self
+            .repo
+            .commands
+            .verify
+            .iter()
+            .filter(|c| c.red_green.is_some())
+            .map(|c| c.name.as_str())
+            .collect();
+        if rg.len() > 1 {
+            problems.push(format!(
+                "red_green: {} gates have a `red_green` block ({}) — the implementer's proof map names the tests of one test runner: keep `red_green` on one gate",
+                rg.len(),
+                rg.join(", ")
+            ));
+        }
         if self.team.is_some() {
             // M11-B2: a machine seat override cannot give the planner or reviewer a fallback
             for seat in ["planner", "reviewer"] {

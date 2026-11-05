@@ -63,6 +63,134 @@ fn m17_ac05_task_create_refuses_a_bad_proof_exempt_section() {
     assert_eq!(exempt[0].ac, "AC-3");
 }
 
+// ── A3: the proof map and the prompt (AC-3) ────────────────────────────────────────────────
+
+/// The store's events of `kind` for task `id`.
+fn store_events(env: &Env, id: &str, kind: &str) -> Vec<Value> {
+    let i = id.to_string();
+    db(env)
+        .call(move |tx| toryo::engine::store::events(tx, &i))
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.1 == kind)
+        .map(|e| e.2)
+        .collect()
+}
+
+/// The prompts of the implementer's turns of the latest run of `id`.
+fn implementer_prompts(env: &Env, id: &str) -> Vec<String> {
+    calls(env, id)
+        .into_iter()
+        .filter(|c| {
+            c["key"]
+                .as_str()
+                .is_some_and(|k| k.starts_with("implementer"))
+        })
+        .map(|c| c["prompt"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// AC-3, AC-13: without a red-green gate an implementation report without `proof` is accepted
+/// (no schema violation), and the prompt says nothing about a proof map.
+#[test]
+fn m17_ac03_a_report_without_proof_passes_without_a_red_green_gate() {
+    let env = setup_rg("", "", &[]);
+    create(&env, "NP-1");
+    let s = script(
+        &env,
+        "np.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(&env, &["run", "NP-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        task(&env, "NP-1").state,
+        toryo::engine::PipelineState::Completed,
+        "{err}"
+    );
+    assert!(
+        store_events(&env, "NP-1", "schema_violation").is_empty(),
+        "{err}"
+    );
+    assert!(
+        !err.contains("does not match implementation.schema.json"),
+        "{err}"
+    );
+    let p = implementer_prompts(&env, "NP-1");
+    assert_eq!(p.len(), 1);
+    assert!(!p[0].contains("Proof map"), "{}", p[0]);
+    // and VERIFY_RESULT.json has no `red_green` key (AC-11, AC-13)
+    assert!(verify_result(&env, "NP-1").get("red_green").is_none());
+}
+
+/// AC-3: with a red-green gate the implementer's prompt explains the proof rule — the gate, its
+/// per-test command, the test globs and the exempt criteria with their reasons.
+#[test]
+fn m17_ac03_the_prompt_explains_the_proof_rule_with_a_red_green_gate() {
+    let env = setup_rg(RG_SRC, "", &[]);
+    let text = std::fs::read_to_string(env.repo.join("TASK.md")).unwrap();
+    std::fs::write(
+        env.repo.join("TASK.md"),
+        format!("{text}\n## Proof exempt\n- AC-3: the export list is read by the reviewer\n"),
+    )
+    .unwrap();
+    create(&env, "PR-1");
+    let s = rg_script(
+        &env,
+        "pr.json",
+        json!([
+            {"ac": "AC-1", "tests": ["Divide-Numbers"]},
+            {"ac": "AC-2", "tests": ["Division by zero"]},
+        ]),
+    );
+    let (code, err) = toryo(&env, &["run", "PR-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    let p = implementer_prompts(&env, "PR-1");
+    assert_eq!(p.len(), 1, "{err}");
+    for want in [
+        "## Proof map (red-green gate `divide-present`)",
+        "every criterion of TASK.md (AC-1, AC-2, AC-3) except the exempt ones",
+        "with `git grep -q -F -e {test} -- src`",
+        "(the files matching `tests/**`)",
+        "it must FAIL",
+        "at most 32 distinct ids",
+        "Exempt (no test required; a test you list for one still runs):\n- AC-3: the export list is read by the reviewer\n",
+    ] {
+        assert!(p[0].contains(want), "`{want}` not in\n{}", p[0]);
+    }
+    assert!(store_events(&env, "PR-1", "schema_violation").is_empty());
+}
+
+/// X48: one red-green gate per configuration — two in `before_handoff` are refused at load.
+#[test]
+fn m17_x48_two_red_green_gates_are_refused() {
+    let org = org_rg(RG_SRC, "").replace(
+        "  divide-present:",
+        "  unit: { kind: check, program: git, args: [status], timeout: 5m, red_green: { tests: [\"tests/**\"], args: [\"{test}\"] } }\n  divide-present:",
+    );
+    let env = setup_rg(
+        "",
+        "",
+        &[
+            (".toryo/toryo-orgchart.yaml", &org),
+            (
+                ".toryo/roles/implementer/toryo-role.yaml",
+                "toryo: 1\npurpose: Change the code.\nbefore_handoff: [divide-present, unit]\n",
+            ),
+        ],
+    );
+    let (code, _, err) = run_out(&env, &["config", "show"]);
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("red_green: 2 gates have a `red_green` block (divide-present, unit)"),
+        "{err}"
+    );
+}
+
 // ── A1: configuration and load refusals (AC-1, AC-2) ──────────────────────────────────────
 
 /// AC-1: a `kind: check` gate of the org chart accepts the block; `config show` (text and
