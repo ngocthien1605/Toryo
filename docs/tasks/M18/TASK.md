@@ -11,9 +11,8 @@ Two names to keep apart:
   those rules change.
 - **Review M18** of `docs/REVIEW-2026-10-01.md` is a finding of that review. Always write it "review M18".
 
-This file is the full specification. It says **what** to build and when it is done. How the session works is
-M17's master prompt (`docs/tasks/M17/MASTER-PROMPT.md`), read with M18 for M17, until `docs/tasks/M18/MASTER-PROMPT.md`
-exists. The acceptance-criteria section below is in Toryo's own `TASK.md` format (it parses with
+This file is the full specification. It says **what** to build and when it is done. How the session works is the
+master prompt, `docs/tasks/M18/MASTER-PROMPT.md`. The acceptance-criteria section below is in Toryo's own `TASK.md` format (it parses with
 `checks::parse_acceptance_ids`), so the same file can later be fed to `toryo task create` for dogfooding.
 
 ## Goal
