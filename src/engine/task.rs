@@ -460,6 +460,8 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     let file = std::path::absolute(&file)?;
     let text = crate::textfile::read_text(&file)?;
     let ac = parse_acceptance_ids(&text)?;
+    // M17-A2 (AC-5): `## Proof exempt` is checked now; the TASK.md snapshot freezes it
+    super::redgreen::parse_proof_exempt(&text, &ac)?;
     let id = task_id(&text, &file, a.id.as_deref());
     valid_task_id(&id)?;
     if !id

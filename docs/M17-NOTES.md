@@ -31,4 +31,5 @@ The four questions of the single round and the owner's answers (each the recomme
 | Task | Commit | Tests added | Next |
 |---|---|---|---|
 | Z0 task docs | `42a09d6` | — | A1 |
-| A1 `red_green` config, refusals, display, M18 | (this commit) | `m17_ac01_an_org_chart_gate_takes_red_green_and_shows_it`, `m17_ec18_a_toryo_yaml_verify_command_takes_red_green`, `m17_ac02_load_refuses_a_bad_red_green_block_naming_gate_and_key`, `m17_ac02_red_green_args_get_the_entry_script_protection` — 886 passed | A2 |
+| A1 `red_green` config, refusals, display, M18 | `2f092f7` | `m17_ac01_an_org_chart_gate_takes_red_green_and_shows_it`, `m17_ec18_a_toryo_yaml_verify_command_takes_red_green`, `m17_ac02_load_refuses_a_bad_red_green_block_naming_gate_and_key`, `m17_ac02_red_green_args_get_the_entry_script_protection` — 886 passed | A2 |
+| A2 `## Proof exempt`; the pure red-green module (`engine/redgreen.rs`: test ids, proof map, red commit, result) | (this commit) | `m17_ac05_task_create_refuses_a_bad_proof_exempt_section`; unit `m17_ac05_proof_exempt_is_parsed_and_refused_with_line_numbers`, `m17_ec03_test_ids_are_inert_or_refused`, `m17_ec04_every_problem_of_a_proof_map_is_named_at_once`, `m17_ec05_one_test_for_two_criteria_and_exempt_criteria` — 891 passed | A3 |

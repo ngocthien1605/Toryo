@@ -10,6 +10,59 @@ use common::m17::*;
 use common::*;
 use serde_json::{json, Value};
 
+// ── A2: `## Proof exempt` (AC-5) ───────────────────────────────────────────────────────────
+
+/// AC-5, edge case 6: `task create` refuses an unknown exempt id, a duplicate and an item without a
+/// reason — with their line numbers, nothing created — and freezes a valid section with the task.
+#[test]
+fn m17_ac05_task_create_refuses_a_bad_proof_exempt_section() {
+    let env = setup_rg(RG_SRC, "", &[]);
+    let text = std::fs::read_to_string(env.repo.join("TASK.md")).unwrap();
+    let with = |section: &str| format!("{text}\n## Proof exempt\n{section}");
+    std::fs::write(
+        env.repo.join("TASK-bad.md"),
+        with("- AC-7: no such criterion\n- AC-2: the installer is checked by hand\n- AC-2: again\n- AC-3:\n"),
+    )
+    .unwrap();
+    let (code, err) = toryo(
+        &env,
+        &["task", "create", "--file", "TASK-bad.md", "--id", "PE-1"],
+        &[],
+    );
+    assert_ne!(code, 0, "{err}");
+    let base = text.lines().count() + 2;
+    for want in [
+        format!("line {}: `AC-7` is not an acceptance criterion of this task (they are AC-1, AC-2, AC-3)", base + 1),
+        format!("line {}: `AC-2` is listed twice", base + 3),
+        format!("line {}: `AC-3` has no reason", base + 4),
+    ] {
+        assert!(err.contains(&want), "`{want}` not in {err}");
+    }
+    assert!(
+        !db(&env)
+            .call(|tx| Ok(toryo::engine::store::get_task(tx, "PE-1").is_ok()))
+            .unwrap(),
+        "no task"
+    );
+    // a valid section: created, and the snapshot holds it
+    std::fs::write(
+        env.repo.join("TASK-ok.md"),
+        with("- AC-3: covered by the module manifest, no runnable test\n"),
+    )
+    .unwrap();
+    let (code, err) = toryo(
+        &env,
+        &["task", "create", "--file", "TASK-ok.md", "--id", "PE-2"],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "PE-2");
+    let snap = std::fs::read_to_string(t.artifacts().join("TASK.md")).unwrap();
+    let exempt = toryo::engine::redgreen::parse_proof_exempt(&snap, &t.acceptance_ids).unwrap();
+    assert_eq!(exempt.len(), 1);
+    assert_eq!(exempt[0].ac, "AC-3");
+}
+
 // ── A1: configuration and load refusals (AC-1, AC-2) ──────────────────────────────────────
 
 /// AC-1: a `kind: check` gate of the org chart accepts the block; `config show` (text and

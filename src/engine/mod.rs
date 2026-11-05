@@ -15,6 +15,7 @@ pub mod goal;
 pub mod lock;
 pub mod protect;
 pub mod recovery;
+pub mod redgreen;
 pub mod render;
 pub mod runner;
 pub mod snapshot;
