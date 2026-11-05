@@ -252,6 +252,7 @@ pub fn cwt(env: &Env, id: &str, k: u32) -> std::path::PathBuf {
 pub fn gate_program(root: &Path, name: &str, cmd: &str, sh: &str) -> String {
     #[cfg(windows)]
     let p = {
+        let _ = sh;
         let p = root.join(format!("{name}.cmd"));
         std::fs::write(&p, format!("@echo off\r\n{}", cmd.replace('\n', "\r\n"))).unwrap();
         p
