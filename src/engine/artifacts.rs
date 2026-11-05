@@ -274,6 +274,55 @@ pub fn head(store: &Store, t: &TaskRow, logical: &str) -> Result<Option<Version>
     }))
 }
 
+/// M17-A4: the newest version of `logical` published for the stage attempt `attempt` (no hash
+/// check), if any — the implementation report of the attempt that made a checkpoint.
+pub fn for_attempt(
+    store: &Store,
+    t: &TaskRow,
+    logical: &str,
+    attempt: &str,
+) -> Result<Option<Version>> {
+    let (tid, l, a) = (t.id.clone(), logical.to_string(), attempt.to_string());
+    let row = store.call(move |tx| {
+        Ok(tx
+            .query_row(
+                "SELECT id, version, path, sha256 FROM artifacts WHERE task_id = ?1 AND logical_name = ?2 AND stage_attempt_id = ?3 ORDER BY version DESC LIMIT 1",
+                [&tid, &l, &a],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)),
+            )
+            .optional()?)
+    })?;
+    Ok(row.map(|(id, v, p, sha)| Version {
+        id,
+        logical: logical.to_string(),
+        version: v as u32,
+        path: abs(t, &p),
+        sha256: sha,
+    }))
+}
+
+/// [`head`] in a read-only transaction (`Store::read`, never `BEGIN IMMEDIATE`) — for the views
+/// (`status`, `dashboard`, X35), which never take the write lock.
+pub fn head_read(store: &Store, t: &TaskRow, logical: &str) -> Result<Option<Version>> {
+    let (tid, l) = (t.id.clone(), logical.to_string());
+    let row = store.read(move |tx| {
+        Ok(tx
+            .query_row(
+                "SELECT a.id, a.version, a.path, a.sha256 FROM artifact_heads h JOIN artifacts a ON a.id = h.artifact_id WHERE h.task_id = ?1 AND h.logical_name = ?2",
+                [&tid, &l],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)),
+            )
+            .optional()?)
+    })?;
+    Ok(row.map(|(id, v, p, sha)| Version {
+        id,
+        logical: logical.to_string(),
+        version: v as u32,
+        path: abs(t, &p),
+        sha256: sha,
+    }))
+}
+
 /// Read a version and check its hash: `artifact_missing` / `artifact_tampered` otherwise.
 pub fn read_version(v: &Version) -> Result<Vec<u8>> {
     let b = std::fs::read(&v.path)

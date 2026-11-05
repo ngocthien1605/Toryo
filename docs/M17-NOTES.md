@@ -27,6 +27,15 @@ The four questions of the single round and the owner's answers (each the recomme
   (`checks::with_red_green`, `{test}` an empty word), so the rules in `cmdline.rs` and `checks.rs` are only called.
 - X48 — one red-green gate per configuration (two are refused at load): a proof map names the tests of one test
   runner.
+- X49 — all green runs before any red run, each side reported whole (not only its first failure); the per-test
+  timeout is the gate's `timeout`, per run.
+- X50 — the private index of the red commit is `<verify folder>/red.index`; the red checkout is
+  `<verify folder>/red/<task>.red` with its own `build`/`cache`/`tmp`/`home`; the message names the checkpoint.
+- X51 — the proof map is the report of the attempt that made the checkpoint (a fan-out winner: its candidate's).
+- X52 — a mutated red checkout is `verify_mutated_tree` and wins over a red failure.
+- X53 — `verify_command.side`; a red run that fails as required is ✔ on the console.
+- X54 — the reviewer's red-green evidence is wrapped as untrusted data; `red_green` is `null` in `--json` without a
+  gate.
 
 ## Progress
 
@@ -35,4 +44,5 @@ The four questions of the single round and the owner's answers (each the recomme
 | Z0 task docs | `42a09d6` | — | A1 |
 | A1 `red_green` config, refusals, display, M18 | `2f092f7` | `m17_ac01_an_org_chart_gate_takes_red_green_and_shows_it`, `m17_ec18_a_toryo_yaml_verify_command_takes_red_green`, `m17_ac02_load_refuses_a_bad_red_green_block_naming_gate_and_key`, `m17_ac02_red_green_args_get_the_entry_script_protection` — 886 passed | A2 |
 | A2 `## Proof exempt`; the pure red-green module (`engine/redgreen.rs`: test ids, proof map, red commit, result) | `678a8a3` | `m17_ac05_task_create_refuses_a_bad_proof_exempt_section`; unit `m17_ac05_proof_exempt_is_parsed_and_refused_with_line_numbers`, `m17_ec03_test_ids_are_inert_or_refused`, `m17_ec04_every_problem_of_a_proof_map_is_named_at_once`, `m17_ec05_one_test_for_two_criteria_and_exempt_criteria` — 891 passed | A3 |
-| A3 `proof` in the schema (strict), read as `[]` without a red-green gate; the proof rule in the implementer's prompt; one red-green gate (X48) | (this commit) | `m17_ac03_a_report_without_proof_passes_without_a_red_green_gate`, `m17_ac03_the_prompt_explains_the_proof_rule_with_a_red_green_gate`, `m17_x48_two_red_green_gates_are_refused`; unit `m17_ac03_a_report_without_proof_passes_only_without_a_red_green_gate` — 895 passed | A4–A7 |
+| A3 `proof` in the schema (strict), read as `[]` without a red-green gate; the proof rule in the implementer's prompt; one red-green gate (X48) | `ca13715` | `m17_ac03_a_report_without_proof_passes_without_a_red_green_gate`, `m17_ac03_the_prompt_explains_the_proof_rule_with_a_red_green_gate`, `m17_x48_two_red_green_gates_are_refused`; unit `m17_ac03_a_report_without_proof_passes_only_without_a_red_green_gate` — 895 passed | A4–A7 |
+| A4–A7 the red-green run: map check before any process, green per test, red commit + checkout, red per test, mutation check, feedback, `VERIFY_RESULT.json` `red_green`, reviewer evidence, `status`/`show`/final gate, `red_green_finished` | (this commit) | `m17_ac06_ac07_ac11_a_red_green_gate_proves_every_criterion`, `m17_ec01_ec14_…`, `m17_ac04_ec03_…`, `m17_ec02_…`, `m17_ec07_…` (2), `m17_ec08_…`, `m17_ec09_…`, `m17_ec10_…`, `m17_ec11_…`, `m17_ec12_…`, `m17_ec13_…`, `m17_ec16_…`, `m17_ec17_…`, `m17_ec18_…_end_to_end`, `m17_ec19_…` — 911 passed | B1 |

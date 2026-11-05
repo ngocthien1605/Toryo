@@ -148,6 +148,38 @@ pub fn describe(e: &EngineEvent) -> String {
             crate::git::short(head),
             if *found { " (found)" } else { "" }
         ),
+        // M17-A6: a red-side run must fail
+        E::VerifyCommand {
+            name,
+            ok,
+            side: Some(side),
+            ..
+        } if side == "red" => format!(
+            "red-green {name} red side {}",
+            if *ok {
+                "passed without the change"
+            } else {
+                "failed as required"
+            }
+        ),
+        E::VerifyCommand {
+            name,
+            ok,
+            side: Some(side),
+            ..
+        } => format!(
+            "red-green {name} {side} side {}",
+            if *ok { "passed" } else { "failed" }
+        ),
+        E::RedGreenFinished {
+            gate,
+            proven,
+            total,
+            pass,
+        } => format!(
+            "red-green {gate}: {proven}/{total} proven{}",
+            if *pass { "" } else { ", failed" }
+        ),
         E::VerifyCommand {
             name,
             ok,
@@ -483,6 +515,7 @@ mod tests {
             active_owner: None,
             compile_only: Some(false),
             next_action: "`toryo resume T-1`".into(),
+            red_green: None,
         };
         let lines = task_lines(&t, &f, &a, |_| 65_000);
         assert!(

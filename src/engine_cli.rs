@@ -1081,6 +1081,13 @@ pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
         if f.compile_only == Some(true) {
             toryo::outln!("               {}", toryo::engine::xpp::COMPILE_ONLY);
         }
+        // M17-A7 (AC-11): what the red-green gate of the verify result in force proved
+        if let Some(rg) = &f.red_green {
+            toryo::outln!(
+                "               red-green: {}",
+                toryo::engine::redgreen::summary_words(rg)
+            );
+        }
         // M11-E3: an environment gate waiting for its machine-wide lock (only while its run is
         // alive: a crash while waiting leaves the row behind — group E review)
         if t.state == PipelineState::Verifying && f.active_owner.is_some() {

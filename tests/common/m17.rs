@@ -55,7 +55,7 @@ pub fn implementation_with(proof: Value) -> Value {
 pub fn full_proof() -> Value {
     json!([
         {"ac": "AC-1", "tests": ["Divide-Numbers"]},
-        {"ac": "AC-2", "tests": ["Division by zero"]},
+        {"ac": "AC-2", "tests": ["Division"]},
         {"ac": "AC-3", "tests": ["Divide-Numbers"]},
     ])
 }
@@ -120,5 +120,86 @@ pub fn rg_script(env: &Env, name: &str, proof: Value) -> String {
             ])],
             "reviewer": [turn(vec![approved()])],
         }),
+    )
+}
+
+/// What the fake test runner of [`rg_runner`] does besides passing and failing.
+#[derive(Default, Clone, Copy)]
+pub struct Runner {
+    /// On the red side, wait (about a minute) while `<root>/SLOW` exists.
+    pub slow: bool,
+    /// On the red side, append to the tracked `README.md` of the checkout.
+    pub mutate: bool,
+    /// On a green run, rename the runner away once while `<root>/MOVE_ONCE` exists: the next
+    /// start finds no program.
+    pub move_once: bool,
+}
+
+/// A fake test runner outside the repository — a `.cmd` on Windows, an executable `sh` script
+/// elsewhere: `runner suite` exits 0; `runner <id>` exits 0 when the checkout's `src` holds the
+/// text `<id>` (green), and otherwise — the red side — does what `r` says and exits 1. Returns its
+/// path with forward slashes (for the org chart).
+pub fn rg_runner(root: &Path, r: Runner) -> String {
+    let marker = |n: &str| root.join(n).display().to_string();
+    #[cfg(windows)]
+    let p = {
+        let p = root.join("rg-runner.cmd");
+        let mut s = String::from("@echo off\r\nif \"%~1\"==\"suite\" exit /b 0\r\ngit grep -q -F -e \"%~1\" -- src\r\nif errorlevel 1 goto red\r\n");
+        if r.move_once {
+            s.push_str(&format!(
+                "if exist \"{m}\" ( del \"{m}\" & move \"%~f0\" \"%~f0.gone\" >nul & exit /b 0 )\r\n",
+                m = marker("MOVE_ONCE")
+            ));
+        }
+        s.push_str("exit /b 0\r\n:red\r\n");
+        if r.slow {
+            s.push_str(&format!(
+                "if exist \"{}\" ping -n 61 127.0.0.1 >nul\r\n",
+                marker("SLOW")
+            ));
+        }
+        if r.mutate {
+            s.push_str("echo mutated>>README.md\r\n");
+        }
+        s.push_str("exit /b 1\r\n");
+        std::fs::write(&p, s).unwrap();
+        p
+    };
+    #[cfg(not(windows))]
+    let p = {
+        use std::os::unix::fs::PermissionsExt;
+        let p = root.join("rg-runner.sh");
+        let mut s = String::from(
+            "#!/bin/sh\n[ \"$1\" = suite ] && exit 0\nif git grep -q -F -e \"$1\" -- src; then\n",
+        );
+        if r.move_once {
+            s.push_str(&format!(
+                "  if [ -f '{m}' ]; then rm -f '{m}'; mv \"$0\" \"$0.gone\"; fi\n",
+                m = marker("MOVE_ONCE")
+            ));
+        }
+        s.push_str("  exit 0\nfi\n");
+        if r.slow {
+            s.push_str(&format!(
+                "i=0; while [ -f '{}' ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done\n",
+                marker("SLOW")
+            ));
+        }
+        if r.mutate {
+            s.push_str("echo mutated >> README.md\n");
+        }
+        s.push_str("exit 1\n");
+        std::fs::write(&p, s).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    };
+    p.display().to_string().replace('\\', "/")
+}
+
+/// The org chart of the M17 fixture whose gate runs the fake test runner `program` (its own
+/// args: `suite`) within `timeout`, with `rg_extra` inside its `red_green` block.
+pub fn org_runner(program: &str, timeout: &str, rg_extra: &str) -> String {
+    format!(
+        "toryo: 1\nteam: calc-team\ngates:\n  divide-present: {{ kind: check, program: \"{program}\", args: [suite], timeout: {timeout}, red_green: {{ tests: [\"tests/**\"], args: [\"{{test}}\"]{rg_extra} }} }}\nseats:\n  planner: {{ profile: claude-max }}\n  implementer: {{ profile: codex-openai }}\n  reviewer: {{ profile: claude-max }}\n"
     )
 }

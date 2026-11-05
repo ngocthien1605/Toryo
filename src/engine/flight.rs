@@ -104,6 +104,18 @@ pub enum EngineEvent {
         /// M11-E3: `environment` for an environment gate; absent otherwise (the M10 shape).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
+        /// M17-A6: `green` or `red` for one test's run of a red-green gate (`name`: the gate and
+        /// the test id); absent otherwise (the shape before M17).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        side: Option<String>,
+    },
+    /// M17-A7 (AC-11): a red-green gate finished its proof — how many acceptance criteria its
+    /// tests proved, of how many, and whether the gate passed.
+    RedGreenFinished {
+        gate: String,
+        proven: u32,
+        total: u32,
+        pass: bool,
     },
     /// M11-E3: an environment gate waits for its machine-wide lock (once per wait);
     /// `holder`: the task whose deployment holds it, when known.
@@ -224,6 +236,7 @@ impl EngineEvent {
             Self::TurnFinished { .. } => "turn_finished",
             Self::CheckpointCreated { .. } => "checkpoint_created",
             Self::VerifyCommand { .. } => "verify_command",
+            Self::RedGreenFinished { .. } => "red_green_finished",
             Self::LockWaiting { .. } => "lock_waiting",
             Self::EnvironmentDeployed { .. } => "environment_deployed",
             Self::GateOpened { .. } => "gate_opened",
@@ -421,21 +434,37 @@ fn render_raw(env: &Envelope) -> String {
             ok,
             duration_ms,
             kind,
+            side,
         } => {
-            let exit = match exit {
+            let exit_words = match exit {
                 Some(code) => format!("exit {code}"),
                 None if *timed_out => "timed out".to_string(),
                 None => "no exit code".to_string(),
             };
-            format!(
-                "  {} {name} ({exit}, {:.1}s){}",
-                if *ok { "✔" } else { "✘" },
-                secs(*duration_ms),
-                kind.as_deref()
-                    .map(|k| format!(" — {k} gate"))
-                    .unwrap_or_default()
-            )
+            // M17-A6: a red-side run must fail — ✔ when it did (a timeout counts as red)
+            let (mark, tail) = match side.as_deref() {
+                Some("red") if !*ok => ("✔", " — red side: fails without the change".to_string()),
+                Some("red") => ("✘", " — red side: passes without the change".to_string()),
+                Some(s) => (if *ok { "✔" } else { "✘" }, format!(" — {s} side")),
+                None => (
+                    if *ok { "✔" } else { "✘" },
+                    kind.as_deref()
+                        .map(|k| format!(" — {k} gate"))
+                        .unwrap_or_default(),
+                ),
+            };
+            format!("  {mark} {name} ({exit_words}, {:.1}s){tail}", secs(*duration_ms))
         }
+        E::RedGreenFinished {
+            gate,
+            proven,
+            total,
+            pass,
+        } => format!(
+            "  {} red-green {gate}: {proven} of {total} acceptance criteria proven{}",
+            if *pass { "✔" } else { "✘" },
+            if *pass { "" } else { " — the gate failed" }
+        ),
         E::LockWaiting { lock, holder } => format!(
             "   waiting for lock {lock}{}",
             holder
@@ -924,10 +953,14 @@ fn redact_event(r: &Redactions, mut e: EngineEvent) -> EngineEvent {
             s(head);
             s(kind);
         }
-        E::VerifyCommand { name, kind, .. } => {
+        E::VerifyCommand {
+            name, kind, side, ..
+        } => {
             s(name);
             o(kind);
+            o(side);
         }
+        E::RedGreenFinished { gate, .. } => s(gate),
         E::LockWaiting { lock, holder } => {
             s(lock);
             o(holder);
@@ -1317,6 +1350,7 @@ mod tests {
                 ok: true,
                 duration_ms: 100,
                 kind: None,
+                side: None,
             },
             EngineEvent::VerifyCommand {
                 name: "dbsync".into(),
@@ -1325,6 +1359,7 @@ mod tests {
                 ok: true,
                 duration_ms: 100,
                 kind: Some("environment".into()),
+                side: None,
             },
             EngineEvent::LockWaiting {
                 lock: "d365-env".into(),
@@ -1523,6 +1558,7 @@ mod tests {
                     ok,
                     duration_ms: 1234,
                     kind: None,
+                    side: None,
                 }),
                 format!(
                     "  {} {name} ({text}, {:.1}s)",
@@ -2022,7 +2058,14 @@ mod tests {
                     ok: _,
                     duration_ms: _,
                     kind: _,
+                    side: _,
                 } => "verify_command",
+                E::RedGreenFinished {
+                    gate: _,
+                    proven: _,
+                    total: _,
+                    pass: _,
+                } => "red_green_finished",
                 E::LockWaiting { lock: _, holder: _ } => "lock_waiting",
                 E::EnvironmentDeployed {
                     lock: _,
@@ -2066,7 +2109,7 @@ mod tests {
             }
         }
         /// The number of arms of `fields_named`.
-        const VARIANTS: usize = 19;
+        const VARIANTS: usize = 20;
         let all = vec![
             EngineEvent::RunStarted {
                 owner: "o".into(),
@@ -2114,6 +2157,13 @@ mod tests {
                 ok: true,
                 duration_ms: 1,
                 kind: Some("k".into()),
+                side: Some("red".into()),
+            },
+            EngineEvent::RedGreenFinished {
+                gate: "g".into(),
+                proven: 1,
+                total: 2,
+                pass: false,
             },
             EngineEvent::LockWaiting {
                 lock: "l".into(),

@@ -16,6 +16,9 @@ pub struct TaskFacts {
     /// R59: the verify of this task proves compile level only (X++).
     pub compile_only: Option<bool>,
     pub next_action: String,
+    /// M17-A7 (AC-11): `{ proven, total, exempt, pass }` of the verify result in force, when it has
+    /// a red-green gate; `None` (`null`) otherwise.
+    pub red_green: Option<Value>,
 }
 
 /// The fix-cycle counters as `status` and SUMMARY.md show them: `1/2` (with `sep` between)
@@ -107,7 +110,19 @@ fn task_json_m10(t: &TaskRow, f: &TaskFacts) -> Value {
         "active_owner": f.active_owner,
         "compile_only": f.compile_only,
         "next_action": f.next_action,
+        // M17-A7 (AC-11, AC-13): always there, `null` without a red-green gate
+        "red_green": f.red_green,
     })
+}
+
+/// M17-A7: the red-green summary of the task's verify result in force (read-only: `status` and the
+/// dashboard never take the write lock, X35), or `None` — no verify result, none with a
+/// red-green gate, or one that cannot be read.
+pub fn red_green_of(st: &super::store::Store, t: &TaskRow) -> Option<Value> {
+    let v = super::artifacts::head_read(st, t, "verify-result").ok()??;
+    let bytes = super::artifacts::read_version(&v).ok()?;
+    let vr: Value = serde_json::from_slice(&bytes).ok()?;
+    super::redgreen::summary_of(&vr)
 }
 
 /// A usage row as `task show` prints it (R41).
@@ -212,6 +227,7 @@ mod tests {
                 active_owner: None,
                 compile_only: Some(false),
                 next_action: "`toryo run T-1`".into(),
+                red_green: None,
             },
         );
         assert_eq!(v["id"], "T-1");
@@ -221,7 +237,8 @@ mod tests {
             (json!(1), json!(4))
         );
         assert_eq!(v["spent_tokens"], 120);
-        for k in ["budget_tokens", "active_owner"] {
+        // (M17: `red_green` is `null` without a red-green gate)
+        for k in ["budget_tokens", "active_owner", "red_green"] {
             assert!(v.get(k).is_some_and(Value::is_null), "{k}: {v}");
         }
         assert_eq!(v["compile_only"], false);

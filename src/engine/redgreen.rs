@@ -642,6 +642,65 @@ impl RedGreenResult {
     }
 }
 
+/// M17-A7 (AC-11): the evidence per criterion for the reviewer — one line each: proven (every test
+/// green and red, a red timeout flagged), not proven (with the side that failed), exempt. The
+/// lines name the implementer's test ids, so the caller hands them over as data.
+pub fn evidence_lines(r: &RedGreenResult) -> String {
+    let side = |s: &Option<Side>| match s {
+        None => "not run".to_string(),
+        Some(s) if s.timed_out => "timed out".to_string(),
+        Some(s) => match s.exit {
+            Some(c) => format!("exit {c}"),
+            None => "no exit code".to_string(),
+        },
+    };
+    let mut out = String::new();
+    if !r.problems.is_empty() {
+        out.push_str(&format!(
+            "the proof map was refused before any test ran: {}\n",
+            r.problems.join("; ")
+        ));
+    }
+    for a in &r.acs {
+        if a.tests.is_empty() {
+            out.push_str(&format!(
+                "- {}: exempt — no test (`## Proof exempt`)\n",
+                a.ac
+            ));
+            continue;
+        }
+        let proven = a.tests.iter().all(|t| {
+            t.green.is_some_and(|g| g.exit == Some(0) && !g.timed_out)
+                && t.red.is_some_and(|x| x.timed_out || x.exit != Some(0))
+        });
+        let tests: Vec<String> = a
+            .tests
+            .iter()
+            .map(|t| {
+                let flag = if t.red.is_some_and(|x| x.timed_out) {
+                    " (the red run TIMED OUT: counted as failing — check that the test really fails without the change)"
+                } else {
+                    ""
+                };
+                format!(
+                    "`{}`: green {}, red {}{flag}",
+                    t.id,
+                    side(&t.green),
+                    side(&t.red)
+                )
+            })
+            .collect();
+        out.push_str(&format!(
+            "- {}{}: {} — {}\n",
+            a.ac,
+            if a.exempt { " (exempt, mapped)" } else { "" },
+            if proven { "proven" } else { "NOT proven" },
+            tests.join("; ")
+        ));
+    }
+    out
+}
+
 /// M17-A7: the red-green summary of a `VERIFY_RESULT.json` value, or `None` (no red-green gate).
 pub fn summary_of(vr: &Value) -> Option<Value> {
     let rg = vr.get("red_green")?;

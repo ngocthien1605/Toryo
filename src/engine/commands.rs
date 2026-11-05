@@ -464,6 +464,7 @@ pub fn facts_with(st: &Store, t: &TaskRow, compile_only: Option<bool>) -> Result
         active_owner,
         compile_only,
         next_action,
+        red_green: crate::engine::views::red_green_of(st, t),
     })
 }
 

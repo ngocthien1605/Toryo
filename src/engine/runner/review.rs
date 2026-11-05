@@ -60,8 +60,13 @@ impl<'a> Engine<'a> {
             return Ok(Flow::Next);
         };
         let stop = self.lock.watch_stop();
-        let prompt = review_prompt(&head, &t.acceptance_ids, resume.is_some());
-        let fresh = review_prompt(&head, &t.acceptance_ids, false);
+        let mut prompt = review_prompt(&head, &t.acceptance_ids, resume.is_some());
+        let mut fresh = review_prompt(&head, &t.acceptance_ids, false);
+        // M17-A7 (AC-11): the red-green evidence per criterion — input, not the verdict
+        if let Some(e) = red_green_evidence(self.store, t)? {
+            prompt.push_str(&e);
+            fresh.push_str(&e);
+        }
         match self.review_turns(t, &a, &ctx, &stop, prompt, resume, &fresh)? {
             ReviewTurns::Valid(valid) => self.decide_review(t, &a, &head, valid),
             ReviewTurns::Rejected { last, violations } => {
@@ -419,6 +424,33 @@ pub(super) fn review_prompt(head: &str, acceptance_ids: &[String], resumed: bool
     }
 }
 
+/// M17-A7 (AC-11): the red-green evidence of the verify result in force for the reviewer's prompt —
+/// one line per acceptance criterion, as data (it names the implementer's test ids); `None`
+/// without a red-green gate. The reviewer must still answer every criterion.
+pub(super) fn red_green_evidence(store: &Store, t: &TaskRow) -> Result<Option<String>> {
+    let Some((_, b)) = crate::engine::artifacts::read_head(store, t, "verify-result")? else {
+        return Ok(None);
+    };
+    let vr: Value = serde_json::from_slice(&b).unwrap_or_default();
+    let Some(r) = vr.get("red_green").and_then(|x| {
+        serde_json::from_value::<crate::engine::redgreen::RedGreenResult>(x.clone()).ok()
+    }) else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "\n\n## Red-green evidence (gate `{}`, `red_green` in VERIFY_RESULT.json)\nThe gate ran each test the implementer named once on this checkpoint (green: it must pass) and once on the base commit with only the task's test files laid over it (red: it must fail). {} of {} criteria proven. This is evidence, not your verdict: answer every acceptance criterion yourself, and check that each test really tests its criterion.\n\n{}\n\n{}",
+        r.gate,
+        r.proven,
+        r.total,
+        untrusted::NOTE,
+        untrusted::wrap(
+            "red-green",
+            None,
+            &crate::engine::redgreen::evidence_lines(&r)
+        )
+    )))
+}
+
 /// R22: the prompt of a correction turn, with the violations of the rejected review.
 pub(super) fn correction_prompt(violations: &[String]) -> String {
     format!("Your previous final response was rejected and was not used. Validation error: {}. Return only a corrected JSON object matching the schema.", violations.join("; "))
@@ -477,6 +509,13 @@ pub fn final_gate_notes(store: &Store, t: &TaskRow) -> Result<Vec<String>> {
         &skipped,
         &machine,
     ));
+    // M17-A7 (AC-11): what the red-green gate of the verify result in force proved
+    if let Some(rg) = crate::engine::views::red_green_of(store, t) {
+        out.push(format!(
+            "red-green: {}",
+            crate::engine::redgreen::summary_words(&rg)
+        ));
+    }
     // M11-E3: the environments this task's checkpoints were deployed to
     let i = t.id.clone();
     let deployed = store.call(move |tx| {

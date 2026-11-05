@@ -161,6 +161,7 @@ impl<'a> Engine<'a> {
                 ok: res.ok(),
                 duration_ms: res.duration_ms as u64,
                 kind: Some("environment".into()),
+                side: None,
             });
             if stop.stopped() {
                 return Ok(EnvGates::Stopped);
