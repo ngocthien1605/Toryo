@@ -32,13 +32,18 @@ pub fn json(cfg: &Effective) -> Value {
         .roles
         .iter()
         .map(|(seat, r)| {
-            json!({
+            let mut v = json!({
                 "seat": seat,
                 "profile": r.profile,
                 "model": r.model,
                 "fallback": r.fallback,
                 "source": source(cfg.origins.roles.get(seat).copied()),
-            })
+            });
+            // M17-B1 (AC-12): only when set — every other seat keeps its shape
+            if let Some(c) = &r.candidates {
+                v["candidates"] = json!(c);
+            }
+            v
         })
         .collect();
     let profiles: Vec<Value> = cfg
@@ -232,6 +237,18 @@ pub fn text(cfg: &Effective) -> String {
             },
             place(&x["source"])
         ));
+        // M17-B1: the best-of-N candidates of the first Implementing stage
+        if let Some(c) = x["candidates"].as_array() {
+            let c: Vec<String> = c
+                .iter()
+                .enumerate()
+                .map(|(i, p)| format!("c{} {}", i + 1, p.as_str().unwrap_or_default()))
+                .collect();
+            s.push_str(&format!(
+                "               candidates (best-of-N, first Implementing stage): {}\n",
+                c.join(", ")
+            ));
+        }
     }
     s.push_str("\nprofiles:\n");
     for x in v["profiles"].as_array().into_iter().flatten() {

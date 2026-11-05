@@ -69,6 +69,14 @@ pub enum FakeStep {
         #[serde(default)]
         detail: String,
     },
+    /// M17-B5: wait until `path` (relative to the session's cwd, or absolute) exists, at most
+    /// `ms` (default 30 s); the turn fails `Unknown` when it does not appear — two turns that
+    /// wait for each other's file prove they run at the same time.
+    WaitFor {
+        path: PathBuf,
+        #[serde(default = "wait_for_ms")]
+        ms: u64,
+    },
     /// The process died without a terminal event.
     Crash,
     /// Never answers again (until interrupted) — for stall/timeout tests.
@@ -225,6 +233,7 @@ impl AgentAdapter for FakeAgentAdapter {
             denials: 0,
             usage_seen: false,
             delay_until: None,
+            wait_for: None,
         }))
     }
 
@@ -262,6 +271,8 @@ struct FakeSession {
     /// End of a running `delay` step. Kept in the session so the delay survives the turn
     /// loop dropping `next_event` at each limits poll (a plain sleep was cut to ~200 ms).
     delay_until: Option<tokio::time::Instant>,
+    /// M17-B5: a `wait_for` step in progress (kept across a dropped `next_event`, like a delay).
+    wait_for: Option<(PathBuf, tokio::time::Instant, u64)>,
 }
 
 #[async_trait]
@@ -273,13 +284,26 @@ impl AgentSession for FakeSession {
     async fn start_turn(&mut self, input: TurnInput) -> Result<TurnId> {
         let role = self.req.role.as_str();
         let key_p = format!("{role}@{}", self.adapter.profile);
+        // M17-B3: a best-of-N candidate's turn (label `implement#c<k>-<n>`) is scripted per
+        // candidate first — `role@profile#c<k>`, then `role#c<k>` — so that two candidates of
+        // the same profile get scripts of their own
+        let keys: Vec<String> = match candidate_of(&input.label) {
+            Some(k) => vec![
+                format!("{key_p}#c{k}"),
+                format!("{role}#c{k}"),
+                key_p.clone(),
+                role.to_string(),
+            ],
+            None => vec![key_p.clone(), role.to_string()],
+        };
+        let key_p = keys[0].clone();
         let turn = {
             let mut s = self.adapter.shared.lock().expect("lock");
-            let key = if s.queues.contains_key(&key_p) {
-                key_p.clone()
-            } else {
-                role.to_string()
-            };
+            let key = keys
+                .iter()
+                .find(|k| s.queues.contains_key(*k))
+                .cloned()
+                .unwrap_or_else(|| role.to_string());
             s.calls.push(FakeCall {
                 key: key.clone(),
                 profile: self.adapter.profile.clone(),
@@ -329,6 +353,7 @@ impl AgentSession for FakeSession {
         self.denials = 0;
         self.usage_seen = false;
         self.delay_until = None;
+        self.wait_for = None;
         self.turns += 1;
         self.env = input.env.clone();
         Ok(self.turns)
@@ -345,6 +370,21 @@ impl AgentSession for FakeSession {
             if let Some(until) = self.delay_until {
                 tokio::time::sleep_until(until).await;
                 self.delay_until = None;
+            }
+            if let Some((p, until, ms)) = self.wait_for.clone() {
+                while !p.exists() {
+                    if tokio::time::Instant::now() >= until {
+                        self.wait_for = None;
+                        self.done = true;
+                        return Some(AgentEvent::TurnFailed {
+                            class: ErrorClass::Unknown,
+                            detail: format!("fake: waited {ms} ms for {}", p.display()),
+                            structured: None,
+                        });
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                self.wait_for = None;
             }
             let Some(step) = self.pending.pop_front() else {
                 self.done = true;
@@ -447,6 +487,10 @@ impl AgentSession for FakeSession {
                     return None;
                 }
                 FakeStep::Hang => self.hang = true,
+                FakeStep::WaitFor { path, ms } => {
+                    let until = tokio::time::Instant::now() + Duration::from_millis(ms);
+                    self.wait_for = Some((self.req.cwd.join(&path), until, ms));
+                }
                 FakeStep::Emit(e) => {
                     match &*e {
                         AgentEvent::SessionIdentified(id) => self.external = Some(id.clone()),
@@ -497,6 +541,7 @@ impl AgentSession for FakeSession {
         self.pending.clear();
         self.hang = false;
         self.delay_until = None;
+        self.wait_for = None;
         self.pending.push_back(FakeStep::Fail {
             class: ErrorClass::ProcessCrashed,
             detail: "interrupted".into(),
@@ -519,6 +564,17 @@ impl FakeSession {
         };
         ends && !self.usage_seen && self.adapter.shared.lock().expect("lock").zero_usage
     }
+}
+
+fn wait_for_ms() -> u64 {
+    30_000
+}
+
+/// M17-B3: the candidate `k` of a turn label `implement#c<k>-<n>`, if it is one.
+pub fn candidate_of(label: &str) -> Option<u32> {
+    let rest = &label[label.find("#c")? + 2..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok().filter(|k| *k > 0)
 }
 
 impl FakeStep {

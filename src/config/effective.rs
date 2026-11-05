@@ -165,7 +165,10 @@ impl Effective {
         }
         // in org chart mode the validation pass reports unknown seat profiles with the others
         for (name, role) in repo.roles.iter().filter(|_| team.is_none()) {
-            for p in std::iter::once(&role.profile).chain(role.fallback.iter().flatten()) {
+            for p in std::iter::once(&role.profile)
+                .chain(role.fallback.iter().flatten())
+                .chain(role.candidates.iter().flatten())
+            {
                 if !repo.profiles.contains_key(p) {
                     bail!(
                         "role `{name}` refers to unknown profile `{p}` — define it under `profiles:` in the machine config ({}) (R60)",
@@ -220,6 +223,29 @@ impl Effective {
         // M11-B3: the org chart's cross-references, kinds and order
         if let Some(root) = crate::team::org_chart_root(&self.repo.project.root) {
             problems.extend(crate::team::problems(self, &root, &hint));
+        }
+        // M17-B1 (AC-12): `candidates` — the implementer's only, 2..=4 profiles of this machine
+        for (seat, r) in &self.repo.roles {
+            let Some(c) = &r.candidates else { continue };
+            let key = match (self.team.is_some(), self.origins.roles.get(seat)) {
+                (_, Some(Origin::Machine | Origin::RepoOverriddenByMachine)) => {
+                    format!("{hint}: seats.{seat}.candidates")
+                }
+                (true, _) => format!("seats.{seat}.candidates"),
+                (false, _) => format!("roles.{seat}.candidates"),
+            };
+            if seat != "implementer" {
+                problems.push(format!(
+                    "{key}: only the implementer seat may have candidates — the {seat} runs one turn; remove it"
+                ));
+                continue;
+            }
+            if !(MIN_CANDIDATES..=MAX_CANDIDATES).contains(&c.len()) {
+                problems.push(format!(
+                    "{key}: {} profile(s) — best-of-N takes {MIN_CANDIDATES} to {MAX_CANDIDATES} candidates (a profile may repeat)",
+                    c.len()
+                ));
+            }
         }
         // M17-A3 (X48): one proof map per checkpoint, so one red-green gate — a test id of one
         // runner is no test id of another

@@ -877,11 +877,16 @@ pub fn run(
             Level::Info,
             "roles",
             format!(
-                "{role} → {}{}",
+                "{role} → {}{}{}",
                 rl.profile,
                 rl.model
                     .as_ref()
                     .map(|m| format!(" ({m})"))
+                    .unwrap_or_default(),
+                // M17-B1 (AC-12): every candidate profile is a machine profile, checked above
+                rl.candidates
+                    .as_ref()
+                    .map(|c| format!(" · candidates {}", c.join(", ")))
                     .unwrap_or_default()
             ),
         );

@@ -136,7 +136,16 @@ pub struct Role {
     /// profile (R49); `[]`: no fallback (EC-23).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<Vec<String>>,
+    /// M17-B1 (X55): implementer only — 2..=4 machine profiles (repeats allowed) that implement
+    /// the approved plan side by side in the first Implementing stage; the best one continues
+    /// (best-of-N). Serialised only when set, so a configuration without it keeps its hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<Vec<String>>,
 }
+
+/// M17-B1: the fewest and the most implementer candidates.
+pub const MIN_CANDIDATES: usize = 2;
+pub const MAX_CANDIDATES: usize = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]

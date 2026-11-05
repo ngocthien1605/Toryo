@@ -194,8 +194,10 @@ pub enum PartialCmd {
     },
 }
 
-fn hub_for(t: &TaskRow, d: &DriveArgs) -> Result<AgentHub> {
+fn hub_for(store: &Store, t: &TaskRow, d: &DriveArgs) -> Result<AgentHub> {
     let cfg = frozen_config(t)?;
+    // M17-B1 (AC-12): the candidates' profiles run turns too, until the fan-out has ended
+    let candidates = toryo::engine::runner::pending_candidate_profiles(store, t, &cfg)?;
     let fake = d.fake_agents.as_deref();
     // the profiles that run a real CLI: all without a fake script; with one, those outside its
     // `only_profiles` (a script without the list fakes every profile)
@@ -210,6 +212,7 @@ fn hub_for(t: &TaskRow, d: &DriveArgs) -> Result<AgentHub> {
             .skip(t.implementer_index)
             .map(String::as_str),
     );
+    ps.extend(candidates.iter().map(String::as_str));
     ps.retain(|p| real(p));
     if !ps.is_empty() {
         // R51: isolation evidence must match the CLI versions installed now
@@ -219,6 +222,7 @@ fn hub_for(t: &TaskRow, d: &DriveArgs) -> Result<AgentHub> {
             .iter()
             .skip(t.implementer_index)
             .map(String::as_str)
+            .chain(candidates.iter().map(String::as_str))
             .filter(|p| real(p))
             .collect();
         bad.extend(toryo::evidence::unverified_implementers(&cfg, &imps)?);
@@ -398,7 +402,7 @@ fn drive_inner(
             RunEnd::Waiting(t.state)
         }
     } else {
-        let hub = hub_for(&t, d)?;
+        let hub = hub_for(store, &t, d)?;
         let mut eng = Engine::new(
             store,
             &hub,
@@ -639,6 +643,25 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     let g = task::task_git(&new, &t.repo)?; // R37 admission under the new machine config
                                             // M18 (group E review): a reloaded gate script must be in the base commit too
     task::check_entry_points(&new, &g, &t.repo, &t.base_commit)?;
+    // M17-B1 (AC-12, edge 35): `candidates` change only while the fan-out has not started
+    let fan = {
+        let i = id.to_string();
+        st.read(move |tx| store::fanout(tx, &i))?
+    };
+    let candidates = |c: &toryo::config::Effective| {
+        c.repo
+            .roles
+            .get("implementer")
+            .and_then(|r| r.candidates.clone())
+    };
+    if let Some(f) = &fan {
+        if candidates(&old) != candidates(&new) {
+            bail!(
+                "{id}: `candidates` cannot change — the best-of-N fan-out already started (phase {}); nothing was changed. Put `candidates` back as it was frozen, or reload before the fan-out of the next task",
+                f.phase
+            );
+        }
+    }
     // diff of the pretty-printed configurations
     let dir = t.artifacts().join("config-history");
     std::fs::create_dir_all(&dir)?;
@@ -680,7 +703,17 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
             bail!("subject_changed: the new configuration digest is {} — it does not start with --expect {e}; nothing was changed", short(&new_sha));
         }
     }
-    let (planner, implementers, reviewer) = task::roles(&new)?;
+    let (planner, mut implementers, reviewer) = task::roles(&new)?;
+    // M17-B9 (AC-22): after a promotion the winner's profile stays first — the fix cycles use it
+    if fan
+        .as_ref()
+        .is_some_and(|f| f.phase == toryo::engine::runner::phase::PROMOTED)
+    {
+        if let Some(w) = t.implementers.first().cloned() {
+            implementers.retain(|p| *p != w);
+            implementers.insert(0, w);
+        }
+    }
     let idx = t
         .current_implementer()
         .and_then(|c| implementers.iter().position(|x| x == c))

@@ -95,6 +95,9 @@ pub struct Seat {
     /// Ordered profiles to switch to when the primary cannot run; omitted = none (D7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<Vec<String>>,
+    /// M17-B1: implementer only — 2..=4 profiles that implement side by side (best-of-N).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<Vec<String>>,
 }
 
 /// Exactly the three seats of the fixed flow: a missing, extra or misspelt seat is an error.
@@ -566,6 +569,7 @@ pub fn load(
                 profile: s.profile.clone(),
                 model: s.model.clone(),
                 fallback: Some(s.fallback.clone().unwrap_or_default()),
+                candidates: s.candidates.clone(),
             },
         );
     }
@@ -708,7 +712,8 @@ pub fn problems(cfg: &Effective, root: &Path, machine: &str) -> Vec<String> {
             }
         };
         let names = std::iter::once(("profile", &r.profile))
-            .chain(r.fallback.iter().flatten().map(|f| ("fallback", f)));
+            .chain(r.fallback.iter().flatten().map(|f| ("fallback", f)))
+            .chain(r.candidates.iter().flatten().map(|c| ("candidates", c)));
         for (k, p) in names {
             if !cfg.repo.profiles.contains_key(p) {
                 out.push(format!(

@@ -203,3 +203,41 @@ pub fn org_runner(program: &str, timeout: &str, rg_extra: &str) -> String {
         "toryo: 1\nteam: calc-team\ngates:\n  divide-present: {{ kind: check, program: \"{program}\", args: [suite], timeout: {timeout}, red_green: {{ tests: [\"tests/**\"], args: [\"{{test}}\"]{rg_extra} }} }}\nseats:\n  planner: {{ profile: claude-max }}\n  implementer: {{ profile: codex-openai }}\n  reviewer: {{ profile: claude-max }}\n"
     )
 }
+
+// ── Part B: best-of-N ──────────────────────────────────────────────────────────────────────
+
+/// The M17 fixture with implementer candidates: `candidates` is the YAML list of the seat (e.g.
+/// `[codex-openai, codex-openai]`), `rg` the red-green block of the gate (empty: none).
+pub fn setup_bon(candidates: &str, rg: &str, files: &[(&str, &str)]) -> Env {
+    setup_rg(rg, &format!(", candidates: {candidates}"), files)
+}
+
+/// The fan-out of a task.
+pub fn fanout(env: &Env, id: &str) -> Option<store::FanoutRow> {
+    let i = id.to_string();
+    db(env).call(move |tx| store::fanout(tx, &i)).unwrap()
+}
+
+/// The candidates of a task.
+pub fn candidates(env: &Env, id: &str) -> Vec<store::CandidateRow> {
+    let i = id.to_string();
+    db(env).call(move |tx| store::candidates(tx, &i)).unwrap()
+}
+
+/// The answer of a compare turn.
+pub fn select(winner: &str, ranking: &[&str]) -> Value {
+    json!({"kind":"complete","structured":{"winner": winner, "reason": format!("{winner} is the clearest"), "ranking": ranking}})
+}
+
+/// A candidate turn that writes the division (with `extra` appended to it) and reports.
+pub fn candidate_turn(extra: &str) -> Value {
+    turn(vec![
+        write("src/Calculator.psm1", &format!("{DIVIDE}{extra}")),
+        implementation(),
+    ])
+}
+
+/// The worktree folder of candidate `k`.
+pub fn cwt(env: &Env, id: &str, k: u32) -> std::path::PathBuf {
+    env.root.join("wts").join(format!("{id}.c{k}"))
+}

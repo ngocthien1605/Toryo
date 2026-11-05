@@ -948,6 +948,8 @@ mod stage_verify;
 pub use stage_verify::*;
 mod red_green;
 pub(in crate::engine) use red_green::*;
+mod fanout;
+pub use fanout::*;
 mod envgates;
 pub use envgates::*;
 mod machine_locks;
