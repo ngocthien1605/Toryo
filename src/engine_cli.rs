@@ -564,6 +564,8 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
                     );
                 }
             }
+            // M17-B10: the candidate worktrees first — a refusal leaves the task as it was
+            toryo::engine::commands::remove_candidate_worktrees(&st, &g, &t, &candidates, *force)?;
             if !t.state.is_terminal() {
                 let i = id.clone();
                 st.call(move |tx| store::transition(tx, &i, PipelineEvent::Cancel).map(|_| ()))?;
@@ -584,7 +586,6 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
                     let _ = g.run(&repo, false, &["worktree", "prune"]);
                 }
             }
-            toryo::engine::commands::remove_candidate_worktrees(&st, &g, &t, &candidates, *force)?;
             if t.run_store.exists() {
                 std::fs::remove_dir_all(&t.run_store)
                     .with_context(|| format!("removing {}", t.run_store.display()))?;
@@ -676,8 +677,14 @@ fn task_config(cli: &Cli, id: &str, reload: bool, expect: Option<&str>) -> Resul
     };
     if let Some(f) = &fan {
         if candidates(&old) != candidates(&new) {
+            // (a budget that admitted fewer than two decided the single path: no fan-out comes)
+            let what = if f.phase == toryo::engine::runner::phase::SINGLE {
+                "this task's best-of-N fan-out was already decided — it takes the single path (phase single), and there is no second fan-out"
+            } else {
+                "the best-of-N fan-out already started"
+            };
             bail!(
-                "{id}: `candidates` cannot change — the best-of-N fan-out already started (phase {}); nothing was changed. Put `candidates` back as it was frozen, or reload before the fan-out of the next task",
+                "{id}: `candidates` cannot change — {what} (phase {}); nothing was changed. Put `candidates` back as it was frozen",
                 f.phase
             );
         }

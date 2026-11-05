@@ -2370,3 +2370,85 @@ fn m17_ec35_reload_after_the_fan_out_is_refused() {
     let (_, after, _) = run_out(&env, &["task", "config", "RL-2"]);
     assert_eq!(before, after, "the frozen configuration stays");
 }
+
+// ── Z3: the review's findings ──────────────────────────────────────────────────────────────
+
+/// X63 (review): a losing candidate whose turn left uncommitted work (here a crashed turn) keeps
+/// its folder — that work exists nowhere else — and says so; `task cleanup` needs `--force` for it.
+#[test]
+fn m17_x63_a_candidate_folder_with_uncommitted_work_is_kept() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, "KP-1");
+    let (code, err) = run_with(
+        &env,
+        "KP-1",
+        json!({
+            "implementer#c1": [turn(vec![write("src/Calculator.psm1", "# half\n"), json!({"kind":"crash"})])],
+            "implementer#c2": [candidate_turn("")],
+            "reviewer": [turn(vec![approved()])],
+        }),
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "KP-1").state, St::Completed, "{err}");
+    assert!(cwt(&env, "KP-1", 1).exists(), "kept: {err}");
+    assert!(
+        !cwt(&env, "KP-1", 2).exists(),
+        "the winner's folder is removed"
+    );
+    assert!(
+        err.contains("kept: candidate c1's worktree") && err.contains("1 uncommitted change(s)"),
+        "{err}"
+    );
+    let (code, err) = toryo(&env, &["task", "cleanup", "KP-1"], &[]);
+    assert_ne!(code, 0, "{err}");
+    assert!(err.contains("of candidate c1"), "{err}");
+    let (code, err) = toryo(&env, &["task", "cleanup", "KP-1", "--force"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!cwt(&env, "KP-1", 1).exists(), "{err}");
+}
+
+/// Review: a candidate turn that ended on its own after a sibling's usage crossed the budget is
+/// checked and checkpointed as any turn — only the cut turn runs again after `budget set`.
+#[test]
+fn m17_review_a_turn_that_ended_after_the_budget_was_hit_is_kept() {
+    let env = setup_bon("[claude-max, claude-max]", "", &[]);
+    create(&env, "BU-4");
+    let (code, err) = toryo(&env, &["budget", "set", "BU-4", "--tokens", "250000"], &[]);
+    assert_eq!(code, 0, "{err}");
+    let (code, err) = run_with(
+        &env,
+        "BU-4",
+        json!({
+            "planner": [turn(vec![tokens(10, 0), plan()])],
+            // c1 crosses the budget itself and ends at once; c2 runs on until it is cut
+            "implementer#c1": [turn(vec![tokens(300_000, 0), write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "implementer#c2": [turn(vec![hang()])],
+        }),
+        &[],
+    );
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(task(&env, "BU-4").state, St::Paused, "{err}");
+    assert_eq!(outcomes(&env, "BU-4")[0], "checkpointed", "{err}");
+    let (code, err) = toryo(
+        &env,
+        &["budget", "set", "BU-4", "--tokens", "100000000"],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let s = script(
+        &env,
+        "bu4b.json",
+        json!({
+            "implementer#c2": [candidate_turn("# two\n")],
+            "reviewer": [turn(vec![select("c1", &["c1", "c2"])]), turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(&env, &["resume", "BU-4", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "BU-4").state, St::Completed, "{err}");
+    assert_eq!(
+        (turns_of(&env, "BU-4", 1), turns_of(&env, "BU-4", 2)),
+        (1, 2)
+    );
+}

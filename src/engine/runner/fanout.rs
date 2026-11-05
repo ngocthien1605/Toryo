@@ -88,7 +88,6 @@ enum TurnEnd {
 /// A candidate turn ready to start.
 struct Prepared {
     c: CandidateRow,
-    profile: String,
     model: Option<String>,
     attempt: AttemptRow,
     open: OpenSession,
@@ -135,7 +134,7 @@ impl<'a> Engine<'a> {
 
     fn candidate_rows(&self) -> Result<Vec<CandidateRow>> {
         let i = self.id.clone();
-        self.store.call(move |tx| store::candidates(tx, &i))
+        self.store.read(move |tx| store::candidates(tx, &i))
     }
 
     fn worktrees_root(&self) -> Result<PathBuf> {
@@ -719,7 +718,6 @@ impl<'a> Engine<'a> {
         };
         Ok(Ok(Some(Prepared {
             c: c.clone(),
-            profile: c.profile.clone(),
             model,
             attempt: a,
             open,
@@ -800,7 +798,7 @@ impl<'a> Engine<'a> {
             self.rec.emit_quiet(EngineEvent::AgentKilled {
                 stage: a.stage.clone(),
                 attempt: a.attempt,
-                profile: p.profile.clone(),
+                profile: p.c.profile.clone(),
                 pid,
                 reason: match (budget_hit, r.cancelled) {
                     (true, _) => "budget",
@@ -810,7 +808,7 @@ impl<'a> Engine<'a> {
                 .into(),
             });
         }
-        self.usage(a, &p.profile, &r, p.model.as_deref())?;
+        self.usage(a, &p.c.profile, &r, p.model.as_deref())?;
         let wt = Worktree::new(&self.g, &c.worktree);
         // the HEAD guard (§8, X24) on the candidate's own branch
         match HeadGuard::check(&wt, &c.branch, &t.base_commit, &t.base_commit)? {
@@ -839,8 +837,10 @@ impl<'a> Engine<'a> {
                 return Ok(TurnEnd::Finished);
             }
         }
-        if escalated || r.cancelled || budget_hit {
-            let class = budget_hit.then_some("budget");
+        // (a turn that ended on its own is checked as any turn, even after the shared budget was
+        // hit by a sibling: only a cut turn runs again)
+        if escalated || r.cancelled {
+            let class = (budget_hit && r.cancelled).then_some("budget");
             self.end_candidate_attempt(a, &r, AttemptStatus::Interrupted, class, None)?;
             return Ok(TurnEnd::Pending);
         }
@@ -1027,7 +1027,7 @@ impl<'a> Engine<'a> {
             )?;
             match why {
                 None => {
-                    self.candidate_checkpointed(t, c, &found.sha, true)?;
+                    self.candidate_checkpointed(c, &found.sha, true)?;
                     return Ok(());
                 }
                 Some(why) => {
@@ -1094,16 +1094,10 @@ impl<'a> Engine<'a> {
             false,
         )?;
         crash_point("fanout:after_checkpoint");
-        self.candidate_checkpointed(t, c, &sha, false)
+        self.candidate_checkpointed(c, &sha, false)
     }
 
-    fn candidate_checkpointed(
-        &self,
-        _t: &TaskRow,
-        c: &CandidateRow,
-        sha: &str,
-        found: bool,
-    ) -> Result<()> {
+    fn candidate_checkpointed(&self, c: &CandidateRow, sha: &str, found: bool) -> Result<()> {
         let (i, k, s) = (self.id.clone(), c.k, sha.to_string());
         self.store.call(move |tx| {
             store::set_candidate_outcome(tx, &i, k, "checkpointed", Some(&s), None)
@@ -1436,8 +1430,11 @@ impl<'a> Engine<'a> {
         Ok(Flow::Next)
     }
 
-    /// M17-B10 (AC-23): remove candidate `c`'s worktree folder — only the one the store recorded at
-    /// its place (X44); its branch stays.
+    /// M17-B10 (AC-23, X56, X63): remove candidate `c`'s worktree folder — only the one the store
+    /// recorded at its place (X44); its branch stays. A folder that holds uncommitted work (a turn
+    /// that never reached a checkpoint: `failed_turn`, `disqualified`) is kept and named — it exists
+    /// nowhere else; `task cleanup --force` removes it. A folder that cannot be removed is kept with a
+    /// warning: the fan-out never stops for it (`task cleanup` tries again).
     pub(in crate::engine) fn remove_candidate_worktree(
         &self,
         t: &TaskRow,
@@ -1446,16 +1443,36 @@ impl<'a> Engine<'a> {
         if !c.created || c.removed {
             return Ok(());
         }
+        if let Err(e) = self.try_remove_candidate_worktree(t, c) {
+            crate::errln!(
+                "WARNING: candidate {}'s worktree {} is kept: {e:#} — `toryo task cleanup {}` removes it",
+                cand::id(c.k),
+                c.worktree.display(),
+                t.id
+            );
+        }
+        Ok(())
+    }
+
+    fn try_remove_candidate_worktree(&self, t: &TaskRow, c: &CandidateRow) -> Result<()> {
         let root = self.worktrees_root()?;
         if c.worktree != cand::worktree_path(&root, &t.id, c.k) {
             bail!(
-                "candidate {}'s recorded worktree {} is not {} — it is not removed",
-                cand::id(c.k),
-                c.worktree.display(),
+                "the recorded worktree is not {}",
                 cand::worktree_path(&root, &t.id, c.k).display()
             );
         }
         if std::fs::symlink_metadata(&c.worktree).is_ok() {
+            let dirty = Worktree::new(&self.g, &c.worktree).changed()?.len();
+            if dirty > 0 {
+                crate::errln!(
+                    "   kept: candidate {}'s worktree {} holds {dirty} uncommitted change(s) of a turn that made no checkpoint — look at it; `toryo task cleanup {} --force` removes it",
+                    cand::id(c.k),
+                    c.worktree.display(),
+                    t.id
+                );
+                return Ok(());
+            }
             let repo = crate::git::Loc::Discover(t.repo.clone());
             let fwd = c.worktree.display().to_string().replace('\\', "/");
             if self
