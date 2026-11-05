@@ -6,8 +6,8 @@
 > Dành cho: anh Thiện — D365FO technical consultant, dùng PowerShell 7, Claude Code và Codex.
 > Thuật ngữ kỹ thuật giữ nguyên tiếng Anh.
 
-> **Bản này khớp với `main` @ `4813720` (2026-10-23, version 0.12.0: M16, bản sửa của review 2026-10-23 — R23,
-> X39–X46; SQL schema version 3).** Lệnh chính là engine: `toryo task create` →
+> **Bản này khớp với nhánh M17 (2026-11-05, version 0.12.0: M16, bản sửa của review 2026-10-23 — R23, X39–X46; M17 —
+> cổng red-green §5.10 và best-of-N §5.11, X47–X62; SQL schema version 4).** Lệnh chính là engine: `toryo task create` →
 > `toryo run` → `toryo approve`. Tham chiếu ngắn bằng tiếng Anh: `README.md`; hiện trạng và danh sách việc còn mở:
 > `docs/STATUS.md`; các quy tắc đang có hiệu lực: `docs/DECISIONS.md`.
 > Các mã như `R51`, `X13`, `M12-07` là số hiệu yêu cầu / quyết định / task trong các file đó và trong `docs/M*-NOTES.md` —
@@ -43,6 +43,9 @@ review là hai "người" độc lập thì review khách quan hơn.
 
 Toryo không gắn với D365FO: gate là một lệnh bất kỳ trả exit code (`dotnet build`, `npm test`, `cargo test`, một
 script PowerShell). Phần riêng cho D365FO nằm ở bộ mẫu `templates\d365fo\` và loại gate dựng sẵn `tool: xpp`.
+
+Hai lựa chọn của M17: một check gate có thể **chứng minh** từng tiêu chí bằng test đỏ-trên-bản-cũ / xanh-trên-bản-mới (mục
+5.10, red-green), và ghế implementer có thể cho **2–4 candidate** làm song song rồi giữ bản tốt nhất (mục 5.11, best-of-N).
 
 ---
 
@@ -1100,6 +1103,136 @@ Máy tiếng Nhật: output của gate không phải UTF-8 (cp932) được gi�
 `.toryo\roles\<role>\instructions.md`; mỗi lần `codex --profile` → một profile Toryo có `CODEX_HOME` riêng. Xoá ba khoá cũ
 khỏi `toryo.yaml`, rồi chạy `toryo config show` và `toryo gate list` để kiểm tra.
 
+### 5.10 Cổng red-green: chứng minh test thật sự kiểm tra thay đổi (M17)
+
+**Ví dụ so sánh.** Khi anh vá một lỗi tính thuế trên D365FO, anh muốn chắc test case "bắt" được lỗi đó: chạy test trên
+**bản cũ** thì phải **đỏ** (fail — lỗi còn đó), chạy trên **bản mới** thì phải **xanh** (pass). Một test xanh trên cả hai bản
+không chứng minh gì — nó chỉ chứng minh test không kiểm tra thay đổi của anh. Cổng red-green làm đúng việc đó cho từng tiêu chí
+nghiệm thu (`AC-n`), tự động, trên commit checkpoint.
+
+**Cấu hình** — một `kind: check` gate trong org chart (hoặc một mục `commands.verify` ở chế độ chỉ-có-`toryo.yaml`; mỗi cấu
+hình chỉ một gate red-green):
+
+```yaml
+# .toryo\toryo-orgchart.yaml (trích)
+gates:
+  unit:
+    kind: check
+    program: dotnet
+    args: [test, --no-restore]
+    timeout: 20m
+    red_green:
+      tests: ["tests/**"]                                   # file test: thứ commit "đỏ" lấy từ checkpoint
+      args: [test, --no-restore, "--filter=FullyQualifiedName~{test}"]   # lần chạy một test; {test} đúng một lần
+      green_output_must_match: "Passed!"                    # nên đặt: filter không khớp test nào vẫn "xanh"
+      max_tests: 32                                         # 1..64, mặc định 32
+```
+
+**Bản đồ chứng minh (`proof`).** Có gate red-green thì `IMPLEMENTATION.json` của implementer phải có
+`"proof": [{ "ac": "AC-1", "tests": ["Calc.Divides"] }, …]` — mỗi tiêu chí không được miễn có 1..n test id (chữ ASCII,
+số và `_:./-[]=,@+#`, 1–200 byte, không bắt đầu bằng `-` hay `/`). Prompt của implementer giải thích quy tắc này (chỉ khi có
+gate). Không có gate red-green thì report không có `proof` vẫn được nhận như trước.
+
+**Miễn chứng minh** — trong TASK.md, một mục riêng:
+
+```markdown
+## Proof exempt
+- AC-3: kiểm tay trên máy UDE (cần môi trường đã deploy)
+```
+
+`task create` từ chối (kèm số dòng) id không phải tiêu chí của task, id lặp lại, hoặc mục không có lý do. Tiêu chí được miễn
+mà vẫn có test trong `proof` thì test đó vẫn chạy.
+
+**Thứ tự chạy trong gate** (đúng chỗ của gate trong `before_handoff`):
+
+1. kiểm tra bản đồ — thiếu tiêu chí, tiêu chí lạ, lặp, `tests` rỗng, test id sai luật, quá `max_tests`: gate thất bại, nêu **mọi**
+   lỗi một lần, và **không process nào chạy**;
+2. `args` của chính gate chạy như mọi khi;
+3. **xanh**: mỗi test id một lần, `{test}` được thay thành argv (cả phần tử hoặc bên trong một phần tử; không bao giờ qua shell do
+   Toryo dựng), trong bản checkout của checkpoint — phải exit 0 trong `timeout` và khớp `green_output_must_match` (nếu đặt);
+4. **commit đỏ**: cây của commit gốc + mọi file khớp `red_green.tests` lấy từ checkpoint (thêm, sửa, xoá — đúng từng byte, cả
+   bit thực thi), cha là commit gốc, **không nằm trên ref nào**;
+5. **đỏ**: checkout sạch của commit đỏ ở `<verify folder>\red\<task>.red`, cùng ranh giới cách ly, dưới verify lock; mỗi test một
+   lần — exit khác 0 là đỏ (đạt), quá thời gian là đỏ và ghi `timed_out`, **exit 0 là thất bại**: "passes without the change —
+   it proves nothing";
+6. checkout đỏ phải còn đúng là commit đỏ, nếu không: `verify_mutated_tree`.
+
+**Kết quả.** Thất bại = một lần gate retry; feedback cho implementer nêu tiêu chí, test, phía (xanh/đỏ), exit code và đuôi output.
+Chương trình không khởi động được → `gate_unavailable` (lỗi máy, không tốn vòng sửa). Dừng (`toryo stop`, Ctrl+C) hoặc crash giữa
+chừng → attempt bị ngắt, `resume` chạy lại verify; sau một vòng sửa, checkpoint mới có commit đỏ mới. `VERIFY_RESULT.json` có
+`red_green` (proven/total/exempt, từng test với exit code hai phía, commit đỏ); reviewer nhận bằng chứng trong prompt **như dữ
+liệu** và vẫn phải tự đánh giá từng tiêu chí; `toryo status`, `task show` (`--json`: `red_green`, `null` khi không có gate) và cổng
+cuối hiện `proven/total`; `watch` in sự kiện `red_green_finished`.
+
+**Lưu ý.** `tests` chỉ nên khớp **file test**: glob rộng như `src/**` làm commit đỏ giống hệt checkpoint, gate thất bại "proves
+nothing". Task sửa lỗi mà test đã có sẵn và đang fail trên commit gốc → phần chồng (overlay) rỗng: được phép. Red-green
+**chưa** chạy được trong gate môi trường (SysTest cần môi trường đã deploy) hay với `tool: xpp` — xem Open trong `docs/STATUS.md`.
+
+### 5.11 Best-of-N: nhiều implementer cùng làm, giữ bản tốt nhất (M17)
+
+**Ví dụ so sánh.** Như **đấu thầu**: 2–4 nhà thầu cùng làm theo **một** bản thiết kế đã duyệt (PLAN.md), mỗi nhà thầu một công
+trường riêng (worktree riêng). Hội đồng kỹ thuật (các check gate) loại bản không đạt trước; còn từ hai bản đạt trở lên thì kiến trúc
+sư trưởng (ghế reviewer) so sánh và chọn một; không chọn được thì theo **bảng điểm cố định**. Bản thắng được nhận bàn giao vào
+nhánh của task (`toryo/<ID>`) **đúng commit đó**, rồi đi qua quy trình bình thường (Verify đầy đủ, Review, cổng cuối).
+
+**Cấu hình:**
+
+```yaml
+# .toryo\toryo-orgchart.yaml (trích)
+seats:
+  implementer: { profile: codex-openai, fallback: [claude-max], candidates: [codex-openai, claude-max] }
+```
+
+(`roles.implementer.candidates` ở chế độ `toryo.yaml`.) 2..4 profile của machine config, lặp lại được (hai phiên độc lập của cùng
+một profile). Bị từ chối trên ghế planner/reviewer, khi ít hơn 2 hoặc nhiều hơn 4, hoặc khi profile không có. Đóng băng lúc
+`task create`; `config show`, `task config`, `doctor` hiện nó; kiểm tra evidence R51 tính cả các profile candidate.
+`task config --reload` chỉ đổi được `candidates` **trước khi** fan-out bắt đầu. Task không có `candidates` chạy y như trước.
+
+**Luồng:**
+
+- **Fan-out** (stage Implementing đầu tiên sau khi duyệt plan): candidate `c<k>` có worktree `<worktrees_root>\<ID>.c<k>` trên nhánh
+  mới `toryo-candidate/<ID>/c<k>` tại commit gốc — Toryo ghi nhận **trước** khi tạo; lỗi hoặc Ctrl+C trong lúc tạo thì những gì đã
+  tạo được dọn lại. Thư mục hay nhánh trùng tên mà Toryo **không** ghi nhận thì bị từ chối kèm tên và **không bao giờ bị xoá**
+  (`candidate_unavailable`, xem §9.1).
+- **Lượt chạy**: các candidate chạy **cùng lúc** trong tiến trình chủ, dưới một task lock; mỗi candidate có profile, session,
+  process group / Job Object, `TEMP` và file ngữ cảnh riêng. Hết lượt, mỗi candidate qua đúng các kiểm tra của một lượt đơn trong
+  worktree của nó (HEAD guard, file được bảo vệ, deny, hàng rào ghi), rồi Toryo commit checkpoint với trailer `Toryo-Task`,
+  `Toryo-Stage: implement#c<k>`, `Toryo-Candidate: c<k>`. Kết quả: `checkpointed`, `no_change`, `failed_turn` (hết quota, crash,
+  output sai — **không** dùng fallback cho candidate), `disqualified(<lớp>)`, `interrupted`.
+- **Chính sách escalation**: thay đổi file được bảo vệ, artifact bị sửa, hoặc vi phạm chính sách khi phục hồi ở **bất kỳ** candidate
+  nào → **cả task** escalate và các lượt khác bị dừng; lỗi máy → task escalate, `toryo resume` trơn chạy tiếp mà **không** chạy lại
+  candidate đã xong; vượt hàng rào ghi/deny, dời HEAD hay gate làm bẩn checkout → **chỉ loại candidate đó**.
+- **Check gate cho từng candidate**: chỉ check gate (gồm red-green), **không bao giờ** gate môi trường; lần lượt từng candidate dưới
+  verify lock, ở `<verify_root>\<task>\c<k>`, mỗi candidate một `VERIFY_RESULT.json` riêng (`candidates\c<k>\` trong run store).
+- **Chọn bản thắng**: đúng một bản đạt → thắng (`by: only`). Từ hai bản đạt → một lượt so sánh **chỉ đọc** của ghế reviewer
+  (`schemas/select.schema.json`: `winner`, `reason`, `ranking`) với `DIFF.patch`, `IMPLEMENTATION.json` và tóm tắt verify của mỗi
+  bản đạt **như dữ liệu**; câu trả lời sai được một lượt sửa; sai lần nữa, lượt thất bại, hay lượt đó ghi file (được trả lại) →
+  theo **bảng điểm** (`by: score`): (1) đạt mọi check gate, (2) nhiều tiêu chí được red-green chứng minh hơn, (3) ít dòng thay đổi
+  hơn (`git diff --numstat`: thêm + xoá), (4) ít token hơn, (5) số thứ tự nhỏ hơn. Không bản nào đạt → bản điểm cao nhất thắng và
+  task vào Fixing với feedback verify của nó (một lần gate retry). Không bản nào có checkpoint → chạy đường một-implementer bình
+  thường (primary + fallback) **một lần**, có một dòng ghi chú; không fan-out lần hai.
+- **Nhận bàn giao (promotion)**: worktree của task phải sạch, ở commit gốc, trên `toryo/<ID>`, không dở thao tác Git — nếu không,
+  không nhánh nào bị di chuyển và task dừng (`candidate_unavailable`). Rồi `toryo/<ID>` được dời tới **đúng** commit của bản thắng
+  (cùng SHA, không tạo commit mới) — đó là anchor. Vòng sửa sau đó dùng profile của bản thắng trước (session mới), rồi tới chuỗi
+  fallback; `reviewer-differs-from-builder` xét profile của bản thắng.
+- **Bản thua**: thư mục worktree của mọi candidate được xoá khi không cần nữa (bản thua: ngay sau khi chọn; bản thắng: lúc nhận bàn
+  giao); **mọi nhánh** `toryo-candidate/<ID>/c<k>` được giữ và nêu tên. `toryo task cleanup` xoá worktree candidate còn sót (chỉ
+  những thư mục Toryo đã ghi nhận; còn việc chưa lưu thì cần `--force`) và giữ nhánh.
+- **Budget**: chỉ bắt đầu số candidate mà budget cho phép theo ước lượng một lượt (`pipeline.unknown_turn_reservation_tokens`, hoặc
+  lượt implement lớn nhất đã đo của task, hoặc 200.000): cho 2..N−1 thì chạy chừng đó (một dòng ghi chú); dưới 2 thì đi đường
+  một-implementer (ghi chú). Ngắt trực tiếp (live interrupt) cộng **chung** các lượt candidate đang chạy: chạm budget thì cắt hết,
+  task `Paused`; `toryo budget set` + `toryo resume` chỉ chạy lại các candidate chưa xong.
+
+**Theo dõi**: `watch` in `best-of-N: 2 candidates — c1 …, c2 …`, `candidate c1: checkpointed …, check gates passed`,
+`✔ candidate c2 selected (by compare)`; `toryo status` / `task show` liệt kê từng candidate, bản thắng, cách chọn và các nhánh được
+giữ (`--json`: `candidates`, `null` khi không có fan-out); dashboard: `now: candidates 1/2 verifying`; cổng cuối nêu bản thắng và
+nhánh của bản thua; `toryo usage` tách `implement#c1`, `implement#c2` và lượt so sánh `select`. Lý do của lượt so sánh là chữ của
+agent: in ra một lần khi được dùng, **không** hiện trong `status`, dashboard hay cổng cuối.
+
+**Giới hạn**: Toryo kiểm tra worktree **của chính** mỗi candidate, không phát hiện một candidate ghi sang worktree của candidate
+khác — sandbox của agent (Claude `--add-dir`, Codex `workspace-write`) là lớp bảo vệ ở đó. Chi phí token xấp xỉ N lần một lượt
+implement.
+
 ## 6. Thực hành: dự án mẫu **BatchRename** (PowerShell module)
 
 Module đổi tên file hàng loạt. Trạng thái ban đầu chỉ có 1 hàm `ConvertTo-SafeFileName`.
@@ -1555,6 +1688,7 @@ Có sáu dạng `next:` cho một task `Escalated`; cột "gõ gì" nói dạng 
 | `context_unreadable` | một file ngữ cảnh (global, `AGENTS.md`/`CLAUDE.md`, `.toryo\context\*.md`, culture, instructions, file của task pack) **không phải UTF-8** (UTF-16 hoặc code page), hoặc **có mà không đọc được** (bị từ chối quyền, đang bị khoá, là một thư mục trùng tên — X45; trước đây bị coi là "không có" và lượt chạy thiếu quy tắc của anh) — lý do nêu tên file; không tốn lượt. Chỉ file thật sự không tồn tại mới được bỏ qua | [máy]: lưu file thành UTF-8 / sửa quyền, đóng chương trình đang giữ file → `toryo resume` |
 | `xpp_toolchain_unavailable` | `tool: xpp` không dùng được: thiếu MSBuild hoặc một gói NuGet CI/CD | [máy]: cài/khai báo `toolchains.xpp` → `toryo resume` (sửa file config → `task config --reload`) |
 | `verify_boundary_unavailable` | không lập được ranh giới Low integrity: `verify_root` không gán được Low label (thiếu `WRITE_OWNER`), hoặc `verify_root` nằm trong cây thư mục mà tiến trình Low ghi được (ví dụ dưới `AppData\LocalLow`). Toryo không tự hạ xuống chạy không cách ly; `toryo doctor` nêu nguyên nhân | [máy]: để `verify.verify_root` mặc định `%LOCALAPPDATA%\toryo-verify` → `task config --reload` → `toryo resume` |
+| `candidate_unavailable` | best-of-N (§5.11): (a) thư mục `<worktrees_root>\<ID>.c<k>` hoặc nhánh `toryo-candidate/<ID>/c<k>` **đã có sẵn** mà Toryo không ghi nhận — lý do nêu tên từng cái; Toryo **không bao giờ xoá** thứ nó không tạo; (b) bản thắng **không nhận bàn giao được**: worktree của task bẩn, HEAD không ở `toryo/<ID>` hoặc không ở commit gốc, hoặc đang dở một thao tác Git — không nhánh nào bị di chuyển | [máy]: (a) tự xoá (`git worktree remove …`, `git branch -D …` trong repo) → `toryo resume`; (b) đưa worktree về sạch, ở commit gốc, trên `toryo/<ID>` (`git -C <worktree> checkout toryo/<ID>`) → `toryo resume` trơn (thử nhận bàn giao lại; `--note` sẽ mở một vòng sửa trên commit gốc và **mất** bản thắng) |
 | `protected_config_changed` | một file được bảo vệ (config, script gate, `AGENTS.md`, `.claude\`, `.git\config`, hooks…) khác baseline — không chạy thêm process nào; lý do nêu file và diff | [bảo vệ] |
 | `verify_mutated_tree` | một gate đã sửa file đã track hoặc `.git` của bản checkout (hoặc repo có `eol=crlf` mà blob còn CRLF: `git add --renormalize .` một lần rồi commit), hoặc script gate môi trường ghi vào bản xuất | [chung]: sửa script (hoặc để implementer sửa code), rồi `toryo resume <id> --note "…"` |
 | `artifact_tampered` · `artifact_missing` | một file trong `runstore\artifacts\` bị sửa hoặc xoá (hash không khớp bản ghi trong DB) | [chung]: khôi phục file nếu có bản sao, rồi `toryo resume <id> --note "…"`; hoặc `toryo task cleanup <id>` |

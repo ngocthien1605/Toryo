@@ -12,6 +12,9 @@ project:
 roles:                                     # names of profiles the machine config defines (R60)
   planner:     { profile: claude-max, model: opus }
   implementer: { profile: codex-foundry }
+  # M17 best-of-N: 2..4 profiles implement the approved plan side by side, the best one continues
+  # (check gates first, then the reviewer's compare turn, then a fixed score; docs/HUONG-DAN.md §5.11):
+  # implementer: { profile: codex-foundry, candidates: [codex-foundry, claude-max] }
   reviewer:    { profile: claude-max, model: opus }
 
 policy:
@@ -30,6 +33,18 @@ commands:
   verify:
     - { name: build, program: pwsh, args: ["-NoProfile", "-File", "scripts/build.ps1"], timeout_min: 10 }
     - { name: test,  program: pwsh, args: ["-NoProfile", "-File", "scripts/test.ps1"],  timeout_min: 10 }
+    # M17 red-green (one per configuration): each acceptance criterion's tests, named by the implementer, must
+    # fail on the base commit with only the task's test files laid over it and pass on the checkpoint
+    # (docs/HUONG-DAN.md §5.10). `{test}` exactly once in `red_green.args`; `## Proof exempt` in TASK.md exempts
+    # a criterion with a reason.
+    # - name: test
+    #   program: pwsh
+    #   args: ["-NoProfile", "-File", "scripts/test.ps1"]
+    #   timeout_min: 10
+    #   red_green:
+    #     tests: ["tests/**"]
+    #     args: ["-NoProfile", "-File", "scripts/test.ps1", "-Name", "{test}"]
+    #     green_output_must_match: "Tests Passed: [1-9]"
 
 timeouts:
   agent_stall_min: 10

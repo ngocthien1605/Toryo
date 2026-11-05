@@ -1235,8 +1235,14 @@ fn m17_ec37_a_leftover_folder_or_branch_is_refused_by_name_and_kept() {
     assert_eq!(t.machine.reason_class(), Some("candidate_unavailable"));
     let why = t.machine.reason().unwrap_or_default().to_string();
     assert!(why.contains("the branch toryo-candidate/LO-1/c1"), "{why}");
+    // (the folder is `<worktrees_root>` as configured, joined with the platform's separator)
+    let folder = cwt(&env, "LO-1", 2)
+        .display()
+        .to_string()
+        .replace('\\', "/");
     assert!(
-        why.contains(&format!("the folder {}", cwt(&env, "LO-1", 2).display())),
+        why.replace('\\', "/")
+            .contains(&format!("the folder {folder} already exist")),
         "{why}"
     );
     assert!(
@@ -2319,4 +2325,48 @@ fn m17_ac16_a_forged_candidate_commit_is_never_accepted() {
         base,
         "c1's checkpoint is one commit on the base"
     );
+}
+
+/// Edge case 35 (after the fan-out), AC-12: once the fan-out started, `task config --reload` that
+/// changes `candidates` is refused with a message, and the frozen configuration stays.
+#[test]
+fn m17_ec35_reload_after_the_fan_out_is_refused() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    let gate = gate_program(
+        &env.root,
+        "present-gate",
+        "git grep -q Divide-Numbers -- src\nexit /b %errorlevel%\n",
+        "git grep -q Divide-Numbers -- src\n",
+    );
+    commit_repo(
+        &env,
+        &[(
+            ".toryo/toryo-orgchart.yaml",
+            &org_gate(&gate, ", candidates: [codex-openai, codex-openai]"),
+        )],
+        "gate",
+    );
+    create(&env, "RL-2");
+    std::fs::remove_file(&gate).unwrap();
+    let (_, err) = run_with(&env, "RL-2", passing_turns(), &[]);
+    // stopped (a machine stop) in the middle of the fan-out: a waiting state, so a reload may run
+    assert_eq!(task(&env, "RL-2").state, St::Escalated, "{err}");
+    assert!(fanout(&env, "RL-2").is_some());
+    let (_, before, _) = run_out(&env, &["task", "config", "RL-2"]);
+    commit_repo(
+        &env,
+        &[(
+            ".toryo/toryo-orgchart.yaml",
+            &org_gate(&gate, ", candidates: [codex-openai, claude-max]"),
+        )],
+        "two vendors",
+    );
+    let (code, err) = toryo(&env, &["task", "config", "RL-2", "--reload"], &[]);
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains("RL-2: `candidates` cannot change — the best-of-N fan-out already started (phase verify); nothing was changed"),
+        "{err}"
+    );
+    let (_, after, _) = run_out(&env, &["task", "config", "RL-2"]);
+    assert_eq!(before, after, "the frozen configuration stays");
 }

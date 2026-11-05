@@ -1475,3 +1475,36 @@ fn m17_ec19_a_huge_per_test_output_is_bounded_and_redacted() {
     assert!(!text.contains(SECRET), "redacted");
     assert_eq!(text.matches("[REDACTED:TORYO_M17_TOKEN]").count(), 2);
 }
+
+/// Edge case 15, AC-6: `{test}` inside an element (`-e{test}`, as in
+/// `--filter=FullyQualifiedName~{test}`) is substituted there, as argv — the gate proves every
+/// criterion; as a whole element it is the fixture's `-e "{test}"` (every other test here).
+#[test]
+fn m17_ec15_test_inside_an_element_is_substituted_there() {
+    let env = setup_rg(
+        r#"red_green: { tests: ["tests/**"], args: [grep, -q, -F, "-e{test}", --, src] }"#,
+        "",
+        &[],
+    );
+    create(&env, "RG-15");
+    let s = rg_script(&env, "rg15.json", full_proof());
+    let (code, err) = toryo(&env, &["run", "RG-15", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        task(&env, "RG-15").state,
+        toryo::engine::PipelineState::Completed,
+        "{err}"
+    );
+    let rg = &verify_result(&env, "RG-15")["red_green"];
+    assert_eq!(
+        (rg["proven"].clone(), rg["pass"].clone()),
+        (json!(3), json!(true)),
+        "{rg}"
+    );
+    let t = &rg["acs"][1]["tests"][0];
+    assert_eq!(
+        (t["green"]["exit"].clone(), t["red"]["exit"].clone()),
+        (json!(0), json!(1)),
+        "{rg}"
+    );
+}

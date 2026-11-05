@@ -782,3 +782,32 @@ pub struct BuildEntry {
     /// Repository-relative, `/`.
     pub path: String,
 }
+
+#[cfg(test)]
+mod m17_red_green_tests {
+    use super::*;
+
+    /// Edge case 15: `{test}` is replaced inside an element and as a whole element, nowhere else.
+    #[test]
+    fn m17_ec15_the_test_id_is_substituted_inside_an_element_or_as_one() {
+        let rg = |args: &[&str]| RedGreen {
+            tests: vec!["tests/**".into()],
+            args: args.iter().map(|a| a.to_string()).collect(),
+            green_output_must_match: None,
+            max_tests: None,
+        };
+        assert_eq!(
+            rg(&["test", "--filter=FullyQualifiedName~{test}", "--no-build"])
+                .args_for("Calc.Divides"),
+            vec![
+                "test",
+                "--filter=FullyQualifiedName~Calc.Divides",
+                "--no-build"
+            ]
+        );
+        assert_eq!(
+            rg(&["--exact", "{test}"]).args_for("divide::by_zero"),
+            vec!["--exact", "divide::by_zero"]
+        );
+    }
+}

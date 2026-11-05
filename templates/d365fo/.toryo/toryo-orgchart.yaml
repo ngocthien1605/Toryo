@@ -168,6 +168,25 @@ gates:
     #   projects: [Projects/Build/ContosoCore.Build.rnrproj]
     #   timeout: 90m
 
+  # OPTIONAL (M17), off by default: a RED-GREEN check gate — for each acceptance criterion the tests the
+  # implementer names (`proof` in IMPLEMENTATION.json) must FAIL on the base commit with only the task's
+  # test files laid over it, and PASS on the checkpoint. Not for `tool: xpp` and not in an environment
+  # gate (SysTest needs a deployed environment): use it for code with a test runner of its own (a C# helper
+  # library, Pester tests of the build scripts). One red-green gate per org chart; it goes in
+  # `before_handoff` like any check gate. A criterion that cannot be proven this way goes under
+  # `## Proof exempt` in TASK.md with its reason (`- AC-3: checked by hand on the UDE machine`).
+  #
+  # unit:
+  #   kind: check
+  #   program: dotnet
+  #   args: [test, Tools/Contoso.Helpers.Tests, --no-restore]
+  #   timeout: 20m
+  #   red_green:
+  #     tests: ["Tools/Contoso.Helpers.Tests/**"]        # test files only: what the red commit takes
+  #     args: [test, Tools/Contoso.Helpers.Tests, --no-restore, "--filter=FullyQualifiedName~{test}"]
+  #     green_output_must_match: "Passed!"              # set it: a filter that matches no test passes green
+  #     max_tests: 32                                   # 1..64
+
   # OPTIONAL, off by default: let Toryo deploy the checkpoint too. To use it, uncomment this gate, add
   # `dbsync` to the implementer's `before_handoff` (after `build`), and define `environment_gates.dbsync`
   # in the machine config (templates/d365fo/toryo.local.yaml.example, templates/d365fo/machine/dbsync.ps1.example).
@@ -206,6 +225,15 @@ gates:
 #             planner's profile when `fallback` is omitted).
 #             Only the implementer may have a fallback; on the planner or
 #             reviewer it is a validation error.
+#   candidates  optional (M17), implementer only: 2..4 profile names (a profile
+#             may repeat) that implement the approved plan SIDE BY SIDE, each
+#             in its own worktree <worktrees_root>\<ID>.c<k> on the branch
+#             toryo-candidate/<ID>/c<k>. The check gates decide first, then one
+#             read-only compare turn of the reviewer seat, then a fixed score;
+#             the winner's commit becomes toryo/<ID> and goes through the normal
+#             Verify, Review and final gate. About N times the tokens of one
+#             implement turn. `fallback` is used on the single path only (a
+#             candidate whose turn fails just loses). See docs/HUONG-DAN.md §5.11.
 #
 # The machine config may override a seat for that machine only (key `seats`,
 # same fields), e.g. the company laptop uses claude-foundry for the planner.
@@ -218,6 +246,7 @@ seats:
   implementer:
     profile: codex-openai          # ChatGPT Plus login (was: codex --profile openai)
     fallback: [claude-max]         # takes over if Codex is out of quota
+    # candidates: [codex-openai, claude-max]   # best-of-N (M17): uncomment to let both implement
 
   reviewer:
     profile: claude-max            # no fallback: the reviewer never changes
