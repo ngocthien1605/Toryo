@@ -156,7 +156,22 @@ impl<'a> Engine<'a> {
         let mut green_ok: std::collections::HashSet<String> = Default::default();
         let mut bad: Vec<Failed> = Vec::new();
         let program = verify_program(&program_text, &at.co.dir);
+        // a program that is gone is `gate_unavailable` before each run — on Windows a missing
+        // `.cmd` starts `cmd.exe`, which only exits 1, and a red run would count that as failing
+        let path = std::env::var_os("PATH");
+        let gone = || {
+            crate::engine::gates::check_gate_problem(c, path.as_deref()).map(|why| {
+                anyhow::Error::new(crate::runner::StartFailed {
+                    name: c.name.clone(),
+                    program: program_text.clone(),
+                    error: why,
+                })
+            })
+        };
         for id in &plan.tests {
+            if let Some(e) = gone() {
+                return Err(e);
+            }
             let run = at.spec(
                 &format!("{} {id}", c.name),
                 program.clone(),
@@ -242,6 +257,9 @@ impl<'a> Engine<'a> {
         let program = verify_program(&program_text, &red_co.dir);
         let mut passed: Vec<Failed> = Vec::new();
         for (n, id) in plan.tests.iter().enumerate() {
+            if let Some(e) = gone() {
+                return Err(e);
+            }
             let run = red_at.spec(
                 &format!("{} {id}", c.name),
                 program.clone(),

@@ -1754,3 +1754,569 @@ fn m17_ec43_red_green_and_best_of_n_more_proven_wins_on_the_score() {
     assert_eq!(vr["red_green"]["proven"], 3, "{vr}");
     assert_eq!(vr["head"].as_str(), c[1].head.as_deref());
 }
+
+// ── B11: the budget and the usage (AC-24, AC-26) ───────────────────────────────────────────
+
+/// `{"kind":"usage", …}` of a fake turn.
+fn tokens(input: u64, output: u64) -> Value {
+    json!({"kind":"usage","input":input,"output":output})
+}
+
+/// Edge case 34, AC-24: a budget that admits one candidate turn of two (each estimated at the
+/// default reservation, nothing reported yet) takes the single path with a note.
+#[test]
+fn m17_ec34_a_budget_for_one_candidate_takes_the_single_path() {
+    let env = setup_bon("[codex-openai, claude-max]", "", &[]);
+    create(&env, "BU-1");
+    // the plan turn reports 10 tokens: 10 + one estimate (the default reservation) reaches it
+    let (code, err) = toryo(&env, &["budget", "set", "BU-1", "--tokens", "200000"], &[]);
+    assert_eq!(code, 0, "{err}");
+    let (code, err) = run_with(
+        &env,
+        "BU-1",
+        json!({
+            "planner": [turn(vec![tokens(10, 0), plan()])],
+            "implementer": [turn(vec![tokens(10, 0), write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![tokens(10, 0), approved()])],
+        }),
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "BU-1").state, St::Completed, "{err}");
+    let f = fanout(&env, "BU-1").unwrap();
+    assert_eq!((f.phase.as_str(), f.n), ("single", 0));
+    assert!(
+        err.contains("note: best-of-N: the budget admits 1 of 2 candidate turns (~200000 tokens each) — the single implementer path runs"),
+        "{err}"
+    );
+    assert!(candidates(&env, "BU-1").is_empty());
+    assert_eq!(
+        stage_profiles(&env, "BU-1", "implement"),
+        vec!["codex-openai"]
+    );
+}
+
+/// Edge case 34, AC-24: a budget that admits two candidate turns of three runs c1 and c2, with a
+/// note.
+#[test]
+fn m17_ec34_a_budget_for_two_of_three_runs_two_candidates() {
+    let env = setup_bon("[codex-openai, codex-openai, claude-max]", "", &[]);
+    create(&env, "BU-2");
+    // 10 (the plan) + 2 estimates reach 300000, 10 + 1 does not
+    let (code, err) = toryo(&env, &["budget", "set", "BU-2", "--tokens", "300000"], &[]);
+    assert_eq!(code, 0, "{err}");
+    let mut turns = json!({
+        "planner": [turn(vec![tokens(10, 0), plan()])],
+        "implementer#c1": [turn(vec![tokens(10, 0), write("src/Calculator.psm1", &format!("{DIVIDE}# one\n")), implementation()])],
+        "implementer#c2": [turn(vec![tokens(10, 0), write("src/Calculator.psm1", &format!("{DIVIDE}# two\n")), implementation()])],
+    });
+    turns["reviewer"] = json!([
+        turn(vec![tokens(10, 0), select("c2", &["c2", "c1"])]),
+        turn(vec![tokens(10, 0), approved()])
+    ]);
+    let (code, err) = run_with(&env, "BU-2", turns, &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "BU-2").state, St::Completed, "{err}");
+    assert!(
+        err.contains("note: best-of-N: the budget admits 2 of 3 candidate turns (~200000 tokens each) — c1 … c2 run"),
+        "{err}"
+    );
+    assert_eq!(candidates(&env, "BU-2").len(), 2);
+    assert_eq!(fanout(&env, "BU-2").unwrap().n, 2);
+    assert!(attempts(&env, "BU-2")
+        .iter()
+        .all(|a| a.stage != "implement#c3"));
+}
+
+/// Edge case 34, AC-24, X57: the live interrupt counts the candidates' running turns together —
+/// at the budget every candidate turn is cut and the task pauses; `budget set` + `resume` runs only
+/// the unfinished candidate again.
+#[test]
+fn m17_ec34_a_live_interrupt_in_the_turns_pauses_and_resume_runs_the_unfinished() {
+    let env = setup_bon("[claude-max, claude-max]", "", &[]);
+    create(&env, "BU-3");
+    let (code, err) = toryo(&env, &["budget", "set", "BU-3", "--tokens", "250000"], &[]);
+    assert_eq!(code, 0, "{err}");
+    let (code, err) = run_with(
+        &env,
+        "BU-3",
+        json!({
+            "planner": [turn(vec![tokens(10, 0), plan()])],
+            "implementer#c1": [turn(vec![tokens(100, 0), write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "implementer#c2": [turn(vec![json!({"kind":"delay","ms":500}), tokens(300_000, 10), hang()])],
+        }),
+        &[],
+    );
+    assert_eq!(code, 1, "{err}");
+    let t = task(&env, "BU-3");
+    assert_eq!(t.state, St::Paused, "{err}");
+    assert!(
+        err.contains("budget reached during the candidates' turns"),
+        "{err}"
+    );
+    assert_eq!(
+        outcomes(&env, "BU-3"),
+        vec!["checkpointed".to_string(), "(pending)".to_string()],
+        "{err}"
+    );
+    let a: Vec<_> = attempts(&env, "BU-3")
+        .into_iter()
+        .filter(|a| a.stage == "implement#c2")
+        .collect();
+    assert_eq!(
+        (a[0].status, a[0].error_class.as_deref()),
+        (
+            toryo::engine::store::AttemptStatus::Interrupted,
+            Some("budget")
+        )
+    );
+    let ev = events(&env, "BU-3");
+    assert!(
+        ev.iter().any(|e| e["type"] == "agent_killed"
+            && e["stage"] == "implement#c2"
+            && e["reason"] == "budget"),
+        "{ev:?}"
+    );
+    let (code, err) = toryo(
+        &env,
+        &["budget", "set", "BU-3", "--tokens", "100000000"],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let s = script(
+        &env,
+        "bu3b.json",
+        json!({
+            "implementer#c2": [candidate_turn("# two\n")],
+            "reviewer": [turn(vec![select("c1", &["c1", "c2"])]), turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(&env, &["resume", "BU-3", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "BU-3").state, St::Completed, "{err}");
+    assert_eq!(
+        (turns_of(&env, "BU-3", 1), turns_of(&env, "BU-3", 2)),
+        (1, 2),
+        "only c2 ran again"
+    );
+}
+
+/// Edge case 42, AC-26: `toryo usage` lists the candidates' turns as their own stages
+/// (`implement#c1`, `implement#c2`) and the compare turn (`select`); the task total is the sum.
+#[test]
+fn m17_ec42_usage_lists_each_candidate_and_the_total_is_the_sum() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, "US-1");
+    let (code, err) = run_with(
+        &env,
+        "US-1",
+        json!({
+            "planner": [turn(vec![tokens(10, 1), plan()])],
+            "implementer#c1": [turn(vec![tokens(100, 10), write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "implementer#c2": [turn(vec![tokens(200, 20), write("src/Calculator.psm1", &format!("{DIVIDE}# two\n")), implementation()])],
+            "reviewer": [turn(vec![tokens(5, 0), select("c2", &["c2", "c1"])]), turn(vec![tokens(7, 0), approved()])],
+        }),
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let prices = env.root.join("prices.toml");
+    std::fs::write(&prices, "version = \"t\"\nsafety_factor = 1.0\n").unwrap();
+    let (code, raw, err) = run_out(
+        &env,
+        &[
+            "usage",
+            "US-1",
+            "--json",
+            "--prices",
+            prices.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let j: Value = serde_json::from_str(&raw).unwrap();
+    let rows = j["rows"].as_array().unwrap();
+    let exact = |stage: &str| -> i64 {
+        rows.iter()
+            .filter(|r| r["stage"] == stage)
+            .map(|r| r["exact_tokens"].as_i64().unwrap())
+            .sum()
+    };
+    assert_eq!(exact("implement#c1"), 110, "{j}");
+    assert_eq!(exact("implement#c2"), 220, "{j}");
+    assert_eq!(exact("select"), 5, "{j}");
+    let sum: i64 = rows
+        .iter()
+        .map(|r| r["exact_tokens"].as_i64().unwrap())
+        .sum();
+    assert_eq!(j["totals"]["exact_tokens"].as_i64(), Some(sum));
+    assert_eq!(sum, 10 + 1 + 110 + 220 + 5 + 7);
+    assert_eq!(task(&env, "US-1").spent_tokens, sum);
+    let (code, text, _) = run_out(
+        &env,
+        &["usage", "US-1", "--prices", prices.to_str().unwrap()],
+    );
+    assert_eq!(code, 0);
+    assert!(
+        text.lines().any(|l| l.starts_with("implement#c1")),
+        "{text}"
+    );
+    assert!(
+        text.lines().any(|l| l.starts_with("implement#c2")),
+        "{text}"
+    );
+    // the candidates' tokens in the view
+    let c = candidates(&env, "US-1");
+    assert_eq!(c.len(), 2);
+    let (_, raw, _) = run_out(&env, &["status", "US-1", "--json"]);
+    let v: Value = serde_json::from_str(&raw).unwrap();
+    let list = v["tasks"][0]["candidates"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        list.iter()
+            .map(|c| c["tokens"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![110, 220],
+        "{v}"
+    );
+}
+
+// ── B13: events, views, dashboard (AC-27, edge case 41) ────────────────────────────────────
+
+/// AC-27: the three fan-out events are recorded and printed by `watch`; `status` and the final
+/// gate name the winner, how it was chosen and the losers' branches, in Toryo's words.
+#[test]
+fn m17_ac27_the_fan_out_events_status_and_the_final_gate() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, "OB-1");
+    let s = script(&env, "ob1.json", {
+        let mut t = passing_turns();
+        t["planner"] = json!([turn(vec![plan()])]);
+        t["reviewer"] = json!([
+            turn(vec![select("c2", &["c2", "c1"])]),
+            turn(vec![approved()])
+        ]);
+        t
+    });
+    let (code, err) = toryo(&env, &["run", "OB-1", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    let (_, err) = toryo(
+        &env,
+        &[
+            "approve",
+            "OB-1",
+            "--gate",
+            "plan",
+            "--continue",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(task(&env, "OB-1").state, St::WaitingFinalApproval, "{err}");
+    assert!(err.contains("final gate — best-of-N: c1 codex-openai checkpointed, check gates passed · c2 codex-openai checkpointed, check gates passed"), "{err}");
+    assert!(err.contains("final gate — winner c2 (codex-openai) by compare · the other candidates' branches are kept: toryo-candidate/OB-1/c1"), "{err}");
+    assert!(
+        !err.contains("c2 is the clearest")
+            || err.contains("winner: candidate c2 (codex-openai) by compare — c2 is the clearest"),
+        "the compare reason only in the selection line: {err}"
+    );
+    let ev = events(&env, "OB-1");
+    let started = ev
+        .iter()
+        .find(|e| e["type"] == "candidates_started")
+        .expect("candidates_started");
+    assert_eq!(started["n"], 2);
+    assert_eq!(started["profiles"], json!(["codex-openai", "codex-openai"]));
+    let finished: Vec<&Value> = ev
+        .iter()
+        .filter(|e| e["type"] == "candidate_finished")
+        .collect();
+    assert!(
+        finished
+            .iter()
+            .any(|e| e["k"] == 1 && e["outcome"] == "checkpointed" && e["gates_passed"] == true),
+        "{finished:?}"
+    );
+    let sel = ev
+        .iter()
+        .find(|e| e["type"] == "candidate_selected")
+        .expect("candidate_selected");
+    assert_eq!(
+        (sel["k"].clone(), sel["by"].clone()),
+        (json!(2), json!("compare"))
+    );
+    let (code, text, err) = run_out(&env, &["watch", "OB-1", "--from-start", "--no-follow"]);
+    assert_eq!(code, 0, "{err}");
+    for want in [
+        "best-of-N: 2 candidates — c1 codex-openai, c2 codex-openai",
+        "candidate c1: checkpointed",
+        "check gates passed",
+        "✔ candidate c2 selected (by compare)",
+    ] {
+        assert!(text.contains(want), "`{want}` not in {text}");
+    }
+    let out = status_out(&env, "OB-1");
+    assert!(out.contains("winner c2 (codex-openai) by compare · the other candidates' branches are kept: toryo-candidate/OB-1/c1"), "{out}");
+    assert!(!out.contains("clearest"), "no agent text in status: {out}");
+}
+
+/// Edge case 41, AC-13, AC-27: `status --json`, `task show --json` and `dashboard --json` carry
+/// `candidates` — `null` without a fan-out, an array of `{ id, profile, outcome, head, verify,
+/// tokens, winner, by, branch }` with one.
+#[test]
+fn m17_ec41_json_documents_with_and_without_candidates() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, "JS-1");
+    create(&env, "JS-2");
+    let (code, err) = run_with(&env, "JS-1", passing_turns(), &[]);
+    assert_eq!(code, 0, "{err}");
+    let doc = |args: &[&str]| -> Value {
+        let (code, raw, err) = run_out(&env, args);
+        assert_eq!(code, 0, "{err}");
+        serde_json::from_str(&raw).unwrap()
+    };
+    let find = |v: &Value, id: &str| -> Value {
+        v["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    let status = doc(&["status", "--json"]);
+    let dash = doc(&["dashboard", "--json"]);
+    let show = doc(&["task", "show", "JS-1", "--json"]);
+    // without a fan-out (JS-2 never ran): null, and the key is there
+    assert!(
+        find(&status, "JS-2")
+            .get("candidates")
+            .is_some_and(Value::is_null),
+        "{status}"
+    );
+    assert!(
+        find(&dash, "JS-2")
+            .get("candidates")
+            .is_some_and(Value::is_null),
+        "{dash}"
+    );
+    let c = candidates(&env, "JS-1");
+    for list in [
+        find(&status, "JS-1")["candidates"].clone(),
+        find(&dash, "JS-1")["candidates"].clone(),
+        show["candidates"].clone(),
+    ] {
+        let list = list
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| panic!("an array: {status}"));
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[1]["id"], "c2");
+        assert_eq!(list[1]["profile"], "codex-openai");
+        assert_eq!(list[1]["outcome"], "checkpointed");
+        assert_eq!(list[1]["head"].as_str(), c[1].head.as_deref());
+        assert_eq!(list[1]["verify"], true);
+        assert_eq!(
+            (list[1]["winner"].clone(), list[1]["by"].clone()),
+            (json!(true), json!("compare"))
+        );
+        assert_eq!(
+            (list[0]["winner"].clone(), list[0]["by"].clone()),
+            (json!(false), Value::Null)
+        );
+        assert_eq!(list[0]["branch"], "toryo-candidate/JS-1/c1");
+        assert!(list[0]["tokens"].is_i64());
+    }
+}
+
+/// AC-27: while a process drives the fan-out, the dashboard's `now:` line shows its progress in
+/// Toryo's words (`candidates 0/2 verifying`).
+#[test]
+fn m17_ac27_the_dashboard_now_line_shows_the_fan_out() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    let gate = gate_program(
+        &env.root,
+        "slow-gate",
+        "ping -n 6 127.0.0.1 >nul\ngit grep -q Divide-Numbers -- src\nexit /b %errorlevel%\n",
+        "sleep 5\ngit grep -q Divide-Numbers -- src\n",
+    );
+    commit_repo(
+        &env,
+        &[(
+            ".toryo/toryo-orgchart.yaml",
+            &org_gate(&gate, ", candidates: [codex-openai, codex-openai]"),
+        )],
+        "a slow gate",
+    );
+    create(&env, "DB-1");
+    let s = script(&env, "db1.json", {
+        let mut t = passing_turns();
+        t["planner"] = json!([turn(vec![plan()])]);
+        t
+    });
+    let mut child = spawn(
+        &env,
+        &["run", "DB-1", "--yes", "--fake-agents", &s],
+        "db1.log",
+    );
+    wait_until("a candidate's gates to run", 90, || {
+        events(&env, "DB-1")
+            .iter()
+            .any(|e| e["type"] == "stage_started" && e["stage"] == "verify#c1")
+    });
+    let (code, text, err) = run_out(&env, &["dashboard", "--once"]);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        text.contains("now: candidates 0/2 verifying · verify#c1 attempt 1"),
+        "{text}"
+    );
+}
+
+// ── B14: two tasks with candidates at once (AC-28, edge case 39) ───────────────────────────
+
+/// Edge case 39, AC-28: `toryo run A B --jobs 2` with candidates in both tasks completes, and the
+/// machine verify lock serialises every candidate's check gates (the gate notes a second run
+/// starting while one runs).
+#[test]
+fn m17_ec39_two_tasks_with_candidates_run_with_two_jobs() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    let busy = env
+        .root
+        .join("BUSY")
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    let overlap = env
+        .root
+        .join("OVERLAP")
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    let gate = gate_program(
+        &env.root,
+        "lock-gate",
+        &format!("if exist \"{busy}\" echo x>>\"{overlap}\"\necho 1>\"{busy}\"\nping -n 2 127.0.0.1 >nul\ndel \"{busy}\"\ngit grep -q Divide-Numbers -- src\nexit /b %errorlevel%\n"),
+        &format!("[ -e '{busy}' ] && echo x >> '{overlap}'\ntouch '{busy}'\nsleep 1\nrm -f '{busy}'\ngit grep -q Divide-Numbers -- src\n"),
+    );
+    commit_repo(
+        &env,
+        &[(
+            ".toryo/toryo-orgchart.yaml",
+            &org_gate(&gate, ", candidates: [codex-openai, codex-openai]"),
+        )],
+        "a gate that notes overlaps",
+    );
+    create(&env, "MJ-A");
+    create(&env, "MJ-B");
+    let s = script(&env, "mj.json", {
+        let mut t = passing_turns();
+        t["planner"] = json!([turn(vec![plan()])]);
+        t
+    });
+    let (code, err) = toryo(
+        &env,
+        &[
+            "run",
+            "MJ-A",
+            "MJ-B",
+            "--jobs",
+            "2",
+            "--yes",
+            "--fake-agents",
+            &s,
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    for id in ["MJ-A", "MJ-B"] {
+        assert_eq!(task(&env, id).state, St::Completed, "{id}: {err}");
+        assert_eq!(fanout(&env, id).unwrap().winner, Some(2), "{id}");
+    }
+    assert!(
+        !env.root.join("OVERLAP").exists(),
+        "two gates ran at once: {err}"
+    );
+}
+
+// ── B9: the builder the review judges, and no foreign commit (AC-22, AC-16) ────────────────
+
+/// AC-22: `reviewer-differs-from-builder` judges the winner's profile — a codex winner reviewed by
+/// claude passes `error`, though a claude candidate implemented too; a claude winner is refused.
+#[test]
+fn m17_ac22_reviewer_differs_from_builder_judges_the_winner() {
+    for (n, (winner, refused)) in [("c1", false), ("c2", true)].into_iter().enumerate() {
+        let org = org_rg("", ", candidates: [codex-openai, claude-max]")
+            + "checks:\n  reviewer-differs-from-builder: error\n";
+        let env = setup_rg("", "", &[(".toryo/toryo-orgchart.yaml", &org)]);
+        let id = format!("SV-{n}");
+        create(&env, &id);
+        let (_, err) = run_with(
+            &env,
+            &id,
+            json!({
+                "implementer#c1": [candidate_turn("# one\n")],
+                "implementer#c2": [candidate_turn("# two\n")],
+                "reviewer": [turn(vec![select(winner, &[winner, if winner == "c1" { "c2" } else { "c1" }])]), turn(vec![approved()])],
+            }),
+            &[],
+        );
+        let t = task(&env, &id);
+        if refused {
+            assert_eq!(t.state, St::Escalated, "{err}");
+            assert!(err.contains("same_vendor_review: claude-max built this checkpoint and claude-max would review it"), "{err}");
+        } else {
+            assert_eq!(t.state, St::Completed, "{err}");
+            assert!(!err.contains("same_vendor_review"), "{err}");
+        }
+    }
+}
+
+/// AC-16: recovery never accepts a commit Toryo did not make — after a crash right after a
+/// candidate's turn, a commit in its worktree that carries Toryo's trailers is undone into the tree
+/// and checked like any change; the candidate's checkpoint is Toryo's own commit.
+#[test]
+fn m17_ac16_a_forged_candidate_commit_is_never_accepted() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, "FG-1");
+    let (code, err) = run_with(
+        &env,
+        "FG-1",
+        passing_turns(),
+        &[("TORYO_TEST_CRASH_AT", "fanout:after_turn")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let w1 = cwt(&env, "FG-1", 1);
+    let base = task(&env, "FG-1").base_commit;
+    std::fs::write(
+        w1.join("src").join("Calculator.psm1"),
+        format!("{DIVIDE}# forged\n"),
+    )
+    .unwrap();
+    git(&w1, &["add", "-A"]);
+    git(
+        &w1,
+        &[
+            "-c", "user.name=agent", "-c", "user.email=a@a", "commit", "-q", "-m",
+            "toryo(FG-1): implement#c1 (candidate c1)\n\nToryo-Task: FG-1\nToryo-Stage: implement#c1\nToryo-Attempt: 1\nToryo-Agent: codex-openai\nToryo-Candidate: c1",
+        ],
+    );
+    let forged = git(&w1, &["rev-parse", "HEAD"]).trim().to_string();
+    let s = script(&env, "fg2.json", passing_turns());
+    let (code, out) = toryo(&env, &["resume", "FG-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(task(&env, "FG-1").state, St::Completed, "{out}");
+    let c = candidates(&env, "FG-1");
+    assert_ne!(c[0].head.as_deref(), Some(forged.as_str()), "{out}");
+    let parent = git(
+        &env.repo,
+        &["rev-parse", &format!("{}^", c[0].head.as_deref().unwrap())],
+    );
+    assert_eq!(
+        parent.trim(),
+        base,
+        "c1's checkpoint is one commit on the base"
+    );
+}
