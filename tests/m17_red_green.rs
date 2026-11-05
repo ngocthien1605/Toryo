@@ -1212,7 +1212,14 @@ fn m17_ec11_a_program_missing_when_red_starts_is_gate_unavailable() {
     );
     let (_, err) = toryo(&env, &["run", "RG-11", "--yes", "--fake-agents", &s], &[]);
     let t = task(&env, "RG-11");
-    assert_eq!(t.state, toryo::engine::PipelineState::Escalated, "{err}");
+    // (the first line says whether the runner moved itself away during its green run)
+    assert_eq!(
+        t.state,
+        toryo::engine::PipelineState::Escalated,
+        "MOVE_ONCE left: {}, runner moved: {}\n{err}",
+        env.root.join("MOVE_ONCE").exists(),
+        std::path::Path::new(&format!("{runner}.gone")).exists()
+    );
     assert_eq!(t.machine.reason_class(), Some("gate_unavailable"), "{err}");
     assert_eq!(t.fix_cycle, 0, "no fix cycle");
     // put the program back: a plain resume re-enters Verify and passes

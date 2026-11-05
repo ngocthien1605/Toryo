@@ -2189,22 +2189,15 @@ fn m17_ac27_the_dashboard_now_line_shows_the_fan_out() {
 #[test]
 fn m17_ec39_two_tasks_with_candidates_run_with_two_jobs() {
     let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
-    let busy = env
-        .root
-        .join("BUSY")
-        .display()
-        .to_string()
-        .replace('\\', "/");
-    let overlap = env
-        .root
-        .join("OVERLAP")
-        .display()
-        .to_string()
-        .replace('\\', "/");
+    // the native spelling for cmd (its `del` can read a `/` as a switch), `/` for sh
+    let busy_native = env.root.join("BUSY").display().to_string();
+    let overlap_native = env.root.join("OVERLAP").display().to_string();
+    let busy = busy_native.replace('\\', "/");
+    let overlap = overlap_native.replace('\\', "/");
     let gate = gate_program(
         &env.root,
         "lock-gate",
-        &format!("if exist \"{busy}\" echo x>>\"{overlap}\"\necho 1>\"{busy}\"\nping -n 2 127.0.0.1 >nul\ndel \"{busy}\"\ngit grep -q Divide-Numbers -- src\nexit /b %errorlevel%\n"),
+        &format!("if exist \"{busy_native}\" echo x>>\"{overlap_native}\"\n(echo busy)>\"{busy_native}\"\nping -n 2 127.0.0.1 >nul\ndel \"{busy_native}\"\ngit grep -q Divide-Numbers -- src\nexit /b %errorlevel%\n"),
         &format!("[ -e '{busy}' ] && echo x >> '{overlap}'\ntouch '{busy}'\nsleep 1\nrm -f '{busy}'\ngit grep -q Divide-Numbers -- src\n"),
     );
     commit_repo(

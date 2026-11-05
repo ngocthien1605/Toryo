@@ -146,9 +146,12 @@ pub fn rg_runner(root: &Path, r: Runner) -> String {
         let p = root.join("rg-runner.cmd");
         let mut s = String::from("@echo off\r\nif \"%~1\"==\"suite\" exit /b 0\r\ngit grep -q -F -e \"%~1\" -- src\r\nif errorlevel 1 goto red\r\n");
         if r.move_once {
+            // the runner's own path spelled with `\`: cmd's `move` and `del` can read a `/` as a
+            // switch, and `%~f0` keeps the spelling the runner was started with
             s.push_str(&format!(
-                "if exist \"{m}\" ( del \"{m}\" & move \"%~f0\" \"%~f0.gone\" >nul & exit /b 0 )\r\n",
-                m = marker("MOVE_ONCE")
+                "if exist \"{m}\" ( del \"{m}\" & move \"{me}\" \"{me}.gone\" >nul & exit /b 0 )\r\n",
+                m = marker("MOVE_ONCE"),
+                me = p.display()
             ));
         }
         s.push_str("exit /b 0\r\n:red\r\n");
