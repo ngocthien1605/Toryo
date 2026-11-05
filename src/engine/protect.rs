@@ -469,6 +469,18 @@ pub fn take_baseline_from(
     Ok(m)
 }
 
+/// M17-B4: a manifest of a scan with no baseline copies — the protected state of a candidate's
+/// worktree when Toryo made it, compared after its turn (R35). It is never put back from, so
+/// nothing is copied.
+pub fn manifest_of(now: Scan, reason: &str) -> PManifest {
+    PManifest {
+        version: 1,
+        created_at: crate::evidence::now_rfc3339(),
+        reason: reason.to_string(),
+        entries: now.entries.into_iter().map(|(k, (_, e))| (k, e)).collect(),
+    }
+}
+
 /// The baseline in force (the head of `protected`), hash-checked; `None` for a task created
 /// before M5 (the caller takes v1 then).
 pub fn baseline(store: &Store, t: &TaskRow) -> Result<Option<(String, PManifest)>> {

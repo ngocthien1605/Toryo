@@ -868,6 +868,8 @@ fn the_escalation_class_is_cleared_on_every_way_out() {
 fn every_machine_caused_class_is_one_of_the_engine_constants() {
     use crate::engine::{context, gates, protect, recovery, runner, verify, xpp};
     let constants = [
+        // M17-B4 (X58)
+        runner::CANDIDATE_UNAVAILABLE,
         gates::GATE_UNAVAILABLE,
         runner::ENV_TIMEOUT,
         gates::ENV_CONFIRM,

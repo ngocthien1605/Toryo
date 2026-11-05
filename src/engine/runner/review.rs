@@ -516,6 +516,10 @@ pub fn final_gate_notes(store: &Store, t: &TaskRow) -> Result<Vec<String>> {
             crate::engine::redgreen::summary_words(&rg)
         ));
     }
+    // M17-B13 (AC-27): the winner of the fan-out, how it was chosen, the losers' branches
+    if let Some(fan) = crate::engine::views::fanout_of(store, t) {
+        out.extend(crate::engine::views::fanout_lines(&fan));
+    }
     // M11-E3: the environments this task's checkpoints were deployed to
     let i = t.id.clone();
     let deployed = store.call(move |tx| {

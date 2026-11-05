@@ -120,6 +120,25 @@ fn press_ctrl_c() {
     }
 }
 
+/// M17 test hook: `TORYO_TEST_INTERRUPT_AT=<point>[,<point>…]` — at that point of the engine the
+/// process counts a Ctrl+C as the console handler does (no console event is sent, so it works in
+/// any test process): the first is a stop request at the next check; a second one ends the
+/// process at once, as a second press does (X29: recovery takes over at the next `resume`).
+pub fn interrupt_point(name: &str) {
+    let Ok(v) = std::env::var("TORYO_TEST_INTERRUPT_AT") else {
+        return;
+    };
+    if !v.split(',').any(|p| p.trim() == name) {
+        return;
+    }
+    if INTERRUPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+        crate::errln!("{}", INTERRUPT_NOTE.trim_matches('\n'));
+    } else {
+        crate::errln!("!! TORYO_TEST_INTERRUPT_AT: a second Ctrl+C at `{name}` — the process ends");
+        std::process::exit(130);
+    }
+}
+
 /// Was Ctrl+C pressed (M13-12)?
 pub fn interrupted() -> bool {
     INTERRUPTS.load(Ordering::SeqCst) > 0

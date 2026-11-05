@@ -241,3 +241,32 @@ pub fn candidate_turn(extra: &str) -> Value {
 pub fn cwt(env: &Env, id: &str, k: u32) -> std::path::PathBuf {
     env.root.join("wts").join(format!("{id}.c{k}"))
 }
+
+/// A gate program outside the repository — a `.cmd` on Windows, an executable `sh` script
+/// elsewhere — with the body `cmd` or `sh`. Returns its path with forward slashes.
+pub fn gate_program(root: &Path, name: &str, cmd: &str, sh: &str) -> String {
+    #[cfg(windows)]
+    let p = {
+        let p = root.join(format!("{name}.cmd"));
+        std::fs::write(&p, format!("@echo off\r\n{}", cmd.replace('\n', "\r\n"))).unwrap();
+        p
+    };
+    #[cfg(not(windows))]
+    let p = {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = cmd;
+        let p = root.join(format!("{name}.sh"));
+        std::fs::write(&p, format!("#!/bin/sh\n{sh}")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    };
+    p.display().to_string().replace('\\', "/")
+}
+
+/// The org chart of the M17 fixture whose check gate runs `program` (no args), with `seat_extra`
+/// inside the implementer seat.
+pub fn org_gate(program: &str, seat_extra: &str) -> String {
+    format!(
+        "toryo: 1\nteam: calc-team\ngates:\n  divide-present: {{ kind: check, program: \"{program}\", timeout: 5m }}\nseats:\n  planner: {{ profile: claude-max }}\n  implementer: {{ profile: codex-openai{seat_extra} }}\n  reviewer: {{ profile: claude-max }}\n"
+    )
+}

@@ -318,11 +318,20 @@ impl<'a> Recovery<'a> {
                         self.recover_writing(&t, a, &wt, &mut notes)?;
                     }
                 }
-                // any other leftover running attempt
-                for a in atts
-                    .iter()
-                    .filter(|a| a.status == AttemptStatus::Running && a.stage != stage)
-                {
+                // M17-B8: the read-only compare turn of a fan-out wrote into the task worktree:
+                // put back first (X32), as after a read-only stage
+                if let Some(a) = atts.iter().find(|a| {
+                    a.status == AttemptStatus::Running && a.stage == super::candidates::SELECT_STAGE
+                }) {
+                    self.recover_select(&t, a, &wt, &mut notes)?;
+                }
+                // any other leftover running attempt (a candidate's turn or check gates: the
+                // fan-out runs the unfinished ones again)
+                for a in atts.iter().filter(|a| {
+                    a.status == AttemptStatus::Running
+                        && a.stage != stage
+                        && a.stage != super::candidates::SELECT_STAGE
+                }) {
                     self.finish(
                         a,
                         AttemptStatus::Interrupted,
@@ -430,6 +439,45 @@ impl<'a> Recovery<'a> {
             })?;
         }
         Ok(notes)
+    }
+
+    /// M17-B8 (AC-19, X32): the read-only compare turn of a fan-out (`select`, in the task
+    /// worktree) was running when its owner died. What it wrote since the record of the tree
+    /// before its turn is put back, and then the task escalates, as after a read-only stage that
+    /// wrote; else the attempt is interrupted and the compare turn runs again on `resume`.
+    fn recover_select(
+        &self,
+        t: &TaskRow,
+        a: &AttemptRow,
+        wt: &Worktree,
+        notes: &mut Vec<String>,
+    ) -> Result<()> {
+        let undone = match super::runner::tree_before(self.store, t, a)? {
+            Some(before) => super::runner::undo_read_only_write(wt, t, &a.id, &before)?,
+            None => None,
+        };
+        let (status, end) = read_only_end(&undone, None, "owner process ended");
+        self.finish(a, status, end, None, None)?;
+        notes.push(format!(
+            "{}: interrupted (the compare turn of best-of-N runs again)",
+            a.id
+        ));
+        if let Some(Undone { reason, .. }) = undone {
+            let i = t.id.clone();
+            self.store.call(move |tx| {
+                store::transition(
+                    tx,
+                    &i,
+                    Ev::Escalate {
+                        reason,
+                        class: None,
+                    },
+                )
+                .map(|_| ())
+            })?;
+            notes.push("escalated: the compare turn changed the worktree (put back)".into());
+        }
+        Ok(())
     }
 
     /// §10 step 5, writing stage. The HEAD guard of the Implementer turn (§8; R12, R25) comes

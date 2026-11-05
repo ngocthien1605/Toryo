@@ -2,6 +2,7 @@
 //! task lock (M3), the ProjectContextLoader (M4) and the stage runners.
 
 pub mod artifacts;
+pub mod candidates;
 pub mod checks;
 pub mod cmdline;
 pub mod commands;

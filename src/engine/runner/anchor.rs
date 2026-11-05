@@ -167,11 +167,14 @@ impl GitAfterTurn {
 }
 
 /// M13-01 (X24): the anchor of a task — the newest attempt's checkpoint (`git_head_after`) or
-/// recovery checkpoint (`partial_commit`), else the task's base commit.
+/// recovery checkpoint (`partial_commit`), else the task's base commit. M17: a best-of-N
+/// candidate's attempts are in its own worktree and never the task's anchor; the promotion's
+/// attempt (`implement`, at the winner's checkpoint) is.
 pub(in crate::engine) fn anchor_of(t: &TaskRow, attempts: &[AttemptRow]) -> String {
     attempts
         .iter()
         .rev()
+        .filter(|a| !crate::engine::candidates::is_candidate_stage(&a.stage))
         .find_map(|a| {
             a.git_head_after
                 .clone()

@@ -35,6 +35,11 @@ pub const SCHEMAS: &[(&str, &str)] = &[
         "goal-split.schema.json",
         include_str!("../../schemas/goal-split.schema.json"),
     ),
+    // M17-B8: the answer of the best-of-N compare turn
+    (
+        "select.schema.json",
+        include_str!("../../schemas/select.schema.json"),
+    ),
 ];
 
 pub const ROLES: &[(&str, &str)] = &[
@@ -355,8 +360,8 @@ mod tests {
     /// embedded schema may use only [`KEYWORDS`] (and annotations), with well-formed values.
     #[test]
     fn every_embedded_schema_uses_only_supported_keywords() {
-        // M16-03: goal-split.schema.json is the sixth
-        assert_eq!(SCHEMAS.len(), 6);
+        // M16-03: goal-split.schema.json is the sixth; M17-B8: select.schema.json the seventh
+        assert_eq!(SCHEMAS.len(), 7);
         for (name, text) in SCHEMAS {
             let s: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(schema_problems(&s), Vec::<String>::new(), "{name}");

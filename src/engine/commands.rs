@@ -203,6 +203,100 @@ pub fn cleanup_would_lose(g: &crate::git::GitCmd, t: &TaskRow) -> Result<Vec<Str
     Ok(lost)
 }
 
+/// M17-B10 (AC-23, X44): the candidate worktrees of a task's fan-out that `task cleanup` removes —
+/// only folders the store recorded (each recorded before Toryo made it) and has not removed yet.
+/// Each must be the folder `<ID>.c<k>` in `project.worktrees_root`; a row that names anything else
+/// makes `task cleanup` refuse before anything is deleted.
+pub fn cleanup_candidates_confined(
+    st: &Store,
+    t: &TaskRow,
+    cfg: Option<&crate::config::Effective>,
+) -> Result<Vec<store::CandidateRow>> {
+    let i = t.id.clone();
+    let rows: Vec<store::CandidateRow> = st
+        .read(move |tx| store::candidates(tx, &i))?
+        .into_iter()
+        .filter(|c| !c.removed)
+        .collect();
+    let root = cfg
+        .and_then(|c| crate::config::expand_vars(&c.repo.project.worktrees_root).ok())
+        .map(PathBuf::from)
+        .filter(|r| r.is_absolute());
+    let canon = |q: &std::path::Path| std::fs::canonicalize(q).unwrap_or(q.to_path_buf());
+    for c in &rows {
+        let name = format!("{}.c{}", t.id, c.k);
+        let named = c.worktree.file_name().is_some_and(|n| *n == *name);
+        let under = root
+            .as_ref()
+            .is_none_or(|r| canon(c.worktree.parent().unwrap_or(&c.worktree)) == canon(r));
+        if !(named && under) {
+            bail!(
+                "{}: the worktree of candidate c{} in the store is {}, not a folder `{name}` in project.worktrees_root — `task cleanup` deletes only what Toryo made; nothing was deleted",
+                t.id,
+                c.k,
+                c.worktree.display()
+            );
+        }
+    }
+    Ok(rows)
+}
+
+/// M17-B10 (edge case 36): what removing the candidate worktrees `rows` would lose — their
+/// uncommitted changes (a candidate's commits stay on its branch).
+pub fn candidates_would_lose(
+    g: &crate::git::GitCmd,
+    rows: &[store::CandidateRow],
+) -> Result<Vec<String>> {
+    let mut lost = Vec::new();
+    for c in rows.iter().filter(|c| c.worktree.exists()) {
+        let n = crate::engine::worktree::Worktree::new(g, &c.worktree)
+            .changed()?
+            .len();
+        if n > 0 {
+            lost.push(format!(
+                "{n} uncommitted change(s) in the worktree {} of candidate c{}",
+                c.worktree.display(),
+                c.k
+            ));
+        }
+    }
+    Ok(lost)
+}
+
+/// M17-B10 (AC-23): remove the candidate worktrees `rows` (their branches are kept). Git removes
+/// a worktree it can look into; with `force` a folder Git cannot remove is deleted itself.
+pub fn remove_candidate_worktrees(
+    st: &Store,
+    g: &crate::git::GitCmd,
+    t: &TaskRow,
+    rows: &[store::CandidateRow],
+    force: bool,
+) -> Result<()> {
+    let repo = crate::git::Loc::Discover(t.repo.clone());
+    for c in rows {
+        if std::fs::symlink_metadata(&c.worktree).is_ok() {
+            let w = c.worktree.display().to_string().replace('\\', "/");
+            if let Err(e) = g.run(&repo, false, &["worktree", "remove", "--force", &w]) {
+                if !force {
+                    return Err(e);
+                }
+                crate::errln!("note: {e:#} — removing the folder itself");
+                std::fs::remove_dir_all(&c.worktree)
+                    .map_err(|x| anyhow::anyhow!("removing {}: {x}", c.worktree.display()))?;
+                let _ = g.run(&repo, false, &["worktree", "prune"]);
+            }
+            crate::errln!(
+                "removed the worktree {} of candidate c{}",
+                c.worktree.display(),
+                c.k
+            );
+        }
+        let (i, k) = (t.id.clone(), c.k);
+        st.call(move |tx| store::set_candidate_removed(tx, &i, k))?;
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 pub struct ResumeArgs {
     pub note: Option<String>,
@@ -465,6 +559,7 @@ pub fn facts_with(st: &Store, t: &TaskRow, compile_only: Option<bool>) -> Result
         compile_only,
         next_action,
         red_green: crate::engine::views::red_green_of(st, t),
+        fanout: crate::engine::views::fanout_of(st, t),
     })
 }
 

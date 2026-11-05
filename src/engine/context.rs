@@ -75,14 +75,25 @@ pub fn global_context_path() -> Option<PathBuf> {
     home_dir().map(|h| h.join(".toryo").join("context").join("global.md"))
 }
 
-/// The role of a stage label (`plan`, `implement`, `fix-N`, `review`).
+/// The role of a stage label (`plan`, `implement`, `fix-N`, `review`; M17: a candidate's
+/// `implement#c<k>` and the compare turn `select`).
 pub fn stage_role(stage: &str) -> Result<Role> {
     Ok(match stage {
         "plan" => Role::Planner,
-        "review" => Role::Reviewer,
-        s if s == "implement" || s.starts_with("fix-") => Role::Implementer,
-        other => bail!("unknown stage `{other}` (plan, implement, fix-N, review)"),
+        "review" | super::candidates::SELECT_STAGE => Role::Reviewer,
+        s if s == "implement" || s.starts_with("fix-") || candidate_turn(s) => Role::Implementer,
+        other => bail!(
+            "unknown stage `{other}` (plan, implement, implement#c<k>, fix-N, review, select)"
+        ),
     })
+}
+
+/// `implement#c<k>`: a best-of-N candidate's turn (M17).
+fn candidate_turn(stage: &str) -> bool {
+    stage
+        .strip_prefix("implement#")
+        .and_then(super::candidates::k_of)
+        .is_some()
 }
 
 /// What one attempt's context is assembled from.
@@ -637,10 +648,15 @@ fn pack_views(stage: &str) -> Result<Vec<String>> {
         Role::Planner => vec![f("TASK.md"), f("DECISIONS.md")],
         Role::Implementer => {
             let mut v = vec![f("TASK.md"), f("PLAN.md"), f("DECISIONS.md")];
-            if stage != "implement" {
+            // a fix cycle (a candidate's turn is a first implementation, M17)
+            if stage.starts_with("fix-") {
                 v.extend([f("VERIFY_RESULT.json"), f("REVIEW.md")]);
             }
             v
+        }
+        // M17-B8: the compare turn gets the candidates' diffs and reports as prompt data
+        Role::Reviewer if stage == super::candidates::SELECT_STAGE => {
+            vec![f("TASK.md"), f("PLAN.md"), f("DECISIONS.md")]
         }
         Role::Reviewer => vec![
             f("TASK.md"),
@@ -1338,5 +1354,26 @@ mod tests {
         assert_eq!(stage_role("fix-2").unwrap(), Role::Implementer);
         assert_eq!(stage_role("review").unwrap(), Role::Reviewer);
         assert!(stage_role("verify").is_err());
+    }
+
+    #[test]
+    fn m17_candidate_and_compare_stages_have_their_roles_and_packs() {
+        assert_eq!(stage_role("implement#c2").unwrap(), Role::Implementer);
+        assert_eq!(stage_role("select").unwrap(), Role::Reviewer);
+        for bad in ["implement#c0", "implement#c", "implement#x1", "verify#c1"] {
+            assert!(stage_role(bad).is_err(), "{bad}");
+        }
+        // a candidate implements the approved plan: no verify result or review of its own yet
+        assert_eq!(
+            pack_views("implement#c1").unwrap(),
+            pack_views("implement").unwrap()
+        );
+        assert!(pack_views("fix-1")
+            .unwrap()
+            .contains(&"VERIFY_RESULT.json".to_string()));
+        assert_eq!(
+            pack_views("select").unwrap(),
+            vec!["TASK.md", "PLAN.md", "DECISIONS.md"]
+        );
     }
 }

@@ -288,3 +288,1469 @@ fn m17_b3_the_fake_agent_addresses_a_candidate_turn_by_its_label() {
         assert_eq!(candidate_of(none), None, "{none}");
     }
 }
+
+// ── B4–B9: the whole flow ──────────────────────────────────────────────────────────────────
+
+/// AC-14, AC-15, AC-18, AC-19, AC-22, edge case 21: two candidates of the same profile get their
+/// own scripts and sessions, both checkpoint and pass, the compare turn picks c2, and `toryo/<ID>`
+/// is moved to exactly c2's checkpoint, which the normal flow verifies, reviews and completes.
+#[test]
+fn m17_ec21_two_candidates_of_one_profile_compare_and_promote() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, "BN-1");
+    let s = script(
+        &env,
+        "bn.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer#c1": [candidate_turn("# one\n")],
+            "implementer#c2": [candidate_turn("# two\n")],
+            "reviewer": [turn(vec![select("c2", &["c2", "c1"])]), turn(vec![approved()])],
+        }),
+    );
+    let (code, err) = toryo(&env, &["run", "BN-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "BN-1").state, St::Completed, "{err}");
+    let f = fanout(&env, "BN-1").expect("a fan-out");
+    assert_eq!(
+        (f.phase.as_str(), f.winner, f.by.as_deref()),
+        ("promoted", Some(2), Some("compare")),
+        "{f:?}"
+    );
+    let c = candidates(&env, "BN-1");
+    assert_eq!(c.len(), 2);
+    assert!(
+        c.iter()
+            .all(|c| c.outcome.as_deref() == Some("checkpointed") && c.verify_pass == Some(true)),
+        "{c:?}"
+    );
+    let head = git(&wt(&env, "BN-1"), &["rev-parse", "HEAD"]);
+    assert_eq!(
+        head.trim(),
+        c[1].head.as_deref().unwrap(),
+        "the task branch is exactly c2's checkpoint"
+    );
+    let msg = git(&wt(&env, "BN-1"), &["log", "-1", "--format=%B"]);
+    assert!(msg.contains("Toryo-Candidate: c2"), "{msg}");
+    // both candidates' branches are kept; their folders are gone
+    for k in 1..=2 {
+        assert!(!cwt(&env, "BN-1", k).exists(), "c{k} folder removed");
+        git(
+            &env.repo,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/toryo-candidate/BN-1/c{k}"),
+            ],
+        );
+    }
+    // the same profile, two scripts, two sessions
+    let calls = calls(&env, "BN-1");
+    let keys: Vec<&str> = calls.iter().filter_map(|c| c["key"].as_str()).collect();
+    assert!(
+        keys.contains(&"implementer#c1") && keys.contains(&"implementer#c2"),
+        "{keys:?}"
+    );
+    let a = attempts(&env, "BN-1");
+    let sessions: Vec<Option<String>> = a
+        .iter()
+        .filter(|a| a.stage.starts_with("implement#c"))
+        .map(|a| a.external_session_id.clone())
+        .collect();
+    assert_eq!(sessions.len(), 2, "{a:?}");
+    assert_ne!(sessions[0], sessions[1]);
+}
+
+/// The candidates' outcomes of task `id`, by `k`.
+fn outcomes(env: &Env, id: &str) -> Vec<String> {
+    candidates(env, id)
+        .into_iter()
+        .map(|c| c.outcome.unwrap_or_else(|| format!("({})", c.state)))
+        .collect()
+}
+
+/// The attempts of task `id` in `stage` with their profiles.
+fn stage_profiles(env: &Env, id: &str, stage: &str) -> Vec<String> {
+    attempts(env, id)
+        .into_iter()
+        .filter(|a| a.stage == stage)
+        .map(|a| a.profile.unwrap_or_default())
+        .collect()
+}
+
+/// A run of the fixture task `id` with `turns` (planner and the approving review added unless
+/// given) → (exit code, stderr).
+fn run_with(env: &Env, id: &str, turns: Value, extra: &[(&str, &str)]) -> (i32, String) {
+    let mut t = turns;
+    if t.get("planner").is_none() {
+        t["planner"] = json!([turn(vec![plan()])]);
+    }
+    let s = script(env, &format!("{id}.json"), t);
+    toryo(env, &["run", id, "--yes", "--fake-agents", &s], extra)
+}
+
+/// Edge case 22 (three tests), AC-16: one candidate's turn fails — quota, a crash, invalid output
+/// — and the other passes: the passing one wins `by: only`; the failed candidate never switches to
+/// the fallback chain.
+fn one_candidate_fails(id: &str, failure: Value, want: &str) {
+    let env = setup_bon(
+        "[codex-openai, codex-openai], fallback: [claude-max]",
+        "",
+        &[],
+    );
+    create(&env, id);
+    let (code, err) = run_with(
+        &env,
+        id,
+        json!({
+            "implementer#c1": [turn(vec![write("src/Calculator.psm1", "# half\n"), failure])],
+            "implementer#c2": [candidate_turn("")],
+            "reviewer": [turn(vec![approved()])],
+        }),
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, id).state, St::Completed, "{err}");
+    assert_eq!(
+        outcomes(&env, id),
+        vec!["failed_turn", "checkpointed"],
+        "{err}"
+    );
+    let c = candidates(&env, id);
+    assert!(
+        c[0].detail.as_deref().unwrap_or_default().contains(want),
+        "{:?}",
+        c[0]
+    );
+    let f = fanout(&env, id).unwrap();
+    assert_eq!((f.winner, f.by.as_deref()), (Some(2), Some("only")));
+    // no fallback for a candidate: claude-max never implemented
+    assert_eq!(
+        stage_profiles(&env, id, "implement#c1"),
+        vec!["codex-openai"]
+    );
+    assert!(
+        attempts(&env, id)
+            .iter()
+            .all(|a| !(a.stage.starts_with("implement")
+                && a.profile.as_deref() == Some("claude-max")))
+    );
+    assert!(!err.contains("switching to"), "{err}");
+}
+
+#[test]
+fn m17_ec22_a_candidate_out_of_quota_loses_without_a_fallback() {
+    one_candidate_fails(
+        "Q-1",
+        fail("QuotaExceeded", "weekly limit"),
+        "QuotaExceeded",
+    );
+}
+
+#[test]
+fn m17_ec22_a_crashed_candidate_loses_without_a_fallback() {
+    one_candidate_fails("Q-2", json!({"kind":"crash"}), "ProcessCrashed");
+}
+
+#[test]
+fn m17_ec22_a_candidate_with_invalid_output_loses_without_a_fallback() {
+    one_candidate_fails(
+        "Q-3",
+        fail("InvalidOutput", "not the schema"),
+        "InvalidOutput",
+    );
+}
+
+/// Edge case 23, AC-21: no candidate changes anything — the single-implementer path runs once,
+/// with a note, and there is no second fan-out.
+#[test]
+fn m17_ec23_no_candidate_changes_anything_the_single_path_runs_once() {
+    let env = setup_bon("[codex-openai, claude-max]", "", &[]);
+    create(&env, "NO-1");
+    let (code, err) = run_with(
+        &env,
+        "NO-1",
+        json!({
+            "implementer#c1": [turn(vec![implementation()])],
+            "implementer#c2": [turn(vec![implementation()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "NO-1").state, St::Completed, "{err}");
+    assert_eq!(outcomes(&env, "NO-1"), vec!["no_change", "no_change"]);
+    assert_eq!(fanout(&env, "NO-1").unwrap().phase, "single");
+    assert!(
+        err.contains("note: best-of-N: no candidate made a checkpoint (c1 no_change, c2 no_change) — the single implementer path runs (the primary and its fallback chain), once"),
+        "{err}"
+    );
+    assert_eq!(
+        stage_profiles(&env, "NO-1", "implement"),
+        vec!["codex-openai"]
+    );
+    assert_eq!(
+        err.matches("best-of-N: 2 candidates").count(),
+        1,
+        "one fan-out: {err}"
+    );
+    for k in 1..=2 {
+        assert!(!cwt(&env, "NO-1", k).exists());
+    }
+}
+
+/// Edge case 24, AC-21, AC-20 (rung 3): every candidate fails the check gates — the best by the
+/// score (fewer changed lines) wins and the task enters Fixing with its verify feedback as one gate
+/// retry; `status` shows the rung; the fix cycle passes.
+#[test]
+fn m17_ec24_all_candidates_fail_the_gates_the_best_by_score_enters_fixing() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, "AF-1");
+    let s = script(
+        &env,
+        "af.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer#c1": [turn(vec![write("src/Calculator.psm1", "# a\n# b\n# c\n"), implementation()])],
+            "implementer#c2": [turn(vec![write("src/Calculator.psm1", "# a\n"), implementation()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+    );
+    // stop at the first owner decision after the fan-out: no --yes for the final gate
+    let (code, err) = toryo(&env, &["run", "AF-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "AF-1");
+    assert_eq!(t.state, St::Completed, "{err}");
+    let f = fanout(&env, "AF-1").unwrap();
+    assert_eq!(
+        (f.winner, f.by.as_deref()),
+        (Some(2), Some("score")),
+        "{f:?}"
+    );
+    assert_eq!(
+        f.reason.as_deref(),
+        Some("score: c2 before c1 — fewer changed lines (1 vs 3)")
+    );
+    assert!(
+        err.contains("[state] Verifying --verify_failed--> Fixing")
+            || err.contains("--verify_failed--> Fixing"),
+        "{err}"
+    );
+    // one gate retry: the fix cycle ran on the winner's profile, from c2's checkpoint
+    assert_eq!(t.fix_cycle, 1);
+    assert_eq!(stage_profiles(&env, "AF-1", "fix-1"), vec!["codex-openai"]);
+    let out = status_out(&env, "AF-1");
+    assert!(
+        out.contains("winner c2 (codex-openai) by score — score: c2 before c1 — fewer changed lines (1 vs 3)"),
+        "{out}"
+    );
+}
+
+/// Edge case 25, AC-20 (rung 5): two candidates equal on every rung — the lower index wins.
+#[test]
+fn m17_ec25_an_exact_tie_goes_to_the_lower_index() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, "TIE-1");
+    let (code, err) = run_with(
+        &env,
+        "TIE-1",
+        json!({
+            "implementer#c1": [turn(vec![write("src/Calculator.psm1", "# same\n"), implementation()])],
+            "implementer#c2": [turn(vec![write("src/Calculator.psm1", "# same\n"), implementation()])],
+            "implementer": [turn(vec![write("src/Calculator.psm1", DIVIDE), implementation()])],
+            "reviewer": [turn(vec![approved()])],
+        }),
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let f = fanout(&env, "TIE-1").unwrap();
+    assert_eq!(
+        (f.winner, f.by.as_deref()),
+        (Some(1), Some("score")),
+        "{err}"
+    );
+    assert_eq!(
+        f.reason.as_deref(),
+        Some("score: c1 before c2 — lower candidate index (c1 vs c2)")
+    );
+}
+
+// ── B8: the compare turn (AC-19) ───────────────────────────────────────────────────────────
+
+/// Two (or three) passing candidates whose compare turn answers with `answers` (each one turn of
+/// the reviewer, then the approving review): the fan-out row after the run.
+fn compare_with(id: &str, n: usize, answers: Vec<Value>) -> (Env, String, store_row::Fan) {
+    let profiles = vec!["codex-openai"; n].join(", ");
+    let env = setup_bon(&format!("[{profiles}]"), "", &[]);
+    create(&env, id);
+    let mut turns = json!({
+        "implementer#c1": [candidate_turn("# one\n")],
+        "implementer#c2": [candidate_turn("# two two\n# two\n")],
+    });
+    if n == 3 {
+        // c3 fails the gate
+        turns["implementer#c3"] = json!([turn(vec![
+            write("src/Calculator.psm1", "# three\n"),
+            implementation()
+        ])]);
+    }
+    let mut reviewer: Vec<Value> = answers.into_iter().map(|a| turn(vec![a])).collect();
+    reviewer.push(turn(vec![approved()]));
+    turns["reviewer"] = json!(reviewer);
+    let (code, err) = run_with(&env, id, turns, &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, id).state, St::Completed, "{err}");
+    let f = fanout(&env, id).unwrap();
+    (env, err, f)
+}
+
+mod store_row {
+    pub type Fan = toryo::engine::store::FanoutRow;
+}
+
+/// The prompts of the compare turn(s) of `id`.
+fn select_prompts(env: &Env, id: &str) -> Vec<String> {
+    calls(env, id)
+        .into_iter()
+        .filter(|c| {
+            c["label"]
+                .as_str()
+                .is_some_and(|l| l.starts_with("select-"))
+        })
+        .map(|c| c["prompt"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// AC-19: the compare turn gets every passing candidate's DIFF.patch, IMPLEMENTATION.json and
+/// verify summary as untrusted data — and not the failing one's.
+#[test]
+fn m17_ac19_the_compare_turn_gets_the_passing_candidates_as_data() {
+    let (env, _, f) = compare_with("CMP-1", 3, vec![select("c1", &["c1", "c2"])]);
+    assert_eq!((f.winner, f.by.as_deref()), (Some(1), Some("compare")));
+    let p = select_prompts(&env, "CMP-1");
+    assert_eq!(p.len(), 1);
+    for want in [
+        "Compare the implementations of the candidates c1, c2",
+        "c1 DIFF.patch",
+        "c2 IMPLEMENTATION.json",
+        "c2 verify summary",
+        "every check gate passed",
+        "+# two two",
+        "untrusted",
+    ] {
+        assert!(p[0].contains(want), "`{want}` not in {}", p[0]);
+    }
+    assert!(
+        !p[0].contains("c3 DIFF.patch") && !p[0].contains("# three"),
+        "{}",
+        p[0]
+    );
+    let c = candidates(&env, "CMP-1");
+    assert_eq!(c[2].verify_pass, Some(false));
+}
+
+/// Edge case 26: an answer naming an unknown id gets one correction turn; a correction naming the
+/// failing candidate is not valid either, and the score decides (`by: score`).
+#[test]
+fn m17_ec26_an_unknown_id_then_a_failing_candidate_fall_to_the_score() {
+    let (env, err, f) = compare_with(
+        "CMP-2",
+        3,
+        vec![select("c9", &["c9", "c1"]), select("c3", &["c3", "c1"])],
+    );
+    assert_eq!(f.by.as_deref(), Some("score"), "{err}");
+    // c1 changed fewer lines than c2
+    assert_eq!(f.winner, Some(1));
+    assert_eq!(
+        f.reason.as_deref(),
+        Some("the compare turn's answer was not valid after one correction; score: c1 before c2 — fewer changed lines (3 vs 4)")
+    );
+    let p = select_prompts(&env, "CMP-2");
+    assert_eq!(p.len(), 2, "one correction turn");
+    assert!(
+        p[1].contains("`winner` `c9` is not one of the candidates to choose from (c1, c2)"),
+        "{}",
+        p[1]
+    );
+    let a: Vec<_> = attempts(&env, "CMP-2")
+        .into_iter()
+        .filter(|a| a.stage == "select")
+        .collect();
+    assert_eq!(a.len(), 1);
+    assert_eq!(a[0].correction_turns, 1);
+    assert!(
+        a[0].error_detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("`c3` is not one of the candidates"),
+        "{:?}",
+        a[0]
+    );
+}
+
+/// Edge case 26: malformed answers (a missing `ranking`, then no structured answer at all) fall to
+/// the score after one correction; a valid correction is used (`by: compare`).
+#[test]
+fn m17_ec26_malformed_answers_fall_to_the_score_a_valid_correction_is_used() {
+    let malformed = json!({"kind":"complete","structured":{"winner":"c2","reason":"r"}});
+    let (_, err, f) = compare_with(
+        "CMP-3",
+        2,
+        vec![malformed.clone(), json!({"kind":"complete","text":"c2"})],
+    );
+    assert_eq!(
+        (f.winner, f.by.as_deref()),
+        (Some(1), Some("score")),
+        "{err}"
+    );
+    let (_, err, f) = compare_with("CMP-4", 2, vec![malformed, select("c2", &["c2", "c1"])]);
+    assert_eq!(
+        (f.winner, f.by.as_deref()),
+        (Some(2), Some("compare")),
+        "{err}"
+    );
+}
+
+/// Edge case 26: a compare turn that fails outright falls to the score.
+#[test]
+fn m17_ec26_a_failed_compare_turn_falls_to_the_score() {
+    let (_, err, f) = compare_with("CMP-5", 2, vec![fail("Overloaded", "busy")]);
+    assert_eq!(
+        (f.winner, f.by.as_deref()),
+        (Some(1), Some("score")),
+        "{err}"
+    );
+    assert!(
+        f.reason
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("the compare turn failed (Overloaded); score: c1 before c2"),
+        "{f:?}"
+    );
+}
+
+/// Edge case 26, AC-19: what the read-only compare turn writes is put back, and its answer is not
+/// used (`by: score`).
+#[test]
+fn m17_ec26_a_compare_turn_that_writes_is_put_back() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, "CMP-6");
+    let (code, err) = run_with(
+        &env,
+        "CMP-6",
+        json!({
+            "implementer#c1": [candidate_turn("# one\n")],
+            "implementer#c2": [candidate_turn("# two two\n# two\n")],
+            "reviewer": [
+                turn(vec![write("NOTES.md", "the reviewer wrote\n"), select("c2", &["c2", "c1"])]),
+                turn(vec![approved()]),
+            ],
+        }),
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "CMP-6").state, St::Completed, "{err}");
+    let f = fanout(&env, "CMP-6").unwrap();
+    assert_eq!(
+        (f.winner, f.by.as_deref()),
+        (Some(1), Some("score")),
+        "{err}"
+    );
+    assert!(
+        f.reason.as_deref().unwrap_or_default().starts_with(
+            "the compare turn wrote into the worktree (put back, its answer not used)"
+        ),
+        "{f:?}"
+    );
+    assert!(!wt(&env, "CMP-6").join("NOTES.md").exists(), "put back");
+    assert!(git(&wt(&env, "CMP-6"), &["log", "--format=%B"]).contains("Toryo-Candidate: c1"));
+}
+
+/// Edge case 27, AC-22: the compare turn picks c2 and the later full review asks for changes —
+/// the fix cycle runs on c2's profile, in a fresh session (X55).
+#[test]
+fn m17_ec27_the_fix_cycle_after_the_compare_runs_on_the_winners_profile() {
+    let env = setup_bon("[codex-openai, claude-max]", "", &[]);
+    create(&env, "FX-1");
+    let (code, err) = run_with(
+        &env,
+        "FX-1",
+        json!({
+            "implementer#c1": [candidate_turn("# one\n")],
+            "implementer#c2": [candidate_turn("# two\n")],
+            "implementer@claude-max": [turn(vec![write("src/Calculator.psm1", "# fixed\n"), implementation()])],
+            "reviewer": [turn(vec![select("c2", &["c2", "c1"])]), turn(vec![changes()]), turn(vec![approved()])],
+        }),
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "FX-1");
+    assert_eq!(t.state, St::Completed, "{err}");
+    assert_eq!(
+        t.implementers.first().map(String::as_str),
+        Some("claude-max")
+    );
+    assert_eq!(stage_profiles(&env, "FX-1", "fix-1"), vec!["claude-max"]);
+    let fix: Vec<Value> = calls(&env, "FX-1")
+        .into_iter()
+        .filter(|c| c["label"].as_str().is_some_and(|l| l.starts_with("fix-1")))
+        .collect();
+    assert_eq!(fix.len(), 1);
+    assert!(
+        fix[0]["resume"].is_null(),
+        "a fresh session (X55): {}",
+        fix[0]
+    );
+}
+
+// ── B6: the post-turn path and the escalation policy (AC-16, AC-17) ────────────────────────
+
+/// Edge case 28, AC-17: a candidate writes a protected file — the task escalates
+/// `protected_config_changed` and the other candidate's running turn is stopped (`agent_killed`).
+#[test]
+fn m17_ec28_a_protected_write_escalates_and_stops_the_other_turn() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, "PR-1");
+    let (code, err) = run_with(
+        &env,
+        "PR-1",
+        json!({
+            "implementer#c1": [turn(vec![
+                write("src/Calculator.psm1", DIVIDE),
+                write(".claude/settings.local.json", "{}\n"),
+                implementation(),
+            ])],
+            "implementer#c2": [turn(vec![hang()])],
+        }),
+        &[],
+    );
+    let t = task(&env, "PR-1");
+    assert_eq!(t.state, St::Escalated, "{code} {err}");
+    let why = t.machine.reason().unwrap_or_default().to_string();
+    assert!(why.starts_with("protected_config_changed"), "{why}");
+    assert!(
+        why.contains(".claude/settings.local.json") && why.contains("candidate c1"),
+        "{why}"
+    );
+    let ev = events(&env, "PR-1");
+    assert!(
+        ev.iter()
+            .any(|e| e["type"] == "agent_killed" && e["stage"] == "implement#c2"),
+        "{ev:?}"
+    );
+    let a: Vec<_> = attempts(&env, "PR-1")
+        .into_iter()
+        .filter(|a| a.stage == "implement#c2")
+        .collect();
+    assert_eq!(
+        a[0].status,
+        toryo::engine::store::AttemptStatus::Interrupted
+    );
+}
+
+/// Edge case 29, AC-17: a candidate writes outside the implementer's write fence — only that
+/// candidate is disqualified; the other wins.
+#[test]
+fn m17_ec29_a_fence_violation_disqualifies_only_that_candidate() {
+    let role =
+        "toryo: 1\npurpose: Change the code.\nwrites: [src/**]\nbefore_handoff: [divide-present]\n";
+    let env = setup_bon(
+        "[codex-openai, codex-openai]",
+        "",
+        &[(".toryo/roles/implementer/toryo-role.yaml", role)],
+    );
+    create(&env, "FN-1");
+    let (code, err) = run_with(
+        &env,
+        "FN-1",
+        json!({
+            "implementer#c1": [turn(vec![write("src/Calculator.psm1", DIVIDE), write("docs/x.md", "x\n"), implementation()])],
+            "implementer#c2": [candidate_turn("")],
+            "reviewer": [turn(vec![approved()])],
+        }),
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "FN-1").state, St::Completed, "{err}");
+    assert_eq!(
+        outcomes(&env, "FN-1"),
+        vec!["disqualified:policy_violation", "checkpointed"]
+    );
+    let f = fanout(&env, "FN-1").unwrap();
+    assert_eq!((f.winner, f.by.as_deref()), (Some(2), Some("only")));
+    let c = candidates(&env, "FN-1");
+    assert!(
+        c[0].detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("docs/x.md"),
+        "{:?}",
+        c[0]
+    );
+    let out = status_out(&env, "FN-1");
+    assert!(
+        out.contains("c1 codex-openai disqualified(policy_violation)"),
+        "{out}"
+    );
+}
+
+// ── B5: the turns run at the same time (AC-15) ─────────────────────────────────────────────
+
+/// AC-15: the candidates' turns overlap — each waits for a file the other writes (one after the
+/// other, the first would wait in vain and fail).
+#[test]
+fn m17_ac15_candidate_turns_run_at_the_same_time() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, "OV-1");
+    let flag = |n: &str| env.root.join(n).display().to_string();
+    let (code, err) = run_with(
+        &env,
+        "OV-1",
+        json!({
+            "implementer#c1": [turn(vec![
+                write(&flag("c1-up"), "1"),
+                json!({"kind":"wait_for","path": flag("c2-up"), "ms": 20000}),
+                write("src/Calculator.psm1", DIVIDE),
+                implementation(),
+            ])],
+            "implementer#c2": [turn(vec![
+                write(&flag("c2-up"), "1"),
+                json!({"kind":"wait_for","path": flag("c1-up"), "ms": 20000}),
+                write("src/Calculator.psm1", &format!("{DIVIDE}# two\n")),
+                implementation(),
+            ])],
+            "reviewer": [turn(vec![select("c1", &["c1", "c2"])]), turn(vec![approved()])],
+        }),
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        outcomes(&env, "OV-1"),
+        vec!["checkpointed", "checkpointed"],
+        "{err}"
+    );
+    assert_eq!(task(&env, "OV-1").state, St::Completed);
+    // each turn ran in its own worktree, with its own TEMP
+    let ctx: Vec<Value> = calls(&env, "OV-1")
+        .into_iter()
+        .filter(|c| {
+            c["label"]
+                .as_str()
+                .is_some_and(|l| l.starts_with("implement#c"))
+        })
+        .collect();
+    assert_eq!(ctx.len(), 2);
+}
+
+// ── B7: the candidates' check gates (AC-18) ────────────────────────────────────────────────
+
+/// AC-18: each checkpointed candidate runs the check gates in `<verify_root>/<task>/c<k>` with a
+/// verify result of its own; an environment gate never runs for a candidate (it runs once, in the
+/// task's Verifying of the winner).
+#[test]
+fn m17_ac18_candidates_run_the_check_gates_only_each_in_its_own_checkout() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    // an environment gate after the check gate, defined by the machine: it logs each run
+    let dir = env.root.join("gates");
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir
+        .join("sync.log")
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    let (program, args) = if cfg!(windows) {
+        let f = dir.join("dbsync.ps1");
+        std::fs::write(
+            &f,
+            format!("Add-Content -Path '{log}' -Value $env:TORYO_SHA\nexit 0\n"),
+        )
+        .unwrap();
+        (
+            "pwsh".to_string(),
+            format!(
+                "[-NoProfile, -NonInteractive, -File, '{}']",
+                f.display().to_string().replace('\\', "/")
+            ),
+        )
+    } else {
+        let f = dir.join("dbsync.sh");
+        std::fs::write(&f, format!("echo \"$TORYO_SHA\" >> '{log}'\nexit 0\n")).unwrap();
+        (
+            "sh".to_string(),
+            format!("['{}']", f.display().to_string().replace('\\', "/")),
+        )
+    };
+    let m = std::fs::read_to_string(&env.machine).unwrap();
+    std::fs::write(
+        &env.machine,
+        format!("{m}environment_gates:\n  dbsync:\n    program: {program}\n    args: {args}\n    lock: d365-env\n"),
+    )
+    .unwrap();
+    let org = org_rg("", ", candidates: [codex-openai, codex-openai]").replacen(
+        "gates:\n",
+        "gates:\n  dbsync: { kind: environment, timeout: 2m, if_missing: error }\n",
+        1,
+    );
+    commit_repo(
+        &env,
+        &[
+            (".toryo/toryo-orgchart.yaml", &org),
+            (
+                ".toryo/roles/implementer/toryo-role.yaml",
+                "toryo: 1\npurpose: Change the code.\nbefore_handoff: [divide-present, dbsync]\n",
+            ),
+        ],
+        "an environment gate",
+    );
+    create(&env, "VF-1");
+    let (code, err) = run_with(
+        &env,
+        "VF-1",
+        json!({
+            "implementer#c1": [candidate_turn("# one\n")],
+            "implementer#c2": [candidate_turn("# two\n")],
+            "reviewer": [turn(vec![select("c2", &["c2", "c1"])]), turn(vec![approved()])],
+        }),
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    let t = task(&env, "VF-1");
+    assert_eq!(t.state, St::Completed, "{err}");
+    let c = candidates(&env, "VF-1");
+    for k in 1..=2u32 {
+        let vr: Value = serde_json::from_slice(
+            &std::fs::read(
+                t.artifacts()
+                    .join(format!("candidates/c{k}/VERIFY_RESULT.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(vr["candidate"], format!("c{k}"));
+        assert_eq!(vr["head"].as_str(), c[k as usize - 1].head.as_deref());
+        assert_eq!(vr["pass"], true);
+        let names: Vec<&str> = vr["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["divide-present"], "check gates only: {vr}");
+        assert!(
+            err.contains(&format!(
+                "verify{}VF-1{}c{k}{}VF-1.c{k}.verify",
+                std::path::MAIN_SEPARATOR,
+                std::path::MAIN_SEPARATOR,
+                std::path::MAIN_SEPARATOR
+            )) || err.contains(&format!("verify/VF-1/c{k}/VF-1.c{k}.verify")),
+            "c{k}'s own checkout: {err}"
+        );
+    }
+    // the environment gate ran once: on the promoted winner
+    let runs: Vec<String> = std::fs::read_to_string(env.root.join("gates").join("sync.log"))
+        .unwrap()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .collect();
+    assert_eq!(runs, vec![c[1].head.clone().unwrap()], "{err}");
+    // the candidates' verify checkouts stay (as the task's own) until `task cleanup`
+    assert!(env
+        .root
+        .join("verify")
+        .join("VF-1")
+        .join("c1")
+        .join("VF-1.c1.verify")
+        .exists());
+    let (code, err) = toryo(&env, &["task", "cleanup", "VF-1"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!env.root.join("verify").join("VF-1").exists(), "{err}");
+    let list = git(&env.repo, &["worktree", "list", "--porcelain"]);
+    assert!(!list.contains("VF-1"), "{list}");
+}
+
+/// Edge case 30, AC-17: a candidate's check-gate code mutates its verify checkout — that
+/// candidate is disqualified (`verify_mutated_tree`); the other wins.
+#[test]
+fn m17_ec30_a_gate_that_mutates_a_candidates_checkout_disqualifies_it() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    let gate = gate_program(
+        &env.root,
+        "mutating-gate",
+        "git grep -q -F -e \"# one\" -- src\nif errorlevel 1 goto check\necho mutated>>README.md\n:check\ngit grep -q Divide-Numbers -- src\nexit /b %errorlevel%\n",
+        "if git grep -q -F -e '# one' -- src; then echo mutated >> README.md; fi\ngit grep -q Divide-Numbers -- src\n",
+    );
+    commit_repo(
+        &env,
+        &[(
+            ".toryo/toryo-orgchart.yaml",
+            &org_gate(&gate, ", candidates: [codex-openai, codex-openai]"),
+        )],
+        "a gate that mutates",
+    );
+    create(&env, "MU-1");
+    let (code, err) = run_with(
+        &env,
+        "MU-1",
+        json!({
+            "implementer#c1": [candidate_turn("# one\n")],
+            "implementer#c2": [candidate_turn("# two\n")],
+            "reviewer": [turn(vec![approved()])],
+        }),
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "MU-1").state, St::Completed, "{err}");
+    assert_eq!(
+        outcomes(&env, "MU-1"),
+        vec!["disqualified:verify_mutated_tree", "checkpointed"],
+        "{err}"
+    );
+    let f = fanout(&env, "MU-1").unwrap();
+    assert_eq!((f.winner, f.by.as_deref()), (Some(2), Some("only")));
+}
+
+/// Edge case 33, AC-17: a machine-caused stop in a candidate's check gates (the gate program is
+/// missing: `gate_unavailable`) escalates the task; a plain `resume` continues the fan-out without
+/// running a finished candidate turn again.
+#[test]
+fn m17_ec33_a_machine_stop_in_a_candidate_verify_resumes_without_new_turns() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    let gate = gate_program(
+        &env.root,
+        "present-gate",
+        "git grep -q Divide-Numbers -- src\nexit /b %errorlevel%\n",
+        "git grep -q Divide-Numbers -- src\n",
+    );
+    commit_repo(
+        &env,
+        &[(
+            ".toryo/toryo-orgchart.yaml",
+            &org_gate(&gate, ", candidates: [codex-openai, codex-openai]"),
+        )],
+        "a gate program outside the repository",
+    );
+    create(&env, "MS-1");
+    let saved = std::fs::read(&gate).unwrap();
+    std::fs::remove_file(&gate).unwrap();
+    let (_, err) = run_with(
+        &env,
+        "MS-1",
+        json!({
+            "implementer#c1": [candidate_turn("# one\n")],
+            "implementer#c2": [candidate_turn("# two\n")],
+        }),
+        &[],
+    );
+    let t = task(&env, "MS-1");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(t.machine.reason_class(), Some("gate_unavailable"), "{err}");
+    assert_eq!(fanout(&env, "MS-1").unwrap().phase, "verify");
+    std::fs::write(&gate, saved).unwrap();
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let s = script(
+        &env,
+        "ms2.json",
+        json!({"reviewer": [turn(vec![select("c2", &["c2", "c1"])]), turn(vec![approved()])]}),
+    );
+    let (code, err) = toryo(&env, &["resume", "MS-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "MS-1").state, St::Completed, "{err}");
+    for k in 1..=2 {
+        assert_eq!(
+            stage_profiles(&env, "MS-1", &format!("implement#c{k}")).len(),
+            1,
+            "c{k}: one turn"
+        );
+    }
+    assert_eq!(fanout(&env, "MS-1").unwrap().winner, Some(2));
+}
+
+// ── B4: the candidates' worktrees and branches (AC-14) ─────────────────────────────────────
+
+/// The candidates' folders and branches of task `id` that exist.
+fn leftovers(env: &Env, id: &str) -> (Vec<u32>, Vec<String>) {
+    let folders = (1..=4).filter(|k| cwt(env, id, *k).exists()).collect();
+    let branches = refs(&env.repo)
+        .into_iter()
+        .filter(|r| r.starts_with(&format!("refs/heads/toryo-candidate/{id}/")))
+        .collect();
+    (folders, branches)
+}
+
+/// The turns of a passing two-candidate run (c2 chosen by the compare turn).
+fn passing_turns() -> Value {
+    json!({
+        "implementer#c1": [candidate_turn("# one\n")],
+        "implementer#c2": [candidate_turn("# two\n")],
+        "reviewer": [turn(vec![select("c2", &["c2", "c1"])]), turn(vec![approved()])],
+    })
+}
+
+/// AC-14: a failure while the worktrees are made takes back every one made and the record; the
+/// next `resume` makes them again and the task completes.
+#[test]
+fn m17_ac14_a_failure_while_the_worktrees_are_made_takes_them_back() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, "WT-1");
+    let (code, err) = run_with(
+        &env,
+        "WT-1",
+        passing_turns(),
+        &[("TORYO_TEST_FAIL_AT", "fanout:after_worktree")],
+    );
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains("removed: the worktree")
+            && err.contains("removed: the branch toryo-candidate/WT-1/c1"),
+        "{err}"
+    );
+    assert_eq!(leftovers(&env, "WT-1"), (vec![], vec![]), "{err}");
+    assert!(fanout(&env, "WT-1").is_none());
+    assert!(candidates(&env, "WT-1").is_empty());
+    let s = script(&env, "wt1.json", passing_turns());
+    let (code, err) = toryo(&env, &["resume", "WT-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "WT-1").state, St::Completed, "{err}");
+}
+
+/// Edge case 37, AC-14: a candidate folder or branch the store did not record is refused by name
+/// (`candidate_unavailable`, a machine stop) and nothing is deleted; once removed by hand, a plain
+/// `resume` continues.
+#[test]
+fn m17_ec37_a_leftover_folder_or_branch_is_refused_by_name_and_kept() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, "LO-1");
+    git(&env.repo, &["branch", "toryo-candidate/LO-1/c1", "main"]);
+    std::fs::create_dir_all(cwt(&env, "LO-1", 2)).unwrap();
+    std::fs::write(cwt(&env, "LO-1", 2).join("mine.txt"), "the owner's\n").unwrap();
+    let (_, err) = run_with(&env, "LO-1", passing_turns(), &[]);
+    let t = task(&env, "LO-1");
+    assert_eq!(t.state, St::Escalated, "{err}");
+    assert_eq!(t.machine.reason_class(), Some("candidate_unavailable"));
+    let why = t.machine.reason().unwrap_or_default().to_string();
+    assert!(why.contains("the branch toryo-candidate/LO-1/c1"), "{why}");
+    assert!(
+        why.contains(&format!("the folder {}", cwt(&env, "LO-1", 2).display())),
+        "{why}"
+    );
+    assert!(
+        why.contains("Toryo never deletes what it did not make"),
+        "{why}"
+    );
+    // nothing deleted, nothing recorded
+    assert!(cwt(&env, "LO-1", 2).join("mine.txt").exists());
+    assert_eq!(
+        leftovers(&env, "LO-1").1,
+        vec!["refs/heads/toryo-candidate/LO-1/c1"]
+    );
+    assert!(fanout(&env, "LO-1").is_none());
+    // removed by hand: a plain resume continues
+    git(&env.repo, &["branch", "-D", "toryo-candidate/LO-1/c1"]);
+    std::fs::remove_dir_all(cwt(&env, "LO-1", 2)).unwrap();
+    let s = script(&env, "lo2.json", passing_turns());
+    let (code, err) = toryo(&env, &["resume", "LO-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "LO-1").state, St::Completed, "{err}");
+}
+
+// ── B5, B12: Ctrl+C and `toryo stop` (AC-15, AC-25, edge case 31) ──────────────────────────
+
+/// Edge case 31: Ctrl+C while the worktrees are made — what was made is taken back; `resume`
+/// starts the fan-out again.
+#[test]
+fn m17_ec31_ctrl_c_during_worktree_creation_takes_back() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, "CC-1");
+    let (_, err) = run_with(
+        &env,
+        "CC-1",
+        passing_turns(),
+        &[("TORYO_TEST_INTERRUPT_AT", "fanout:after_worktree")],
+    );
+    assert!(
+        err.contains("stop request handled during the creation of the candidates' worktrees"),
+        "{err}"
+    );
+    assert_eq!(leftovers(&env, "CC-1"), (vec![], vec![]), "{err}");
+    assert!(fanout(&env, "CC-1").is_none());
+    assert_eq!(task(&env, "CC-1").state, St::Implementing);
+    let s = script(&env, "cc1.json", passing_turns());
+    let (code, err) = toryo(&env, &["resume", "CC-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "CC-1").state, St::Completed, "{err}");
+}
+
+/// Edge case 31, AC-15: Ctrl+C while the candidates' turns run ends every one of them; `resume`
+/// runs the unfinished turns again.
+#[test]
+fn m17_ec31_ctrl_c_during_the_turns_ends_every_candidate_turn() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, "CC-2");
+    let (_, err) = run_with(
+        &env,
+        "CC-2",
+        json!({"implementer#c1": [turn(vec![hang()])], "implementer#c2": [turn(vec![hang()])]}),
+        &[("TORYO_TEST_INTERRUPT_AT", "fanout:turns")],
+    );
+    let a: Vec<_> = attempts(&env, "CC-2")
+        .into_iter()
+        .filter(|a| a.stage.starts_with("implement#c"))
+        .collect();
+    assert_eq!(a.len(), 2, "{err}");
+    assert!(
+        a.iter()
+            .all(|a| a.status == toryo::engine::store::AttemptStatus::Interrupted),
+        "{a:?}\n{err}"
+    );
+    let ev = events(&env, "CC-2");
+    assert_eq!(
+        ev.iter().filter(|e| e["type"] == "agent_killed").count(),
+        2,
+        "{err}"
+    );
+    assert_eq!(fanout(&env, "CC-2").unwrap().phase, "turns");
+    let s = script(&env, "cc2.json", passing_turns());
+    let (code, err) = toryo(&env, &["resume", "CC-2", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "CC-2").state, St::Completed, "{err}");
+    assert_eq!(stage_profiles(&env, "CC-2", "implement#c1").len(), 2);
+}
+
+/// Edge case 31, AC-25: a second Ctrl+C while the turns are being ended ends the process at once;
+/// the next `resume` recovers (the turns were interrupted) and completes.
+#[test]
+fn m17_ec31_a_second_ctrl_c_ends_the_process_and_resume_recovers() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, "CC-3");
+    let (code, err) = run_with(
+        &env,
+        "CC-3",
+        json!({"implementer#c1": [turn(vec![hang()])], "implementer#c2": [turn(vec![hang()])]}),
+        &[("TORYO_TEST_INTERRUPT_AT", "fanout:turns,fanout:stopping")],
+    );
+    assert_eq!(code, 130, "{err}");
+    let s = script(&env, "cc3.json", passing_turns());
+    let (code, err) = toryo(&env, &["resume", "CC-3", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "CC-3").state, St::Completed, "{err}");
+    assert!(attempts(&env, "CC-3")
+        .iter()
+        .filter(|a| a.stage == "implement#c1")
+        .any(|a| a.status == toryo::engine::store::AttemptStatus::Interrupted));
+}
+
+/// Edge case 31: `toryo stop` from another process during the fan-out ends every candidate turn.
+#[test]
+fn m17_ec31_toryo_stop_from_another_process_ends_the_fan_out() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, "ST-1");
+    let s = script(
+        &env,
+        "st1.json",
+        json!({
+            "planner": [turn(vec![plan()])],
+            "implementer#c1": [turn(vec![hang()])],
+            "implementer#c2": [turn(vec![hang()])],
+        }),
+    );
+    let mut child = spawn(
+        &env,
+        &["run", "ST-1", "--yes", "--fake-agents", &s],
+        "st1.log",
+    );
+    wait_until("both candidate turns", 60, || {
+        events(&env, "ST-1")
+            .iter()
+            .filter(|e| e["type"] == "agent_spawned")
+            .count()
+            >= 3
+    });
+    let (code, err) = toryo(&env, &["stop", "ST-1"], &[]);
+    assert_eq!(code, 0, "{err}");
+    let st = child.wait().unwrap();
+    let log = std::fs::read_to_string(env.root.join("st1.log")).unwrap();
+    assert!(st.code().is_some(), "{log}");
+    let a: Vec<_> = attempts(&env, "ST-1")
+        .into_iter()
+        .filter(|a| a.stage.starts_with("implement#c"))
+        .collect();
+    assert!(
+        a.iter()
+            .all(|a| a.status == toryo::engine::store::AttemptStatus::Interrupted),
+        "{a:?}\n{log}"
+    );
+    assert_eq!(task(&env, "ST-1").state, St::Implementing, "{log}");
+    let s = script(&env, "st2.json", passing_turns());
+    let (code, err) = toryo(&env, &["resume", "ST-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "ST-1").state, St::Completed, "{err}");
+}
+
+// ── B9: promotion (AC-22) ──────────────────────────────────────────────────────────────────
+
+/// Edge case 38, AC-22, X60: the task worktree is dirty, or its HEAD left the task branch or the
+/// base, before the promotion — the task stops (`candidate_unavailable`, a machine stop) and no
+/// branch moves; put back by hand, a plain `resume` promotes.
+#[test]
+fn m17_ec38_a_dirty_task_worktree_or_a_moved_head_stops_the_promotion() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, "PM-1");
+    let (code, err) = run_with(
+        &env,
+        "PM-1",
+        passing_turns(),
+        &[("TORYO_TEST_CRASH_AT", "fanout:after_select")],
+    );
+    assert_eq!(code, 86, "{err}");
+    let w = wt(&env, "PM-1");
+    let base = task(&env, "PM-1").base_commit;
+    let s = script(
+        &env,
+        "pm1.json",
+        json!({"reviewer": [turn(vec![approved()])]}),
+    );
+    let refused = |want: &str| {
+        let before = git(&w, &["rev-parse", "toryo/PM-1"]);
+        let (_, err) = toryo(&env, &["resume", "PM-1", "--yes", "--fake-agents", &s], &[]);
+        let t = task(&env, "PM-1");
+        assert_eq!(t.state, St::Escalated, "{err}");
+        assert_eq!(
+            t.machine.reason_class(),
+            Some("candidate_unavailable"),
+            "{err}"
+        );
+        let why = t.machine.reason().unwrap_or_default().to_string();
+        assert!(
+            why.contains("the winner c2 (codex-openai) cannot be promoted") && why.contains(want),
+            "`{want}` not in {why}"
+        );
+        assert!(why.ends_with("then `toryo resume PM-1`"), "{why}");
+        assert_eq!(
+            git(&w, &["rev-parse", "toryo/PM-1"]),
+            before,
+            "no branch moved"
+        );
+    };
+    // dirty
+    std::fs::write(w.join("stray.txt"), "x\n").unwrap();
+    refused("the worktree is not clean ([\"stray.txt\"])");
+    std::fs::remove_file(w.join("stray.txt")).unwrap();
+    // a commit on top of the base
+    git(
+        &w,
+        &[
+            "-c",
+            "user.name=o",
+            "-c",
+            "user.email=o@o",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "owner",
+        ],
+    );
+    refused("not at the base");
+    git(&w, &["reset", "-q", "--hard", &base]);
+    // another branch
+    git(&w, &["checkout", "-q", "-b", "elsewhere"]);
+    refused("HEAD is not on toryo/PM-1");
+    git(&w, &["checkout", "-q", "toryo/PM-1"]);
+    // put back: a plain resume promotes
+    let (code, err) = toryo(&env, &["resume", "PM-1", "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "PM-1").state, St::Completed, "{err}");
+    let c = candidates(&env, "PM-1");
+    assert_eq!(
+        git(&w, &["rev-parse", "HEAD"]).trim(),
+        c[1].head.as_deref().unwrap()
+    );
+}
+
+// ── B10: losers and cleanup (AC-23, edge case 36) ──────────────────────────────────────────
+
+/// Edge case 36, AC-23: `task cleanup` in the middle of a fan-out (the task not active) removes the
+/// candidate worktrees the store recorded — `--force` is needed while one holds unsaved work — and
+/// keeps their branches.
+#[test]
+fn m17_ec36_task_cleanup_in_the_middle_of_a_fan_out() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    let gate = gate_program(
+        &env.root,
+        "present-gate",
+        "git grep -q Divide-Numbers -- src\nexit /b %errorlevel%\n",
+        "git grep -q Divide-Numbers -- src\n",
+    );
+    commit_repo(
+        &env,
+        &[(
+            ".toryo/toryo-orgchart.yaml",
+            &org_gate(&gate, ", candidates: [codex-openai, codex-openai]"),
+        )],
+        "gate",
+    );
+    create(&env, "CL-1");
+    std::fs::remove_file(&gate).unwrap();
+    let (_, err) = run_with(&env, "CL-1", passing_turns(), &[]);
+    assert_eq!(task(&env, "CL-1").state, St::Escalated, "{err}");
+    assert_eq!(leftovers(&env, "CL-1").0, vec![1, 2], "{err}");
+    // unsaved work in c1: refused without --force, nothing deleted
+    std::fs::write(cwt(&env, "CL-1", 1).join("wip.txt"), "unsaved\n").unwrap();
+    let (code, err) = toryo(&env, &["task", "cleanup", "CL-1"], &[]);
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains("uncommitted change(s) in the worktree") && err.contains("of candidate c1"),
+        "{err}"
+    );
+    assert_eq!(leftovers(&env, "CL-1").0, vec![1, 2]);
+    let (code, err) = toryo(&env, &["task", "cleanup", "CL-1", "--force"], &[]);
+    assert_eq!(code, 0, "{err}");
+    let (folders, branches) = leftovers(&env, "CL-1");
+    assert!(folders.is_empty(), "{err}");
+    assert_eq!(branches.len(), 2, "branches kept: {err}");
+    assert!(
+        err.contains(
+            "the candidates' branches are kept: toryo-candidate/CL-1/c1, toryo-candidate/CL-1/c2"
+        ),
+        "{err}"
+    );
+    assert!(!git(&env.repo, &["worktree", "list"]).contains("CL-1"));
+}
+
+/// AC-23: `task cleanup` after a crash in the middle of the turns removes the candidate worktrees.
+#[test]
+fn m17_ac23_task_cleanup_after_a_crash_in_the_middle_of_a_fan_out() {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, "CL-2");
+    let (code, err) = run_with(
+        &env,
+        "CL-2",
+        passing_turns(),
+        &[("TORYO_TEST_CRASH_AT", "fanout:after_checkpoint")],
+    );
+    assert_eq!(code, 86, "{err}");
+    assert!(!leftovers(&env, "CL-2").0.is_empty());
+    let (code, err) = toryo(&env, &["task", "cleanup", "CL-2", "--force"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(leftovers(&env, "CL-2").0.is_empty(), "{err}");
+    assert!(!git(&env.repo, &["worktree", "list"]).contains("CL-2"));
+}
+
+// ── B12: a crash at every point of the fan-out (AC-25, edge case 32) ───────────────────────
+
+/// A run of the passing two-candidate fan-out that crashes at `point`, then a `resume` (whose
+/// reviewer answers the compare turn again only when `compare_again`) → the env and the task id
+/// after the resume, which must have completed with c2, chosen by the compare turn, promoted
+/// once.
+fn crash_and_resume(id: &str, point: &str, compare_again: bool) -> (Env, String) {
+    let env = setup_bon("[codex-openai, codex-openai]", "", &[]);
+    create(&env, id);
+    let (code, err) = run_with(&env, id, passing_turns(), &[("TORYO_TEST_CRASH_AT", point)]);
+    assert_eq!(code, 86, "{point}: {err}");
+    let mut turns = passing_turns();
+    if !compare_again {
+        turns["reviewer"] = json!([turn(vec![approved()])]);
+    }
+    let s = script(&env, &format!("{id}-resume.json"), turns);
+    let (code, out) = toryo(&env, &["resume", id, "--yes", "--fake-agents", &s], &[]);
+    assert_eq!(code, 0, "{point}: {out}");
+    let t = task(&env, id);
+    assert_eq!(t.state, St::Completed, "{point}: {out}");
+    let f = fanout(&env, id).unwrap();
+    assert_eq!(
+        (f.winner, f.by.as_deref(), f.phase.as_str()),
+        (Some(2), Some("compare"), "promoted"),
+        "{point}"
+    );
+    let c = candidates(&env, id);
+    assert_eq!(
+        git(&wt(&env, id), &["rev-parse", "HEAD"]).trim(),
+        c[1].head.as_deref().unwrap(),
+        "{point}: the task branch is c2's checkpoint"
+    );
+    assert_eq!(
+        stage_profiles(&env, id, "implement").len(),
+        1,
+        "{point}: one promotion"
+    );
+    // no commit Toryo did not make: each candidate branch is one checkpoint on the base
+    for k in 1..=2 {
+        let log = git(
+            &env.repo,
+            &[
+                "log",
+                "--format=%(trailers:key=Toryo-Candidate,valueonly)",
+                &format!("{}..toryo-candidate/{id}/c{k}", t.base_commit),
+            ],
+        );
+        assert_eq!(log.trim(), format!("c{k}"), "{point}: c{k}'s branch");
+    }
+    for k in 1..=2 {
+        assert!(!cwt(&env, id, k).exists(), "{point}: c{k}'s folder removed");
+    }
+    (env, format!("{err}\n{out}"))
+}
+
+/// The number of turns candidate `k` of `id` had.
+fn turns_of(env: &Env, id: &str, k: u32) -> usize {
+    stage_profiles(env, id, &format!("implement#c{k}")).len()
+}
+
+/// Edge case 32: a crash after the first candidate's checkpoint, before the second's — `resume`
+/// takes that checkpoint by its trailers (no new turn for it) and completes with the same winner.
+#[test]
+fn m17_ec32_a_crash_after_the_first_checkpoint_before_the_second() {
+    let (env, out) = crash_and_resume("CR-1", "fanout:after_checkpoint", true);
+    assert!(out.contains("(already committed: trailer match)"), "{out}");
+    let done: Vec<u32> = (1..=2)
+        .filter(|k| turns_of(&env, "CR-1", *k) == 1)
+        .collect();
+    assert!(
+        !done.is_empty(),
+        "the checkpointed candidate's turn did not run again: {out}"
+    );
+}
+
+/// Edge case 32: a crash after the selection, before the promotion — the same winner, no second
+/// compare turn, one promotion, no turn again.
+#[test]
+fn m17_ec32_a_crash_after_the_selection_before_the_promotion() {
+    let (env, out) = crash_and_resume("CR-2", "fanout:after_select", false);
+    assert_eq!(
+        attempts(&env, "CR-2")
+            .iter()
+            .filter(|a| a.stage == "select")
+            .count(),
+        1,
+        "{out}"
+    );
+    assert_eq!(
+        (turns_of(&env, "CR-2", 1), turns_of(&env, "CR-2", 2)),
+        (1, 1)
+    );
+}
+
+/// Edge case 32: a crash after the branch moved to the winner, before the state change — one
+/// promotion (no second reset, no new commit), no turn again.
+#[test]
+fn m17_ec32_a_crash_after_the_promotion_before_the_state_change() {
+    let (env, out) = crash_and_resume("CR-3", "fanout:after_promote_ref", false);
+    assert_eq!(
+        (turns_of(&env, "CR-3", 1), turns_of(&env, "CR-3", 2)),
+        (1, 1),
+        "{out}"
+    );
+    let ev = events(&env, "CR-3");
+    let found: Vec<&Value> = ev
+        .iter()
+        .filter(|e| e["type"] == "checkpoint_created")
+        .collect();
+    assert_eq!(found.len(), 1, "{ev:?}");
+    assert_eq!(
+        found[0]["found"], true,
+        "the moved branch was found, not moved again"
+    );
+}
+
+/// AC-25: a crash at each other point of the fan-out — while the worktrees are made, when a turn
+/// began or ended, between the checkpoints and the gates, inside a candidate's gates, after the
+/// compare turn, after the promotion's record — resumes to the same result.
+#[test]
+fn m17_ac25_a_crash_at_every_point_of_the_fan_out_resumes_to_the_same_result() {
+    for (n, (point, compare_again, turns_kept)) in [
+        ("fanout:after_worktree", true, false),
+        ("fanout:after_begin", true, false),
+        ("fanout:after_turn", true, false),
+        ("fanout:before_verify", true, true),
+        ("fanout:after_gates", true, true),
+        ("fanout:after_compare_turn", true, true),
+        ("fanout:after_promote", false, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("CM-{n}");
+        let (env, out) = crash_and_resume(&id, point, compare_again);
+        if turns_kept {
+            assert_eq!(
+                (turns_of(&env, &id, 1), turns_of(&env, &id, 2)),
+                (1, 1),
+                "{point}: {out}"
+            );
+        }
+    }
+}
+
+// ── Z1: red-green and best-of-N together (AC-29, edge case 43) ─────────────────────────────
+
+/// A candidate turn of the red-green fixture: the division, its test file, and `proof`.
+fn rg_candidate(proof: Value) -> Value {
+    turn(vec![
+        write("src/Calculator.psm1", DIVIDE),
+        write(
+            "tests/Divide.Tests.ps1",
+            "Describe 'Divide' { It 'divides' { Divide-Numbers -A 6 -B 3 | Should -Be 2 } }\n",
+        ),
+        implementation_with(proof),
+    ])
+}
+
+/// Edge case 43, AC-29, AC-20 (rung 2): two candidates pass a red-green gate, the compare turn
+/// fails, and the one with more acceptance criteria proven wins on the score; the task's own
+/// Verifying proves the winner again with the winner's proof map (X51).
+#[test]
+fn m17_ec43_red_green_and_best_of_n_more_proven_wins_on_the_score() {
+    let env = setup_bon("[codex-openai, codex-openai]", RG_SRC, &[]);
+    let text = std::fs::read_to_string(env.repo.join("TASK.md")).unwrap();
+    commit_repo(
+        &env,
+        &[(
+            "TASK.md",
+            &format!("{text}\n## Proof exempt\n- AC-3: the export list is read by the reviewer\n"),
+        )],
+        "AC-3 exempt",
+    );
+    create(&env, "RB-1");
+    let (code, err) = run_with(
+        &env,
+        "RB-1",
+        json!({
+            "implementer#c1": [rg_candidate(json!([
+                {"ac": "AC-1", "tests": ["Divide-Numbers"]},
+                {"ac": "AC-2", "tests": ["Division"]},
+            ]))],
+            "implementer#c2": [rg_candidate(full_proof())],
+            "reviewer": [turn(vec![fail("Overloaded", "busy")]), turn(vec![approved()])],
+        }),
+        &[],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(task(&env, "RB-1").state, St::Completed, "{err}");
+    let c = candidates(&env, "RB-1");
+    assert_eq!(
+        (c[0].verify_pass, c[1].verify_pass),
+        (Some(true), Some(true)),
+        "{err}"
+    );
+    assert_eq!((c[0].proven, c[1].proven), (Some(2), Some(3)), "{err}");
+    let f = fanout(&env, "RB-1").unwrap();
+    assert_eq!(
+        (f.winner, f.by.as_deref()),
+        (Some(2), Some("score")),
+        "{err}"
+    );
+    assert_eq!(
+        f.reason.as_deref(),
+        Some("the compare turn failed (Overloaded); score: c2 before c1 — more acceptance criteria proven red-green (3 vs 2)")
+    );
+    // the task's Verifying of the promoted winner proved its criteria with c2's map
+    let vr = verify_result(&env, "RB-1");
+    assert_eq!(vr["red_green"]["proven"], 3, "{vr}");
+    assert_eq!(vr["head"].as_str(), c[1].head.as_deref());
+}

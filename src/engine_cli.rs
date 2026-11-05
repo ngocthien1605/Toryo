@@ -534,6 +534,9 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
             // R23-24 (N-11): the folders `cleanup` deletes are the ones `task create` made — the
             // row's paths are checked before anything is deleted
             cleanup_confined(&t, cfg.as_ref())?;
+            // M17-B10 (AC-23, X44): and the candidate worktrees the store recorded
+            let candidates =
+                toryo::engine::commands::cleanup_candidates_confined(&st, &t, cfg.as_ref())?;
             let g = match &cfg {
                 Some(c) => task::task_git(c, &t.repo)?,
                 None => task::cleanup_git(&t.repo)?,
@@ -541,7 +544,13 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
             // M12-12 (a): what cleanup deletes cannot be had back — say what, and ask for --force
             if !*force {
                 // M13-07: a cleanup that cannot look does not delete
-                let lost = match cleanup_would_lose(&g, &t) {
+                let lost = match cleanup_would_lose(&g, &t).and_then(|mut l| {
+                    l.extend(toryo::engine::commands::candidates_would_lose(
+                        &g,
+                        &candidates,
+                    )?);
+                    Ok(l)
+                }) {
                     Ok(lost) => lost,
                     Err(e) => bail!(
                         "{id}: cannot tell what the worktree holds ({e:#}) — pass `--force` to delete it anyway (`toryo task cleanup {id} --force`)"
@@ -575,6 +584,7 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
                     let _ = g.run(&repo, false, &["worktree", "prune"]);
                 }
             }
+            toryo::engine::commands::remove_candidate_worktrees(&st, &g, &t, &candidates, *force)?;
             if t.run_store.exists() {
                 std::fs::remove_dir_all(&t.run_store)
                     .with_context(|| format!("removing {}", t.run_store.display()))?;
@@ -585,6 +595,16 @@ pub fn task(cli: &Cli, cmd: &TaskCmd) -> Result<i32> {
             })?;
             lock.release();
             toryo::errln!("removed the worktree and the run store of {id}; the branch {} is kept (`git branch -D {}` when you no longer need it)", t.branch, t.branch);
+            // M17-B10: the candidates' branches are kept as well
+            let i = id.clone();
+            let branches: Vec<String> = st
+                .read(move |tx| store::candidates(tx, &i))?
+                .into_iter()
+                .map(|c| c.branch)
+                .collect();
+            if !branches.is_empty() {
+                toryo::errln!("the candidates' branches are kept: {}", branches.join(", "));
+            }
             Ok(0)
         }
     }
@@ -1120,6 +1140,12 @@ pub fn status(id: Option<&str>, json: bool) -> Result<i32> {
                 "               red-green: {}",
                 toryo::engine::redgreen::summary_words(rg)
             );
+        }
+        // M17-B13 (AC-27): the best-of-N fan-out, its winner and how it was chosen
+        if let Some(fan) = &f.fanout {
+            for l in views::fanout_lines(fan) {
+                toryo::outln!("               {l}");
+            }
         }
         // M11-E3: an environment gate waiting for its machine-wide lock (only while its run is
         // alive: a crash while waiting leaves the row behind — group E review)

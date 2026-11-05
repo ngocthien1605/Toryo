@@ -117,6 +117,28 @@ pub enum EngineEvent {
         total: u32,
         pass: bool,
     },
+    /// M17-B13 (AC-27): the first Implementing stage fans out to `n` candidates (their profiles,
+    /// in order: `c1`, `c2`, …).
+    CandidatesStarted {
+        n: u32,
+        profiles: Vec<String>,
+    },
+    /// M17-B13: candidate `k` is done — `outcome` (`checkpointed`, `no_change`, `failed_turn`,
+    /// `disqualified:<class>`), its checkpoint and whether every check gate passed (absent when
+    /// none ran).
+    CandidateFinished {
+        k: u32,
+        outcome: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gates_passed: Option<bool>,
+    },
+    /// M17-B13: the winner and how it was chosen (`only`, `compare`, `score`).
+    CandidateSelected {
+        k: u32,
+        by: String,
+    },
     /// M11-E3: an environment gate waits for its machine-wide lock (once per wait);
     /// `holder`: the task whose deployment holds it, when known.
     LockWaiting {
@@ -237,6 +259,9 @@ impl EngineEvent {
             Self::CheckpointCreated { .. } => "checkpoint_created",
             Self::VerifyCommand { .. } => "verify_command",
             Self::RedGreenFinished { .. } => "red_green_finished",
+            Self::CandidatesStarted { .. } => "candidates_started",
+            Self::CandidateFinished { .. } => "candidate_finished",
+            Self::CandidateSelected { .. } => "candidate_selected",
             Self::LockWaiting { .. } => "lock_waiting",
             Self::EnvironmentDeployed { .. } => "environment_deployed",
             Self::GateOpened { .. } => "gate_opened",
@@ -454,6 +479,34 @@ fn render_raw(env: &Envelope) -> String {
                 ),
             };
             format!("  {mark} {name} ({exit_words}, {:.1}s){tail}", secs(*duration_ms))
+        }
+        E::CandidatesStarted { n, profiles } => format!(
+            "   best-of-N: {n} candidates — {}",
+            profiles
+                .iter()
+                .enumerate()
+                .map(|(i, p)| format!("c{} {p}", i + 1))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        E::CandidateFinished {
+            k,
+            outcome,
+            head,
+            gates_passed,
+        } => format!(
+            "   candidate c{k}: {outcome}{}{}",
+            head.as_deref()
+                .map(|h| format!(" {}", crate::git::short(h)))
+                .unwrap_or_default(),
+            match gates_passed {
+                Some(true) => ", check gates passed",
+                Some(false) => ", check gates failed",
+                None => "",
+            }
+        ),
+        E::CandidateSelected { k, by } => {
+            format!("✔ candidate c{k} selected (by {by})")
         }
         E::RedGreenFinished {
             gate,
@@ -961,6 +1014,16 @@ fn redact_event(r: &Redactions, mut e: EngineEvent) -> EngineEvent {
             o(side);
         }
         E::RedGreenFinished { gate, .. } => s(gate),
+        E::CandidatesStarted { profiles, .. } => {
+            for p in profiles.iter_mut() {
+                s(p);
+            }
+        }
+        E::CandidateFinished { outcome, head, .. } => {
+            s(outcome);
+            o(head);
+        }
+        E::CandidateSelected { by, .. } => s(by),
         E::LockWaiting { lock, holder } => {
             s(lock);
             o(holder);
@@ -2066,6 +2129,14 @@ mod tests {
                     total: _,
                     pass: _,
                 } => "red_green_finished",
+                E::CandidatesStarted { n: _, profiles: _ } => "candidates_started",
+                E::CandidateFinished {
+                    k: _,
+                    outcome: _,
+                    head: _,
+                    gates_passed: _,
+                } => "candidate_finished",
+                E::CandidateSelected { k: _, by: _ } => "candidate_selected",
                 E::LockWaiting { lock: _, holder: _ } => "lock_waiting",
                 E::EnvironmentDeployed {
                     lock: _,
@@ -2109,7 +2180,7 @@ mod tests {
             }
         }
         /// The number of arms of `fields_named`.
-        const VARIANTS: usize = 20;
+        const VARIANTS: usize = 23;
         let all = vec![
             EngineEvent::RunStarted {
                 owner: "o".into(),
@@ -2164,6 +2235,20 @@ mod tests {
                 proven: 1,
                 total: 2,
                 pass: false,
+            },
+            EngineEvent::CandidatesStarted {
+                n: 2,
+                profiles: vec!["p".into(), "q".into()],
+            },
+            EngineEvent::CandidateFinished {
+                k: 1,
+                outcome: "checkpointed".into(),
+                head: Some("h".into()),
+                gates_passed: Some(true),
+            },
+            EngineEvent::CandidateSelected {
+                k: 1,
+                by: "compare".into(),
             },
             EngineEvent::LockWaiting {
                 lock: "l".into(),

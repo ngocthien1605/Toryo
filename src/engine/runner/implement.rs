@@ -6,6 +6,11 @@ use super::*;
 
 impl<'a> Engine<'a> {
     pub(super) fn implement(&mut self, t: &TaskRow) -> Result<Flow> {
+        // M17-B4: the first Implementing stage of a task with candidates fans out (AC-14);
+        // without them, in a fix cycle and on the single path this is the stage as before (AC-13)
+        if let Some(flow) = self.fan_out(t)? {
+            return Ok(flow);
+        }
         let wt = Worktree::new(&self.g, &t.worktree);
         // `--no-fallback` never takes the current implementer away (EC-16): no implementer
         // here means the chain was used up

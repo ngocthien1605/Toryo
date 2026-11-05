@@ -180,6 +180,22 @@ pub fn describe(e: &EngineEvent) -> String {
             "red-green {gate}: {proven}/{total} proven{}",
             if *pass { "" } else { ", failed" }
         ),
+        E::CandidatesStarted { n, .. } => format!("{n} candidates started"),
+        E::CandidateFinished {
+            k,
+            outcome,
+            gates_passed,
+            ..
+        } => format!(
+            "candidate c{k} {}{}",
+            outcome.split(':').next().unwrap_or_default(),
+            match gates_passed {
+                Some(true) => ", gates passed",
+                Some(false) => ", gates failed",
+                None => "",
+            }
+        ),
+        E::CandidateSelected { k, by } => format!("candidate c{k} selected by {by}"),
         E::VerifyCommand {
             name,
             ok,
@@ -272,10 +288,20 @@ pub fn task_lines(
         t.spent_tokens,
     )];
     let mut doing = Vec::new();
+    // M17-B13 (AC-27): the fan-out's progress, in Toryo's words, while a process drives it
+    let progress = f
+        .fanout
+        .as_ref()
+        .filter(|_| f.active_owner.is_some())
+        .and_then(views::fanout_progress);
+    if let (Some(p), None) = (&progress, &a.stage) {
+        doing.push(format!("now: {p}"));
+    }
     // a stage is "now" only while a process drives the task — after a crash it is history
     if let (Some(s), true) = (&a.stage, f.active_owner.is_some()) {
         doing.push(format!(
-            "now: {} attempt {}{} for {}",
+            "now: {}{} attempt {}{} for {}",
+            progress.map(|p| format!("{p} · ")).unwrap_or_default(),
             s.stage,
             s.attempt,
             s.profile
@@ -516,6 +542,7 @@ mod tests {
             compile_only: Some(false),
             next_action: "`toryo resume T-1`".into(),
             red_green: None,
+            fanout: None,
         };
         let lines = task_lines(&t, &f, &a, |_| 65_000);
         assert!(

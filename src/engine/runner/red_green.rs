@@ -65,7 +65,37 @@ impl<'a> Engine<'a> {
         else {
             return Ok(None);
         };
-        self.proof_of_attempt(t, &a.id, "implementation")
+        if let Some(p) = self.proof_of_attempt(t, &a.id, "implementation")? {
+            return Ok(Some(p));
+        }
+        // X51: the checkpoint of a promoted best-of-N winner — its candidate's own report
+        let i = self.id.clone();
+        let (fan, rows) = self
+            .store
+            .call(move |tx| Ok((store::fanout(tx, &i)?, store::candidates(tx, &i)?)))?;
+        let winner = fan
+            .filter(|f| f.phase == phase::PROMOTED)
+            .and_then(|f| f.winner)
+            .filter(|k| {
+                rows.iter()
+                    .any(|c| c.k == *k && c.head.as_deref() == Some(head))
+            });
+        let Some(k) = winner else {
+            return Ok(None);
+        };
+        let stage = crate::engine::candidates::stage(k);
+        let Some(c) = atts
+            .iter()
+            .rev()
+            .find(|x| x.stage == stage && x.status == AttemptStatus::Succeeded)
+        else {
+            return Ok(None);
+        };
+        self.proof_of_attempt(
+            t,
+            &c.id,
+            &format!("implementation#{}", crate::engine::candidates::id(k)),
+        )
     }
 
     /// M17-A4: `proof` of the newest `logical` report (`implementation`, a candidate's
