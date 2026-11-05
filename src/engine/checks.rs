@@ -726,6 +726,44 @@ pub fn which_in(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
     None
 }
 
+/// M17-A1 (AC-2, X47): the verify commands as M18 reads them — every command, and after each one
+/// with a `red_green` block the same program with `red_green.args`, every `{test}` an empty word
+/// (which names no file). The entry scripts and the file arguments of a red-green run are then
+/// protected — and an entry script missing at the base commit refused at `task create` — exactly
+/// like those of the gate's own `args`: the rules of this module and of `cmdline.rs` are not
+/// changed, they only get this input too. Without a `red_green` block the list is `cmds` as it is.
+pub fn with_red_green(cmds: &[CommandSpec]) -> Vec<CommandSpec> {
+    let mut out = Vec::with_capacity(cmds.len());
+    for c in cmds {
+        out.push(c.clone());
+        if let Some(rg) = &c.red_green {
+            out.push(CommandSpec {
+                name: format!("{} (red_green.args)", c.name),
+                args: rg.args_for(""),
+                red_green: None,
+                ..c.clone()
+            });
+        }
+    }
+    out
+}
+
+/// M17-A1: the matcher of `red_green.tests` — the write fence's pattern rules ([`fence_pattern`])
+/// and its case (insensitive, `/` and `\` alike, EC-09). `None` when a glob is not valid (load
+/// refuses it; a frozen configuration has none).
+pub fn test_globs(globs: &[String]) -> Option<Vec<regex::Regex>> {
+    globs
+        .iter()
+        .map(|g| fence_pattern(g).ok().map(|p| glob_ci(&p)))
+        .collect()
+}
+
+/// M17-A1: does the repository path `path` match one of the compiled [`test_globs`]?
+pub fn is_test_path(globs: &[regex::Regex], path: &str) -> bool {
+    let p = norm_path(path);
+    globs.iter().any(|g| g.is_match(&p))
+}
+
 /// `commands.verify` from the config, else `scripts/build.ps1` + `scripts/test.ps1` if they exist.
 pub fn verify_commands(cfg: &Effective, repo: &Path) -> Result<Vec<CommandSpec>> {
     // M11: in org chart mode the check gates are the verify commands — never the scripts

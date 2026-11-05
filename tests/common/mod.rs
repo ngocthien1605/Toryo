@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use toryo::engine::store::{self, Store};
 
+/// M17: the red-green and best-of-N fixtures.
+pub mod m17;
+
 pub const DIVIDE: &str = "\nfunction Divide-Numbers { param($A,$B) if ($B -eq 0) { throw 'Division by zero' }; $A / $B }\n";
 
 pub struct Env {

@@ -201,6 +201,17 @@ pub fn gate_checks(cfg: &Effective) -> Vec<Check> {
             ),
             None => add(Level::Ok, format!("check gate `{}` can start here", c.name)),
         }
+        // M17-A1 (AC-1): the red-green proof the gate runs inside a task
+        if let Some(rg) = &c.red_green {
+            add(
+                Level::Ok,
+                format!(
+                    "check gate `{}`: {}",
+                    c.name,
+                    rg.words(c.program.as_deref())
+                ),
+            );
+        }
     }
     if let Some(team) = &cfg.team {
         for (name, g) in team.handoff_gates() {

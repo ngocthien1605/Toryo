@@ -229,6 +229,8 @@ fn admission(cfg: &Effective, g: &GitCmd, repo: &Path, base: &str) -> Result<Adm
         notes: Vec::new(),
     };
     let cmds = super::checks::verify_commands(cfg, repo).unwrap_or_default();
+    // M17-A1 (AC-2): a red-green gate's per-test arguments get the admission of its own
+    let cmds = super::checks::with_red_green(&cmds);
     let entries = super::checks::verify_entries(&cmds, repo);
     let net: Vec<(String, String)> = super::checks::script_like_args(&cmds, repo)
         .into_iter()

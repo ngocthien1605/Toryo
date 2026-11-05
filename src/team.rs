@@ -79,6 +79,10 @@ pub struct GateDecl {
     pub timeout: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub if_missing: Option<IfMissing>,
+    /// M17-A1: check only, with `program` — the red-green proof of the gate
+    /// ([`crate::config::RedGreen`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub red_green: Option<crate::config::RedGreen>,
 }
 
 /// One seat: which Toryo profile sits there (owner decision D2).
@@ -446,6 +450,7 @@ pub fn gate_command(name: &str, d: &GateDecl) -> CommandSpec {
         metadata: d.metadata.clone(),
         projects: d.projects.clone(),
         diagnostics: d.diagnostics.clone(),
+        red_green: d.red_green.clone(),
     }
 }
 
@@ -786,6 +791,13 @@ pub fn problems(cfg: &Effective, root: &Path, machine: &str) -> Vec<String> {
                 }
             }
             GateType::Environment => {
+                // M17-A1 (AC-2): red-green proves tests in the clean checkout; an environment
+                // gate runs against a deployed environment, with the owner's rights
+                if d.red_green.is_some() {
+                    out.push(format!(
+                        "{key}.red_green: only a `kind: check` gate can prove its tests red-green — an environment gate runs against your environment, with your full rights; remove `red_green`"
+                    ));
+                }
                 for (k, set) in [
                     ("program", d.program.is_some()),
                     ("args", !d.args.is_empty()),

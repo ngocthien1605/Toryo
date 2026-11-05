@@ -113,7 +113,8 @@ pub fn task_policy(t: &TaskRow, cfg: &Effective) -> Result<(GitCmd, Protected, V
     let g = task_git(cfg, &t.repo)?;
     let cmds = verify_commands(cfg, &t.worktree)?;
     let base = super::task::base_files(&g, &t.repo, &t.base_commit)?;
-    let mut exact = verify_files_at_base(&cmds, &t.worktree, &base);
+    // M17-A1: a red-green gate's per-test arguments are protected like its own (AC-2)
+    let mut exact = verify_files_at_base(&super::checks::with_red_green(&cmds), &t.worktree, &base);
     if let Ok(r) = rel(&t.repo, &t.task_file) {
         exact.push(r); // the task is the contract: agents may not edit it
     }

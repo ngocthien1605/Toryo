@@ -112,6 +112,10 @@ fn list(cli: &Cli) -> Result<i32> {
                     limit_words(c),
                     describe(c)
                 );
+                // M17-A1 (AC-1): the red-green proof, which only a task runs
+                if let Some(rg) = &c.red_green {
+                    toryo::outln!("      {}", rg.words(c.program.as_deref()));
+                }
             }
         }
         _ => toryo::outln!(
@@ -183,6 +187,14 @@ fn run_gate(cli: &Cli, a: &RunArgs) -> Result<i32> {
         CommandKind::Program { program, args } => {
             if a.low {
                 bail!("--low is for `tool: xpp` gates for now: a program gate at Low integrity needs a clean checkout of a commit, which a task makes (`toryo run`)");
+            }
+            // M17-A1 (AC-1): only the gate's own args run here — red-green needs the task's
+            // base commit, its checkpoint and the implementer's proof map
+            if c.red_green.is_some() {
+                toryo::errln!(
+                    "note: `{}` has a `red_green` block — red-green runs only inside a task (`toryo run`); this runs the gate's own args",
+                    c.name
+                );
             }
             run_program(&cfg, c, program, args, &repo, a.print_only, timeout)
         }

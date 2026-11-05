@@ -120,7 +120,10 @@ impl<'a> Engine<'a> {
         // M16-02 (X36): what the check gates ran, hashed while no other task's Low code can
         // change the checkout; then the next task may run its check gates while the
         // environment gates of this one wait for their own lock (M11-E3)
-        let scripts = verify::script_hashes(&verify_files(&self.cmds, &co.dir), &co);
+        let scripts = verify::script_hashes(
+            &verify_files(&crate::engine::checks::with_red_green(&self.cmds), &co.dir),
+            &co,
+        );
         // M16-R1: when no environment gate follows (none is defined, or a check gate failed),
         // this is the one check of the checkout after the run — made under the lock, so that no
         // other task's Low code can hide a mutation (or add one) before it is looked at

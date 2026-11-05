@@ -61,7 +61,7 @@ pub fn json(cfg: &Effective) -> Value {
             .iter()
             .map(|(name, g)| {
                 let skipped = g.decl.kind == GateType::Environment && g.machine.is_none();
-                json!({
+                let mut v = json!({
                     "name": name,
                     "kind": g.decl.kind,
                     "timeout": g.decl.timeout,
@@ -75,7 +75,12 @@ pub fn json(cfg: &Effective) -> Value {
                     "confirm": g.machine.as_ref().map(|m| m.confirm.as_str()),
                     "defined_on_this_machine": g.decl.kind == GateType::Check || !skipped,
                     "source": source(cfg.origins.gates.get(name).copied()),
-                })
+                });
+                // M17-A1 (AC-1): only when set — every other gate keeps its shape
+                if let Some(rg) = &g.decl.red_green {
+                    v["red_green"] = red_green_json(rg, g.decl.program.as_deref());
+                }
+                v
             })
             .collect(),
         None => cfg
@@ -84,7 +89,7 @@ pub fn json(cfg: &Effective) -> Value {
             .verify
             .iter()
             .map(|c| {
-                json!({
+                let mut v = json!({
                     "name": c.name,
                     "kind": "check",
                     "timeout": c.timeout_min.map(|m| format!("{m}m")),
@@ -94,7 +99,11 @@ pub fn json(cfg: &Effective) -> Value {
                     "confirm": null,
                     "defined_on_this_machine": true,
                     "source": source((!cfg.origins.roles.is_empty()).then_some(Origin::Repo)),
-                })
+                });
+                if let Some(rg) = &c.red_green {
+                    v["red_green"] = red_green_json(rg, c.program.as_deref());
+                }
+                v
             })
             .collect(),
     };
@@ -141,6 +150,18 @@ pub fn json(cfg: &Effective) -> Value {
         "no_effect": cfg.keys_without_effect(),
         "limits": team.map(|t| json!(t.limits)),
         "checks": team.map(|t| json!(t.checks)),
+    })
+}
+
+/// M17-A1: a gate's `red_green` block in `config show --json`: the block as written, the cap in
+/// force and the line `gate list` prints.
+fn red_green_json(rg: &crate::config::RedGreen, program: Option<&str>) -> Value {
+    json!({
+        "tests": rg.tests,
+        "args": rg.args,
+        "green_output_must_match": rg.green_output_must_match,
+        "max_tests": rg.max_tests(),
+        "words": rg.words(program),
     })
 }
 
@@ -253,6 +274,9 @@ pub fn text(cfg: &Effective) -> String {
                 .map(shown_arg)
                 .collect();
             s.push_str(&format!("      runs: {}\n", argv.join(" ")));
+        }
+        if let Some(w) = x["red_green"]["words"].as_str() {
+            s.push_str(&format!("      {w}\n"));
         }
         if let Some(c) = x["confirm"].as_str() {
             s.push_str(&format!(

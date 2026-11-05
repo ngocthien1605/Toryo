@@ -243,6 +243,77 @@ pub struct CommandSpec {
     /// Serialised only when set, so a configuration without it keeps its hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<String>,
+    /// M17-A1: the red-green proof of a `program` check gate ([`RedGreen`]). Serialised only
+    /// when set, so a configuration without it keeps its hash (AC-13).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub red_green: Option<RedGreen>,
+}
+
+/// M17-A1 (X47): the `red_green` block of a `kind: check` gate or a `commands.verify` entry.
+/// Every acceptance criterion names the tests that prove it (`IMPLEMENTATION.json` `proof`);
+/// each runs once per side with [`TEST_PLACEHOLDER`] replaced by its id — on the checkpoint it
+/// must pass (green), on the base commit with the task's test files laid over it it must fail
+/// (red). Checked at load ([`super::validate`]): only on a `program` check gate, `{test}`
+/// exactly once in `args` and never in `program`, `tests` not empty and every glob valid, a
+/// valid regex, `max_tests` 1..=64.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedGreen {
+    /// Globs (repository-relative, the write fence's rules and case) of the test files: what
+    /// the red commit takes from the checkpoint.
+    pub tests: Vec<String>,
+    /// The arguments of one test's run (the gate's `program`); `{test}` exactly once, as a whole
+    /// element or inside one (`--filter=Name~{test}`).
+    pub args: Vec<String>,
+    /// A green run's output must match this regex (catches "0 tests ran").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub green_output_must_match: Option<String>,
+    /// The most distinct test ids a checkpoint may declare (1..=64, default 32).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tests: Option<u32>,
+}
+
+/// M17-A1: what `red_green.args` holds where the test id goes.
+pub const TEST_PLACEHOLDER: &str = "{test}";
+
+/// M17-A1: `red_green.max_tests` when unset, and its bounds.
+pub const DEFAULT_MAX_TESTS: u32 = 32;
+pub const MAX_MAX_TESTS: u32 = 64;
+
+impl RedGreen {
+    /// The distinct test ids a checkpoint may declare.
+    pub fn max_tests(&self) -> usize {
+        self.max_tests.unwrap_or(DEFAULT_MAX_TESTS) as usize
+    }
+
+    /// The arguments of the run of test `id`: every `{test}` replaced by it (load-time
+    /// validation makes it exactly one). The id is passed as argv — never through a shell
+    /// Toryo builds.
+    pub fn args_for(&self, id: &str) -> Vec<String> {
+        self.args
+            .iter()
+            .map(|a| a.replace(TEST_PLACEHOLDER, id))
+            .collect()
+    }
+
+    /// The block in one line (`gate list`, `doctor`, `config show`): the per-test command of the
+    /// gate's `program`, the test globs, the cap and the output rule.
+    pub fn words(&self, program: Option<&str>) -> String {
+        let argv: Vec<&str> = std::iter::once(program.unwrap_or_default())
+            .chain(self.args.iter().map(String::as_str))
+            .collect();
+        format!(
+            "red-green (inside a task only): per test `{}` · tests {} · at most {} test ids{}",
+            argv.join(" "),
+            self.tests.join(", "),
+            self.max_tests(),
+            match &self.green_output_must_match {
+                Some(r) => format!(" · a green run must match `{r}`"),
+                None =>
+                    " · no green output rule (a filter that matches no test passes green)".into(),
+            }
+        )
+    }
 }
 
 /// The built-in verify kinds (`commands.verify[].tool`, R59).
@@ -279,6 +350,7 @@ impl CommandSpec {
             metadata: None,
             projects: Vec::new(),
             diagnostics: None,
+            red_green: None,
         }
     }
 
@@ -294,6 +366,7 @@ impl CommandSpec {
             metadata: Some(metadata.into()),
             projects: projects.iter().map(|p| p.to_string()).collect(),
             diagnostics: None,
+            red_green: None,
         }
     }
 
