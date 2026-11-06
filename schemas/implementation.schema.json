@@ -1,12 +1,24 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["summary", "deviations", "validation_performed", "open_issues", "resolved"],
+  "required": ["summary", "deviations", "validation_performed", "open_issues", "resolved", "proof"],
   "properties": {
     "summary":              { "type": "string" },
     "deviations":           { "type": "array", "items": { "type": "string" } },
     "validation_performed": { "type": "array", "items": { "type": "string" } },
     "open_issues":          { "type": "array", "items": { "type": "string" } },
-    "resolved":             { "type": "array", "items": { "type": "string" } }
+    "resolved":             { "type": "array", "items": { "type": "string" } },
+    "proof": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ac", "tests"],
+        "properties": {
+          "ac":    { "type": "string" },
+          "tests": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
   }
 }

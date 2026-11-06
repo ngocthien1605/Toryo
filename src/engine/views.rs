@@ -16,6 +16,12 @@ pub struct TaskFacts {
     /// R59: the verify of this task proves compile level only (X++).
     pub compile_only: Option<bool>,
     pub next_action: String,
+    /// M17-A7 (AC-11): `{ proven, total, exempt, pass }` of the verify result in force, when it has
+    /// a red-green gate; `None` (`null`) otherwise.
+    pub red_green: Option<Value>,
+    /// M17-B13 (AC-27): the best-of-N fan-out ([`fanout_of`]); `None` (`candidates: null`) when the
+    /// task has none.
+    pub fanout: Option<Value>,
 }
 
 /// The fix-cycle counters as `status` and SUMMARY.md show them: `1/2` (with `sep` between)
@@ -107,7 +113,170 @@ fn task_json_m10(t: &TaskRow, f: &TaskFacts) -> Value {
         "active_owner": f.active_owner,
         "compile_only": f.compile_only,
         "next_action": f.next_action,
+        // M17-A7 (AC-11, AC-13): always there, `null` without a red-green gate
+        "red_green": f.red_green,
+        // M17-B13 (AC-27, AC-13): always there, `null` without a fan-out
+        "candidates": f.fanout.as_ref().map(|v| v["candidates"].clone()),
     })
+}
+
+/// M17-B13 (AC-27): the fan-out of a task, in Toryo's words only (X35) — read-only, like
+/// [`red_green_of`]: `{ phase, n, winner, by, reason, note, candidates: [ { id, profile, outcome,
+/// head, verify, tokens, winner, by, branch } ] }`. `reason` is the score's rung (or why the score
+/// decided); the compare turn's own reason is the agent's text and is never shown here. `None`:
+/// the task has no fan-out, or the store cannot be read.
+pub fn fanout_of(st: &super::store::Store, t: &TaskRow) -> Option<Value> {
+    let i = t.id.clone();
+    let (fan, rows, atts, tokens) = st
+        .read(move |tx| {
+            let Some(f) = super::store::fanout(tx, &i)? else {
+                return Ok(None);
+            };
+            let rows = super::store::candidates(tx, &i)?;
+            let atts = super::store::attempts(tx, &i)?;
+            let mut tokens = Vec::new();
+            for c in &rows {
+                tokens.push(super::store::candidate_tokens(tx, &i, c.k)?);
+            }
+            Ok(Some((f, rows, atts, tokens)))
+        })
+        .ok()??;
+    let by = fan.by.clone();
+    let list: Vec<Value> = rows
+        .iter()
+        .zip(tokens)
+        .map(|(c, tokens)| {
+            let stage = super::candidates::stage(c.k);
+            let last = atts.iter().rev().find(|a| a.stage == stage);
+            let outcome = match c.outcome.as_deref() {
+                Some(o) => match o.strip_prefix("disqualified:") {
+                    Some(class) => format!("disqualified({class})"),
+                    None => o.to_string(),
+                },
+                None => match last.map(|a| a.status) {
+                    Some(super::store::AttemptStatus::Interrupted) => "interrupted".into(),
+                    Some(super::store::AttemptStatus::Running) => "running".into(),
+                    _ if c.state == "turn_done" => "running".into(),
+                    _ => "pending".into(),
+                },
+            };
+            let winner = fan.winner == Some(c.k);
+            json!({
+                "id": super::candidates::id(c.k),
+                "profile": c.profile,
+                "outcome": outcome,
+                "head": c.head,
+                "verify": c.verify_pass,
+                "tokens": tokens,
+                "winner": winner,
+                "by": if winner { by.clone() } else { None },
+                "branch": c.branch,
+            })
+        })
+        .collect();
+    Some(json!({
+        "phase": fan.phase,
+        "n": fan.n,
+        "winner": fan.winner.map(super::candidates::id),
+        "by": fan.by,
+        "reason": if fan.by.as_deref() == Some("compare") { None } else { fan.reason.clone() },
+        "note": fan.note,
+        "candidates": list,
+    }))
+}
+
+/// M17-B13: the fan-out phase as the dashboard's `now:` says it — `candidates 1/2 verifying`
+/// (how many of the candidates are past this phase, of how many) — or `None` once it ended.
+pub fn fanout_progress(v: &Value) -> Option<String> {
+    let list = v["candidates"].as_array()?;
+    let n = list.len();
+    let count = |f: &dyn Fn(&Value) -> bool| list.iter().filter(|c| f(c)).count();
+    let turned = |c: &Value| {
+        !matches!(
+            c["outcome"].as_str(),
+            Some("running" | "pending" | "interrupted")
+        )
+    };
+    let (done, verb) = match v["phase"].as_str()? {
+        "creating" => (0, "creating worktrees"),
+        "turns" => (count(&turned), "implementing"),
+        "verify" => (
+            count(&|c: &Value| c["outcome"] != "checkpointed" || !c["verify"].is_null()),
+            "verifying",
+        ),
+        "select" => (n, "selecting"),
+        "selected" => (n, "promoting"),
+        _ => return None,
+    };
+    Some(format!("candidates {done}/{n} {verb}"))
+}
+
+/// M17-B13 (AC-27): the lines `status`, `task show` and the final gate print for a fan-out, in
+/// Toryo's words: each candidate's outcome, then the winner, how it was chosen and the other
+/// candidates' kept branches (or the note of the single path).
+pub fn fanout_lines(v: &Value) -> Vec<String> {
+    let list = v["candidates"].as_array().cloned().unwrap_or_default();
+    let words: Vec<String> = list
+        .iter()
+        .map(|c| {
+            let gates = match c["verify"].as_bool() {
+                Some(true) => ", check gates passed",
+                Some(false) => ", check gates failed",
+                None => "",
+            };
+            format!(
+                "{} {} {}{gates}",
+                c["id"].as_str().unwrap_or("?"),
+                c["profile"].as_str().unwrap_or("?"),
+                c["outcome"].as_str().unwrap_or("?")
+            )
+        })
+        .collect();
+    let phase = v["phase"].as_str().unwrap_or("?");
+    let mut out = vec![if matches!(phase, "promoted" | "single") {
+        format!("best-of-N: {}", words.join(" · "))
+    } else {
+        format!("best-of-N ({phase}): {}", words.join(" · "))
+    }];
+    if let Some(w) = list.iter().find(|c| c["winner"] == true) {
+        let losers: Vec<&str> = list
+            .iter()
+            .filter(|c| c["winner"] != true)
+            .filter_map(|c| c["branch"].as_str())
+            .collect();
+        out.push(format!(
+            "winner {} ({}) by {}{}{}",
+            w["id"].as_str().unwrap_or("?"),
+            w["profile"].as_str().unwrap_or("?"),
+            v["by"].as_str().unwrap_or("?"),
+            v["reason"]
+                .as_str()
+                .map(|r| format!(" — {r}"))
+                .unwrap_or_default(),
+            if losers.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " · the other candidates' branches are kept: {}",
+                    losers.join(", ")
+                )
+            }
+        ));
+    }
+    if let Some(n) = v["note"].as_str() {
+        out.push(n.to_string());
+    }
+    out
+}
+
+/// M17-A7: the red-green summary of the task's verify result in force (read-only: `status` and the
+/// dashboard never take the write lock, X35), or `None` — no verify result, none with a
+/// red-green gate, or one that cannot be read.
+pub fn red_green_of(st: &super::store::Store, t: &TaskRow) -> Option<Value> {
+    let v = super::artifacts::head_read(st, t, "verify-result").ok()??;
+    let bytes = super::artifacts::read_version(&v).ok()?;
+    let vr: Value = serde_json::from_slice(&bytes).ok()?;
+    super::redgreen::summary_of(&vr)
 }
 
 /// A usage row as `task show` prints it (R41).
@@ -212,6 +381,8 @@ mod tests {
                 active_owner: None,
                 compile_only: Some(false),
                 next_action: "`toryo run T-1`".into(),
+                red_green: None,
+                fanout: None,
             },
         );
         assert_eq!(v["id"], "T-1");
@@ -221,7 +392,8 @@ mod tests {
             (json!(1), json!(4))
         );
         assert_eq!(v["spent_tokens"], 120);
-        for k in ["budget_tokens", "active_owner"] {
+        // (M17: `red_green` is `null` without a red-green gate, `candidates` without a fan-out)
+        for k in ["budget_tokens", "active_owner", "red_green", "candidates"] {
             assert!(v.get(k).is_some_and(Value::is_null), "{k}: {v}");
         }
         assert_eq!(v["compile_only"], false);

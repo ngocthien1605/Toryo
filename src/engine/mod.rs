@@ -2,6 +2,7 @@
 //! task lock (M3), the ProjectContextLoader (M4) and the stage runners.
 
 pub mod artifacts;
+pub mod candidates;
 pub mod checks;
 pub mod cmdline;
 pub mod commands;
@@ -15,6 +16,7 @@ pub mod goal;
 pub mod lock;
 pub mod protect;
 pub mod recovery;
+pub mod redgreen;
 pub mod render;
 pub mod runner;
 pub mod snapshot;

@@ -6,6 +6,11 @@ use super::*;
 
 impl<'a> Engine<'a> {
     pub(super) fn implement(&mut self, t: &TaskRow) -> Result<Flow> {
+        // M17-B4: the first Implementing stage of a task with candidates fans out (AC-14);
+        // without them, in a fix cycle and on the single path this is the stage as before (AC-13)
+        if let Some(flow) = self.fan_out(t)? {
+            return Ok(flow);
+        }
         let wt = Worktree::new(&self.g, &t.worktree);
         // `--no-fallback` never takes the current implementer away (EC-16): no implementer
         // here means the chain was used up
@@ -38,7 +43,12 @@ impl<'a> Engine<'a> {
                 Ok((store::last_attempt(tx, &i, &s)?, failed))
             })?
         };
-        let prompt = implementer_prompt(t.fix_cycle, t.feedback.as_deref(), t.handoff.as_deref());
+        let mut prompt =
+            implementer_prompt(t.fix_cycle, t.feedback.as_deref(), t.handoff.as_deref());
+        // M17-A3 (AC-3): the proof rule, only when a red-green gate runs
+        if let Some(rule) = self.proof_rule(t)? {
+            prompt.push_str(&rule);
+        }
         let resume = implementer_resume(prev.as_ref(), kind, &profile);
         let fallback_from = fallback_from(t, prev.as_ref(), &profile);
         let (prompt, model) = match kind {
@@ -62,6 +72,37 @@ impl<'a> Engine<'a> {
             fallback_from,
             failed_before,
         })
+    }
+
+    /// M17-A3 (AC-3): the proof rule of the implementer's prompt when a red-green gate is in the
+    /// verify commands ([`crate::engine::redgreen::proof_rule`]), with the exempt criteria of the
+    /// task's frozen TASK.md; `None` without one.
+    pub(super) fn proof_rule(&self, t: &TaskRow) -> Result<Option<String>> {
+        let Some(c) = self.cmds.iter().find(|c| c.red_green.is_some()) else {
+            return Ok(None);
+        };
+        let rg = c.red_green.as_ref().expect("red_green");
+        let exempt = self.proof_exempt(t)?;
+        Ok(Some(crate::engine::redgreen::proof_rule(
+            &c.name,
+            c.program.as_deref().unwrap_or_default(),
+            rg,
+            &t.acceptance_ids,
+            &exempt,
+        )))
+    }
+
+    /// M17-A2: the `## Proof exempt` items of the task's frozen TASK.md (the hash-checked `task`
+    /// artifact; `task create` refused an invalid section).
+    pub(in crate::engine) fn proof_exempt(
+        &self,
+        t: &TaskRow,
+    ) -> Result<Vec<crate::engine::redgreen::Exempt>> {
+        let Some((_, bytes)) = crate::engine::artifacts::read_head(self.store, t, "task")? else {
+            return Ok(Vec::new());
+        };
+        let text = crate::textfile::decode(&t.artifacts().join("TASK.md"), &bytes)?;
+        crate::engine::redgreen::parse_proof_exempt(&text, &t.acceptance_ids)
     }
 
     /// Begin the attempt at the current HEAD with an empty TEMP (R46), assemble its context
@@ -170,8 +211,11 @@ impl<'a> Engine<'a> {
                 &serde_json::to_vec_pretty(v)?,
                 &format!("implementation-{}.json", t.fix_cycle),
             )?;
-            // EC-25: the report is informational, so a schema mismatch is recorded, not fatal
-            if let Err(errors) = contracts::validate("implementation.schema.json", v) {
+            // EC-25: the report is informational, so a schema mismatch is recorded, not fatal.
+            // M17-A3 (AC-3): without a red-green gate a report without `proof` is `proof: []`
+            let red_green = crate::engine::redgreen::gate_of(&self.cmds).is_some();
+            let checked = contracts::implementation_as_checked(v, red_green);
+            if let Err(errors) = contracts::validate("implementation.schema.json", &checked) {
                 crate::errln!(
                     "!! implementation.json does not match implementation.schema.json: {}",
                     errors.join("; ")

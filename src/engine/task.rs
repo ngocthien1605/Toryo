@@ -229,6 +229,8 @@ fn admission(cfg: &Effective, g: &GitCmd, repo: &Path, base: &str) -> Result<Adm
         notes: Vec::new(),
     };
     let cmds = super::checks::verify_commands(cfg, repo).unwrap_or_default();
+    // M17-A1 (AC-2): a red-green gate's per-test arguments get the admission of its own
+    let cmds = super::checks::with_red_green(&cmds);
     let entries = super::checks::verify_entries(&cmds, repo);
     let net: Vec<(String, String)> = super::checks::script_like_args(&cmds, repo)
         .into_iter()
@@ -458,6 +460,8 @@ pub fn create(cfg: &Effective, store: &Store, a: CreateArgs) -> Result<TaskRow> 
     let file = std::path::absolute(&file)?;
     let text = crate::textfile::read_text(&file)?;
     let ac = parse_acceptance_ids(&text)?;
+    // M17-A2 (AC-5): `## Proof exempt` is checked now; the TASK.md snapshot freezes it
+    super::redgreen::parse_proof_exempt(&text, &ac)?;
     let id = task_id(&text, &file, a.id.as_deref());
     valid_task_id(&id)?;
     if !id

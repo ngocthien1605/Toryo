@@ -35,6 +35,11 @@ pub const SCHEMAS: &[(&str, &str)] = &[
         "goal-split.schema.json",
         include_str!("../../schemas/goal-split.schema.json"),
     ),
+    // M17-B8: the answer of the best-of-N compare turn
+    (
+        "select.schema.json",
+        include_str!("../../schemas/select.schema.json"),
+    ),
 ];
 
 pub const ROLES: &[(&str, &str)] = &[
@@ -64,6 +69,23 @@ pub fn schema(name: &str) -> Result<&'static str> {
         .find(|(n, _)| *n == name)
         .map(|(_, c)| *c)
         .ok_or_else(|| anyhow::anyhow!("no schema {name}"))
+}
+
+/// M17-A3 (AC-3): an implementation report as the engine checks it against
+/// `implementation.schema.json`. `proof` is required by the schema (strict style, safe for Codex
+/// structured output), but without a red-green gate in the verify commands a report that has no
+/// `proof` is read as `"proof": []` — every fake script, recorded stream and agent from before M17
+/// keeps passing unchanged. With a red-green gate it is checked as it is: a missing map is a schema
+/// violation (recorded, EC-25) and the gate's map check fails it.
+pub fn implementation_as_checked(v: &Value, red_green: bool) -> Value {
+    match v {
+        Value::Object(m) if !red_green && !m.contains_key("proof") => {
+            let mut m = m.clone();
+            m.insert("proof".into(), Value::Array(Vec::new()));
+            Value::Object(m)
+        }
+        _ => v.clone(),
+    }
 }
 
 /// Role template by file name (`planner.md`, `implementer.md`, `reviewer.md`).
@@ -338,8 +360,8 @@ mod tests {
     /// embedded schema may use only [`KEYWORDS`] (and annotations), with well-formed values.
     #[test]
     fn every_embedded_schema_uses_only_supported_keywords() {
-        // M16-03: goal-split.schema.json is the sixth
-        assert_eq!(SCHEMAS.len(), 6);
+        // M16-03: goal-split.schema.json is the sixth; M17-B8: select.schema.json the seventh
+        assert_eq!(SCHEMAS.len(), 7);
         for (name, text) in SCHEMAS {
             let s: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(schema_problems(&s), Vec::<String>::new(), "{name}");
@@ -373,8 +395,48 @@ mod tests {
             "issues": [{"id": "I-1", "severity": "high", "blocking": true, "file": "src/a.ps1", "line": 3, "description": "add the zero test"}],
             "resolved_from_previous": ["I-7"], "extra": "allowed: no additionalProperties"});
         assert_eq!(validate("review.schema.json", &review), Ok(()));
+        // M17-A3: `proof` is required by the schema (was: the report without it was valid as it
+        // is); the engine reads a report without it as `proof: []` when no red-green gate runs
         let imp = json!({"summary": "s", "deviations": [], "validation_performed": ["read"], "open_issues": [], "resolved": []});
-        assert_eq!(validate("implementation.schema.json", &imp), Ok(()));
+        assert_eq!(
+            validate("implementation.schema.json", &imp),
+            Err(vec!["$: missing required property `proof`".to_string()])
+        );
+        assert_eq!(
+            validate(
+                "implementation.schema.json",
+                &implementation_as_checked(&imp, false)
+            ),
+            Ok(())
+        );
+        let with_proof = json!({"summary": "s", "deviations": [], "validation_performed": ["read"], "open_issues": [], "resolved": [], "proof": [{"ac": "AC-1", "tests": ["calc::adds_two"]}]});
+        assert_eq!(validate("implementation.schema.json", &with_proof), Ok(()));
+    }
+
+    /// M17-A3 (AC-3): without a red-green gate a report without `proof` is read as `proof: []`;
+    /// with one it is checked as returned; a report that has `proof` is never changed.
+    #[test]
+    fn m17_ac03_a_report_without_proof_passes_only_without_a_red_green_gate() {
+        let imp = json!({"summary": "s", "deviations": [], "validation_performed": [], "open_issues": [], "resolved": []});
+        assert_eq!(implementation_as_checked(&imp, false)["proof"], json!([]));
+        assert!(implementation_as_checked(&imp, true).get("proof").is_none());
+        assert!(validate(
+            "implementation.schema.json",
+            &implementation_as_checked(&imp, true)
+        )
+        .is_err());
+        let p = json!({"summary": "s", "proof": [{"ac": "AC-1", "tests": ["t"]}]});
+        assert_eq!(implementation_as_checked(&p, false), p);
+        assert_eq!(implementation_as_checked(&json!("x"), false), json!("x"));
+        // the map's entries are strict too
+        let bad = json!({"summary": "s", "deviations": [], "validation_performed": [], "open_issues": [], "resolved": [], "proof": [{"ac": "AC-1", "tests": ["t"], "why": "x"}, {"ac": "AC-2"}]});
+        assert_eq!(
+            validate("implementation.schema.json", &bad),
+            Err(vec![
+                "$.proof[0].why: not allowed (the schema lists no such property)".to_string(),
+                "$.proof[1]: missing required property `tests`".into(),
+            ])
+        );
     }
 
     #[test]
@@ -445,7 +507,8 @@ mod tests {
     #[test]
     fn strict_schemas_refuse_additional_properties_and_long_values_are_cut() {
         let long = "x".repeat(100);
-        let imp = json!({"summary": "s", "deviations": [], "validation_performed": [], "open_issues": [], "resolved": [], "bonus": long, "odd key": 1});
+        // (M17-A3: `proof` added — the schema requires it now; the assertions are unchanged)
+        let imp = json!({"summary": "s", "deviations": [], "validation_performed": [], "open_issues": [], "resolved": [], "proof": [], "bonus": long, "odd key": 1});
         assert_eq!(
             validate("implementation.schema.json", &imp),
             Err(vec![
@@ -453,7 +516,7 @@ mod tests {
                 "$[\"odd key\"]: not allowed (the schema lists no such property)".into(),
             ])
         );
-        let imp = json!({"summary": long, "deviations": [1], "validation_performed": [], "open_issues": [], "resolved": []});
+        let imp = json!({"summary": long, "deviations": [1], "validation_performed": [], "open_issues": [], "resolved": [], "proof": []});
         assert_eq!(
             validate("implementation.schema.json", &imp),
             Err(vec![

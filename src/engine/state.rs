@@ -42,9 +42,10 @@ pub const MAX_PLAN_AUTO_REJECTIONS: u32 = 2;
 /// over budget, or a gate/toolchain/boundary the machine cannot provide. Leaving one costs no
 /// fix cycle: a plain `toryo resume <id>` goes back into the stage, which checks its
 /// precondition again (a cause still there escalates again, no turn and no cycle).
-pub const MACHINE_CAUSED: [&str; 9] = {
+pub const MACHINE_CAUSED: [&str; 10] = {
     use EscalationClass as C;
     [
+        C::CandidateUnavailable.as_str(),
         C::GateUnavailable.as_str(),
         C::EnvironmentGateTimeout.as_str(),
         C::EnvironmentGateConfirm.as_str(),
@@ -71,6 +72,9 @@ pub fn is_machine_caused(class: &str) -> bool {
 /// case, `max_fix_cycles`, …) is still a string: it is never machine-caused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EscalationClass {
+    /// M17-B4 (X58): a best-of-N candidate's worktree folder or branch exists and the store did
+    /// not record it — refused by name, never deleted; a plain `resume` after it is removed.
+    CandidateUnavailable,
     GateUnavailable,
     EnvironmentGateTimeout,
     EnvironmentGateConfirm,
@@ -92,9 +96,10 @@ pub enum EscalationClass {
 }
 
 impl EscalationClass {
-    pub const ALL: [EscalationClass; 18] = {
+    pub const ALL: [EscalationClass; 19] = {
         use EscalationClass as C;
         [
+            C::CandidateUnavailable,
             C::GateUnavailable,
             C::EnvironmentGateTimeout,
             C::EnvironmentGateConfirm,
@@ -119,6 +124,7 @@ impl EscalationClass {
     pub const fn as_str(self) -> &'static str {
         use EscalationClass as C;
         match self {
+            C::CandidateUnavailable => "candidate_unavailable",
             C::GateUnavailable => "gate_unavailable",
             C::EnvironmentGateTimeout => "environment_gate_timeout",
             C::EnvironmentGateConfirm => "environment_gate_confirm",
@@ -145,7 +151,8 @@ impl EscalationClass {
         use EscalationClass as C;
         matches!(
             self,
-            C::GateUnavailable
+            C::CandidateUnavailable
+                | C::GateUnavailable
                 | C::EnvironmentGateTimeout
                 | C::EnvironmentGateConfirm
                 | C::EnvironmentGateUnavailable

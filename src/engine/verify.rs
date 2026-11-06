@@ -288,6 +288,57 @@ fn record_path(t: &TaskRow) -> PathBuf {
     t.artifacts().join("verify-checkout.json")
 }
 
+/// M17: where one detached verify checkout lives — its folder `base` (with `build`, `cache`,
+/// `tmp`, `home`), the checkout's own folder name in it, and the run-store file that records it.
+/// The task's checkout is [`Slot::main`]; the red checkout of a red-green gate (M17-A5) and a
+/// candidate's checkout (M17-B7) are folders under it, so `task cleanup` removes them with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Slot {
+    pub base: PathBuf,
+    pub dir_name: String,
+    pub record: PathBuf,
+}
+
+impl Slot {
+    /// `<verify_root>/<task>/<task>.verify` (as before M17).
+    pub fn main(t: &TaskRow, cfg: &Effective) -> Self {
+        Self {
+            base: verify_root(cfg).join(&t.id),
+            dir_name: format!("{}.verify", t.id),
+            record: record_path(t),
+        }
+    }
+
+    /// M17-A5: the red checkout of `parent` — `<parent base>/red/<task>.red` (a candidate's:
+    /// `<task>.c<k>.red`).
+    pub fn red(t: &TaskRow, parent: &Slot) -> Self {
+        let stem = parent
+            .dir_name
+            .strip_suffix(".verify")
+            .unwrap_or(&parent.dir_name);
+        let tag = parent
+            .record
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("verify-checkout")
+            .to_string();
+        Self {
+            base: parent.base.join("red"),
+            dir_name: format!("{stem}.red"),
+            record: t.artifacts().join(format!("{tag}-red.json")),
+        }
+    }
+
+    /// M17-B7: the verify checkout of candidate `k` — `<verify_root>/<task>/c<k>/<task>.c<k>.verify`.
+    pub fn candidate(t: &TaskRow, cfg: &Effective, k: u32) -> Self {
+        Self {
+            base: verify_root(cfg).join(&t.id).join(format!("c{k}")),
+            dir_name: format!("{}.c{k}.verify", t.id),
+            record: t.artifacts().join(format!("verify-checkout-c{k}.json")),
+        }
+    }
+}
+
 fn empty_dir(d: &Path) -> Result<()> {
     // never through a link: a junction put in place of `d` (or inside it) is removed as a
     // link, its target is left alone (M11-R2 review)
@@ -362,14 +413,28 @@ pub fn prepare(
     sha: &str,
     b: Boundary,
 ) -> Result<Checkout> {
+    prepare_in(g, t, cfg, sha, b, &Slot::main(t, cfg))
+}
+
+/// [`prepare`] in `slot` (M17: the red checkout, a candidate's checkout) — the same checks and the
+/// same boundary: the folder is proven not Low-writable, the checkout and its folders are labelled
+/// Low, and the checkout must be a clean checkout of `sha` before anything runs in it.
+pub fn prepare_in(
+    g: &GitCmd,
+    t: &TaskRow,
+    cfg: &Effective,
+    sha: &str,
+    b: Boundary,
+    slot: &Slot,
+) -> Result<Checkout> {
     let low = b == Boundary::LowIntegrity;
-    let rec: Option<Checkout> = std::fs::read(record_path(t))
+    let rec: Option<Checkout> = std::fs::read(&slot.record)
         .ok()
         .and_then(|x| serde_json::from_slice(&x).ok());
     // (R13) a recorded checkout is used while it is under the verify root in force: after a
     // `verify_root` change (`task config --reload`) a new one is made there; the old folder is
     // left alone
-    let base = verify_root(cfg).join(&t.id);
+    let base = slot.base.clone();
     if low {
         std::fs::create_dir_all(&base)?;
         not_low_writable(&base, &verify_root(cfg))?;
@@ -379,7 +444,7 @@ pub fn prepare(
     {
         Some(c) => c,
         None => {
-            let dir = base.join(format!("{}.verify", t.id));
+            let dir = base.join(&slot.dir_name);
             let repo = Loc::Discover(t.repo.clone());
             let fwd = dir.display().to_string().replace('\\', "/");
             if dir.exists() {
@@ -417,7 +482,7 @@ pub fn prepare(
                 label(&[c.dir.clone(), c.build(), c.cache(), c.tmp(), c.home()])
                     .map_err(|e| stop(UNAVAILABLE, format!("{UNAVAILABLE}: {e:#} (R45)")))?;
             }
-            std::fs::write(record_path(t), serde_json::to_vec_pretty(&c)?)?;
+            std::fs::write(&slot.record, serde_json::to_vec_pretty(&c)?)?;
             c
         }
     };
@@ -1177,7 +1242,7 @@ pub fn cleanup(g: &GitCmd, t: &TaskRow, cfg: Option<&Effective>) -> Result<()> {
     let rec: Option<Checkout> = std::fs::read(record_path(t))
         .ok()
         .and_then(|x| serde_json::from_slice(&x).ok());
-    let base = rec
+    let mut base = rec
         .as_ref()
         .map(|c| c.base.clone())
         .or_else(|| cfg.map(|c| verify_root(c).join(&t.id)));
@@ -1188,6 +1253,36 @@ pub fn cleanup(g: &GitCmd, t: &TaskRow, cfg: Option<&Effective>) -> Result<()> {
             false,
             &["worktree", "remove", "--force", &fwd],
         );
+    }
+    // M17: the red checkouts (`<base>/red`, a candidate's `<base>/c<k>/red`) and the candidates'
+    // checkouts (`<base>/c<k>`) are under the task's verify folder: their Git entries are removed,
+    // then the folder (found through one of them when the task's own record is gone)
+    for f in std::fs::read_dir(t.artifacts())
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = f.file_name().to_string_lossy().to_string();
+        if name.starts_with("verify-checkout-") && name.ends_with(".json") {
+            if let Some(c) = std::fs::read(f.path())
+                .ok()
+                .and_then(|x| serde_json::from_slice::<Checkout>(&x).ok())
+            {
+                let fwd = c.dir.display().to_string().replace('\\', "/");
+                let _ = g.output(
+                    &Loc::Discover(t.repo.clone()),
+                    false,
+                    &["worktree", "remove", "--force", &fwd],
+                );
+                if base.is_none() {
+                    base = c
+                        .base
+                        .ancestors()
+                        .find(|a| a.file_name().is_some_and(|n| *n == *t.id))
+                        .map(Path::to_path_buf);
+                }
+            }
+        }
     }
     if let Some(base) = base.filter(|b| b.exists()) {
         std::fs::remove_dir_all(&base).with_context(|| format!("removing {}", base.display()))?;

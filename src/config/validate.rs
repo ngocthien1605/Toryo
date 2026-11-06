@@ -193,6 +193,7 @@ pub(crate) fn verify_command_problems(
     machine: &str,
 ) {
     let key = key.to_string();
+    red_green_problems(out, &key, c);
     let Some(tool) = &c.tool else {
         if c.program.is_none() {
             out.push(format!("{key}: needs `program` (with `args`) or `tool`"));
@@ -245,6 +246,74 @@ pub(crate) fn verify_command_problems(
     }
     if toolchains.xpp.is_none() {
         out.push(format!("{key}.tool: `tool: xpp` needs `toolchains.xpp` in the machine config ({machine}): msbuild, nugets (R59)"));
+    }
+}
+
+/// M17-A1 (AC-2): the problems of a check gate's `red_green` block, each naming the gate (`key`)
+/// and the key — not with `tool: xpp` (red-green needs a test runner that takes one test), `{test}`
+/// exactly once in `red_green.args` and never in `program`, `tests` not empty and each glob one
+/// the write fence's matcher accepts, a valid `green_output_must_match`, `max_tests` 1..=64.
+/// (An unknown key is serde's refusal; an environment gate is refused by `team::problems`.)
+pub(crate) fn red_green_problems(out: &mut Vec<String>, key: &str, c: &CommandSpec) {
+    let Some(rg) = &c.red_green else {
+        return;
+    };
+    let at = |k: &str| format!("{key}.red_green.{k}");
+    if c.tool.is_some() {
+        out.push(format!(
+            "{key}.red_green: not with `tool: xpp` — red-green runs one test at a time through a test runner (`program` + `red_green.args`); remove `red_green` or make the gate a `program` gate"
+        ));
+    }
+    if c.program
+        .as_deref()
+        .is_some_and(|p| p.contains(TEST_PLACEHOLDER))
+    {
+        out.push(format!(
+            "{key}.program: `{TEST_PLACEHOLDER}` may not appear in `program` — the test id is an argument (`red_green.args`), never the program"
+        ));
+    }
+    if rg.tests.is_empty() {
+        out.push(format!(
+            "{}: empty — list the globs of the test files (e.g. `tests/**`): the red commit takes them from the checkpoint",
+            at("tests")
+        ));
+    }
+    for g in &rg.tests {
+        if let Err(why) = crate::engine::checks::fence_pattern(g) {
+            out.push(format!("{}: `{g}` is not a valid glob: {why}", at("tests")));
+        }
+    }
+    let n: usize = rg
+        .args
+        .iter()
+        .map(|a| a.matches(TEST_PLACEHOLDER).count())
+        .sum();
+    match n {
+        1 => {}
+        0 => out.push(format!(
+            "{}: `{TEST_PLACEHOLDER}` is missing — write it exactly once, as a whole argument or inside one (`--filter=FullyQualifiedName~{TEST_PLACEHOLDER}`)",
+            at("args")
+        )),
+        n => out.push(format!(
+            "{}: `{TEST_PLACEHOLDER}` appears {n} times — write it exactly once",
+            at("args")
+        )),
+    }
+    if let Some(re) = &rg.green_output_must_match {
+        if let Err(e) = regex::Regex::new(re) {
+            out.push(format!(
+                "{}: `{re}` is not a valid regular expression: {e}",
+                at("green_output_must_match")
+            ));
+        }
+    }
+    if let Some(m) = rg.max_tests {
+        if m == 0 || m > MAX_MAX_TESTS {
+            out.push(format!(
+                "{}: `{m}` is out of range (1..={MAX_MAX_TESTS})",
+                at("max_tests")
+            ));
+        }
     }
 }
 

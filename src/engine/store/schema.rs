@@ -122,6 +122,38 @@ CREATE TABLE IF NOT EXISTS environment_deployments (
 CREATE TABLE IF NOT EXISTS environment_waits (
   task TEXT PRIMARY KEY, lock TEXT NOT NULL, since TEXT NOT NULL
 );
+-- M17-B2 (schema version 4): best-of-N — the fan-out of a task's first Implementing stage and
+-- its candidates; a version-3 database gets them on open, nothing else changes
+CREATE TABLE IF NOT EXISTS fanouts (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+  n INTEGER NOT NULL,
+  phase TEXT NOT NULL,
+  winner INTEGER,
+  by TEXT,
+  reason TEXT,
+  note TEXT,
+  started_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS candidates (
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  k INTEGER NOT NULL,
+  profile TEXT NOT NULL,
+  worktree TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  created INTEGER NOT NULL DEFAULT 0,
+  removed INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL DEFAULT 'pending',
+  outcome TEXT,
+  head TEXT,
+  verify_pass INTEGER,
+  proven INTEGER,
+  changed_lines INTEGER,
+  feedback TEXT,
+  winner INTEGER NOT NULL DEFAULT 0,
+  detail TEXT,
+  PRIMARY KEY (task_id, k)
+);
 CREATE TABLE IF NOT EXISTS deploy_confirmations (
   task TEXT NOT NULL, gate TEXT NOT NULL, commit_sha TEXT NOT NULL, config_sha256 TEXT NOT NULL,
   mode TEXT NOT NULL, asked_at TEXT NOT NULL, confirmed_at TEXT,

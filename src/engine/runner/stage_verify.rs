@@ -91,22 +91,37 @@ impl<'a> Engine<'a> {
             )?;
             e.stopped()
         };
-        let ran = match self.run_verify_commands(b, &co, &head, &stop, xpp.as_ref()) {
+        // M17-A4: what the red-green gate needs — the proof map of the attempt that made the
+        // checkpoint, the exempt criteria, and where its red checkout goes
+        let proof = ProofInput {
+            proof: self.proof_of(t, &head)?,
+            exempt: self.proof_exempt(t)?,
+            slot: verify::Slot::main(t, &self.cfg),
+        };
+        let ran = match self.run_verify_commands(b, &co, &head, &stop, xpp.as_ref(), &proof) {
             Ok(r) => r,
             // M12-05: the program disappeared between the preflight and the start (or is no
             // executable): the same class, with the OS error
             Err(e) => return self.gate_start_failed(t, &a, e),
         };
-        let Some((mut results, mut failure)) = ran else {
+        let Some(VerifyRun {
+            mut results,
+            mut failure,
+            red_green,
+            red_mutated,
+        }) = ran
+        else {
             return interrupted(self);
         };
         // M11-R9 (X6, replaces X2): the environment gates read a fresh export of the commit,
         // never the Low checkout. Before the first one, a check gate that changed a tracked file
         // is still wrong (R29: escalate, no environment gate); what it left besides is not
         // deployed — one warning and `checkout_extra` in VERIFY_RESULT.json
-        let mut before_deploy: Option<String> = None;
+        // M17-A6: a red run that changed the red checkout is `verify_mutated_tree`, before
+        // anything else, and no environment gate runs
+        let mut before_deploy: Option<String> = red_mutated;
         let mut extra: Option<Vec<String>> = None;
-        if failure.is_none() && self.deploys() {
+        if failure.is_none() && before_deploy.is_none() && self.deploys() {
             before_deploy = verify::mutated(&self.g, &co, &head)?;
             let found = verify::checkout_extra(&self.g, &co)?;
             if !found.is_empty() {
@@ -120,7 +135,10 @@ impl<'a> Engine<'a> {
         // M16-02 (X36): what the check gates ran, hashed while no other task's Low code can
         // change the checkout; then the next task may run its check gates while the
         // environment gates of this one wait for their own lock (M11-E3)
-        let scripts = verify::script_hashes(&verify_files(&self.cmds, &co.dir), &co);
+        let scripts = verify::script_hashes(
+            &verify_files(&crate::engine::checks::with_red_green(&self.cmds), &co.dir),
+            &co,
+        );
         // M16-R1: when no environment gate follows (none is defined, or a check gate failed),
         // this is the one check of the checkout after the run — made under the lock, so that no
         // other task's Low code can hide a mutation (or add one) before it is looked at
@@ -181,6 +199,10 @@ impl<'a> Engine<'a> {
         }
         if let Some(x) = extra {
             vr["checkout_extra"] = json!(x);
+        }
+        // M17-A7 (AC-11): only with a red-green gate — every other result keeps its bytes
+        if let Some(r) = &red_green {
+            vr["red_green"] = json!(r);
         }
         self.put(
             t,
@@ -401,6 +423,13 @@ impl<'a> Engine<'a> {
         a: &AttemptRow,
         e: anyhow::Error,
     ) -> Result<Flow> {
+        // M17-A5: the red checkout could not be made at the boundary, or is not clean — the
+        // class of the verify checkout (X8), typed with the error
+        if let Some(stop) = e.downcast_ref::<verify::Stop>() {
+            let class = stop.class.to_string();
+            self.escalate_attempt(a, class, format!("{e:#}"))?;
+            return Ok(Flow::Next);
+        }
         let Some(s) = e.downcast_ref::<crate::runner::StartFailed>() else {
             return Err(e);
         };
@@ -491,7 +520,8 @@ impl<'a> Engine<'a> {
         head: &str,
         stop: &StopWatch,
         xpp: Option<&xpp::Toolchain>,
-    ) -> Result<Option<(Vec<Value>, Option<String>)>> {
+        proof: &ProofInput,
+    ) -> Result<Option<VerifyRun>> {
         let mut env = verify::env(co);
         // M11-E1: TORYO_TASK, TORYO_SHA, TORYO_VERIFY_CHECKOUT for every command
         verify::set_gate_vars(&mut env, &self.id, head, co, &co.dir);
@@ -506,7 +536,38 @@ impl<'a> Engine<'a> {
             redact: crate::engine::flight::task_redactions(&self.cfg, &t),
         };
         let mut results = Vec::new();
+        let mut red_green = None;
         for c in &self.cmds {
+            // M17-A4 (AC-4): a red-green gate checks the proof map first — no process starts,
+            // not even the gate's own args, for a map that is not valid
+            let plan = match &c.red_green {
+                None => None,
+                Some(rg) => match crate::engine::redgreen::plan(
+                    proof.proof.as_ref(),
+                    &t.acceptance_ids,
+                    &proof.exempt,
+                    rg.max_tests(),
+                ) {
+                    Ok(p) => Some((rg, p)),
+                    Err(problems) => {
+                        let f = map_feedback(&c.name, &problems);
+                        let r = crate::engine::redgreen::RedGreenResult::refused(
+                            &c.name,
+                            &t.base_commit,
+                            &t.acceptance_ids,
+                            &proof.exempt,
+                            problems,
+                        );
+                        self.red_green_finished(&r);
+                        return Ok(Some(VerifyRun {
+                            results,
+                            failure: Some(untrusted::wrap("verify", None, &f)),
+                            red_green: Some(r),
+                            red_mutated: None,
+                        }));
+                    }
+                },
+            };
             let ran = match (c.kind(), xpp) {
                 (CommandKind::Program { program, args }, _) => {
                     let program = verify_program(&expand_vars(program)?, &co.dir);
@@ -538,12 +599,37 @@ impl<'a> Engine<'a> {
                 None => return Ok(None),
                 // R61: verify output comes from the code under test — data, not instructions
                 Some(Some(f)) => {
-                    return Ok(Some((results, Some(untrusted::wrap("verify", None, &f)))))
+                    return Ok(Some(VerifyRun {
+                        results,
+                        failure: Some(untrusted::wrap("verify", None, &f)),
+                        red_green: None,
+                        red_mutated: None,
+                    }))
                 }
                 Some(None) => {}
             }
+            // M17-A6: the gate's own args passed — its tests, one by one, green then red
+            if let Some((rg, plan)) = plan {
+                let Some(out) = self.red_green_run(c, rg, plan, &at, b, head, proof)? else {
+                    return Ok(None);
+                };
+                red_green = Some(out.result);
+                if out.mutated.is_some() || out.failure.is_some() {
+                    return Ok(Some(VerifyRun {
+                        results,
+                        failure: out.failure.map(|f| untrusted::wrap("verify", None, &f)),
+                        red_green,
+                        red_mutated: out.mutated,
+                    }));
+                }
+            }
         }
-        Ok(Some((results, None)))
+        Ok(Some(VerifyRun {
+            results,
+            failure: None,
+            red_green,
+            red_mutated: None,
+        }))
     }
 
     /// R59: MSBuild on each project of a `tool: xpp` command, in order, stopping at the first
@@ -615,7 +701,7 @@ impl<'a> Engine<'a> {
         run: RunSpec,
         stop: &StopWatch,
     ) -> Result<Option<CommandResult>> {
-        self.run_gate_command(run, stop, None)
+        self.run_gate_command(run, stop, None, None)
     }
 
     /// [`Self::run_verify_command`] for a gate of `kind` (`environment`, M11-E3: shown in its
@@ -625,6 +711,7 @@ impl<'a> Engine<'a> {
         run: RunSpec,
         stop: &StopWatch,
         kind: Option<&str>,
+        side: Option<&str>,
     ) -> Result<Option<CommandResult>> {
         let name = run.name.clone();
         let io = self.gate_io(&name);
@@ -639,8 +726,15 @@ impl<'a> Engine<'a> {
             ok: res.ok(),
             duration_ms: res.duration_ms as u64,
             kind: kind.map(str::to_string),
+            side: side.map(str::to_string),
         });
-        if let (false, Some(log)) = (res.ok(), &res.log) {
+        // (M17-A6: a red-side run must fail — its log is worth a look only when it did not)
+        let wrong = if side == Some("red") {
+            res.ok()
+        } else {
+            !res.ok()
+        };
+        if let (true, Some(log)) = (wrong, &res.log) {
             crate::errln!("    full output: {}", log.display());
         }
         Ok(Some(res))

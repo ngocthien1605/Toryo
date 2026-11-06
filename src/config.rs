@@ -1063,6 +1063,62 @@ commands:
         assert_eq!(m.verify.min_boundary.as_deref(), Some("low_integrity"));
     }
 
+    /// M17: the commented `red_green` and `candidates` examples of the templates parse once
+    /// uncommented — the examples cannot drift from the structs.
+    #[test]
+    fn the_commented_m17_examples_parse() {
+        let t = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
+        let read = |f: &str| {
+            std::fs::read_to_string(t.join(f))
+                .unwrap()
+                .replace("\r\n", "\n")
+        };
+        // the commented block that starts at the first line (after `marker`) whose text after
+        // `#` starts with `first`, as long as the lines stay comments
+        let block = |text: &str, marker: &str, first: &str| -> String {
+            let from = text.find(marker).unwrap_or_else(|| panic!("{marker}"));
+            text[from..]
+                .lines()
+                .skip_while(|l| {
+                    !l.trim_start()
+                        .trim_start_matches('#')
+                        .trim_start()
+                        .starts_with(first)
+                })
+                .take_while(|l| l.trim_start().starts_with('#'))
+                .map(|l| l.replacen("# ", "", 1))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        for f in ["toryo.yaml.example", "dogfood/toryo.yaml.example"] {
+            let text = read(f);
+            let specs: Vec<CommandSpec> =
+                serde_yaml::from_str(&block(&text, "# M17 red-green", "- name:")).unwrap();
+            let rg = specs[0].red_green.as_ref().expect("red_green");
+            assert_eq!(
+                rg.args.iter().filter(|a| a.contains("{test}")).count(),
+                1,
+                "{f}"
+            );
+            assert!(rg.green_output_must_match.is_some(), "{f}");
+            let seat: BTreeMap<String, Role> =
+                serde_yaml::from_str(&block(&text, "M17 best-of-N", "implementer:")).unwrap();
+            let c = seat["implementer"].candidates.as_ref().expect("candidates");
+            assert!((MIN_CANDIDATES..=MAX_CANDIDATES).contains(&c.len()), "{f}");
+        }
+        let org = read("d365fo/.toryo/toryo-orgchart.yaml");
+        let gates: BTreeMap<String, crate::team::GateDecl> =
+            serde_yaml::from_str(&block(&org, "a RED-GREEN check gate", "unit:")).unwrap();
+        assert!(gates["unit"].red_green.is_some());
+        let seat = org
+            .lines()
+            .find_map(|l| l.trim_start().strip_prefix("# candidates: "))
+            .expect("the commented candidates line");
+        let list = seat.split('#').next().unwrap().trim();
+        let c: Vec<String> = serde_yaml::from_str(list).unwrap();
+        assert_eq!(c.len(), 2);
+    }
+
     /// M12-08 (X20): the keys `keys_without_effect` announces are read by no engine code. When
     /// one starts being used this test fails — take it off the list (and out of the notes), so
     /// that the message "has no effect" stays true.

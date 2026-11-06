@@ -78,6 +78,7 @@ toryo status [ID] [--json] · toryo task list|show ID [--json] · toryo watch ID
 toryo dashboard [--once] [--json] [--interval S] [--hide-done]   # every task at a glance; no lock, writes nothing
 toryo task config ID [--reload]           # the frozen configuration; reload only while the task waits
 toryo task cleanup ID [--force]           # --force when it would delete unsaved work or snapshots
+                                          # (also in a best-of-N candidate's worktree; branches are kept)
 toryo budget set ID --tokens N | --none   · toryo usage ID [--json] [--prices FILE]
 toryo context show ID --stage plan|implement|review    # what the agent actually receives
 toryo config show [--json]                # which files were read, where every setting comes from
@@ -171,7 +172,8 @@ CULTURE.md                              # optional team norms
 ```
 
 - **Seats:** `planner`, `implementer`, `reviewer`, each a profile of the machine config. Only the implementer may
-  have a `fallback` (an ordered list of profiles, used when it is out of quota).
+  have a `fallback` (an ordered list of profiles, used when it is out of quota) and `candidates` (2–4 profiles that
+  implement side by side: [best-of-N](#best-of-n-implementer-candidates)).
 - **Limits:** `max_gate_retries` and `max_review_rounds` are counted separately.
 - **Checks:** `reviewer-differs-from-builder: off | warn | error`.
 - **Write fence:** the implementer's `writes:` (the only files it may change) and `never:` (never, even inside
@@ -206,11 +208,107 @@ run on the checkpoint commit, stop at the first failure, and the exit code decid
 - **Line endings.** A repository with `text` / `eol=crlf` attributes over blobs that still hold CRLF makes Git report the
   verify checkout as modified: run `git add --renormalize .` once and commit, or every verify stops with
   `verify_mutated_tree`.
+- **Red-green.** A check gate may carry a `red_green` block: it then also proves, per acceptance criterion, that the
+  tests the implementer names fail without the change and pass with it ([below](#red-green-proof-gate)).
 - **Cannot start** → the task stops before any gate runs, and no implementer turn is spent:
   a **check gate** whose program is not on the machine → `gate_unavailable`;
   an **environment gate** whose program, script or secret is missing → `environment_gate_unavailable`
   (`task create` already refuses one whose script is missing). An environment gate that runs into its timeout stops the
   task for you (`environment_gate_timeout`), also with no implementer turn.
+
+## Red-green proof gate
+
+A test that passes on the base commit proves nothing about the change. A `kind: check` gate (or a `commands.verify`
+entry in toryo.yaml-only mode; one per configuration) may carry:
+
+```yaml
+gates:
+  unit: { kind: check, program: cargo, args: [test, --locked], timeout: 20m,
+          red_green: { tests: ["tests/**"], args: [test, --locked, "{test}", --, --exact],
+                       green_output_must_match: "test result: ok\\. [1-9]", max_tests: 32 } }
+```
+
+- **The proof map.** With such a gate the implementer's `IMPLEMENTATION.json` must hold `proof`:
+  `[{ "ac": "AC-1", "tests": ["divide::by_zero"] }, …]` — every acceptance criterion that is not exempt, each with
+  1..n test ids (ASCII letters, digits and `_:./-[]=,@+#`, 1–200 bytes, not starting with `-` or `/`; at most
+  `max_tests` distinct ids, default 32, 1–64). TASK.md may exempt a criterion with a reason: a section
+  `## Proof exempt` with `- AC-3: checked by hand on the UDE machine` (refused at `task create`, with its line, for an
+  unknown id, a duplicate or no reason). Without a red-green gate a report without `proof` is fine, as before.
+- **The run, in the gate's place in `before_handoff`:** (1) the map is checked — any problem fails the gate with every
+  problem named, and **no process starts**; (2) the gate's own `args` run as always; (3) **green**: each distinct test id
+  once, `{test}` replaced as one argv element or inside one (`--filter=Name~{test}`, never through a shell Toryo builds),
+  in the checkpoint's verify checkout — exit 0 within the gate's `timeout`, and `green_output_must_match` when set (a
+  filter that matches no test passes green otherwise: set it); (4) **the red commit**: the base tree with every path that
+  matches `red_green.tests` taken from the checkpoint (added, modified, deleted — byte-exact blobs and modes), parent =
+  the base, made with Git plumbing and on **no ref**; (5) **red**: its clean checkout `<verify folder>\red\<task>.red`, at
+  the verify boundary under the verify lock; each test once — a non-zero exit is red, a timeout is red and flagged
+  `timed_out`, an exit 0 fails the gate ("passes without the change — it proves nothing"); (6) the red checkout must still
+  be the red commit (`verify_mutated_tree`).
+- **Results.** A failure is one gate retry with feedback that names criterion, test, side, exit code and the output tail. A
+  program that cannot start is `gate_unavailable` (no fix cycle). A stop or a crash inside the runs interrupts the attempt and
+  verify runs again on resume; a fix cycle's checkpoint gets a new red commit. `VERIFY_RESULT.json` holds `red_green`
+  (`proven`, `total`, `exempt`, per criterion and test the green and red exit codes, the red commit; relative paths only —
+  no key without the gate); the reviewer gets the evidence in its prompt as data and still answers every criterion
+  itself; `status`, `task show` (`red_green` in `--json`, `null` without the gate) and the final gate show
+  `proven/total`; `red_green_finished` is printed by `watch`.
+- **Globs.** `tests` names what the red commit takes from the checkpoint: test files only. A glob as wide as `src/**`
+  makes red the same as green, and the gate fails "proves nothing". A bug fix whose test already exists and fails on the
+  base is an empty overlay: allowed.
+
+## Best-of-N implementer candidates
+
+```yaml
+seats:
+  implementer: { profile: codex, fallback: [claude], candidates: [codex, claude] }   # 2..4 profiles, repeats allowed
+```
+
+(`roles.implementer.candidates` in toryo.yaml mode.) Refused on another seat, with fewer than 2 or more than 4 entries,
+or with a profile the machine config does not define; frozen at `task create`, shown by `config show`, `task config` and
+`doctor`, covered by the R51 evidence check; `task config --reload` may change it only before the fan-out started. A
+task without `candidates` runs exactly as before.
+
+- **Fan-out.** At the first Implementing stage after the plan approval, candidate `c<k>` gets the worktree
+  `<worktrees_root>\<ID>.c<k>` on a new branch `toryo-candidate/<ID>/c<k>` at the base commit — recorded before it is
+  made; a failure or Ctrl+C while they are made takes back what was made. A folder or branch of that name that Toryo did
+  not record is refused by name and never deleted (`candidate_unavailable`; remove it, then `toryo resume <ID>`).
+- **Turns.** The candidates' turns run **at the same time** inside the owner process, under the one task lock, each
+  with its own profile, session, process group / Job Object, `TEMP` and context, on the same approved plan. Each turn's
+  end goes through the single turn's checks in its own worktree (HEAD guard, protected state, deny and fence) and Toryo's
+  checkpoint commit with the trailers `Toryo-Task`, `Toryo-Stage: implement#c<k>` and `Toryo-Candidate: c<k>`.
+  Outcomes: `checkpointed`, `no_change`, `failed_turn` (quota, crash, invalid output — **no fallback chain** for a
+  candidate), `disqualified(<class>)`, `interrupted`. A protected change, a tampered artifact or a recovery policy
+  violation in any candidate escalates the task and stops the other turns; a fence or deny violation, a moved HEAD or a
+  mutated verify checkout disqualifies that candidate only. A stop request or Ctrl+C ends every running turn.
+- **Check gates.** Each checkpointed candidate runs the check gates (red-green included; **never** an environment gate),
+  one after another under the verify lock, in `<verify_root>\<task>\c<k>`, with its own `VERIFY_RESULT.json`
+  (`candidates\c<k>\` in the run store).
+- **Selection.** One passing candidate wins (`by: only`). Two or more: one read-only compare turn of the **reviewer
+  seat** (`schemas/select.schema.json`: `winner`, `reason`, `ranking`) with each passing candidate's `DIFF.patch`,
+  `IMPLEMENTATION.json` and verify summary as untrusted data; an invalid answer gets one correction turn; a second invalid
+  answer, a failed turn or a write (put back) falls to the **score** (`by: score`), which is also the tie-break:
+  (1) every check gate passed, (2) more criteria proven red-green, (3) fewer changed lines (`git diff --numstat` added +
+  deleted), (4) fewer tokens, (5) the lower index. No candidate passed: the best by score wins and the task enters
+  Fixing with its verify feedback (one gate retry). No candidate checkpointed: the single-implementer path (primary +
+  fallback) runs once, with a note — no second fan-out.
+- **Promotion.** The task worktree must be clean, at the base, on `toryo/<ID>`, with no unfinished Git operation — else
+  nothing moves and the task stops (`candidate_unavailable`: put it back, `toryo resume <ID>`). Then `toryo/<ID>` is moved
+  to **exactly** the winner's commit (same SHA, no new commit); it is the anchor, and the normal flow follows: Verifying
+  (every check gate again, then the environment gates), Reviewing, the final gate. Fix cycles use the winner's profile
+  first (a fresh session), then the fallback chain; `reviewer-differs-from-builder` judges the winner's profile.
+- **Losers.** Every candidate folder is removed when it is no longer needed (the losers' after the selection, the
+  winner's at its promotion); every candidate branch is kept and named. `task cleanup` removes a candidate worktree still
+  there (only one the store recorded; `--force` when it holds unsaved work) and keeps the branches.
+- **Budget.** A fan-out starts only the candidates the budget admits at the reservation estimate of a turn (the
+  `pipeline.unknown_turn_reservation_tokens`, else the task's largest exact implement turn, else 200,000): 2..N−1 run with
+  a note, fewer than 2 take the single path with a note. The live interrupt counts the running candidate turns together:
+  at the budget they are all cut and the task pauses; `budget set` + `resume` runs only the unfinished candidates.
+- **Seeing it.** `candidates_started`, `candidate_finished`, `candidate_selected` in `events.jsonl` and `watch`;
+  `status` / `task show` list each candidate, the winner, how it was chosen and the kept branches (`candidates` in
+  `--json`: `[{ id, profile, outcome, head, verify, tokens, winner, by, branch }]`, `null` without a fan-out); the
+  dashboard's `now:` shows `candidates 1/2 verifying`; the final gate names the winner and the losers' branches.
+  `toryo usage` shows each candidate's turns as its own stage (`implement#c1`, `implement#c2`, and the compare turn
+  `select`). The compare turn's own reason is printed once, when it is used, and never shown by `status`, the dashboard
+  or the final gate (they speak Toryo's words only).
 
 ## What the boundary does and does not buy
 
@@ -227,7 +325,13 @@ In plain words, so that "Low integrity" is not read as "sandbox":
   approval**, unless `confirm` is `first` or `always`.
 - The last 40 lines of a gate's output go to the model vendors (as the implementer's fix feedback), and only `secret_env`
   values are redacted. Print no connection string, key or token.
-- Untrusted text (a task pack file, verify output) reaches the agents only as data, never as instructions.
+- **Red-green** runs agent-written test code twice — on the checkpoint and on the red commit (the base with the task's
+  test files) — both at the same boundary as every check gate.
+- **Best-of-N candidates** run side by side as your user, each in its own worktree. Toryo checks each one's own worktree,
+  not what one candidate might write into a sibling's: the agents' own sandboxes (Claude `--add-dir`, Codex
+  `workspace-write`) are the guard there.
+- Untrusted text (a task pack file, verify output, a candidate's diff for the compare turn) reaches the agents only as
+  data, never as instructions.
 - Text an agent, a vendor or a gate wrote reaches **your console** as inert text: escape sequences are removed, carriage
   returns dropped, other control and direction-changing characters shown as `�` — a plan or an escalation reason cannot
   write your clipboard, retitle the window or paint a forged "Completed" line. `--json` output is data and keeps what was
@@ -238,7 +342,8 @@ In plain words, so that "Low integrity" is not read as "sandbox":
 `toryo status <ID>` ends with `next:` — the command to type. `docs/HUONG-DAN.md` §9.1 lists every escalation class
 with its meaning and what to type. Three rules cover most of it: a **machine-caused** stop (`gate_unavailable`,
 `environment_gate_unavailable`, `environment_gate_timeout`, `environment_gate_confirm`, `skill_unavailable`,
-`context_over_budget`, `context_unreadable`, `xpp_toolchain_unavailable`, `verify_boundary_unavailable`) costs no fix
+`context_over_budget`, `context_unreadable`, `xpp_toolchain_unavailable`, `verify_boundary_unavailable`,
+`candidate_unavailable`) costs no fix
 cycle — fix the cause and `toryo resume <ID>` (after `toryo task config <ID> --reload` if the fix is in a config file);
 a protected file that changed → restore it, or `resume --accept-protected-change <path>`; everything else →
 `resume --note "…"` (one more fix cycle), `approve --gate final --force` (opens the final gate without the AI review) or
@@ -248,7 +353,9 @@ a protected file that changed → restore it, or `resume --accept-protected-chan
 
 - `toryo watch <ID>` follows the flight recorder `<data dir>\runs\<ID>\events.jsonl` without taking the lock; `--json`
   prints the raw events (`run_started`, `state_changed`, `stage_started/finished`, `turn_finished`, `checkpoint_created`,
-  `verify_command`, `gate_opened`, `escalated` with a typed `reason_class`, `paused`, `run_ended`, …).
+  `verify_command` (with `side: green | red` for a red-green run), `red_green_finished`, `candidates_started`,
+  `candidate_finished`, `candidate_selected`, `gate_opened`, `escalated` with a typed `reason_class`, `paused`,
+  `run_ended`, …).
   The file also holds **diagnostic events** (X39) — never printed, left out of the rendered `watch` (and of its
   history of 20) and of the dashboard's `last:`: `lock_acquired` / `lock_released` (`machine:verify` or an environment
   lock; `released` is written before the lock is let go), `cancel_requested` (`source`: `ctrl_c` or `stop`),
@@ -266,7 +373,8 @@ a protected file that changed → restore it, or `resume --accept-protected-chan
   never its reason, a pause or an error no text at all; `toryo watch <ID>` shows the text (X35).
 - `toryo status [ID] --json`, `toryo task list --json` and `toryo task show ID --json` print one JSON document on
   stdout (snake_case; a key is always present, `null` when there is no value): state, fix cycle, token spend and
-  budget, `active_owner`, `next_action`, attempts, usage rows, gate occurrences and the environments' deployment rows.
+  budget, `active_owner`, `next_action`, `red_green` and `candidates` (M17; `null` when the task has none), attempts,
+  usage rows, gate occurrences and the environments' deployment rows.
 - `toryo usage ID` shows tokens per stage × profile × model, and an estimated cost for per-token billing from the
   machine's `prices.toml` (`templates/prices.toml.example`); subscription rows show `—`.
 - `notify: { toast: true }` in the machine config (or `--notify`) shows a Windows toast when a task needs you.
@@ -280,7 +388,7 @@ a protected file that changed → restore it, or `resume --accept-protected-chan
 
 | Path | What |
 |---|---|
-| `src/engine/` | the engine: state machine, SQLite store (`store/`: one module per table), task lock (`lock/`), the stages (`runner/`: plan, implement, checkpoint, verify, environment gates, review, budget, gate decisions), the library half of the CLI (`commands.rs`), recovery and snapshots, context loader, protected-state scan, artifacts, verify checkout and boundary, gates, `tool: xpp`, flight recorder, views, usage |
+| `src/engine/` | the engine: state machine, SQLite store (`store/`: one module per table), task lock (`lock/`), the stages (`runner/`: plan, implement, checkpoint, verify, red-green, the best-of-N fan-out, environment gates, review, budget, gate decisions), the pure parts of red-green (`redgreen.rs`) and best-of-N (`candidates.rs`), the library half of the CLI (`commands.rs`), recovery and snapshots, context loader, protected-state scan, artifacts, verify checkout and boundary, gates, `tool: xpp`, flight recorder, views, usage |
 | `src/agents/` | Claude and Codex adapters (exact launch lines, stream parsers), the fake agent, the hub |
 | `src/process/` | Job Objects, Low-integrity spawning, environment allowlist, secret redaction, output decoding |
 | `src/config.rs` + `src/config/`, `src/team.rs` + `src/team/` | machine and repository config (types, the effective configuration, checks, the machine/repository guard, secrets), the org chart, environment gates, skills |

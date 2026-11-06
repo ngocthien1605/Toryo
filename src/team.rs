@@ -79,6 +79,10 @@ pub struct GateDecl {
     pub timeout: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub if_missing: Option<IfMissing>,
+    /// M17-A1: check only, with `program` — the red-green proof of the gate
+    /// ([`crate::config::RedGreen`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub red_green: Option<crate::config::RedGreen>,
 }
 
 /// One seat: which Toryo profile sits there (owner decision D2).
@@ -91,6 +95,9 @@ pub struct Seat {
     /// Ordered profiles to switch to when the primary cannot run; omitted = none (D7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<Vec<String>>,
+    /// M17-B1: implementer only — 2..=4 profiles that implement side by side (best-of-N).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<Vec<String>>,
 }
 
 /// Exactly the three seats of the fixed flow: a missing, extra or misspelt seat is an error.
@@ -446,6 +453,7 @@ pub fn gate_command(name: &str, d: &GateDecl) -> CommandSpec {
         metadata: d.metadata.clone(),
         projects: d.projects.clone(),
         diagnostics: d.diagnostics.clone(),
+        red_green: d.red_green.clone(),
     }
 }
 
@@ -561,6 +569,7 @@ pub fn load(
                 profile: s.profile.clone(),
                 model: s.model.clone(),
                 fallback: Some(s.fallback.clone().unwrap_or_default()),
+                candidates: s.candidates.clone(),
             },
         );
     }
@@ -703,7 +712,8 @@ pub fn problems(cfg: &Effective, root: &Path, machine: &str) -> Vec<String> {
             }
         };
         let names = std::iter::once(("profile", &r.profile))
-            .chain(r.fallback.iter().flatten().map(|f| ("fallback", f)));
+            .chain(r.fallback.iter().flatten().map(|f| ("fallback", f)))
+            .chain(r.candidates.iter().flatten().map(|c| ("candidates", c)));
         for (k, p) in names {
             if !cfg.repo.profiles.contains_key(p) {
                 out.push(format!(
@@ -786,6 +796,13 @@ pub fn problems(cfg: &Effective, root: &Path, machine: &str) -> Vec<String> {
                 }
             }
             GateType::Environment => {
+                // M17-A1 (AC-2): red-green proves tests in the clean checkout; an environment
+                // gate runs against a deployed environment, with the owner's rights
+                if d.red_green.is_some() {
+                    out.push(format!(
+                        "{key}.red_green: only a `kind: check` gate can prove its tests red-green — an environment gate runs against your environment, with your full rights; remove `red_green`"
+                    ));
+                }
                 for (k, set) in [
                     ("program", d.program.is_some()),
                     ("args", !d.args.is_empty()),

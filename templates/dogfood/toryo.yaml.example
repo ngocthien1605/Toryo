@@ -14,6 +14,8 @@ project:
 roles:                                                     # TODO(owner) 2
   planner:     { profile: claude-max, model: opus }
   implementer: { profile: codex-openai, fallback: [claude-max] }
+  # M17 best-of-N (about twice the tokens of one implement turn; HUONG-DAN §5.11):
+  # implementer: { profile: codex-openai, fallback: [claude-max], candidates: [codex-openai, claude-max] }
   reviewer:    { profile: claude-max, model: opus }
 
 pipeline:
@@ -32,6 +34,18 @@ verify:
 commands:
   verify:
     - { name: rust, program: pwsh, args: [-NoProfile, -File, scripts/verify.ps1], timeout_min: 45 }
+    # M17 red-green (HUONG-DAN §5.10): the implementer names, per acceptance criterion, the tests that prove
+    # it (`proof` in IMPLEMENTATION.json); each must fail on the base with only `tests/**` laid over it and
+    # pass on the checkpoint. A Rust test id is its path, e.g. `m17_ec07_globs_that_are_too_wide_prove_nothing`.
+    # The test id is one argv element of `cargo` — never put `{test}` inside a `pwsh -Command` string.
+    # - name: unit
+    #   program: cargo
+    #   args: [test, --locked]
+    #   timeout_min: 45
+    #   red_green:
+    #     tests: ["tests/**"]
+    #     args: [test, --locked, "{test}", --, --exact]
+    #     green_output_must_match: "test result: ok\\. [1-9]"
 
 timeouts:
   agent_stall_min: 10

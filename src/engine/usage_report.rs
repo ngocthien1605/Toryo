@@ -132,8 +132,11 @@ pub fn default_prices_path() -> Option<std::path::PathBuf> {
 pub fn stage_role(stage: &str) -> Option<&'static str> {
     match stage {
         "plan" => Some("planner"),
-        "review" => Some("reviewer"),
-        s if s == "implement" || s.starts_with("fix-") => Some("implementer"),
+        // M17: the compare turn of best-of-N is the reviewer seat's
+        "review" | super::candidates::SELECT_STAGE => Some("reviewer"),
+        s if s == "implement" || s.starts_with("fix-") || s.starts_with("implement#c") => {
+            Some("implementer")
+        }
         _ => None,
     }
 }

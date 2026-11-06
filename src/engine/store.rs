@@ -20,10 +20,11 @@ use crate::config::data_dir;
 use crate::domain::TokenUsage;
 use crate::usage::{Accounting, Buckets, Weights};
 
-/// 2 (M13-05): `deploy_confirmations`; 3 (R23-36): `stage_attempts.undo_pending`. A database of
-/// an older version is opened and raised (the tables are created, the column added and set from
-/// the words it replaces, nothing else changes); one of a higher version is refused.
-pub const SCHEMA_VERSION: i64 = 3;
+/// 2 (M13-05): `deploy_confirmations`; 3 (R23-36): `stage_attempts.undo_pending`; 4 (M17-B2):
+/// `fanouts` and `candidates` (best-of-N). A database of an older version is opened and raised
+/// (the tables are created, the column added and set from the words it replaces, nothing else
+/// changes); one of a higher version is refused.
+pub const SCHEMA_VERSION: i64 = 4;
 
 mod schema;
 use schema::SCHEMA;
@@ -239,6 +240,8 @@ mod control;
 pub use control::*;
 mod artifacts;
 pub use artifacts::*;
+mod candidates;
+pub use candidates::*;
 
 // ── stage attempts ───────────────────────────────────────────────────────────────────
 
@@ -276,10 +279,11 @@ mod tests {
 
     /// M13-05 AC-4: the schema version is raised (2: `deploy_confirmations`), a database of
     /// version 1 opens and is raised without losing a row, and one a newer toryo wrote is refused.
-    /// (R23-36: the version is 3 now — the assertions on "2" became "3", and the newer one "4".)
+    /// (R23-36: the version is 3 now — the assertions on "2" became "3", and the newer one "4".
+    /// M17-B2: the version is 4 now — "3" became "4", and the newer one "5".)
     #[test]
     fn an_older_database_opens_and_is_raised() {
-        assert_eq!(SCHEMA_VERSION, 3);
+        assert_eq!(SCHEMA_VERSION, 4);
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("toryo.db");
         // a version-1 database with a task in it: no `deploy_confirmations` table
@@ -306,7 +310,7 @@ mod tests {
         }
         assert_eq!(version(&p), "1");
         let st = Store::open(&p).unwrap();
-        assert_eq!(version(&p), "3");
+        assert_eq!(version(&p), "4");
         assert_eq!(
             st.call(|tx| get_task(tx, "OLD-1")).unwrap().id,
             "OLD-1",
@@ -341,13 +345,57 @@ mod tests {
         // a database a newer toryo wrote
         Connection::open(&p)
             .unwrap()
-            .execute_batch("UPDATE meta SET value='4' WHERE key='schema_version';")
+            .execute_batch("UPDATE meta SET value='5' WHERE key='schema_version';")
             .unwrap();
         let e = Store::open(&p).err().expect("refused").to_string();
         assert!(
-            e.contains("schema version 4") && e.contains("expects 3"),
+            e.contains("schema version 5") && e.contains("expects 4"),
             "{e}"
         );
+    }
+
+    /// M17-B2 (AC-26, edge case 40): a version-3 database with a task in it (no `fanouts`, no
+    /// `candidates`) opens, is raised to 4 and keeps its task; the new tables work.
+    #[test]
+    fn m17_ec40_a_version_3_database_is_raised_to_4() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("toryo.db");
+        {
+            let st = Store::open(&p).unwrap();
+            st.call(|tx| insert_task(tx, &new_task("V3-1"))).unwrap();
+        }
+        Connection::open(&p)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE candidates; DROP TABLE fanouts; UPDATE meta SET value='3' WHERE key='schema_version';",
+            )
+            .unwrap();
+        let st = Store::open(&p).unwrap();
+        let v: String = Connection::open(&p)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, "4");
+        assert_eq!(st.call(|tx| get_task(tx, "V3-1")).unwrap().id, "V3-1");
+        assert!(st.call(|tx| fanout(tx, "V3-1")).unwrap().is_none());
+        st.call(|tx| {
+            insert_fanout(tx, "V3-1", 2, "creating", None)?;
+            insert_candidate(
+                tx,
+                "V3-1",
+                1,
+                "a",
+                Path::new("/w/V3-1.c1"),
+                "toryo-candidate/V3-1/c1",
+            )
+        })
+        .unwrap();
+        let c = st.call(|tx| candidates(tx, "V3-1")).unwrap();
+        assert_eq!((c.len(), c[0].k, c[0].state.as_str()), (1, 1, "pending"));
     }
 
     /// R23-36: a database of version 2 kept a pending undo of a read-only role's write (X32) only
